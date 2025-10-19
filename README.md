@@ -72,28 +72,32 @@ For more examples, see [Usage Guide](docs/usage.md).
 Comprehensive documentation is available in the [`docs/`](docs/) folder:
 
 ### Getting Started
+
 - **[Installation Guide](docs/installation.md)** - Setup and configuration
 - **[Usage Guide](docs/usage.md)** - Basic to advanced usage examples
 - **[Architecture](docs/architecture.md)** - System design and components
 
 ### Training & Development
+
 - **[Training Pipeline](docs/training-pipeline.md)** - Complete training workflow
 - **[Data Format](docs/data-format.md)** - Dataset specifications
 - **[Model Details](docs/model-details.md)** - Model architecture and configuration
 
 ### Analysis & Evaluation
+
 - **[Evaluation Metrics](docs/evaluation.md)** - Quality assessment framework
 - **[Security Applications](docs/security-applications.md)** - Real-world use cases
 - **[Comparisons](docs/comparisons.md)** - Benchmarks vs traditional decompilers
 
 ### Reference
+
 - **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
 - **[Contributing](docs/contributing.md)** - Contribution guidelines
 - **[Limitations & Future Work](docs/limitations-future-work.md)** - Current limitations and roadmap
 
 ## Project Structure
 
-```
+```text
 A1.5_Smart_Contract_Bytecode_To_Code_Generator/
 ├── src/                     # Core implementation
 │   ├── bytecode_analyzer.py   # EVM bytecode → TAC conversion
@@ -139,6 +143,7 @@ This implementation is based on the research paper:
 ```
 
 **Paper Highlights**:
+
 - First successful application of LLMs to smart contract decompilation
 - Novel hybrid approach combining static analysis with neural methods
 - Comprehensive dataset of 238,446 TAC-to-Solidity function pairs

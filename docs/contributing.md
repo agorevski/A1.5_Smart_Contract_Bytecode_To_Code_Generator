@@ -5,26 +5,31 @@ We welcome contributions to the Smart Contract Decompilation project!
 ## Areas for Contribution
 
 ### 1. Data Collection
+
 - More efficient contract discovery methods
 - Additional data sources beyond Etherscan
 - Improved contract filtering and selection
 
 ### 2. TAC Generation
+
 - Enhanced pattern recognition
 - Better control flow recovery
 - Improved storage layout detection
 
 ### 3. Model Architecture
+
 - Experiment with different model sizes
 - Alternative fine-tuning approaches
 - Ensemble methods
 
 ### 4. Evaluation
+
 - Additional metrics and benchmarks
 - Comparative studies
 - Real-world case studies
 
 ### 5. Documentation
+
 - More examples and tutorials
 - Improved explanations
 - Additional use cases
@@ -105,6 +110,7 @@ git commit -m "feat: add new feature description"
 ```
 
 Use conventional commit messages:
+
 - `feat:` New feature
 - `fix:` Bug fix
 - `docs:` Documentation

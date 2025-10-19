@@ -20,17 +20,20 @@ This document provides detailed comparisons between our LLM-based approach and t
 **Approach**: Declarative decompilation using Datalog
 
 **Strengths**:
+
 - Sound static analysis
 - Formal verification support
 - Precise control flow recovery
 
 **Weaknesses**:
+
 - Generic variable names (v0, v1, temp1)
 - Goto-based control flow
 - No semantic understanding
 - Difficult to read output
 
 **Example Output**:
+
 ```solidity
 function func_0x70a08231(uint256 varg0) public view returns (uint256) {
     v0 = storage[keccak256(varg0, 0x0)];
@@ -43,17 +46,20 @@ function func_0x70a08231(uint256 varg0) public view returns (uint256) {
 **Approach**: Pattern matching and heuristics
 
 **Strengths**:
+
 - Fast decompilation
 - Good for simple contracts
 - Attempts variable recovery
 
 **Weaknesses**:
+
 - Limited to known patterns
 - Breaks on complex logic
 - No learning capability
 - Hard-coded rules
 
 **Example Output**:
+
 ```solidity
 function unknown70a08231(address arg0) public view returns (uint256) {
     return stor_0_0_19[arg0];
@@ -65,11 +71,13 @@ function unknown70a08231(address arg0) public view returns (uint256) {
 **Approach**: Direct bytecode to pseudo-code
 
 **Strengths**:
+
 - Simple and fast
 - Low-level accuracy
 - Good for debugging
 
 **Weaknesses**:
+
 - Very low-level output
 - No Solidity syntax
 - Minimal abstraction
@@ -82,6 +90,7 @@ function unknown70a08231(address arg0) public view returns (uint256) {
 #### 1. Meaningful Variable Recovery
 
 **Traditional**:
+
 ```solidity
 function func(address v0, uint256 v1) public {
     require(v0 != address(0));
@@ -90,6 +99,7 @@ function func(address v0, uint256 v1) public {
 ```
 
 **Our Approach**:
+
 ```solidity
 function updateBalance(address account, uint256 amount) public {
     require(account != address(0), "Invalid address");
@@ -100,6 +110,7 @@ function updateBalance(address account, uint256 amount) public {
 #### 2. Structured Control Flow
 
 **Traditional**:
+
 ```solidity
 function func() public {
     v0 = 1;
@@ -113,6 +124,7 @@ label_1:
 ```
 
 **Our Approach**:
+
 ```solidity
 function func() public returns (uint256) {
     uint256 counter = 1;
@@ -126,6 +138,7 @@ function func() public returns (uint256) {
 #### 3. Type Recovery
 
 **Traditional**:
+
 ```solidity
 function func(uint256 v0) public {
     stor[v0] = msg.sender;
@@ -133,6 +146,7 @@ function func(uint256 v0) public {
 ```
 
 **Our Approach**:
+
 ```solidity
 function setOwner(uint256 tokenId) public {
     _owners[tokenId] = msg.sender;
@@ -144,6 +158,7 @@ function setOwner(uint256 tokenId) public {
 **Traditional**: No comments
 
 **Our Approach**: Can infer intent
+
 ```solidity
 // Update user balance after transfer
 function updateBalance(address user, uint256 amount) public {

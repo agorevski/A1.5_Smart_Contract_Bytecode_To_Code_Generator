@@ -21,6 +21,7 @@ The system uses multiple complementary metrics to evaluate decompilation quality
 Measures how well the decompiled code preserves the meaning of the original using Sentence-BERT embeddings.
 
 **Method**:
+
 ```python
 from sentence_transformers import SentenceTransformer
 from scipy.spatial.distance import cosine
@@ -36,6 +37,7 @@ similarity = 1 - cosine(embedding1, embedding2)
 ```
 
 **Interpretation**:
+
 - **0.95-1.0**: Nearly perfect semantic match
 - **0.85-0.95**: Excellent quality (peak in distribution)
 - **0.70-0.85**: Good quality
@@ -49,6 +51,7 @@ similarity = 1 - cosine(embedding1, embedding2)
 Measures n-gram overlap between original and decompiled code.
 
 **Method**:
+
 ```python
 from nltk.translate.bleu_score import sentence_bleu
 
@@ -59,6 +62,7 @@ bleu = sentence_bleu(reference, candidate, weights=(0.25, 0.25, 0.25, 0.25))
 ```
 
 **Interpretation**:
+
 - **0.8-1.0**: Excellent match
 - **0.6-0.8**: Good match
 - **0.4-0.6**: Moderate match
@@ -69,6 +73,7 @@ bleu = sentence_bleu(reference, candidate, weights=(0.25, 0.25, 0.25, 0.25))
 Measures longest common subsequence, capturing sequential similarity.
 
 **Method**:
+
 ```python
 from rouge_score import rouge_scorer
 
@@ -84,6 +89,7 @@ rouge_l = scores['rougeL'].fmeasure
 Measures character-level similarity using Levenshtein distance.
 
 **Method**:
+
 ```python
 from Levenshtein import distance
 
@@ -93,6 +99,7 @@ normalized_distance = edit_dist / max_len
 ```
 
 **Interpretation**:
+
 - **0.0-0.2**: Excellent match
 - **0.2-0.4**: Good match (paper target)
 - **0.4-0.6**: Moderate match
@@ -105,6 +112,7 @@ normalized_distance = edit_dist / max_len
 Measures token-by-token correctness.
 
 **Method**:
+
 ```python
 def token_accuracy(original, decompiled):
     orig_tokens = original.split()
@@ -122,6 +130,7 @@ def token_accuracy(original, decompiled):
 Percentage of functions that are perfectly decompiled.
 
 **Method**:
+
 ```python
 def exact_match(original, decompiled):
     # Normalize whitespace
@@ -138,6 +147,7 @@ def exact_match(original, decompiled):
 Evaluates preservation of if/else, loops, and other control structures.
 
 **Method**:
+
 ```python
 import re
 
@@ -168,6 +178,7 @@ def control_flow_preservation(original, decompiled):
 Evaluates correct recovery of function names, parameters, and modifiers.
 
 **Components**:
+
 - Function name match
 - Parameter count and types
 - Visibility modifier (public/external/internal/private)
@@ -175,6 +186,7 @@ Evaluates correct recovery of function names, parameters, and modifiers.
 - Return type
 
 **Method**:
+
 ```python
 def parse_function_signature(code):
     pattern = r'function\s+(\w+)\s*\((.*?)\)\s+(public|external|internal|private)(?:\s+(view|pure|payable))?\s*(?:returns\s*\((.*?)\))?'
@@ -217,6 +229,7 @@ def signature_accuracy(original, decompiled):
 Measures similarity in code length (as proxy for complexity).
 
 **Method**:
+
 ```python
 def length_correlation(original, decompiled):
     orig_len = len(original.split())
@@ -233,6 +246,7 @@ def length_correlation(original, decompiled):
 Compares distribution of tokens between original and decompiled.
 
 **Method**:
+
 ```python
 from collections import Counter
 from scipy.stats import wasserstein_distance
@@ -260,6 +274,7 @@ def token_distribution_similarity(original, decompiled):
 Evaluates preservation of critical security patterns.
 
 **Patterns**:
+
 - `require` statements
 - Access control modifiers
 - Overflow checks
@@ -267,6 +282,7 @@ Evaluates preservation of critical security patterns.
 - Reentrancy guards
 
 **Method**:
+
 ```python
 def security_pattern_preservation(original, decompiled):
     patterns = [
@@ -297,6 +313,7 @@ def security_pattern_preservation(original, decompiled):
 Measures cyclomatic complexity similarity.
 
 **Method**:
+
 ```python
 def cyclomatic_complexity(code):
     # Count decision points

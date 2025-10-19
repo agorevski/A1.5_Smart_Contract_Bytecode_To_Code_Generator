@@ -13,12 +13,14 @@ Decompilation enables security analysis of unverified contracts, vulnerability d
 **Context**: Unverified contract with critical state management bug
 
 **Discovery Process**:
+
 1. Contract bytecode obtained from blockchain
 2. Decompiled to readable Solidity
 3. Identified flawed unlock mechanism
 4. Confirmed vulnerability allowing repeated withdrawals
 
 **Vulnerable Code** (decompiled):
+
 ```solidity
 function unlockToken(uint256 _tokenId) external {
     require(tokenLocks[msg.sender][_tokenId].isLocked, "Token is already unlocked");
@@ -44,6 +46,7 @@ function unlockToken(uint256 _tokenId) external {
 **Context**: Proprietary MEV bot with unverified contracts exploited
 
 **Analysis**:
+
 1. Bot contract bytecode decompiled
 2. Identified vulnerable callback functions
 3. Found missing access controls
@@ -67,6 +70,7 @@ function d3MMSwapCallBack(address _to, uint256 _amount, bytes calldata) external
 ```
 
 **Exploit Mechanism**:
+
 1. Attacker deployed malicious contract
 2. Called bot's callback functions directly
 3. Drained tokens via unprotected transfers
@@ -105,6 +109,7 @@ alert_vulnerable_contracts(similar_contracts)
 ```
 
 **Timeline**:
+
 - **Detection**: T+0 minutes
 - **Decompilation**: T+2 minutes
 - **Analysis**: T+10 minutes
@@ -115,6 +120,7 @@ alert_vulnerable_contracts(similar_contracts)
 ### 1. Reentrancy Attacks
 
 **Vulnerable Pattern**:
+
 ```solidity
 function withdraw(uint256 amount) external {
     require(balances[msg.sender] >= amount);
@@ -128,6 +134,7 @@ function withdraw(uint256 amount) external {
 ```
 
 **Detection via Decompilation**:
+
 - Identify external calls
 - Check state update ordering
 - Verify reentrancy guards
@@ -135,6 +142,7 @@ function withdraw(uint256 amount) external {
 ### 2. Access Control Issues
 
 **Vulnerable Pattern**:
+
 ```solidity
 function setOwner(address newOwner) external {
     // VULNERABLE: Missing access control
@@ -148,6 +156,7 @@ function withdrawAll() external {
 ```
 
 **Detection**:
+
 - Look for missing `onlyOwner` modifiers
 - Check `msg.sender` validations
 - Verify role-based access control
@@ -155,6 +164,7 @@ function withdrawAll() external {
 ### 3. Integer Overflow/Underflow
 
 **Vulnerable Pattern** (pre-Solidity 0.8):
+
 ```solidity
 function transfer(address to, uint256 amount) external {
     // VULNERABLE: No overflow check
@@ -164,6 +174,7 @@ function transfer(address to, uint256 amount) external {
 ```
 
 **Detection**:
+
 - Check for SafeMath usage
 - Verify compiler version (< 0.8.0)
 - Look for unchecked arithmetic
@@ -171,6 +182,7 @@ function transfer(address to, uint256 amount) external {
 ### 4. Unprotected Selfdestruct
 
 **Vulnerable Pattern**:
+
 ```solidity
 function kill() external {
     // VULNERABLE: Anyone can destroy contract
@@ -179,6 +191,7 @@ function kill() external {
 ```
 
 **Detection**:
+
 - Identify `selfdestruct` calls
 - Check access controls
 - Verify authorization logic
@@ -204,7 +217,8 @@ for vuln in report.vulnerabilities:
 ```
 
 **Output Example**:
-```
+
+```text
 Vulnerabilities found: 3
   [HIGH] Reentrancy: External call before state update in withdraw()
   [MEDIUM] Access Control: Missing owner check in setAdmin()
@@ -229,6 +243,7 @@ Vulnerabilities found: 3
 **Contract**: DeFi protocol with price oracle manipulation
 
 **Decompilation revealed**:
+
 ```solidity
 function liquidate(address user) external {
     uint256 price = oracle.getPrice();  // VULNERABLE: Manipulable
@@ -242,6 +257,7 @@ function liquidate(address user) external {
 **Vulnerability**: Oracle could be manipulated via flash loans
 
 **Fix**:
+
 - Use time-weighted average prices (TWAP)
 - Implement price deviation checks
 - Add liquidation delays
@@ -251,6 +267,7 @@ function liquidate(address user) external {
 **Contract**: Upgradeable contract with storage collision
 
 **Decompilation revealed**:
+
 ```solidity
 // Proxy storage
 address implementation;  // slot 0
@@ -276,9 +293,9 @@ uint256 balance;        // slot 1 - COLLISION!
 
 ### Decompilation in Security Workflow
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
-│         Smart Contract Security Workflow         │
+│         Smart Contract Security Workflow        │
 ├─────────────────────────────────────────────────┤
 │                                                 │
 │  1. Contract Deployed (Unverified)              │

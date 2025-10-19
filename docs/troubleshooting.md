@@ -7,29 +7,34 @@ Common issues and solutions for the Smart Contract Decompilation system.
 ### Issue: CUDA Out of Memory
 
 **Symptoms**:
-```
+
+```text
 RuntimeError: CUDA out of memory. Tried to allocate X GB
 ```
 
 **Solutions**:
 
-1. **Enable 4-bit quantization** (already default):
+**Enable 4-bit quantization** (already default):
+
 ```python
 config.use_4bit_quantization = True
 ```
 
-2. **Reduce batch size**:
+**Reduce batch size**:
+
 ```python
 config.batch_size = 2  # Lower from 4
 config.gradient_accumulation_steps = 8  # Increase to maintain effective batch
 ```
 
-3. **Enable gradient checkpointing**:
+**Enable gradient checkpointing**:
+
 ```python
 config.use_gradient_checkpointing = True
 ```
 
-4. **Clear GPU cache**:
+**Clear GPU cache**:
+
 ```python
 import torch
 torch.cuda.empty_cache()
@@ -38,7 +43,8 @@ torch.cuda.empty_cache()
 ### Issue: PyTorch Installation Fails
 
 **Symptoms**:
-```
+
+```text
 ERROR: Could not find a version that satisfies the requirement torch
 ```
 
@@ -55,11 +61,13 @@ pip install torch torchvision torchaudio
 ### Issue: Transformers Library Error
 
 **Symptoms**:
-```
+
+```text
 ImportError: cannot import name 'AutoModelForCausalLM'
 ```
 
 **Solution**:
+
 ```bash
 pip install --upgrade transformers accelerate
 ```
@@ -67,46 +75,53 @@ pip install --upgrade transformers accelerate
 ### Issue: Permission Denied for Model Download
 
 **Symptoms**:
-```
+
+```text
 HTTPError: 401 Unauthorized
 ```
 
 **Solutions**:
 
-1. **Login with Hugging Face CLI**:
+**Login with Hugging Face CLI**:
+
 ```bash
 huggingface-cli login
 # Enter your token when prompted
 ```
 
-2. **Set environment variable**:
+**Set environment variable**:
+
 ```bash
 export HF_TOKEN="your_token_here"
 ```
 
-3. **Accept model license**: Visit https://huggingface.co/meta-llama/Llama-3.2-3B and accept terms
+**Accept model license**: Visit [Llama-3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) and accept terms
 
 ## Training Issues
 
 ### Issue: Loss Not Decreasing
 
 **Symptoms**:
+
 - Training loss plateaus immediately
 - Validation loss doesn't improve
 
 **Solutions**:
 
-1. **Lower learning rate**:
+**Lower learning rate**:
+
 ```python
 config.learning_rate = 1e-4  # Down from 2e-4
 ```
 
-2. **Increase warmup**:
+**Increase warmup**:
+
 ```python
 config.warmup_steps = 1000  # Up from 500
 ```
 
-3. **Check data quality**:
+**Check data quality**:
+
 ```python
 # Verify dataset
 for item in dataset[:10]:
@@ -117,45 +132,52 @@ for item in dataset[:10]:
 ### Issue: Overfitting
 
 **Symptoms**:
+
 - Training loss much lower than validation loss
 - Large gap between train/val metrics
 
 **Solutions**:
 
-1. **Increase regularization**:
+**Increase regularization**:
+
 ```python
 config.weight_decay = 0.05  # Up from 0.01
 config.lora_dropout = 0.1   # Up from 0.05
 ```
 
-2. **Reduce epochs**:
+**Reduce epochs**:
+
 ```python
 config.num_epochs = 2  # Down from 3
 ```
 
-3. **Add more training data** or **augment existing data**
+**Add more training data** or **augment existing data**
 
 ### Issue: Slow Training Speed
 
 **Symptoms**:
+
 - Training takes much longer than expected
 - Low GPU utilization
 
 **Solutions**:
 
-1. **Enable bfloat16**:
+**Enable bfloat16**:
+
 ```python
 config.bf16 = True
 config.fp16 = False
 ```
 
-2. **Increase dataloader workers**:
+**Increase dataloader workers**:
+
 ```python
 config.dataloader_num_workers = 4
 config.dataloader_pin_memory = True
 ```
 
-3. **Check GPU utilization**:
+**Check GPU utilization**:
+
 ```bash
 watch -n 1 nvidia-smi
 ```
@@ -165,13 +187,15 @@ watch -n 1 nvidia-smi
 ### Issue: Etherscan API Rate Limiting
 
 **Symptoms**:
-```
+
+```text
 Error: Max rate limit reached
 ```
 
 **Solutions**:
 
-1. **Add delays between requests**:
+**Add delays between requests**:
+
 ```python
 builder = DatasetBuilder(
     etherscan_api_key="your_key",
@@ -179,13 +203,15 @@ builder = DatasetBuilder(
 )
 ```
 
-2. **Use multiple API keys**:
+**Use multiple API keys**:
+
 ```python
 api_keys = ["key1", "key2", "key3"]
 builder = DatasetBuilder(api_keys=api_keys)
 ```
 
-3. **Implement exponential backoff**:
+**Implement exponential backoff**:
+
 ```python
 import time
 from requests.exceptions import HTTPError
@@ -205,13 +231,15 @@ def collect_with_retry(address, max_retries=3):
 ### Issue: Contract Verification Failed
 
 **Symptoms**:
-```
+
+```text
 Error: Contract source code not verified
 ```
 
 **Solutions**:
 
-1. **Skip unverified contracts**:
+**Skip unverified contracts**:
+
 ```python
 verified_addresses = [
     addr for addr in addresses 
@@ -219,37 +247,42 @@ verified_addresses = [
 ]
 ```
 
-2. **Use bytecode-only mode** (if applicable)
+**Use bytecode-only mode** (if applicable)
 
-3. **Request contract owner to verify** on Etherscan
+**Request contract owner to verify** on Etherscan
 
 ## Inference Issues
 
 ### Issue: Slow Inference Speed
 
 **Symptoms**:
+
 - Decompilation takes too long
 - Low tokens/second throughput
 
 **Solutions**:
 
-1. **Reduce max_new_tokens**:
+**Reduce max_new_tokens**:
+
 ```python
 generation_config.max_new_tokens = 1024  # Down from 2048
 ```
 
-2. **Use greedy decoding**:
+**Use greedy decoding**:
+
 ```python
 generation_config.do_sample = False
 generation_config.num_beams = 1
 ```
 
-3. **Merge LoRA weights**:
+**Merge LoRA weights**:
+
 ```python
 model = model.merge_and_unload()
 ```
 
-4. **Use lower temperature**:
+**Use lower temperature**:
+
 ```python
 generation_config.temperature = 0.1
 ```
@@ -257,13 +290,15 @@ generation_config.temperature = 0.1
 ### Issue: Low Quality Decompilation
 
 **Symptoms**:
+
 - Generated code doesn't compile
 - Semantic similarity < 0.5
 - Missing critical logic
 
 **Solutions**:
 
-1. **Adjust temperature**:
+**Adjust temperature**:
+
 ```python
 # Try different temperatures
 for temp in [0.1, 0.3, 0.5]:
@@ -271,16 +306,18 @@ for temp in [0.1, 0.3, 0.5]:
     evaluate(result)
 ```
 
-2. **Check TAC quality**:
+**Check TAC quality**:
+
 ```python
 # Verify TAC is well-formed
 print(tac)
 assert 'function_selector' in tac
 ```
 
-3. **Retrain with more data** or **fine-tune further**
+**Retrain with more data** or **fine-tune further**
 
-4. **Use ensemble approach**:
+**Use ensemble approach**:
+
 ```python
 # Generate multiple candidates
 results = []
@@ -297,35 +334,40 @@ best = max(results, key=lambda x: evaluate(x))
 ### Issue: Disk Space Full
 
 **Symptoms**:
-```
+
+```text
 OSError: [Errno 28] No space left on device
 ```
 
 **Solutions**:
 
-1. **Clean old checkpoints**:
+**Clean old checkpoints**:
+
 ```bash
 # Keep only last 3 checkpoints
 ls -t models/checkpoints/checkpoint-* | tail -n +4 | xargs rm -rf
 ```
 
-2. **Compress datasets**:
+**Compress datasets**:
+
 ```bash
 gzip data/processed/*.jsonl
 ```
 
-3. **Use external storage** for models/data
+**Use external storage** for models/data
 
 ### Issue: Out of System RAM
 
 **Symptoms**:
-```
+
+```text
 MemoryError: Unable to allocate array
 ```
 
 **Solutions**:
 
-1. **Use streaming datasets**:
+**Use streaming datasets**:
+
 ```python
 from datasets import load_dataset
 
@@ -336,33 +378,38 @@ dataset = load_dataset(
 )
 ```
 
-2. **Reduce dataloader workers**:
+**Reduce dataloader workers**:
+
 ```python
 config.dataloader_num_workers = 2
 ```
 
-3. **Process in smaller batches**
+**Process in smaller batches** -
 
 ### Issue: Module Import Errors
 
 **Symptoms**:
-```
+
+```text
 ModuleNotFoundError: No module named 'src'
 ```
 
 **Solutions**:
 
-1. **Add to PYTHONPATH**:
+**Add to PYTHONPATH**:
+
 ```bash
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 ```
 
-2. **Use absolute imports**:
+**Use absolute imports**:
+
 ```python
 from A1.5_Smart_Contract_Bytecode_To_Code_Generator.src import module
 ```
 
-3. **Install as package**:
+**Install as package**:
+
 ```bash
 pip install -e .
 ```
@@ -372,37 +419,41 @@ pip install -e .
 ### Issue: High Edit Distance
 
 **Symptoms**:
+
 - Most functions have edit distance > 0.4
 - Syntactic errors in output
 
 **Solutions**:
 
-1. **Train for more epochs**
-2. **Increase LoRA rank**:
+**Train for more epochs**
+**Increase LoRA rank**
+
 ```python
 config.lora_rank = 32  # Up from 16
 ```
 
-3. **Check training data quality**
-4. **Verify TAC generation accuracy**
+**Check training data quality**
+**Verify TAC generation accuracy**
 
 ### Issue: Low Semantic Similarity
 
 **Symptoms**:
+
 - Semantic similarity < 0.7 on average
 - Meaning not preserved
 
 **Solutions**:
 
-1. **Ensure diverse training data**
-2. **Increase model capacity**:
+**Ensure diverse training data**
+**Increase model capacity**:
+
 ```python
 # Use larger base model
 config.model_name = "meta-llama/Llama-3.1-8B"
 ```
 
-3. **Train for more epochs**
-4. **Check that TAC preserves semantics**
+**Train for more epochs**
+**Check that TAC preserves semantics**
 
 ## Debugging Tips
 

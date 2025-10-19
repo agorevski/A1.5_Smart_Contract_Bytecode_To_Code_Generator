@@ -9,11 +9,13 @@ This document outlines current limitations and planned improvements for the Smar
 **Limitation**: Quality depends on diversity and size of training dataset
 
 **Impact**:
+
 - May struggle with rare or novel patterns
 - Limited by Solidity versions in training data
 - Dependent on quality of verified contracts
 
 **Mitigation**:
+
 - Continuously expand training dataset
 - Include contracts from multiple sources
 - Balance complexity distribution
@@ -23,11 +25,13 @@ This document outlines current limitations and planned improvements for the Smar
 **Limitation**: Significant GPU resources needed for training and inference
 
 **Specifications**:
+
 - Training: NVIDIA A100 (40GB) recommended
 - Inference: 4-6GB VRAM minimum
 - Time: 1-2 seconds per function (GPU)
 
 **Impact**:
+
 - Not suitable for resource-constrained environments
 - Higher operational costs than traditional decompilers
 - Slower than CPU-based tools
@@ -37,12 +41,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Limitation**: Some sophisticated financial mechanisms need improvement
 
 **Challenges**:
+
 - Fixed-point arithmetic precision
 - Complex temporal mechanics
 - Novel DeFi primitives
 - Cross-contract interactions
 
 **Examples**:
+
 - Flash loan mechanics
 - Automated market makers (AMMs)
 - Yield farming strategies
@@ -53,6 +59,7 @@ This document outlines current limitations and planned improvements for the Smar
 **Limitation**: Highly optimized bytecode can be challenging
 
 **Issues**:
+
 - Inline assembly not always perfectly handled
 - Compiler optimizations may obscure intent
 - Manual optimizations difficult to reverse
@@ -63,11 +70,13 @@ This document outlines current limitations and planned improvements for the Smar
 **Limitation**: Output may vary slightly between runs
 
 **Causes**:
+
 - Temperature-based sampling
 - Random seed variation
 - Model stochasticity
 
 **Impact**:
+
 - Reproducibility concerns
 - Need for validation
 - Multiple runs may be necessary
@@ -77,11 +86,13 @@ This document outlines current limitations and planned improvements for the Smar
 **Limitation**: Maximum 20,000 tokens per function
 
 **Impact**:
+
 - Very large functions may be truncated
 - Some complex contracts exceed limit
 - Requires function splitting
 
 **Mitigation**:
+
 - Split large functions
 - Process in multiple passes
 - Use sliding window approach
@@ -93,12 +104,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Extend beyond Solidity to other smart contract languages
 
 **Targets**:
+
 - Vyper decompilation
 - Yul intermediate language
 - Move language (Aptos/Sui)
 - Rust-based contracts (Solana)
 
 **Benefits**:
+
 - Broader applicability
 - Cross-language analysis
 - Unified decompilation platform
@@ -110,12 +123,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Optimize for faster processing and edge deployment
 
 **Approaches**:
+
 - Model distillation
 - Quantization improvements
 - Batch optimization
 - Caching strategies
 
 **Targets**:
+
 - < 500ms per function
 - CPU-friendly inference
 - Edge device deployment
@@ -127,12 +142,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Better handling of complex DeFi protocols
 
 **Focus Areas**:
+
 - Flash loan detection
 - Reentrancy patterns
 - Proxy pattern recognition
 - Upgrade mechanism detection
 
 **Methods**:
+
 - Specialized training data
 - Pattern-specific modules
 - Hybrid analysis
@@ -144,12 +161,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: User feedback integration for iterative refinement
 
 **Features**:
+
 - Confidence scoring
 - Alternative suggestions
 - User corrections
 - Incremental improvement
 
 **Interface**:
+
 - Web-based UI
 - IDE plugins
 - API endpoints
@@ -161,12 +180,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Seamless integration with existing tools and workflows
 
 **Integrations**:
+
 - IDE plugins (VSCode, IntelliJ)
 - CI/CD pipeline support
 - Security scanner integration
 - Blockchain explorers
 
 **APIs**:
+
 - REST API
 - Python SDK
 - JavaScript library
@@ -178,12 +199,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: More comprehensive quality assessment
 
 **Metrics**:
+
 - Gas efficiency preservation
 - Security pattern detection
 - Formal verification compatibility
 - Cross-version consistency
 
 **Benchmarks**:
+
 - Standardized test suite
 - Public leaderboard
 - Community challenges
@@ -195,12 +218,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Domain-specific models for different contract types
 
 **Models**:
+
 - ERC-20/721 specialist
 - DeFi protocol expert
 - DAO governance focus
 - NFT marketplace specialist
 
 **Benefits**:
+
 - Higher accuracy for specific domains
 - Faster inference
 - Better pattern recognition
@@ -212,12 +237,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Provide insights into decompilation decisions
 
 **Features**:
+
 - Confidence scores per line
 - Alternative interpretations
 - Reasoning visualization
 - Uncertainty quantification
 
 **Methods**:
+
 - Attention visualization
 - Token probability analysis
 - Ablation studies
@@ -229,12 +256,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Bridge gap with formal verification tools
 
 **Approach**:
+
 - Generate verification-friendly output
 - Preserve invariants
 - Include proof hints
 - Compatibility with tools (Coq, Isabelle)
 
 **Benefits**:
+
 - Higher assurance
 - Automated proof generation
 - Security guarantees
@@ -246,12 +275,14 @@ This document outlines current limitations and planned improvements for the Smar
 **Goal**: Model improvement from user feedback
 
 **Features**:
+
 - Correction collection
 - Automatic retraining
 - Performance monitoring
 - A/B testing
 
 **Privacy**:
+
 - Federated learning
 - Differential privacy
 - Opt-in participation
@@ -308,6 +339,7 @@ Combine neural and symbolic approaches
 ## Feedback
 
 We actively seek feedback on:
+
 - Priority of enhancements
 - New use cases
 - Performance requirements

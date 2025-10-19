@@ -63,18 +63,20 @@ lora_config = LoraConfig(
 
 LoRA decomposes weight updates as low-rank matrices:
 
-```
+```text
 W' = W + BA/α
 ```
 
 Where:
+
 - W: Original weights (frozen)
 - B: Low-rank matrix (r × d)
 - A: Low-rank matrix (d × r)
 - α: Scaling factor
 - r: Rank (much smaller than d)
 
-**Memory Savings**: 
+**Memory Savings**:
+
 - Original: 3.21B parameters
 - LoRA: ~30M trainable parameters (~99% reduction)
 
@@ -125,6 +127,7 @@ scheduler = get_linear_schedule_with_warmup(
 ```
 
 **Schedule Phases**:
+
 1. **Warmup** (0-500 steps): Linear increase from 0 to 2e-4
 2. **Linear Decay** (500-75000): Linear decrease to 0
 
@@ -263,6 +266,7 @@ generation_config = GenerationConfig(
 ### Sampling Strategies
 
 #### Greedy Decoding
+
 ```python
 generation_config = GenerationConfig(
     do_sample=False,
@@ -271,6 +275,7 @@ generation_config = GenerationConfig(
 ```
 
 #### Top-p (Nucleus) Sampling
+
 ```python
 generation_config = GenerationConfig(
     do_sample=True,
@@ -280,6 +285,7 @@ generation_config = GenerationConfig(
 ```
 
 #### Top-k Sampling
+
 ```python
 generation_config = GenerationConfig(
     do_sample=True,
@@ -289,6 +295,7 @@ generation_config = GenerationConfig(
 ```
 
 #### Beam Search
+
 ```python
 generation_config = GenerationConfig(
     do_sample=False,
@@ -361,6 +368,7 @@ tokenizer.save_pretrained("models/merged/smart_contract_decompiler")
 ### Alternative LoRA Configurations
 
 #### High Capacity
+
 ```python
 # More parameters for complex patterns
 lora_config = LoraConfig(
@@ -372,6 +380,7 @@ lora_config = LoraConfig(
 ```
 
 #### Memory Efficient
+
 ```python
 # Fewer parameters for limited memory
 lora_config = LoraConfig(

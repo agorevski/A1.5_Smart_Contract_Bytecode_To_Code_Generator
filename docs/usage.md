@@ -33,7 +33,8 @@ print(tac_representation)
 ```
 
 **Output Example:**
-```
+
+```text
 function_selector_0x70a08231:
   v0 = CALLDATALOAD 0x04
   v1 = SLOAD storage[mapping_0][v0]
@@ -63,6 +64,7 @@ print(solidity_code)
 ```
 
 **Output Example:**
+
 ```solidity
 function balanceOf(address account) public view returns (uint256) {
     return _balances[account];
@@ -309,6 +311,7 @@ if __name__ == '__main__':
 ```
 
 Usage:
+
 ```bash
 # From hex string
 python decompile.py "0x608060405234801561001057..."
@@ -365,6 +368,7 @@ if __name__ == '__main__':
 ```
 
 Usage:
+
 ```bash
 curl -X POST http://localhost:5000/decompile \
   -H "Content-Type: application/json" \
