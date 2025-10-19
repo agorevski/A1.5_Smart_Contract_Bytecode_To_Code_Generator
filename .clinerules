@@ -1,0 +1,402 @@
+# Cline Rules for Smart Contract Decompilation Project
+
+## Project Overview
+
+This repository implements smart contract decompilation using Llama 3.2 3B, converting EVM bytecode into human-readable Solidity code through a two-stage pipeline:
+
+1. **Bytecode-to-TAC**: Static analysis converts EVM bytecode to Three-Address Code (TAC)
+2. **TAC-to-Solidity**: Fine-tuned LLM generates readable Solidity from TAC
+
+Research paper: "Decompiling Smart Contracts with a Large Language Model" (arXiv:2506.19624v1)
+
+## Technology Stack
+
+### Core ML/AI Libraries
+
+- **PyTorch** (>=2.0.0): Deep learning framework
+- **Transformers** (>=4.35.0): Hugging Face library for LLMs
+- **PEFT** (>=0.6.0): Parameter-Efficient Fine-Tuning (LoRA)
+- **Accelerate** (>=0.24.0): Distributed training support
+- **bitsandbytes** (>=0.41.0): 8-bit quantization
+
+### Blockchain Libraries
+
+- **web3** (>=6.11.0): Ethereum interaction
+- **pyevmasm** (>=0.2.3): EVM disassembly
+- **eth-utils**, **eth-abi**: Ethereum utilities
+- **py-evm**: EVM implementation
+
+### Data Science
+
+- **numpy**, **pandas**, **scipy**, **scikit-learn**: Data processing
+- **nltk**, **rouge-score**, **sentence-transformers**: Evaluation metrics
+
+## Project Structure
+
+### Core Modules (`src/`)
+
+- `bytecode_analyzer.py`: EVM bytecode → TAC conversion with control flow analysis
+- `dataset_pipeline.py`: Data collection and preprocessing from Etherscan
+- `model_setup.py`: Model configuration, LoRA fine-tuning, inference
+- `training_pipeline.py`: End-to-end training orchestration
+
+### Documentation (`docs/`)
+
+- Comprehensive guides for installation, usage, training, evaluation
+- Security applications, troubleshooting, comparisons with traditional decompilers
+- Contributing guidelines and limitations
+
+### Supporting Files
+
+- `demo.py`: Demonstration script
+- `demo_dataset.jsonl`: Sample training data
+- `requirements.txt`: Python dependencies
+- `reference/`: Research paper PDF
+
+## Code Style & Patterns
+
+### Type Hints & Dataclasses
+
+Always use type hints and dataclasses for structured data:
+
+```python
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+@dataclass
+class TACInstruction:
+    operation: TACOperationType
+    result: Optional[str] = None
+    operand1: Optional[str] = None
+    metadata: Optional[Dict] = None
+```
+
+### Logging Patterns
+
+Use Python logging with descriptive messages:
+
+```python
+import logging
+
+self.logger = logging.getLogger(__name__)
+self.logger.info(f"Parsed {len(self.instructions)} instructions")
+self.logger.error(f"Failed to parse bytecode: {e}")
+```
+
+### Error Handling with Fallbacks
+
+Implement robust error handling with fallback mechanisms:
+
+```python
+try:
+    # Primary comprehensive analysis
+    blocks = self._construct_basic_blocks(jump_targets)
+except Exception as e:
+    self.logger.error(f"Control flow analysis failed: {e}")
+    # Fallback to basic analysis
+    return self._fallback_control_flow_analysis()
+```
+
+### Enums for Constants
+
+Use enums for operation types and constants:
+
+```python
+from enum import Enum
+
+class TACOperationType(Enum):
+    ASSIGN = "assign"
+    BINARY_OP = "binary_op"
+    LOAD = "load"
+    STORE = "store"
+```
+
+## Domain-Specific Knowledge
+
+### EVM Bytecode Analysis
+
+- **Stack-based architecture**: EVM uses a stack for operations
+- **JUMPDEST**: Only valid jump targets in bytecode
+- **Function selectors**: 4-byte identifiers (first 4 bytes of keccak256 hash)
+- **Memory vs Storage**: Temporary vs persistent data
+
+### TAC (Three-Address Code) Representation
+
+- Intermediate representation between bytecode and Solidity
+- Format: `result = operand1 operator operand2`
+- Includes control flow: basic blocks, jumps, conditional branches
+- Preserves semantic information for LLM processing
+
+### Control Flow Analysis Concepts
+
+- **Basic blocks**: Sequences of instructions with single entry/exit
+- **Predecessors/Successors**: Block relationships in control flow graph
+- **Dominance analysis**: Which blocks must execute before others
+- **Loop detection**: Identifying back edges in control flow
+- **Dead code**: Unreachable blocks
+
+### Smart Contract Patterns
+
+- **Function dispatcher**: Routes calls based on function selector
+- **Fallback function**: Executed when no function matches
+- **Modifiers**: `payable`, `view`, `pure`
+- **Visibility**: `public`, `private`, `internal`, `external`
+
+## Model & Training
+
+### Fine-Tuning Configuration
+
+- **Base model**: Llama 3.2 3B (meta-llama/Llama-3.2-3B)
+- **Method**: LoRA (Low-Rank Adaptation) for efficiency
+- **LoRA config**: r=16, alpha=32, dropout=0.1
+- **Target modules**: All linear layers for comprehensive adaptation
+- **Quantization**: 8-bit loading to reduce memory
+
+### Training Parameters
+
+- **Batch size**: 4 per device
+- **Gradient accumulation**: 8 steps
+- **Learning rate**: 2e-4 with cosine scheduler
+- **Epochs**: 3-5 depending on dataset size
+- **Max sequence length**: 4096 tokens
+
+### Dataset Format (JSONL)
+
+```json
+{
+  "bytecode": "0x608060405...",
+  "tac": "// TAC representation with control flow...",
+  "solidity": "contract Example {\n  function foo() public {...}\n}"
+}
+```
+
+## Evaluation Metrics
+
+### Key Metrics
+
+- **Semantic Similarity**: CodeBERT embeddings + cosine similarity (target: >0.8)
+- **Edit Distance**: Normalized Levenshtein distance (target: <0.4)
+- **Success Rate**: Percentage of functions with high similarity (target: >78%)
+
+### Evaluation Approach
+
+Compare generated Solidity against verified source code:
+
+1. Tokenize both outputs
+2. Compute embeddings using pre-trained CodeBERT
+3. Calculate cosine similarity and edit distance
+4. Aggregate metrics across dataset
+
+## Environment Requirements
+
+### Hardware
+
+- **GPU**: CUDA-compatible with 16GB+ VRAM for training, 4GB+ for inference
+- **RAM**: 32GB+ system memory recommended
+- **Storage**: 50GB+ for models and datasets
+
+### API Keys (Environment Variables)
+
+- `ETHERSCAN_API_KEY`: For fetching verified contracts
+- `HF_TOKEN`: Hugging Face token for model access
+
+### GPU Configuration
+
+```python
+# Check CUDA availability
+import torch
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+```
+
+## Development Guidelines
+
+### When Adding New Features
+
+1. **Update documentation**: Keep `docs/` folder synchronized
+2. **Add type hints**: Maintain type safety throughout
+3. **Include logging**: Add appropriate log messages
+4. **Error handling**: Implement try-except with fallbacks
+5. **Test with demo**: Verify using `demo.py`
+
+### When Modifying Bytecode Analysis
+
+- Consider impact on TAC generation
+- Test with various bytecode patterns (loops, conditionals, storage)
+- Validate control flow graph construction
+- Check jump target resolution accuracy
+
+### When Changing Model Configuration
+
+- Document changes in `docs/model-details.md`
+- Test memory requirements and training time
+- Validate output quality with evaluation metrics
+- Consider inference speed implications
+
+### When Working with Data Pipeline
+
+- Ensure JSONL format consistency
+- Validate bytecode hex format (0x prefix handling)
+- Check TAC representation completeness
+- Verify Solidity code validity
+
+## Common Patterns & Utilities
+
+### Bytecode Preprocessing
+
+```python
+# Remove 0x prefix if present
+clean_bytecode = bytecode[2:] if bytecode.startswith('0x') else bytecode
+```
+
+### Temporary Variable Generation
+
+```python
+def _generate_temp_var(self) -> str:
+    self.variable_counter += 1
+    return f"temp_{self.variable_counter}"
+```
+
+### PC (Program Counter) Handling
+
+```python
+# Safe PC extraction with fallback
+pc = getattr(instr, 'pc', fallback_index)
+```
+
+## Testing & Validation
+
+### Unit Tests
+
+- Test control flow analysis with known patterns
+- Validate TAC instruction conversion
+- Check function boundary detection
+- Verify basic block construction
+
+### Integration Tests
+
+- End-to-end bytecode → TAC → Solidity pipeline
+- Test with real contract bytecode
+- Validate against verified source code
+
+### Demo Script Usage
+
+```bash
+# Run demonstration
+python demo.py
+
+# Check logs
+cat demo.log
+```
+
+## Security Considerations
+
+### When Analyzing Bytecode
+
+- Validate bytecode format before processing
+- Handle malformed bytecode gracefully
+- Be aware of potential infinite loops in analysis
+- Set reasonable limits on analysis depth
+
+### When Using LLM Output
+
+- Generated Solidity is approximation, not exact reconstruction
+- Variable names are inferred, not original
+- Some optimizations may not be preserved
+- Always review security-critical code manually
+
+## Performance Optimization
+
+### For Large-Scale Processing
+
+- Use batch processing for multiple contracts
+- Implement caching for repeated analyses
+- Consider distributed training with DeepSpeed
+- Profile memory usage during training
+
+### For Inference
+
+- Use 8-bit quantization for reduced memory
+- Cache model on first load
+- Batch similar-length inputs together
+- Set appropriate max_new_tokens limit
+
+## Documentation Standards
+
+### Code Comments
+
+- Document complex algorithms (control flow analysis, dominance)
+- Explain EVM-specific behaviors
+- Reference paper sections where applicable
+- Include examples for non-obvious patterns
+
+### Docstrings
+
+Use comprehensive docstrings with Args/Returns:
+
+```python
+def analyze_control_flow(self) -> Dict[str, BasicBlock]:
+    """
+    Perform comprehensive control flow analysis.
+    
+    Returns:
+        Dictionary mapping block IDs to BasicBlock objects
+    """
+```
+
+## Version Control
+
+### Commit Messages
+
+- Reference paper sections for research-based changes
+- Note metric improvements in evaluation changes
+- Document breaking changes in data format
+- Include issue numbers when applicable
+
+### Branch Strategy
+
+- `main`: Stable, production-ready code
+- `develop`: Integration branch for features
+- Feature branches: Specific improvements or additions
+
+## Troubleshooting References
+
+### Common Issues
+
+- CUDA out of memory → Reduce batch size or use gradient checkpointing
+- Poor decompilation quality → Check TAC representation, retrain with more data
+- Bytecode parsing errors → Validate bytecode format, check pyevmasm version
+- Model loading failures → Verify HF_TOKEN, check model availability
+
+### Where to Look
+
+- `docs/troubleshooting.md`: Comprehensive troubleshooting guide
+- `demo.log`: Runtime logs from demonstration
+- GitHub Issues: Community-reported problems and solutions
+
+## Research Context
+
+### Paper Implementation
+
+This codebase implements the methodology from:
+
+- **Title**: Decompiling Smart Contracts with a Large Language Model
+- **Authors**: David, Zhou, Song, Gervais, Qin
+- **arXiv**: 2506.19624v1
+- **Year**: 2025
+
+### Key Contributions
+
+- First successful LLM application to smart contract decompilation
+- Hybrid approach: static analysis + neural methods
+- Dataset: 238,446 TAC-to-Solidity function pairs
+- Achieves 0.82 avg semantic similarity (vs 0.4-0.5 traditional methods)
+
+## Additional Notes
+
+- Prefer explicit over implicit conversions
+- Maintain backward compatibility with dataset formats
+- Keep model checkpoints organized by date/version
+- Document any deviations from paper methodology
+- Test with diverse contract types (tokens, DeFi, NFTs)
