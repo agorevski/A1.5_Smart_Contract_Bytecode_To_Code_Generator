@@ -23,9 +23,6 @@ def setup_logging():
 
     Sets up logging with INFO level to both a file (demo.log) and console output.
     Log messages include timestamp, logger name, level, and message.
-
-    Returns:
-        None
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -45,6 +42,9 @@ def demo_bytecode_to_tac():
 
     Returns:
         bool: True if conversion succeeds, False otherwise.
+
+    Raises:
+        Exception: If bytecode analysis fails.
     """
     print("\n" + "="*60)
     print("DEMO 1: EVM Bytecode to Three-Address Code Conversion")
@@ -91,6 +91,9 @@ def demo_evaluation_metrics():
 
     Returns:
         bool: True if evaluation succeeds, False otherwise.
+
+    Raises:
+        Exception: If evaluation framework initialization or metric computation fails.
     """
     print("\n" + "="*60)
     print("DEMO 2: Evaluation Metrics Framework")
@@ -176,6 +179,9 @@ def demo_model_setup():
 
     Returns:
         bool: True if setup succeeds, False otherwise.
+
+    Raises:
+        Exception: If model configuration or trainer initialization fails.
     """
     print("\n" + "="*60)
     print("DEMO 3: Llama 3.2 3B Model Setup with LoRA")
@@ -235,6 +241,9 @@ def demo_dataset_format():
 
     Returns:
         bool: True if dataset creation succeeds, False otherwise.
+
+    Raises:
+        Exception: If saving the sample dataset to file fails.
     """
     print("\n" + "="*60)
     print("DEMO 4: Dataset Format and Structure")
@@ -338,7 +347,7 @@ def demo_paper_metrics():
     syntactic accuracy, and comparison with traditional decompilers.
 
     Returns:
-        bool: True (always succeeds as it displays static data).
+        bool: Always returns True as it displays static data.
     """
     print("\n" + "="*60)
     print("DEMO 5: Paper-Specific Metrics and Results")
@@ -410,9 +419,6 @@ def main():
     Executes five demo functions covering bytecode-to-TAC conversion,
     evaluation metrics, model setup, dataset formatting, and paper metrics.
     Displays a summary of results and next steps.
-
-    Returns:
-        None
     """
     setup_logging()
     

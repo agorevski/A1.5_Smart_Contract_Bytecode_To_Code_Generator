@@ -58,6 +58,12 @@ class EtherscanAPI:
     """Interface for collecting verified contracts from Etherscan."""
     
     def __init__(self, api_key: str, base_url: str = "https://api.etherscan.io/v2/api"):
+        """Initialize the Etherscan API client.
+
+        Args:
+            api_key: Etherscan API key for authentication.
+            base_url: Base URL for Etherscan API. Defaults to v2 API.
+        """
         self.api_key = api_key
         self.base_url = base_url
         self.session = requests.Session()
@@ -160,6 +166,7 @@ class SolidityParser:
     """Parser for extracting functions from Solidity source code."""
     
     def __init__(self):
+        """Initialize the Solidity parser."""
         self.logger = logging.getLogger(__name__)
     
     def extract_functions(self, source_code: str, contract_name: Optional[str] = None) -> List[Dict]:
@@ -199,7 +206,14 @@ class SolidityParser:
         return functions
     
     def _clean_source_code(self, source_code: str) -> str:
-        """Clean and normalize Solidity source code."""
+        """Clean and normalize Solidity source code.
+
+        Args:
+            source_code: Raw Solidity source code, possibly JSON-encoded.
+
+        Returns:
+            Cleaned and normalized source code string.
+        """
         # Handle JSON-encoded source (Etherscan format)
         if source_code.startswith('{'):
             try:
@@ -241,7 +255,14 @@ class SolidityParser:
         return source_code
     
     def _extract_contracts(self, source_code: str) -> List[Dict]:
-        """Extract contract definitions from source code using brace counting."""
+        """Extract contract definitions from source code using brace counting.
+
+        Args:
+            source_code: Cleaned Solidity source code.
+
+        Returns:
+            List of dictionaries containing contract name, type, and body.
+        """
         contracts = []
         
         # Find contract keywords with proper brace matching
@@ -276,7 +297,14 @@ class SolidityParser:
         return contracts
     
     def _extract_functions_from_contract(self, contract_body: str) -> List[Dict]:
-        """Extract function definitions from contract body using brace counting."""
+        """Extract function definitions from contract body using brace counting.
+
+        Args:
+            contract_body: The body content of a Solidity contract.
+
+        Returns:
+            List of function dictionaries with name, body, signature, and metadata.
+        """
         functions = []
         
         # Find all function declarations
@@ -395,7 +423,14 @@ class SolidityParser:
     
     def _add_function_to_list(self, functions: List[Dict], name: str, 
                              full_function: str, body: str):
-        """Helper to add a parsed function to the list."""
+        """Add a parsed function to the list with extracted metadata.
+
+        Args:
+            functions: List to append the function to.
+            name: Function name.
+            full_function: Complete function source including signature and body.
+            body: Function body content only.
+        """
         # Extract function metadata
         visibility = self._extract_visibility(full_function)
         is_payable = 'payable' in full_function
@@ -417,7 +452,14 @@ class SolidityParser:
         self.logger.debug(f"Extracted function {name} ({visibility})")
     
     def _extract_visibility(self, function_code: str) -> str:
-        """Extract function visibility."""
+        """Extract function visibility from function code.
+
+        Args:
+            function_code: Complete function source code.
+
+        Returns:
+            Visibility string: 'private', 'internal', 'external', or 'public'.
+        """
         # Check in order of specificity
         if re.search(r'\bprivate\b', function_code):
             return 'private'
@@ -435,6 +477,12 @@ class DatasetBuilder:
     """Main class for building the training dataset."""
     
     def __init__(self, etherscan_api_key: str, output_dir: str = "data"):
+        """Initialize the dataset builder.
+
+        Args:
+            etherscan_api_key: API key for Etherscan.
+            output_dir: Directory for output files and database. Defaults to "data".
+        """
         self.etherscan = EtherscanAPI(etherscan_api_key)
         self.parser = SolidityParser()
         self.output_dir = Path(output_dir)
@@ -446,7 +494,10 @@ class DatasetBuilder:
         self._init_database()
     
     def _init_database(self):
-        """Initialize SQLite database for caching contract data."""
+        """Initialize SQLite database for caching contract data.
+
+        Creates contracts and function_pairs tables if they don't exist.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -519,7 +570,11 @@ class DatasetBuilder:
         return collected
     
     def _store_contract(self, contract_data: ContractData):
-        """Store contract data in database."""
+        """Store contract data in database.
+
+        Args:
+            contract_data: ContractData object containing contract information.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -583,7 +638,16 @@ class DatasetBuilder:
         return total_pairs
     
     def _create_function_pairs(self, address: str, source_code: str, bytecode: str) -> List[FunctionPair]:
-        """Create TAC-to-Solidity function pairs from contract data."""
+        """Create TAC-to-Solidity function pairs from contract data.
+
+        Args:
+            address: Contract address.
+            source_code: Verified Solidity source code.
+            bytecode: Contract runtime bytecode.
+
+        Returns:
+            List of FunctionPair objects for training.
+        """
         pairs = []
         
         try:
@@ -872,7 +936,11 @@ class DatasetBuilder:
             return None
     
     def _store_function_pair(self, pair: FunctionPair):
-        """Store function pair in database."""
+        """Store function pair in database.
+
+        Args:
+            pair: FunctionPair object to store. Duplicates are skipped based on hash.
+        """
         # Create hash for deduplication
         content = f"{pair.tac_representation}{pair.solidity_code}"
         hash_value = hashlib.md5(content.encode()).hexdigest()
@@ -999,7 +1067,12 @@ class DatasetBuilder:
         return str(filepath)
     
     def get_dataset_statistics(self) -> Dict:
-        """Get statistics about the collected dataset."""
+        """Get statistics about the collected dataset.
+
+        Returns:
+            Dictionary containing total contracts, function pairs,
+            visibility distribution, and length statistics.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -1041,7 +1114,12 @@ class DatasetBuilder:
         return stats
 
 def main():
-    """Example usage of the dataset pipeline."""
+    """Run example usage of the dataset pipeline.
+
+    Demonstrates the complete workflow: collecting contracts from Etherscan,
+    processing them into TAC-Solidity function pairs, filtering the dataset,
+    and exporting to JSONL format.
+    """
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,

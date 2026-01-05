@@ -78,6 +78,14 @@ class SmartContractDataset(Dataset):
         max_length: int = 20000,
         template_format: str = "alpaca"
     ):
+        """Initialize the dataset with training data.
+
+        Args:
+            data_path: Path to the JSONL file containing TAC-to-Solidity pairs.
+            tokenizer: Pre-initialized tokenizer for encoding text.
+            max_length: Maximum sequence length for tokenization.
+            template_format: Prompt template format ('alpaca' or 'simple').
+        """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.template_format = template_format
@@ -87,7 +95,14 @@ class SmartContractDataset(Dataset):
         self._add_special_tokens()
     
     def _load_data(self, data_path: str) -> List[Dict]:
-        """Load dataset from JSONL file."""
+        """Load dataset from JSONL file.
+
+        Args:
+            data_path: Path to the JSONL file containing training data.
+
+        Returns:
+            List of dictionaries containing the loaded data items.
+        """
         data = []
         with open(data_path, 'r') as f:
             for line in f:
@@ -96,7 +111,11 @@ class SmartContractDataset(Dataset):
         return data
     
     def _add_special_tokens(self):
-        """Add special tokens for smart contract decompilation."""
+        """Add special tokens for smart contract decompilation.
+
+        Adds tokens for TAC, Solidity, function boundaries, and metadata
+        markers if they don't already exist in the tokenizer vocabulary.
+        """
         special_tokens = [
             "<TAC_START>", "<TAC_END>",
             "<SOLIDITY_START>", "<SOLIDITY_END>",
@@ -114,11 +133,21 @@ class SmartContractDataset(Dataset):
             self.tokenizer.add_tokens(new_tokens)
     
     def _format_prompt(self, tac_input: str, solidity_output: str, metadata: Dict) -> str:
-        """
-        Format the training example using the template described in the paper.
-        
+        """Format the training example using the template described in the paper.
+
         Creates clear delineation between TAC input and Solidity output with
         special tokens for function boundaries and metadata.
+
+        Args:
+            tac_input: Three-address code representation of the function.
+            solidity_output: Target Solidity code output.
+            metadata: Dictionary containing function metadata (name, visibility, etc.).
+
+        Returns:
+            Formatted prompt string ready for tokenization.
+
+        Raises:
+            ValueError: If an unknown template format is specified.
         """
         if self.template_format == "alpaca":
             # Alpaca-style formatting
@@ -173,10 +202,22 @@ class SmartContractDataset(Dataset):
         return prompt
     
     def __len__(self) -> int:
+        """Return the number of examples in the dataset.
+
+        Returns:
+            Total number of data items.
+        """
         return len(self.data)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single training example."""
+        """Get a single training example.
+
+        Args:
+            idx: Index of the example to retrieve.
+
+        Returns:
+            Dictionary containing input_ids, attention_mask, and labels tensors.
+        """
         item = self.data[idx]
         
         # Format the prompt
@@ -213,6 +254,12 @@ class SmartContractModelTrainer:
     """
     
     def __init__(self, config: ModelConfig, output_dir: str = "models"):
+        """Initialize the trainer with model configuration.
+
+        Args:
+            config: ModelConfig instance with model and LoRA settings.
+            output_dir: Directory for saving model checkpoints and outputs.
+        """
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -224,14 +271,16 @@ class SmartContractModelTrainer:
         self.peft_model = None
     
     def setup_model(self, force_reload: bool = False) -> Tuple[AutoTokenizer, PeftModel]:
-        """
-        Set up the Llama 3.2 3B model with LoRA configuration.
-        
+        """Set up the Llama 3.2 3B model with LoRA configuration.
+
+        Initializes the tokenizer, loads the base model with optional quantization,
+        and applies LoRA adapters to the specified target modules.
+
         Args:
-            force_reload: Whether to force reload the model
-            
+            force_reload: Whether to force reload the model even if already loaded.
+
         Returns:
-            Tuple of (tokenizer, peft_model)
+            Tuple containing the tokenizer and PEFT model with LoRA adapters.
         """
         if self.tokenizer is None or self.peft_model is None or force_reload:
             self.logger.info("Setting up Llama 3.2 3B model with LoRA...")
@@ -307,11 +356,25 @@ class SmartContractModelTrainer:
         eval_steps: int = 500,
         max_grad_norm: float = 1.0
     ) -> TrainingArguments:
-        """
-        Create training arguments based on the paper's optimization strategy.
-        
+        """Create training arguments based on the paper's optimization strategy.
+
         Implements AdamW optimizer with learning rate schedule including
         warmup period followed by linear decay.
+
+        Args:
+            batch_size: Per-device training and evaluation batch size.
+            learning_rate: Initial learning rate for AdamW optimizer.
+            num_epochs: Total number of training epochs.
+            warmup_steps: Number of warmup steps for learning rate scheduler.
+            weight_decay: Weight decay coefficient for regularization.
+            gradient_accumulation_steps: Number of steps to accumulate gradients.
+            logging_steps: Number of steps between logging updates.
+            save_steps: Number of steps between checkpoint saves.
+            eval_steps: Number of steps between evaluations.
+            max_grad_norm: Maximum gradient norm for clipping.
+
+        Returns:
+            Configured TrainingArguments instance for the Trainer.
         """
         return TrainingArguments(
             output_dir=str(self.output_dir / "checkpoints"),
@@ -354,19 +417,21 @@ class SmartContractModelTrainer:
         num_epochs: int = 3,
         resume_from_checkpoint: Optional[str] = None
     ) -> str:
-        """
-        Train the model on the smart contract decompilation dataset.
-        
+        """Train the model on the smart contract decompilation dataset.
+
+        Loads the training and optional evaluation datasets, sets up the
+        Trainer with configured arguments, and runs the training loop.
+
         Args:
-            train_dataset_path: Path to training dataset (JSONL format)
-            eval_dataset_path: Optional path to evaluation dataset
-            batch_size: Training batch size
-            learning_rate: Learning rate
-            num_epochs: Number of training epochs
-            resume_from_checkpoint: Optional checkpoint to resume from
-            
+            train_dataset_path: Path to training dataset in JSONL format.
+            eval_dataset_path: Optional path to evaluation dataset in JSONL format.
+            batch_size: Per-device training batch size.
+            learning_rate: Learning rate for the optimizer.
+            num_epochs: Total number of training epochs.
+            resume_from_checkpoint: Optional path to checkpoint directory to resume from.
+
         Returns:
-            Path to the final model
+            Path to the directory containing the final saved model.
         """
         # Setup model if not already done
         tokenizer, peft_model = self.setup_model()
@@ -427,7 +492,17 @@ class SmartContractModelTrainer:
         return str(final_model_path)
     
     def save_model(self, path: str):
-        """Save the trained model and tokenizer."""
+        """Save the trained model and tokenizer.
+
+        Saves the LoRA adapter weights, tokenizer, and model configuration
+        to the specified directory.
+
+        Args:
+            path: Directory path where the model will be saved.
+
+        Raises:
+            ValueError: If the model has not been initialized.
+        """
         if self.peft_model is None or self.tokenizer is None:
             raise ValueError("Model not initialized. Call setup_model() first.")
         
@@ -446,7 +521,17 @@ class SmartContractModelTrainer:
         self.logger.info(f"Model saved to {save_path}")
     
     def load_model(self, path: str) -> Tuple[AutoTokenizer, PeftModel]:
-        """Load a previously trained model."""
+        """Load a previously trained model.
+
+        Loads the model configuration, tokenizer, base model, and LoRA adapter
+        from the specified directory.
+
+        Args:
+            path: Directory path containing the saved model.
+
+        Returns:
+            Tuple containing the loaded tokenizer and PEFT model.
+        """
         load_path = Path(path)
         
         # Load configuration
@@ -484,6 +569,11 @@ class SmartContractDecompiler:
     """
     
     def __init__(self, model_path: str):
+        """Initialize the decompiler with a trained model.
+
+        Args:
+            model_path: Path to the directory containing the trained model.
+        """
         self.trainer = SmartContractModelTrainer(ModelConfig())
         self.tokenizer, self.model = self.trainer.load_model(model_path)
         self.model.eval()
@@ -496,18 +586,20 @@ class SmartContractDecompiler:
         temperature: float = 0.1,
         do_sample: bool = True
     ) -> str:
-        """
-        Decompile TAC representation to Solidity code.
-        
+        """Decompile TAC representation to Solidity code.
+
+        Formats the TAC input using the training template, generates Solidity
+        code using the trained model, and extracts the output between markers.
+
         Args:
-            tac_input: Three-address code representation
-            metadata: Optional metadata about the function
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            do_sample: Whether to use sampling
-            
+            tac_input: Three-address code representation of the function.
+            metadata: Optional dictionary containing function metadata.
+            max_new_tokens: Maximum number of tokens to generate.
+            temperature: Sampling temperature for generation (lower = more deterministic).
+            do_sample: Whether to use sampling; if False, uses greedy decoding.
+
         Returns:
-            Generated Solidity code
+            Generated Solidity code extracted from the model output.
         """
         # Format the input using the same template as training
         dataset = SmartContractDataset.__new__(SmartContractDataset)
@@ -549,7 +641,11 @@ class SmartContractDecompiler:
         return solidity_code
 
 def main():
-    """Example usage of the model training pipeline."""
+    """Execute example usage of the model training pipeline.
+
+    Demonstrates how to configure and initialize the model trainer,
+    set up the Llama 3.2 3B model with LoRA, and display model statistics.
+    """
     # Setup logging
     logging.basicConfig(level=logging.INFO)
     

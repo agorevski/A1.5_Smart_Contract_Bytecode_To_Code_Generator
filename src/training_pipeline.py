@@ -94,6 +94,9 @@ class SmartContractEvaluator:
         Sets up the sentence transformer model for semantic similarity,
         ROUGE scorer for text overlap metrics, and ensures NLTK punkt
         tokenizer is available.
+
+        Raises:
+            Exception: If sentence transformer model fails to load.
         """
         self.logger = logging.getLogger(__name__)
         
@@ -108,15 +111,15 @@ class SmartContractEvaluator:
             nltk.download('punkt')
     
     def compute_semantic_similarity(self, original: str, decompiled: str) -> float:
-        """
-        Compute semantic similarity using sentence transformers.
-        
+        """Compute semantic similarity using sentence transformers.
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+
         Returns:
-            Cosine similarity score (0-1)
+            Cosine similarity score between 0 and 1, where 1 indicates
+            identical semantic meaning.
         """
         try:
             # Encode both texts
@@ -131,15 +134,15 @@ class SmartContractEvaluator:
             return 0.0
     
     def compute_normalized_edit_distance(self, original: str, decompiled: str) -> float:
-        """
-        Compute normalized edit distance (Levenshtein distance).
-        
+        """Compute normalized edit distance (Levenshtein distance).
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+
         Returns:
-            Normalized edit distance (0-1, where 0 is identical)
+            Normalized edit distance between 0 and 1, where 0 indicates
+            identical strings.
         """
         try:
             # Normalize whitespace
@@ -157,15 +160,16 @@ class SmartContractEvaluator:
             return 1.0
     
     def compute_bleu_score(self, original: str, decompiled: str) -> float:
-        """
-        Compute BLEU score for code similarity.
-        
+        """Compute BLEU score for code similarity.
+
+        Uses smoothing to handle short sequences appropriately.
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            
+            original: Original Solidity code (reference).
+            decompiled: Decompiled Solidity code (candidate).
+
         Returns:
-            BLEU score (0-1)
+            BLEU score between 0 and 1, where 1 indicates perfect match.
         """
         try:
             # Tokenize
@@ -184,15 +188,14 @@ class SmartContractEvaluator:
             return 0.0
     
     def compute_rouge_score(self, original: str, decompiled: str) -> float:
-        """
-        Compute ROUGE-L score.
-        
+        """Compute ROUGE-L score.
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+
         Returns:
-            ROUGE-L F1 score (0-1)
+            ROUGE-L F1 score between 0 and 1.
         """
         try:
             scores = self.rouge_scorer.score(original, decompiled)
@@ -203,15 +206,15 @@ class SmartContractEvaluator:
             return 0.0
     
     def compute_token_accuracy(self, original: str, decompiled: str) -> float:
-        """
-        Compute token-level accuracy.
-        
+        """Compute token-level accuracy using Jaccard similarity.
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+
         Returns:
-            Token accuracy (0-1)
+            Token accuracy between 0 and 1, computed as the intersection
+            over union of token sets.
         """
         try:
             original_tokens = set(original.split())
@@ -230,15 +233,18 @@ class SmartContractEvaluator:
             return 0.0
     
     def analyze_structural_preservation(self, original: str, decompiled: str) -> float:
-        """
-        Analyze how well control flow and structure are preserved.
-        
+        """Analyze how well control flow and structure are preserved.
+
+        Compares counts of structural keywords (if, else, for, while,
+        function, return, require, assert, revert, braces, parentheses).
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+
         Returns:
-            Structural preservation score (0-1)
+            Structural preservation score between 0 and 1, where 1 indicates
+            identical structural element counts.
         """
         try:
             # Count key structural elements
@@ -310,16 +316,20 @@ class SmartContractEvaluator:
             return {}
     
     def evaluate_function(self, original: str, decompiled: str, metadata: Optional[Dict] = None) -> EvaluationMetrics:
-        """
-        Comprehensive evaluation of a single function decompilation.
-        
+        """Comprehensive evaluation of a single function decompilation.
+
+        Computes all metrics including semantic similarity, edit distance,
+        BLEU, ROUGE-L, token accuracy, and structural preservation.
+
         Args:
-            original: Original Solidity code
-            decompiled: Decompiled Solidity code
-            metadata: Optional metadata about the function
-            
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+            metadata: Optional metadata about the function for additional
+                context in the evaluation results.
+
         Returns:
-            EvaluationMetrics object
+            EvaluationMetrics dataclass containing all computed metrics
+            and metadata comparison results.
         """
         # Compute all metrics
         semantic_similarity = self.compute_semantic_similarity(original, decompiled)
@@ -395,11 +405,20 @@ class SmartContractTrainingPipeline:
         self.evaluator = SmartContractEvaluator()
     
     def collect_and_prepare_dataset(self) -> Tuple[str, str, str]:
-        """
-        Collect contracts and prepare training dataset.
-        
+        """Collect contracts and prepare training dataset.
+
+        Loads contract addresses from file or uses sample addresses,
+        collects contracts via Etherscan API, processes them into
+        function pairs, filters and cleans the dataset, and splits
+        into train/validation/test sets.
+
         Returns:
-            Tuple of (train_path, validation_path, test_path)
+            Tuple of (train_path, validation_path, test_path) pointing
+            to the JSONL dataset files.
+
+        Raises:
+            FileNotFoundError: If contract_addresses_file is specified
+                but does not exist.
         """
         self.logger.info("Starting dataset collection and preparation...")
         
@@ -494,15 +513,15 @@ class SmartContractTrainingPipeline:
         return str(train_path), str(val_path), str(test_path)
     
     def train_model(self, train_path: str, val_path: str) -> str:
-        """
-        Train the model on the prepared dataset.
-        
+        """Train the model on the prepared dataset.
+
         Args:
-            train_path: Path to training dataset
-            val_path: Path to validation dataset
-            
+            train_path: Path to training dataset JSONL file.
+            val_path: Path to validation dataset JSONL file.
+
         Returns:
-            Path to trained model
+            Path to the directory containing the trained model weights
+            and configuration.
         """
         self.logger.info("Starting model training...")
         
@@ -518,15 +537,19 @@ class SmartContractTrainingPipeline:
         return model_path
     
     def evaluate_model(self, model_path: str, test_path: str) -> Dict[str, Any]:
-        """
-        Comprehensive evaluation of the trained model.
-        
+        """Comprehensive evaluation of the trained model.
+
+        Loads the trained model, runs inference on test samples, and
+        computes aggregate statistics across all evaluation metrics.
+        Results are saved to a timestamped JSON file.
+
         Args:
-            model_path: Path to trained model
-            test_path: Path to test dataset
-            
+            model_path: Path to trained model directory.
+            test_path: Path to test dataset JSONL file.
+
         Returns:
-            Evaluation results dictionary
+            Dictionary containing aggregate statistics (mean, std, median,
+            min, max, percentiles) for all metrics.
         """
         self.logger.info("Starting model evaluation...")
         
@@ -655,11 +678,14 @@ class SmartContractTrainingPipeline:
         return stats
     
     def run_complete_pipeline(self) -> Dict[str, Any]:
-        """
-        Run the complete training and evaluation pipeline.
-        
+        """Run the complete training and evaluation pipeline.
+
+        Executes the full workflow: dataset collection and preparation,
+        model training, and comprehensive evaluation.
+
         Returns:
-            Final evaluation results
+            Dictionary containing final evaluation results with aggregate
+            statistics for all metrics.
         """
         self.logger.info("Starting complete smart contract decompilation pipeline...")
         

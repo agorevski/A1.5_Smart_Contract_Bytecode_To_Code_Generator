@@ -56,8 +56,9 @@ def test_solidity_parser():
     all function definitions, logging their names, signatures, and attributes.
 
     Returns:
-        list: A list of dictionaries containing extracted function information,
-            including name, signature, visibility, is_payable, and is_view.
+        list[dict]: A list of dictionaries containing extracted function
+            information, including name, signature, visibility, is_payable,
+            and is_view.
     """
     logger.info("=" * 60)
     logger.info("Testing Solidity Parser")
@@ -81,9 +82,9 @@ def test_bytecode_analysis():
     and identified functions with their selectors and entry blocks.
 
     Returns:
-        tuple: A tuple containing:
-            - analyzer (BytecodeAnalyzer): The configured bytecode analyzer instance.
-            - functions (dict): Dictionary mapping function names to function objects.
+        tuple[BytecodeAnalyzer, dict]: A tuple containing the configured
+            bytecode analyzer instance and a dictionary mapping function
+            names to function objects.
     """
     logger.info("\n" + "=" * 60)
     logger.info("Testing Bytecode Analysis")
@@ -114,6 +115,9 @@ def test_selector_calculation():
     Calculates and logs the 4-byte function selectors for a set of test
     function signatures using Keccak-256 hashing. Verifies that selector
     generation works correctly for common Solidity function signatures.
+
+    Returns:
+        None
     """
     logger.info("\n" + "=" * 60)
     logger.info("Testing Selector Calculation")
@@ -139,6 +143,9 @@ def test_function_matching():
     calculating function selectors, analyzing bytecode, and matching Solidity
     functions to their bytecode counterparts. Logs matched functions with
     their selectors and TAC preview.
+
+    Returns:
+        None
     """
     logger.info("\n" + "=" * 60)
     logger.info("Testing Function Matching Pipeline")
@@ -188,6 +195,9 @@ def test_tac_extraction():
     Analyzes the SAMPLE_BYTECODE, identifies functions, and extracts the
     Three-Address Code (TAC) representation for the first identified function.
     Logs the generated TAC output for verification.
+
+    Returns:
+        None
     """
     logger.info("\n" + "=" * 60)
     logger.info("Testing TAC Extraction")

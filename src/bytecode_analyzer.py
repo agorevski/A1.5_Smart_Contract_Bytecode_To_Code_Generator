@@ -117,28 +117,26 @@ class BytecodeAnalyzer:
             self.instructions = []
     
     def _generate_temp_var(self) -> str:
-        """
-        Generate a unique temporary variable name for TAC representation.
+        """Generate a unique temporary variable name for TAC representation.
         
         Returns:
-            Temporary variable name (e.g., 'temp_1', 'temp_2', etc.)
+            str: Temporary variable name (e.g., 'temp_1', 'temp_2', etc.).
         """
         self.variable_counter += 1
         return f"temp_{self.variable_counter}"
 
     def analyze_control_flow(self) -> Dict[str, BasicBlock]:
-        """
-        Perform comprehensive control flow analysis to identify basic blocks.
+        """Perform comprehensive control flow analysis to identify basic blocks.
         
         This implementation includes:
-        - Advanced jump target detection with stack simulation
-        - Comprehensive basic block construction
-        - Complete predecessor/successor relationship analysis
-        - Loop detection and dominance analysis
-        - Exception handling pattern recognition
+            - Advanced jump target detection with stack simulation
+            - Comprehensive basic block construction
+            - Complete predecessor/successor relationship analysis
+            - Loop detection and dominance analysis
+            - Exception handling pattern recognition
         
         Returns:
-            Dictionary mapping block IDs to BasicBlock objects
+            Dict[str, BasicBlock]: Dictionary mapping block IDs to BasicBlock objects.
         """
         self.logger.info("Starting comprehensive control flow analysis")
         
@@ -168,11 +166,10 @@ class BytecodeAnalyzer:
             return self._fallback_control_flow_analysis()
     
     def _detect_jump_targets(self) -> set:
-        """
-        Enhanced jump target detection using stack simulation and pattern recognition.
+        """Detect jump targets using stack simulation and pattern recognition.
         
         Returns:
-            Set of program counter values that are valid jump targets
+            set: Set of program counter values that are valid jump targets.
         """
         jump_targets = set()
         
@@ -271,15 +268,14 @@ class BytecodeAnalyzer:
         return jump_targets
     
     def _resolve_jump_targets(self, jump_index: int, stack_simulator) -> set:
-        """
-        Resolve jump targets for JUMP/JUMPI instructions using stack analysis.
+        """Resolve jump targets for JUMP/JUMPI instructions using stack analysis.
         
         Args:
-            jump_index: Index of the jump instruction
-            stack_simulator: Current stack state
+            jump_index (int): Index of the jump instruction.
+            stack_simulator: Current stack state (may be None).
             
         Returns:
-            Set of possible jump targets
+            set: Set of possible jump target addresses.
         """
         targets = set()
         
@@ -310,14 +306,13 @@ class BytecodeAnalyzer:
         return targets
     
     def _analyze_function_dispatch_pattern(self, push4_index: int) -> set:
-        """
-        Analyze function dispatcher patterns to find function entry points.
+        """Analyze function dispatcher patterns to find function entry points.
         
         Args:
-            push4_index: Index of PUSH4 instruction with function selector
+            push4_index (int): Index of PUSH4 instruction with function selector.
             
         Returns:
-            Set of function entry point addresses
+            set: Set of function entry point addresses.
         """
         targets = set()
         
@@ -345,14 +340,13 @@ class BytecodeAnalyzer:
         return targets
     
     def _construct_basic_blocks(self, jump_targets: set) -> Dict[str, BasicBlock]:
-        """
-        Construct basic blocks with precise boundaries and comprehensive analysis.
+        """Construct basic blocks with precise boundaries and comprehensive analysis.
         
         Args:
-            jump_targets: Set of all identified jump targets
+            jump_targets (set): Set of all identified jump targets.
             
         Returns:
-            Dictionary of basic blocks
+            Dict[str, BasicBlock]: Dictionary mapping block IDs to BasicBlock objects.
         """
         blocks = {}
         
@@ -414,16 +408,15 @@ class BytecodeAnalyzer:
         return blocks
     
     def _find_block_end(self, start_pc: int, sorted_targets: List[int], target_index: int) -> int:
-        """
-        Find the end PC for a basic block starting at start_pc.
+        """Find the end PC for a basic block starting at start_pc.
         
         Args:
-            start_pc: Starting program counter
-            sorted_targets: Sorted list of all jump targets
-            target_index: Index of start_pc in sorted_targets
+            start_pc (int): Starting program counter.
+            sorted_targets (List[int]): Sorted list of all jump targets.
+            target_index (int): Index of start_pc in sorted_targets.
             
         Returns:
-            End program counter for the block
+            int: End program counter for the block.
         """
         # Default end is the next target minus 1
         if target_index + 1 < len(sorted_targets):
@@ -436,11 +429,10 @@ class BytecodeAnalyzer:
         return start_pc
     
     def _analyze_block_relationships(self, blocks: Dict[str, BasicBlock]) -> None:
-        """
-        Analyze predecessor/successor relationships between basic blocks.
+        """Analyze predecessor/successor relationships between basic blocks.
         
         Args:
-            blocks: Dictionary of basic blocks to analyze
+            blocks (Dict[str, BasicBlock]): Dictionary of basic blocks to analyze.
         """
         # Create PC to block mapping
         pc_to_block = {}
@@ -455,13 +447,12 @@ class BytecodeAnalyzer:
     def _analyze_single_block_relationships(self, block: BasicBlock, 
                                           all_blocks: Dict[str, BasicBlock],
                                           pc_to_block: Dict[int, str]) -> None:
-        """
-        Analyze relationships for a single basic block.
+        """Analyze relationships for a single basic block.
         
         Args:
-            block: Block to analyze
-            all_blocks: All blocks in the program
-            pc_to_block: Mapping from PC to block ID
+            block (BasicBlock): Block to analyze.
+            all_blocks (Dict[str, BasicBlock]): All blocks in the program.
+            pc_to_block (Dict[int, str]): Mapping from PC to block ID.
         """
         if 'raw_instructions' not in block.metadata:
             return
@@ -509,14 +500,13 @@ class BytecodeAnalyzer:
                 self._add_edge(block.id, successor_id, all_blocks)
     
     def _get_jump_targets_from_block(self, instructions: List) -> set:
-        """
-        Extract jump targets from a sequence of instructions.
+        """Extract jump targets from a sequence of instructions.
         
         Args:
-            instructions: List of raw instructions
+            instructions (List): List of raw EVM instructions.
             
         Returns:
-            Set of jump target addresses
+            set: Set of jump target addresses.
         """
         targets = set()
         
@@ -537,14 +527,13 @@ class BytecodeAnalyzer:
         return targets
     
     def _get_next_instruction_pc(self, current_pc: int) -> Optional[int]:
-        """
-        Get the PC of the next instruction after current_pc.
+        """Get the PC of the next instruction after current_pc.
         
         Args:
-            current_pc: Current program counter
+            current_pc (int): Current program counter.
             
         Returns:
-            PC of next instruction or None if not found
+            Optional[int]: PC of next instruction or None if not found.
         """
         found_current = False
         for instr in self.instructions:
@@ -556,13 +545,12 @@ class BytecodeAnalyzer:
         return None
     
     def _add_edge(self, from_block: str, to_block: str, all_blocks: Dict[str, BasicBlock]) -> None:
-        """
-        Add an edge between two blocks.
+        """Add an edge between two blocks in the control flow graph.
         
         Args:
-            from_block: Source block ID
-            to_block: Target block ID
-            all_blocks: All blocks dictionary
+            from_block (str): Source block ID.
+            to_block (str): Target block ID.
+            all_blocks (Dict[str, BasicBlock]): All blocks dictionary.
         """
         if from_block in all_blocks and to_block in all_blocks:
             if to_block not in all_blocks[from_block].successors:
@@ -571,11 +559,10 @@ class BytecodeAnalyzer:
                 all_blocks[to_block].predecessors.append(from_block)
     
     def _perform_advanced_analysis(self, blocks: Dict[str, BasicBlock]) -> None:
-        """
-        Perform advanced control flow analysis including loop detection and dominance.
+        """Perform advanced control flow analysis including loop detection and dominance.
         
         Args:
-            blocks: Dictionary of basic blocks
+            blocks (Dict[str, BasicBlock]): Dictionary of basic blocks.
         """
         # Loop detection
         self._detect_loops(blocks)
@@ -587,11 +574,10 @@ class BytecodeAnalyzer:
         self._analyze_reachability(blocks)
     
     def _detect_loops(self, blocks: Dict[str, BasicBlock]) -> None:
-        """
-        Detect loops in the control flow graph using back edge detection.
+        """Detect loops in the control flow graph using back edge detection.
         
         Args:
-            blocks: Dictionary of basic blocks
+            blocks (Dict[str, BasicBlock]): Dictionary of basic blocks.
         """
         if not blocks:
             return
@@ -632,11 +618,12 @@ class BytecodeAnalyzer:
             block.metadata['is_loop_header'] = any(edge[1] == block.id for edge in back_edges)
     
     def _compute_dominance(self, blocks: Dict[str, BasicBlock]) -> None:
-        """
-        Compute dominance relationships between blocks.
+        """Compute dominance relationships between blocks.
+        
+        Uses an iterative algorithm to find dominators for each block.
         
         Args:
-            blocks: Dictionary of basic blocks
+            blocks (Dict[str, BasicBlock]): Dictionary of basic blocks.
         """
         if not blocks:
             return
@@ -678,11 +665,12 @@ class BytecodeAnalyzer:
             block.metadata['dominators'] = dominators[block_id]
     
     def _analyze_reachability(self, blocks: Dict[str, BasicBlock]) -> None:
-        """
-        Analyze block reachability to identify dead code.
+        """Analyze block reachability to identify dead code.
+        
+        Performs DFS from entry blocks to mark all reachable blocks.
         
         Args:
-            blocks: Dictionary of basic blocks
+            blocks (Dict[str, BasicBlock]): Dictionary of basic blocks.
         """
         if not blocks:
             return
@@ -713,11 +701,13 @@ class BytecodeAnalyzer:
             block.metadata['is_dead_code'] = block_id not in reachable
     
     def _fallback_control_flow_analysis(self) -> Dict[str, BasicBlock]:
-        """
-        Fallback control flow analysis for error recovery.
+        """Fallback control flow analysis for error recovery.
+        
+        Creates a single basic block containing all instructions when
+        the main analysis fails.
         
         Returns:
-            Basic control flow analysis result
+            Dict[str, BasicBlock]: Basic control flow analysis result.
         """
         self.logger.warning("Using fallback control flow analysis")
         
@@ -742,14 +732,13 @@ class BytecodeAnalyzer:
         return blocks
     
     def _get_instruction_name(self, instr) -> str:
-        """
-        Get instruction name from various instruction object types.
+        """Get instruction name from various instruction object types.
         
         Args:
-            instr: Instruction object (dict or pyevmasm object)
+            instr: Instruction object (dict or evmdasm object).
             
         Returns:
-            Instruction name as string
+            str: Instruction name as string.
         """
         # Handle dictionary format (from our parser)
         if isinstance(instr, dict):
@@ -764,15 +753,14 @@ class BytecodeAnalyzer:
             return str(instr)
     
     def _get_pc(self, instr, fallback: int) -> int:
-        """
-        Get program counter from instruction object.
+        """Get program counter from instruction object.
         
         Args:
-            instr: Instruction object (dict or pyevmasm object)
-            fallback: Fallback value if PC not found
+            instr: Instruction object (dict or evmdasm object).
+            fallback (int): Fallback value if PC not found.
             
         Returns:
-            Program counter value
+            int: Program counter value.
         """
         # Handle dictionary format (from our parser)
         if isinstance(instr, dict):
@@ -782,14 +770,13 @@ class BytecodeAnalyzer:
         return getattr(instr, 'pc', fallback)
     
     def _get_operand(self, instr):
-        """
-        Get operand from instruction object.
+        """Get operand from instruction object.
         
         Args:
-            instr: Instruction object (dict or pyevmasm object)
+            instr: Instruction object (dict or evmdasm object).
             
         Returns:
-            Operand value or None
+            Optional[Any]: Operand value or None if not present.
         """
         # Handle dictionary format (from our parser)
         if isinstance(instr, dict):
@@ -808,12 +795,11 @@ class BytecodeAnalyzer:
             self.stack_values = {}  # Map instruction index to known values
         
         def process_instruction(self, instr, index: int) -> None:
-            """
-            Process an instruction and update stack state.
+            """Process an instruction and update stack state.
             
             Args:
-                instr: EVM instruction
-                index: Instruction index
+                instr: EVM instruction object.
+                index (int): Instruction index in the bytecode.
             """
             name = self._get_name(instr)
             
@@ -867,18 +853,24 @@ class BytecodeAnalyzer:
                 self.stack = self.stack[-1024:]
         
         def get_stack_top_value(self) -> Optional[int]:
-            """
-            Get the top value from the stack if known.
+            """Get the top value from the stack if known.
             
             Returns:
-                Top stack value or None if unknown
+                Optional[int]: Top stack value or None if unknown.
             """
             if self.stack and isinstance(self.stack[-1], int):
                 return self.stack[-1]
             return None
         
         def _get_name(self, instr) -> str:
-            """Get instruction name."""
+            """Get instruction name from instruction object.
+            
+            Args:
+                instr: EVM instruction object.
+                
+            Returns:
+                str: Instruction name.
+            """
             if hasattr(instr, 'name'):
                 return instr.name
             elif hasattr(instr, 'opcode'):
@@ -887,11 +879,13 @@ class BytecodeAnalyzer:
                 return str(instr)
     
     def identify_functions(self) -> Dict[str, Function]:
-        """
-        Identify function boundaries and extract function metadata by analyzing the dispatcher.
+        """Identify function boundaries and extract function metadata.
+        
+        Analyzes the dispatcher pattern to identify functions by their
+        4-byte selectors and corresponding jump targets.
         
         Returns:
-            Dictionary mapping function names to Function objects
+            Dict[str, Function]: Dictionary mapping function names to Function objects.
         """
         functions = {}
         
@@ -996,11 +990,10 @@ class BytecodeAnalyzer:
         return functions
     
     def convert_to_tac(self) -> List[TACInstruction]:
-        """
-        Convert EVM instructions to Three-Address Code representation.
+        """Convert EVM instructions to Three-Address Code representation.
         
         Returns:
-            List of TAC instructions
+            List[TACInstruction]: List of TAC instructions.
         """
         tac_instructions = []
         stack = []  # Simulate EVM stack for analysis
@@ -1016,15 +1009,15 @@ class BytecodeAnalyzer:
         return tac_instructions
     
     def _convert_instruction_to_tac(self, instr, stack: List[str]) -> Union[TACInstruction, List[TACInstruction], None]:
-        """
-        Convert a single EVM instruction to TAC format.
+        """Convert a single EVM instruction to TAC format.
         
         Args:
-            instr: EVM instruction
-            stack: Current stack state (for analysis)
+            instr: EVM instruction object.
+            stack (List[str]): Current stack state for analysis.
             
         Returns:
-            TAC instruction(s) or None
+            Union[TACInstruction, List[TACInstruction], None]: TAC instruction(s)
+                or None if the instruction doesn't produce TAC output.
         """
         # Handle different instruction object types
         if hasattr(instr, 'name'):
@@ -1208,11 +1201,13 @@ class BytecodeAnalyzer:
         )
     
     def generate_tac_representation(self) -> str:
-        """
-        Generate a string representation of the TAC code with integrated control flow analysis.
+        """Generate a string representation of TAC with control flow analysis.
+        
+        Performs comprehensive analysis including control flow, function
+        identification, and TAC conversion.
         
         Returns:
-            String representation suitable for LLM input
+            str: String representation suitable for LLM input.
         """
         try:
             # Perform comprehensive analysis
@@ -1236,8 +1231,10 @@ class BytecodeAnalyzer:
             return self._generate_fallback_tac()
     
     def _convert_and_integrate_tac(self) -> None:
-        """
-        Convert EVM instructions to TAC and integrate with basic blocks.
+        """Convert EVM instructions to TAC and integrate with basic blocks.
+        
+        Converts raw instructions within each basic block to TAC format
+        and adds control flow metadata to the instructions.
         """
         # Create PC to instruction mapping
         pc_to_instr = {}
@@ -1276,11 +1273,13 @@ class BytecodeAnalyzer:
                 self._add_control_flow_metadata_to_block(block)
     
     def _add_control_flow_metadata_to_block(self, block: BasicBlock) -> None:
-        """
-        Add control flow analysis metadata to basic block.
+        """Add control flow analysis metadata to basic block.
+        
+        Adds information about predecessors, successors, block type,
+        loop headers, and reachability.
         
         Args:
-            block: Basic block to enhance with metadata
+            block (BasicBlock): Basic block to enhance with metadata.
         """
         # Add successor/predecessor information
         if not block.metadata:
@@ -1310,11 +1309,10 @@ class BytecodeAnalyzer:
             block.metadata['is_reachable'] = block.metadata.get('is_reachable', True)
     
     def _format_integrated_tac_output(self) -> str:
-        """
-        Generate formatted TAC output with integrated control flow information.
+        """Generate formatted TAC output with integrated control flow information.
         
         Returns:
-            Formatted TAC representation
+            str: Formatted TAC representation with comments and metadata.
         """
         tac_lines = []
         tac_lines.append("// Three-Address Code Representation with Control Flow Analysis")
@@ -1339,13 +1337,12 @@ class BytecodeAnalyzer:
         return "\n".join(tac_lines)
     
     def _format_function_tac(self, tac_lines: List[str], func_name: str, function: Function) -> None:
-        """
-        Format TAC output for a specific function.
+        """Format TAC output for a specific function.
         
         Args:
-            tac_lines: List to append formatted lines to
-            func_name: Function name
-            function: Function object
+            tac_lines (List[str]): List to append formatted lines to.
+            func_name (str): Function name.
+            function (Function): Function object containing metadata.
         """
         tac_lines.append(f"function {func_name}:")
         if function.selector:
@@ -1370,11 +1367,10 @@ class BytecodeAnalyzer:
             self._format_block_tac(tac_lines, block, indent="  ")
     
     def _format_all_blocks_tac(self, tac_lines: List[str]) -> None:
-        """
-        Format TAC output for all blocks when no functions are identified.
+        """Format TAC output for all blocks when no functions are identified.
         
         Args:
-            tac_lines: List to append formatted lines to
+            tac_lines (List[str]): List to append formatted lines to.
         """
         tac_lines.append("main:")
         tac_lines.append("  // No specific functions identified - showing all basic blocks")
@@ -1387,13 +1383,12 @@ class BytecodeAnalyzer:
             self._format_block_tac(tac_lines, block, indent="  ")
     
     def _format_block_tac(self, tac_lines: List[str], block: BasicBlock, indent: str = "") -> None:
-        """
-        Format TAC output for a single basic block.
+        """Format TAC output for a single basic block.
         
         Args:
-            tac_lines: List to append formatted lines to
-            block: Basic block to format
-            indent: Indentation string
+            tac_lines (List[str]): List to append formatted lines to.
+            block (BasicBlock): Basic block to format.
+            indent (str): Indentation string. Defaults to "".
         """
         # Block header with metadata
         tac_lines.append(f"{indent}{block.id}:")
@@ -1428,11 +1423,10 @@ class BytecodeAnalyzer:
         tac_lines.append("")
     
     def _generate_fallback_tac(self) -> str:
-        """
-        Generate fallback TAC representation when comprehensive analysis fails.
+        """Generate fallback TAC representation when comprehensive analysis fails.
         
         Returns:
-            Basic TAC representation
+            str: Basic TAC representation without control flow analysis.
         """
         self.logger.warning("Using fallback TAC generation")
         
@@ -1466,7 +1460,14 @@ class BytecodeAnalyzer:
         return "\n".join(tac_lines)
     
     def _format_tac_instruction(self, instr: TACInstruction) -> str:
-        """Format a TAC instruction as a string."""
+        """Format a TAC instruction as a string.
+        
+        Args:
+            instr (TACInstruction): TAC instruction to format.
+            
+        Returns:
+            str: Human-readable string representation of the instruction.
+        """
         if instr.operation == TACOperationType.ASSIGN:
             if instr.operand1:
                 return f"{instr.result} = {instr.operand1}"
@@ -1501,14 +1502,16 @@ class BytecodeAnalyzer:
 
 
 def analyze_bytecode_to_tac(bytecode: str) -> str:
-    """
-    Convenience function to analyze bytecode and return TAC representation.
+    """Analyze bytecode and return TAC representation.
+    
+    Convenience function that creates a BytecodeAnalyzer and generates
+    the TAC representation in a single call.
     
     Args:
-        bytecode: Hex string of EVM bytecode
+        bytecode (str): Hex string of EVM bytecode (with or without 0x prefix).
         
     Returns:
-        TAC representation as string
+        str: TAC representation as string.
     """
     analyzer = BytecodeAnalyzer(bytecode)
     return analyzer.generate_tac_representation()
