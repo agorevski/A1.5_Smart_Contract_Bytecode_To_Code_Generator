@@ -89,6 +89,12 @@ class SmartContractEvaluator:
     """
     
     def __init__(self):
+        """Initialize the evaluator with required NLP models and scorers.
+
+        Sets up the sentence transformer model for semantic similarity,
+        ROUGE scorer for text overlap metrics, and ensures NLTK punkt
+        tokenizer is available.
+        """
         self.logger = logging.getLogger(__name__)
         
         # Initialize evaluation models
@@ -271,7 +277,16 @@ class SmartContractEvaluator:
             return 0.0
     
     def extract_function_metadata(self, code: str) -> Dict[str, Any]:
-        """Extract function metadata from Solidity code."""
+        """Extract function metadata from Solidity code.
+
+        Args:
+            code: Solidity source code to analyze.
+
+        Returns:
+            Dictionary containing extracted metadata including visibility,
+            payable status, view/pure modifiers, and presence of require
+            statements.
+        """
         try:
             metadata = {
                 'has_function_keyword': 'function' in code,
@@ -353,6 +368,12 @@ class SmartContractTrainingPipeline:
     """
     
     def __init__(self, config: TrainingConfig):
+        """Initialize the training pipeline with the given configuration.
+
+        Args:
+            config: TrainingConfig object containing all pipeline settings
+                including API keys, paths, and hyperparameters.
+        """
         self.config = config
         self.logger = logging.getLogger(__name__)
         
@@ -427,7 +448,15 @@ class SmartContractTrainingPipeline:
         return train_path, val_path, test_path
     
     def _split_dataset(self, dataset_path: str) -> Tuple[str, str, str]:
-        """Split dataset into train, validation, and test sets."""
+        """Split dataset into train, validation, and test sets.
+
+        Args:
+            dataset_path: Path to the complete JSONL dataset file.
+
+        Returns:
+            Tuple containing paths to (train_dataset, validation_dataset,
+            test_dataset) JSONL files.
+        """
         # Load data
         data = []
         with open(dataset_path, 'r') as f:
@@ -562,7 +591,17 @@ class SmartContractTrainingPipeline:
         return aggregate_stats
     
     def _compute_aggregate_statistics(self, results: List[Dict]) -> Dict[str, Any]:
-        """Compute aggregate statistics from evaluation results."""
+        """Compute aggregate statistics from evaluation results.
+
+        Args:
+            results: List of dictionaries containing individual evaluation
+                results with metrics for each function.
+
+        Returns:
+            Dictionary containing aggregate statistics (mean, std, median,
+            min, max, percentiles) for each metric, plus paper-specific
+            threshold metrics.
+        """
         if not results:
             return {}
         
@@ -641,7 +680,12 @@ class SmartContractTrainingPipeline:
         return evaluation_results
 
 def main():
-    """Example usage of the complete training pipeline."""
+    """Run an example demonstration of the complete training pipeline.
+
+    Sets up logging, loads configuration from environment variables,
+    and executes the full data collection, training, and evaluation
+    pipeline with reduced parameters suitable for demonstration.
+    """
     # Setup logging
     logging.basicConfig(
         level=logging.INFO,

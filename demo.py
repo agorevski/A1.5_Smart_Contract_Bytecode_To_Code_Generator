@@ -19,7 +19,14 @@ from src.model_setup import ModelConfig, SmartContractModelTrainer
 from src.training_pipeline import SmartContractEvaluator, EvaluationMetrics
 
 def setup_logging():
-    """Setup logging configuration."""
+    """Configure logging for the demo script.
+
+    Sets up logging with INFO level to both a file (demo.log) and console output.
+    Log messages include timestamp, logger name, level, and message.
+
+    Returns:
+        None
+    """
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -30,7 +37,15 @@ def setup_logging():
     )
 
 def demo_bytecode_to_tac():
-    """Demonstrate bytecode to TAC conversion."""
+    """Demonstrate EVM bytecode to Three-Address Code conversion.
+
+    Converts sample smart contract bytecode to TAC representation and
+    displays analysis statistics including line counts, function counts,
+    and basic block counts.
+
+    Returns:
+        bool: True if conversion succeeds, False otherwise.
+    """
     print("\n" + "="*60)
     print("DEMO 1: EVM Bytecode to Three-Address Code Conversion")
     print("="*60)
@@ -68,7 +83,15 @@ def demo_bytecode_to_tac():
         return False
 
 def demo_evaluation_metrics():
-    """Demonstrate evaluation metrics computation."""
+    """Demonstrate evaluation metrics computation for decompiled code.
+
+    Compares original Solidity code with decompiled output using multiple
+    metrics including semantic similarity, edit distance, BLEU score,
+    ROUGE-L score, token accuracy, and structural preservation.
+
+    Returns:
+        bool: True if evaluation succeeds, False otherwise.
+    """
     print("\n" + "="*60)
     print("DEMO 2: Evaluation Metrics Framework")
     print("="*60)
@@ -145,7 +168,15 @@ def demo_evaluation_metrics():
         return False
 
 def demo_model_setup():
-    """Demonstrate model configuration and setup."""
+    """Demonstrate Llama 3.2 3B model configuration with LoRA.
+
+    Creates and displays model configuration matching paper specifications,
+    including max sequence length, LoRA parameters, and quantization settings.
+    Initializes the model trainer without loading the actual model.
+
+    Returns:
+        bool: True if setup succeeds, False otherwise.
+    """
     print("\n" + "="*60)
     print("DEMO 3: Llama 3.2 3B Model Setup with LoRA")
     print("="*60)
@@ -197,7 +228,14 @@ def demo_model_setup():
         return False
 
 def demo_dataset_format():
-    """Demonstrate dataset formatting and structure."""
+    """Demonstrate dataset formatting and structure for TAC-to-Solidity pairs.
+
+    Creates sample dataset entries with TAC input, Solidity output, and
+    metadata. Displays dataset statistics and saves a sample JSONL file.
+
+    Returns:
+        bool: True if dataset creation succeeds, False otherwise.
+    """
     print("\n" + "="*60)
     print("DEMO 4: Dataset Format and Structure")
     print("="*60)
@@ -293,7 +331,15 @@ function changeOwner:
         return False
 
 def demo_paper_metrics():
-    """Demonstrate metrics mentioned in the paper."""
+    """Demonstrate metrics and results from the research paper.
+
+    Displays simulated results matching the paper specifications including
+    dataset statistics, model configuration, semantic preservation metrics,
+    syntactic accuracy, and comparison with traditional decompilers.
+
+    Returns:
+        bool: True (always succeeds as it displays static data).
+    """
     print("\n" + "="*60)
     print("DEMO 5: Paper-Specific Metrics and Results")
     print("="*60)
@@ -359,7 +405,15 @@ def demo_paper_metrics():
     return True
 
 def main():
-    """Run all demonstrations."""
+    """Run all demonstrations for the smart contract decompilation system.
+
+    Executes five demo functions covering bytecode-to-TAC conversion,
+    evaluation metrics, model setup, dataset formatting, and paper metrics.
+    Displays a summary of results and next steps.
+
+    Returns:
+        None
+    """
     setup_logging()
     
     print("Smart Contract Decompilation System - Demo")

@@ -1,10 +1,10 @@
 {
   "configurations": [
     {
-      "name": "Python: run.py",
+      "name": "Python: Dataset Pipeline",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/run.py",
+      "module": "src.dataset_pipeline",
       "console": "integratedTerminal",
       "args": []
     }

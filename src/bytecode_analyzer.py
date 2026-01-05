@@ -10,8 +10,8 @@ import logging
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from evmdasm import EvmBytecode
 
-import pyevmasm
 from eth_utils import to_hex
 from web3 import Web3
 
@@ -95,76 +95,37 @@ class BytecodeAnalyzer:
         self._parse_bytecode()
     
     def _parse_bytecode(self) -> None:
-        """Parse bytecode into individual EVM instructions."""
+        """
+        Parse EVM bytecode into instruction objects using evmdasm.
+        
+        This method uses EvmBytecode to convert raw bytecode into
+        a list of instruction objects that can be analyzed.
+        """
         try:
-            # Remove '0x' prefix if present
+            # Remove 0x prefix if present
             clean_bytecode = self.bytecode[2:] if self.bytecode.startswith('0x') else self.bytecode
             
-            # Parse using pyevmasm - it returns a string, not individual objects
-            disassembly_str = pyevmasm.disassemble_hex(clean_bytecode)
+            # Disassemble bytecode using evmdasm
+            # EvmBytecode.disassemble() returns an iterator of Instruction objects
+            evm = EvmBytecode(clean_bytecode)
+            self.instructions = list(evm.disassemble())
             
-            # Parse the disassembly string into individual instructions
-            self.instructions = self._parse_disassembly_string(disassembly_str)
             self.logger.info(f"Parsed {len(self.instructions)} instructions from bytecode")
             
         except Exception as e:
             self.logger.error(f"Failed to parse bytecode: {e}")
-            raise
-    
-    def _parse_disassembly_string(self, disassembly_str: str) -> List[Dict]:
-        """
-        Parse pyevmasm disassembly string into individual instruction objects.
-        
-        Args:
-            disassembly_str: String output from pyevmasm.disassemble_hex()
-            
-        Returns:
-            List of instruction dictionaries
-        """
-        instructions = []
-        lines = disassembly_str.strip().split('\n')
-        pc = 0
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Parse instruction line (e.g., "PUSH1 0x80", "JUMPDEST", "ADD")
-            parts = line.split()
-            if not parts:
-                continue
-            
-            opcode = parts[0]
-            operand = parts[1] if len(parts) > 1 else None
-            
-            # Create instruction dictionary
-            instruction = {
-                'name': opcode,
-                'pc': pc,
-                'operand': operand,
-                'raw_line': line
-            }
-            
-            instructions.append(instruction)
-            
-            # Estimate PC increment (simplified)
-            if opcode.startswith('PUSH'):
-                try:
-                    push_size = int(opcode[4:]) if len(opcode) > 4 else 1
-                    pc += 1 + push_size  # Opcode + operand bytes
-                except ValueError:
-                    pc += 1
-            else:
-                pc += 1
-        
-        return instructions
+            self.instructions = []
     
     def _generate_temp_var(self) -> str:
-        """Generate a temporary variable name."""
+        """
+        Generate a unique temporary variable name for TAC representation.
+        
+        Returns:
+            Temporary variable name (e.g., 'temp_1', 'temp_2', etc.)
+        """
         self.variable_counter += 1
         return f"temp_{self.variable_counter}"
-    
+
     def analyze_control_flow(self) -> Dict[str, BasicBlock]:
         """
         Perform comprehensive control flow analysis to identify basic blocks.
@@ -927,49 +888,98 @@ class BytecodeAnalyzer:
     
     def identify_functions(self) -> Dict[str, Function]:
         """
-        Identify function boundaries and extract function metadata.
+        Identify function boundaries and extract function metadata by analyzing the dispatcher.
         
         Returns:
             Dictionary mapping function names to Function objects
         """
         functions = {}
         
-        # Look for function selectors in the bytecode
-        # This is a simplified implementation - real implementation would be more sophisticated
+        self.logger.info("Identifying functions from bytecode dispatcher")
         
-        # Check for dispatcher pattern at the beginning
-        dispatcher_found = False
-        current_function = None
+        # Strategy: Look for function selector patterns in the dispatcher
+        # Pattern: PUSH4 <selector>, EQ, PUSH <target>, JUMPI
+        # Or variations: DUP1, PUSH4 <selector>, EQ, PUSH <target>, JUMPI
         
         for i, instr in enumerate(self.instructions):
-            # Look for PUSH4 followed by EQ pattern (function selector check)
             instr_name = self._get_instruction_name(instr)
-            if (instr_name == 'PUSH4' and 
-                i + 2 < len(self.instructions)):
-                next_instr = self.instructions[i + 1]
-                next_name = self._get_instruction_name(next_instr)
-                if next_name == 'EQ':
-                    selector = self._get_operand(instr)
-                    if selector:
+            
+            # Look for PUSH4 (4-byte function selector)
+            if instr_name == 'PUSH4':
+                selector_value = self._get_operand(instr)
+                
+                if not selector_value:
+                    continue
+                
+                # Normalize selector to 0x format
+                if isinstance(selector_value, str):
+                    if not selector_value.startswith('0x'):
+                        selector = '0x' + selector_value
+                    else:
+                        selector = selector_value
+                else:
+                    selector = '0x' + format(int(selector_value), '08x')
+                
+                # Ensure it's exactly 10 characters (0x + 8 hex digits)
+                if len(selector) == 10:
+                    # Look ahead for EQ instruction
+                    eq_found = False
+                    jump_target = None
+                    
+                    for j in range(i + 1, min(i + 10, len(self.instructions))):
+                        check_instr = self.instructions[j]
+                        check_name = self._get_instruction_name(check_instr)
+                        
+                        if check_name == 'EQ':
+                            eq_found = True
+                            # Now look for PUSH followed by JUMPI
+                            for k in range(j + 1, min(j + 5, len(self.instructions))):
+                                target_instr = self.instructions[k]
+                                target_name = self._get_instruction_name(target_instr)
+                                
+                                if target_name.startswith('PUSH'):
+                                    target_operand = self._get_operand(target_instr)
+                                    if target_operand:
+                                        try:
+                                            if isinstance(target_operand, str):
+                                                jump_target = int(target_operand, 16)
+                                            else:
+                                                jump_target = int(target_operand)
+                                        except (ValueError, TypeError):
+                                            pass
+                                
+                                elif target_name == 'JUMPI' and jump_target is not None:
+                                    # Found complete pattern!
+                                    break
+                            break
+                    
+                    # If we found a complete dispatcher pattern, create function
+                    if eq_found and jump_target is not None:
                         function_name = f"function_{selector}"
                         
-                        # Find the corresponding JUMPDEST
-                        # Simplified - would need more sophisticated analysis
+                        # Find the basic block at this jump target
                         entry_block = None
                         for block_id, block in self.basic_blocks.items():
-                            # Check if any instruction in the block is JUMPDEST
-                            entry_block = block_id
-                            break
-                
-                if entry_block:
-                    functions[function_name] = Function(
-                        name=function_name,
-                        selector=selector,
-                        basic_blocks=[],  # Would be populated with actual analysis
-                        entry_block=entry_block,
-                        parameters=[],
-                        return_types=[]
-                    )
+                            if block.start_address == jump_target:
+                                entry_block = block_id
+                                break
+                        
+                        if not entry_block:
+                            # Create a dummy entry block reference
+                            entry_block = f"block_{jump_target:04x}"
+                        
+                        functions[function_name] = Function(
+                            name=function_name,
+                            selector=selector,
+                            basic_blocks=[],
+                            entry_block=entry_block,
+                            parameters=[],
+                            return_types=[]
+                        )
+                        
+                        self.logger.debug(f"Identified function with selector {selector} at target {jump_target:04x}")
+        
+        self.logger.info(f"Identified {len(functions)} functions from dispatcher")
         
         # Add a fallback function if no specific functions found
         if not functions and self.basic_blocks:
@@ -980,6 +990,7 @@ class BytecodeAnalyzer:
                 basic_blocks=list(self.basic_blocks.values()),
                 entry_block=entry_block
             )
+            self.logger.info("No functions found - created fallback function")
         
         self.functions = functions
         return functions
