@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Contract Bytecode Decompiler</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-content">
+      <h1>🔍 Smart Contract Bytecode Decompiler</h1>
+      <p class="subtitle">EVM Bytecode → TAC → Solidity &nbsp;|&nbsp; Powered by fine-tuned Llama 3.2 3B</p>
+    </div>
+  </header>
+
+  <!-- GPU Stats Panel -->
+  <section id="gpu-panel" class="gpu-panel">
+    <div class="gpu-panel-header">
+      <h2>🖥️ GPU Status</h2>
+      <span id="gpu-status-dot" class="gpu-status-dot offline" title="Checking…"></span>
+    </div>
+    <div id="gpu-cards" class="gpu-cards">
+      <div class="gpu-placeholder">Checking GPU availability…</div>
+    </div>
+  </section>
+
+  <main>
+    <!-- Input Section -->
+    <section class="input-section">
+      <div class="section-header">
+        <h2>Input Bytecode</h2>
+        <div class="input-actions">
+          <button id="btn-sample" class="btn btn-secondary" title="Load sample bytecode">📋 Load Sample</button>
+          <button id="btn-clear" class="btn btn-secondary" title="Clear input">✕ Clear</button>
+        </div>
+      </div>
+      <textarea
+        id="bytecode-input"
+        placeholder="Paste EVM bytecode here (with or without 0x prefix)&#10;&#10;Example: 0x608060405234801561001057600080fd5b50..."
+        spellcheck="false"
+      ></textarea>
+      <div class="input-footer">
+        <span id="char-count" class="char-count">0 characters</span>
+        <button id="btn-decompile" class="btn btn-primary">⚡ Decompile</button>
+      </div>
+    </section>
+
+    <!-- Loading / Progress Section -->
+    <div id="loading" class="loading hidden">
+      <div class="spinner"></div>
+      <p id="progress-message">Processing bytecode…</p>
+
+      <!-- Progress bar -->
+      <div class="progress-container">
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <span id="progress-percent" class="progress-percent">0%</span>
+      </div>
+
+      <!-- Detailed status -->
+      <div id="progress-details" class="progress-details">
+        <div id="progress-stage" class="progress-stage"></div>
+        <div id="progress-functions" class="progress-functions hidden">
+          <span id="progress-func-label">Functions:</span>
+          <span id="progress-func-count"></span>
+        </div>
+      </div>
+
+      <!-- Function log (scrollable list of completed functions) -->
+      <div id="progress-log" class="progress-log hidden">
+        <ul id="progress-log-list"></ul>
+      </div>
+    </div>
+
+    <!-- Error Banner -->
+    <div id="error-banner" class="error-banner hidden">
+      <span id="error-text"></span>
+      <button id="btn-dismiss-error" class="btn-dismiss">✕</button>
+    </div>
+
+    <!-- Results Section -->
+    <section id="results-section" class="results-section hidden">
+      <div class="tabs">
+        <button id="tab-btn-original" class="tab hidden" data-tab="tab-original">📄 Original Solidity</button>
+        <button class="tab active" data-tab="tab-solidity">Generated Solidity</button>
+        <button class="tab" data-tab="tab-functions">🔗 Function Mapping</button>
+        <button class="tab" data-tab="tab-tac">TAC Output</button>
+        <button class="tab" data-tab="tab-analysis">Analysis Info</button>
+      </div>
+
+      <div class="tab-panels">
+        <!-- Original Solidity Tab (only visible when sample is loaded) -->
+        <div id="tab-original" class="tab-panel hidden">
+          <div class="panel-header">
+            <h3>Original Solidity Source</h3>
+            <button class="btn btn-small btn-copy" data-target="original-output">📋 Copy</button>
+          </div>
+          <div class="original-note">
+            This is the verified source code that was compiled into the sample bytecode.
+            Compare it with the <strong>Generated Solidity</strong> tab to evaluate decompilation quality.
+          </div>
+          <pre><code id="original-output" class="code-block solidity"></code></pre>
+        </div>
+
+        <!-- Solidity Tab -->
+        <div id="tab-solidity" class="tab-panel active">
+          <div class="panel-header">
+            <h3>Reconstructed Solidity Code</h3>
+            <button class="btn btn-small btn-copy" data-target="solidity-output">📋 Copy</button>
+          </div>
+          <div id="model-warning" class="warning hidden">
+            <span>⚠️</span> <span id="model-warning-text"></span>
+          </div>
+          <pre><code id="solidity-output" class="code-block solidity"></code></pre>
+        </div>
+
+        <!-- Function Mapping Tab -->
+        <div id="tab-functions" class="tab-panel hidden">
+          <div class="panel-header">
+            <h3>Function Selector Mapping</h3>
+          </div>
+          <p class="tab-description">
+            Each function selector (4-byte hash) is resolved to its likely human-readable name.
+            Confidence indicates how certain the mapping is.
+          </p>
+          <div id="function-mapping-content" class="function-mapping-table-wrap">
+            <p class="text-muted">No function data yet. Run a decompilation first.</p>
+          </div>
+        </div>
+
+        <!-- TAC Tab -->
+        <div id="tab-tac" class="tab-panel hidden">
+          <div class="panel-header">
+            <h3>Three-Address Code (TAC)</h3>
+            <button class="btn btn-small btn-copy" data-target="tac-output">📋 Copy</button>
+          </div>
+          <pre><code id="tac-output" class="code-block tac"></code></pre>
+        </div>
+
+        <!-- Analysis Tab -->
+        <div id="tab-analysis" class="tab-panel hidden">
+          <div class="panel-header">
+            <h3>Analysis Details</h3>
+          </div>
+          <div id="analysis-content" class="analysis-grid"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Based on <em>"Decompiling Smart Contracts with a Large Language Model"</em>
+      (arXiv:2506.19624v1)
+    </p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

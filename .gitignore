@@ -1,2 +1,49 @@
-**/__pycache__/*.*
-**/model_responses/*.*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Model artifacts
+models/
+results/
+model_responses/
+checkpoints/
+wandb/
+
+# Data (large files — regenerate with download_hf_contracts.py)
+data/*.db
+data/*.jsonl
+
+# Keep demo dataset for reference
+!demo_dataset.jsonl
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env

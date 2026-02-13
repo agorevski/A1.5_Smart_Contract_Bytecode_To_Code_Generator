@@ -431,7 +431,6 @@ def main():
     
     # Run demonstrations
     results["bytecode_to_tac"] = demo_bytecode_to_tac()
-    x = 1 / 0
     results["evaluation_metrics"] = demo_evaluation_metrics()
     results["model_setup"] = demo_model_setup()
     results["dataset_format"] = demo_dataset_format()

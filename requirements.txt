@@ -12,6 +12,7 @@ py-evm
 eth-abi
 eth-utils
 evmdasm
+py-solc-x
 
 # Data processing and analysis
 numpy
@@ -30,6 +31,15 @@ seaborn
 wandb
 tensorboard
 
+# Hugging Face Hub
+huggingface_hub
+
+# HTTP requests
+requests
+
+# GPU monitoring
+nvidia-ml-py3
+
 # File processing and utilities
 tqdm
 click
@@ -41,6 +51,10 @@ pytest
 black
 flake8
 mypy
+
+# Optional: Flash Attention 2 for faster inference
+# Requires CUDA toolkit; install with: pip install flash-attn --no-build-isolation
+# flash-attn
 
 # Optional: For distributed training
 # deepspeed>=0.10.0

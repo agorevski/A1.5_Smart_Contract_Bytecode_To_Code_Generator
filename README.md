@@ -1,176 +1,213 @@
-# Smart Contract Decompilation with Llama 3.2 3B
+# Smart Contract Bytecode-to-Solidity Decompiler
 
-This repository implements the methodology described in the research paper **"Decompiling Smart Contracts with a Large Language Model"** (arXiv:2506.19624v1) for fine-tuning Llama 3.2 3B to convert EVM bytecode into human-readable Solidity code.
+A two-stage pipeline for decompiling EVM smart contract bytecode into human-readable Solidity code, powered by a fine-tuned Llama 3.2 3B model.
 
-## Overview
+**Paper:** [Decompiling Smart Contracts with a Large Language Model](reference/2506.19624v1.pdf) (arXiv:2506.19624v1)
 
-The system combines traditional program analysis with modern large language models to achieve high-quality smart contract decompilation through a two-stage pipeline:
+## Architecture
 
-1. **Bytecode-to-TAC Conversion**: Static analysis converts EVM bytecode into structured Three-Address Code (TAC)
-2. **TAC-to-Solidity Generation**: Fine-tuned Llama 3.2 3B model generates readable Solidity code from TAC
+```
+EVM Bytecode → Static Analysis → TAC (Three-Address Code) → Fine-tuned LLM → Solidity
+```
 
-## Key Results
-
-Our implementation recreates the methodology that achieved:
-
-| Metric | Paper Result |
-|--------|--------------|
-| **Semantic Similarity (avg)** | 0.82 |
-| **Functions > 0.8 similarity** | 78.3% |
-| **Functions < 0.4 edit distance** | 82.5% |
-| **Dataset Size** | 238,446 function pairs |
-
-This represents a **significant improvement** over traditional decompilers which typically achieve only 40-50% of functions with >0.8 semantic similarity.
+1. **Bytecode → TAC** — `src/bytecode_analyzer.py` disassembles EVM bytecode, constructs control-flow graphs, and emits Three-Address Code  
+2. **TAC → Solidity** — A LoRA fine-tuned Llama 3.2 3B translates TAC into readable Solidity  
 
 ## Quick Start
 
-### Installation
+### 1. Install Dependencies
 
 ```bash
-# Clone repository
-git clone <repository-url>
-cd A1.5_Smart_Contract_Bytecode_To_Code_Generator
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Set environment variables
-export ETHERSCAN_API_KEY="your_etherscan_api_key"
-export HF_TOKEN="your_huggingface_token"
-
-# Verify installation
-python demo.py
 ```
 
-For detailed installation instructions, see [Installation Guide](docs/installation.md).
+> **Requirements:** Python ≥ 3.10, CUDA-compatible GPU with ≥ 4 GB VRAM (inference) / ≥ 16 GB (training).
 
-### Basic Usage
+### 2. Download Training Data
 
-```python
-from src.bytecode_analyzer import analyze_bytecode_to_tac
-from src.model_setup import SmartContractDecompiler
+Download verified Solidity contracts from HuggingFace (`andstor/smart_contracts`), compile each with compatible solc versions, generate TAC, and export training pairs:
 
-# Step 1: Convert bytecode to TAC
-bytecode = "0x608060405234801561001057600080fd5b50..."
-tac_representation = analyze_bytecode_to_tac(bytecode)
+```bash
+# Download 20 contracts (quick test)
+python download_hf_contracts.py --limit 20
 
-# Step 2: Decompile to Solidity (requires trained model)
-decompiler = SmartContractDecompiler("models/final/smart_contract_decompiler")
-solidity_code = decompiler.decompile_tac_to_solidity(
-    tac_representation,
-    temperature=0.3,
-    max_new_tokens=2048
-)
+# Download 100 contracts with max 3 compiler versions each
+python download_hf_contracts.py --limit 100 --max-compiler-versions 3
 
-print(solidity_code)
+# Full dataset (all available contracts)
+python download_hf_contracts.py
 ```
 
-For more examples, see [Usage Guide](docs/usage.md).
+**Phases** (can be run independently):
 
-## Documentation
+```bash
+python download_hf_contracts.py --download-only     # Phase 1: Download only
+python download_hf_contracts.py --compile-only       # Phase 2: Compile & generate TAC
+python download_hf_contracts.py --export-only        # Phase 3: Export JSONL
+```
 
-Comprehensive documentation is available in the [`docs/`](docs/) folder:
+**Output:** `data/hf_training_dataset.jsonl` — each line is `{"input": "<TAC>", "output": "<Solidity>", "metadata": {...}}`
 
-### Getting Started
+### 3. Train the Model
 
-- **[Installation Guide](docs/installation.md)** - Setup and configuration
-- **[Usage Guide](docs/usage.md)** - Basic to advanced usage examples
-- **[Architecture](docs/architecture.md)** - System design and components
+```bash
+# Train on the downloaded dataset (Llama 3.2 3B with LoRA)
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
 
-### Training & Development
+# Quick test (1 epoch, small batch)
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
 
-- **[Training Pipeline](docs/training-pipeline.md)** - Complete training workflow
-- **[Data Format](docs/data-format.md)** - Dataset specifications
-- **[Model Details](docs/model-details.md)** - Model architecture and configuration
+# Fast E2E test with a tiny model (no GPU needed)
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
 
-### Analysis & Evaluation
+# Full training with custom parameters
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
+    --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 4096
+```
 
-- **[Evaluation Metrics](docs/evaluation.md)** - Quality assessment framework
-- **[Security Applications](docs/security-applications.md)** - Real-world use cases
-- **[Comparisons](docs/comparisons.md)** - Benchmarks vs traditional decompilers
+**Output:** Trained model saved to `models/`
 
-### Reference
+### 4. Evaluate
 
-- **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
-- **[Contributing](docs/contributing.md)** - Contribution guidelines
-- **[Limitations & Future Work](docs/limitations-future-work.md)** - Current limitations and roadmap
+Evaluation runs automatically after training unless `--skip-eval` is passed. Results are saved to `results/`.
+
+```bash
+# Train and evaluate
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
+
+# Train without evaluation
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --skip-eval
+```
+
+## End-to-End Example
+
+```bash
+# Step 1: Download and prepare 20 contracts
+python download_hf_contracts.py --limit 20
+
+# Step 2: Train the model on the downloaded data
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
+
+# Step 3: Check results
+ls results/
+```
+
+## Running Tests
+
+```bash
+# Run all tests
+python -m pytest
+
+# Verbose output
+python -m pytest -v
+
+# Run only bytecode analyzer tests
+python -m pytest tests/test_bytecode_analyzer.py -v
+
+# Run only dataset pipeline tests
+python -m pytest tests/test_dataset_pipeline.py -v
+```
 
 ## Project Structure
 
-```text
-A1.5_Smart_Contract_Bytecode_To_Code_Generator/
-├── src/                     # Core implementation
+```
+├── download_hf_contracts.py   # CLI: Download HuggingFace data → compile → export
+├── train.py                   # CLI: Train & evaluate the decompilation model
+├── requirements.txt           # Python dependencies
+├── pyproject.toml             # Project config (pytest, black, mypy)
+│
+├── src/                       # Core library
+│   ├── __init__.py
 │   ├── bytecode_analyzer.py   # EVM bytecode → TAC conversion
-│   ├── dataset_pipeline.py    # Data collection & preprocessing
-│   ├── model_setup.py         # Model configuration & fine-tuning
-│   └── training_pipeline.py   # End-to-end training orchestration
-├── docs/                    # Comprehensive documentation
-├── reference/               # Research paper
-├── demo.py                  # Demonstration script
-├── demo_dataset.jsonl       # Sample data
-└── requirements.txt         # Python dependencies
+│   ├── dataset_pipeline.py    # Etherscan data collection, parsing, DB
+│   ├── local_compiler.py      # Local solc compilation (py-solc-x)
+│   ├── model_setup.py         # Model config, LoRA fine-tuning, inference
+│   ├── training_pipeline.py   # Evaluation metrics (semantic similarity, edit distance)
+│   └── settings.yaml          # API keys config
+│
+├── tests/                     # Unit tests (pytest)
+│   ├── test_bytecode_analyzer.py   # 130 tests for bytecode analysis
+│   └── test_dataset_pipeline.py    # 65 tests for dataset pipeline
+│
+├── scripts/                   # Debug & utility scripts
+│   ├── demo.py
+│   ├── check_bytecode_format.py
+│   ├── inspect_bytecode.py
+│   └── debug_*.py             # Ad-hoc debugging scripts
+│
+├── data/                      # Generated datasets (gitignored)
+├── models/                    # Trained models (gitignored)
+├── results/                   # Evaluation results (gitignored)
+├── docs/                      # Documentation
+│   ├── architecture.md        # System design & data flow
+│   ├── model-details.md       # Model config, LoRA, quantization
+│   ├── data-format.md         # JSONL schema, TAC format, DB schema
+│   └── contributing.md        # Development setup & guidelines
+├── demo_dataset.jsonl         # Sample training data (3 examples)
+└── reference/                 # Research paper PDF
 ```
 
-## Features
+## CLI Reference
 
-- **High-Quality Decompilation**: 78.3% of functions achieve >0.8 semantic similarity
-- **Meaningful Variables**: Recovers semantically meaningful variable names
-- **Structured Control Flow**: Reconstructs if/else, while loops (not goto-based)
-- **Type Recovery**: Infers uint256, address, mapping types
-- **Security Analysis**: Enables vulnerability detection in unverified contracts
-- **Production Ready**: Implements published research methodology
+### `download_hf_contracts.py`
 
-## Prerequisites
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--limit N` | `0` (all) | Max contracts to download |
+| `--max-compiler-versions N` | `0` (all) | Max solc versions per contract |
+| `--workers N` | auto | Parallel compilation workers |
+| `--max-body-dupes N` | `5` | Max copies of same function body |
+| `--min-body-length N` | `50` | Min Solidity body length |
+| `--download-only` | — | Only download, skip compilation |
+| `--compile-only` | — | Only compile downloaded contracts |
+| `--export-only` | — | Only export existing pairs to JSONL |
+| `--output PATH` | `data/hf_training_dataset.jsonl` | Output file |
+| `--db PATH` | `data/contracts.db` | SQLite database path |
 
-- Python 3.8 or higher
-- CUDA-compatible GPU (16GB+ VRAM for training, 4GB+ for inference)
-- 32GB+ system RAM recommended
-- Etherscan API key ([Get one here](https://etherscan.io/apis))
-- Hugging Face token ([Get one here](https://huggingface.co/settings/tokens))
+### `train.py`
 
-## Research Paper Citation
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--skip-collection` | — | Use existing dataset (skip Etherscan) |
+| `--dataset PATH` | auto | Path to JSONL dataset |
+| `--small` | — | Quick test: 1 epoch, batch=2 |
+| `--tiny` | — | Use `facebook/opt-125m` for fast testing |
+| `--epochs N` | `3` | Training epochs |
+| `--batch-size N` | `4` | Per-device batch size |
+| `--lr FLOAT` | `2e-4` | Learning rate |
+| `--max-seq-length N` | `2048` | Max token sequence length |
+| `--model-name NAME` | `meta-llama/Llama-3.2-3B` | Base model |
+| `--skip-eval` | — | Skip post-training evaluation |
+| `--dataset-only` | — | Only build dataset, skip training |
 
-This implementation is based on the research paper:
+## Environment Variables
 
-```bibtex
-@article{david2025decompiling,
-  title={Decompiling Smart Contracts with a Large Language Model},
-  author={David, Isaac and Zhou, Liyi and Song, Dawn and Gervais, Arthur and Qin, Kaihua},
-  journal={arXiv preprint arXiv:2506.19624},
-  year={2025},
-  url={https://arxiv.org/abs/2506.19624}
-}
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `HF_TOKEN` | For Llama access | HuggingFace token (gated model) |
+| `ETHERSCAN_API_KEY` | For Etherscan collection | Only needed with `train.py` without `--skip-collection` |
 
-**Paper Highlights**:
+Alternatively, set these in `src/settings.yaml`.
 
-- First successful application of LLMs to smart contract decompilation
-- Novel hybrid approach combining static analysis with neural methods
-- Comprehensive dataset of 238,446 TAC-to-Solidity function pairs
-- Achieves 0.82 average semantic similarity (vs 0.4-0.5 for traditional methods)
-- [Publicly accessible implementation](https://evmdecompiler.com)
+## Model Details
+
+- **Base model:** Llama 3.2 3B (`meta-llama/Llama-3.2-3B`)
+- **Fine-tuning:** LoRA (r=16, α=32, dropout=0.1)
+- **Quantization:** 8-bit via bitsandbytes
+- **Target metrics:** Semantic similarity > 0.8, Edit distance < 0.4
+
+See [docs/model-details.md](docs/model-details.md) for more.
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| CUDA out of memory | Reduce `--batch-size` or use `--tiny` |
+| `HF_TOKEN` required | Set `HF_TOKEN` env var or add to `src/settings.yaml` |
+| No training pairs generated | Check solc installation: `python -c "from solcx import get_installed_solc_versions; print(get_installed_solc_versions())"` |
+| Download hangs | HuggingFace data is cached after first download; check `~/.cache/huggingface/hub/` |
+
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Original research by David et al. (2025)
-- Llama 3.2 model by Meta AI
-- LoRA implementation by Microsoft Research
-- Hugging Face Transformers library
-- Ethereum community for verified contracts
-
-## Support
-
-- **Issues**: [GitHub Issues](../../issues)
-- **Discussions**: [GitHub Discussions](../../discussions)
-- **Paper**: [arXiv:2506.19624](https://arxiv.org/abs/2506.19624)
-- **Demo**: [evmdecompiler.com](https://evmdecompiler.com)
-
----
-
-**Version**: 1.0.0  
-**Status**: Production Ready  
-**Last Updated**: 2025-10-19
+MIT — see [LICENSE](LICENSE)
