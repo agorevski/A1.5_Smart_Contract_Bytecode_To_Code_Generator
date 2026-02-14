@@ -236,13 +236,18 @@ class SmartContractModelTrainer:
         return None
 
     def setup_model(
-        self, force_reload: bool = False
+        self, force_reload: bool = False, use_deepspeed: bool = False
     ) -> Tuple[AutoTokenizer, PeftModel]:
         """Set up the Llama 3.2 3B model with LoRA configuration."""
         if self.tokenizer is not None and self.peft_model is not None and not force_reload:
             return self.tokenizer, self.peft_model
 
         self.logger.info("Setting up model with LoRA...")
+
+        # Enable TF32 for matmuls on Ampere+ GPUs (~2x faster than FP32 precision)
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         hf_token = self._get_hf_token()
 
@@ -258,30 +263,51 @@ class SmartContractModelTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        # Determine dtype and device based on GPU availability
+        has_cuda = torch.cuda.is_available()
+        if has_cuda:
+            gpu_cap = torch.cuda.get_device_capability()
+            use_bf16 = gpu_cap[0] >= 8  # Ampere+ supports bf16 natively
+            compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
+        else:
+            compute_dtype = torch.float32
+        model_dtype = compute_dtype
+
         # Configure quantization
         quantization_config = None
         if self.config.use_quantization:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=self.config.load_in_4bit,
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
 
-        # Determine dtype and device based on GPU availability
-        has_cuda = torch.cuda.is_available()
-        model_dtype = torch.float16 if has_cuda else torch.float32
+        # Determine which GPU this process owns (for DDP / multi-GPU)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
         # Load base model
+        # Use SDPA (Scaled Dot-Product Attention) for fused attention kernels
+        attn_impl = None
+        if has_cuda:
+            try:
+                import flash_attn  # noqa: F401
+                attn_impl = "flash_attention_2"
+            except ImportError:
+                attn_impl = "sdpa"  # PyTorch 2.x built-in efficient attention
+
         load_kwargs = {
             "trust_remote_code": True,
             "torch_dtype": model_dtype,
             "use_cache": False,
             "token": hf_token,
         }
+        if attn_impl:
+            load_kwargs["attn_implementation"] = attn_impl
         if quantization_config:
             load_kwargs["quantization_config"] = quantization_config
-            load_kwargs["device_map"] = "auto"
+            # Pin the quantized model to this process's GPU
+            load_kwargs["device_map"] = {"": local_rank} if has_cuda else "auto"
         elif has_cuda:
             load_kwargs["device_map"] = "auto"
         # For CPU without quantization, don't set device_map
@@ -292,7 +318,10 @@ class SmartContractModelTrainer:
         )
 
         if self.config.use_quantization:
-            self.model = prepare_model_for_kbit_training(self.model)
+            self.model = prepare_model_for_kbit_training(
+                self.model, use_gradient_checkpointing=True,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
 
         # Auto-detect target modules for LoRA if defaults don't exist in model
         target_modules = self.config.target_modules
@@ -321,10 +350,6 @@ class SmartContractModelTrainer:
         if len(self.tokenizer) > self.peft_model.config.vocab_size:
             self.peft_model.resize_token_embeddings(len(self.tokenizer))
 
-        try:
-            self.peft_model.gradient_checkpointing_enable()
-        except Exception:
-            self.logger.warning("Gradient checkpointing not supported by this model, skipping")
         self.peft_model.print_trainable_parameters()
 
         self.logger.info("Model setup completed successfully")
@@ -344,6 +369,7 @@ class SmartContractModelTrainer:
         max_grad_norm: float = 1.0,
         do_eval: bool = True,
         train_dataset_size: int = 0,
+        deepspeed_config: Optional[str] = None,
     ) -> TrainingArguments:
         """Create training arguments based on the paper's optimization strategy.
         
@@ -374,12 +400,46 @@ class SmartContractModelTrainer:
         save_strategy = "epoch" if is_small else "steps"
         logging_steps_final = max(1, min(logging_steps, total_steps)) if is_small else logging_steps
 
+        # Determine mixed-precision strategy
+        has_cuda = torch.cuda.is_available()
+        use_bf16 = False
+        use_fp16 = False
+
+        # When DeepSpeed is active, align with its config to avoid conflicts
+        if deepspeed_config:
+            try:
+                with open(deepspeed_config, "r") as _ds_f:
+                    ds_cfg = json.load(_ds_f)
+                if ds_cfg.get("bf16", {}).get("enabled", False):
+                    use_bf16 = True
+                    use_fp16 = False
+                elif ds_cfg.get("fp16", {}).get("enabled", False):
+                    use_fp16 = True
+                    use_bf16 = False
+                # else: both False, full precision
+            except Exception as e:
+                self.logger.warning(f"Could not read DeepSpeed config for precision settings: {e}")
+                # Fall back to auto-detection below
+                if has_cuda:
+                    gpu_cap = torch.cuda.get_device_capability()
+                    if gpu_cap[0] >= 8:
+                        use_bf16 = True
+                    else:
+                        use_fp16 = True
+        elif has_cuda:
+            gpu_cap = torch.cuda.get_device_capability()
+            if gpu_cap[0] >= 8:  # Ampere+ supports bf16 natively
+                use_bf16 = True
+            else:
+                use_fp16 = True
+
         args = {
             "output_dir": str(self.output_dir / "checkpoints"),
             "num_train_epochs": num_epochs,
             "per_device_train_batch_size": batch_size,
             "per_device_eval_batch_size": batch_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
+            "optim": "adamw_torch_fused" if has_cuda else "adamw_torch",
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
             "max_grad_norm": max_grad_norm,
@@ -388,14 +448,28 @@ class SmartContractModelTrainer:
             "logging_steps": logging_steps_final,
             "save_strategy": save_strategy,
             "dataloader_pin_memory": True,
+            "dataloader_num_workers": 4,
+            "dataloader_persistent_workers": True,
+            "group_by_length": True,
             "remove_unused_columns": False,
             "push_to_hub": False,
             "report_to": "none",
             "seed": 42,
-            "fp16": torch.cuda.is_available(),
+            "bf16": use_bf16,
+            "fp16": use_fp16,
             "gradient_checkpointing": True,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "dataloader_drop_last": False,
         }
+
+        # For DDP with quantized models, disable unused parameter detection
+        if self.config.use_quantization and has_cuda:
+            args["ddp_find_unused_parameters"] = False
+
+        # DeepSpeed integration
+        if deepspeed_config:
+            args["deepspeed"] = deepspeed_config
+            self.logger.info(f"DeepSpeed enabled with config: {deepspeed_config}")
 
         if save_strategy == "steps":
             args["save_steps"] = save_steps
@@ -422,9 +496,12 @@ class SmartContractModelTrainer:
         learning_rate: float = 2e-4,
         num_epochs: int = 3,
         resume_from_checkpoint: Optional[str] = None,
+        deepspeed_config: Optional[str] = None,
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
-        tokenizer, peft_model = self.setup_model()
+        tokenizer, peft_model = self.setup_model(
+            use_deepspeed=deepspeed_config is not None
+        )
 
         self.logger.info("Loading training dataset...")
         train_dataset = SmartContractDataset(
@@ -479,6 +556,7 @@ class SmartContractModelTrainer:
             num_epochs=num_epochs,
             do_eval=do_eval,
             train_dataset_size=len(train_dataset),
+            deepspeed_config=deepspeed_config,
         )
 
         trainer = Trainer(

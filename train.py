@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 End-to-End Training Pipeline for Smart Contract Decompilation
@@ -240,8 +241,21 @@ def train_model(
     model_name: str = "meta-llama/Llama-3.2-3B",
     resume_from: str = None,
     use_quantization: bool = True,
+    deepspeed_config: str = None,
 ) -> str:
     """Fine-tune the model and return path to saved model."""
+    # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
+    # quantized models cannot use DataParallel across multiple GPUs.
+    # Restrict to a single GPU to prevent the Trainer from wrapping
+    # the model in DataParallel.  Use `torchrun --nproc_per_node=N`
+    # for proper multi-GPU DDP training.
+    if (
+        use_quantization
+        and "LOCAL_RANK" not in os.environ
+        and "CUDA_VISIBLE_DEVICES" not in os.environ
+    ):
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
     from src.model_setup import ModelConfig, SmartContractModelTrainer
 
     logger = logging.getLogger(__name__)
@@ -269,6 +283,7 @@ def train_model(
         learning_rate=learning_rate,
         num_epochs=num_epochs,
         resume_from_checkpoint=resume_from,
+        deepspeed_config=deepspeed_config,
     )
 
     logger.info(f"Training complete. Model saved to {model_path}")
@@ -426,7 +441,19 @@ def main():
         "--resume", type=str, default=None, help="Resume from checkpoint"
     )
     parser.add_argument(
+        "--deepspeed",
+        type=str,
+        default=None,
+        help="Path to DeepSpeed config JSON (e.g. ds_config.json)",
+    )
+    parser.add_argument(
         "--skip-eval", action="store_true", help="Skip evaluation after training"
+    )
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=0,
+        help="Local rank passed by DeepSpeed launcher (do not set manually)",
     )
 
     args = parser.parse_args()
@@ -524,6 +551,7 @@ def main():
         model_name=args.model_name,
         resume_from=args.resume,
         use_quantization=use_quant,
+        deepspeed_config=args.deepspeed,
     )
 
     # ── Step 3: Evaluation ───────────────────────────────────────
