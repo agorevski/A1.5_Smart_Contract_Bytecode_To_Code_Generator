@@ -1430,6 +1430,121 @@ class BytecodeAnalyzer:
 
         return f"// {op.value}: {meta}"
 
+    # ------------------------------------------------------------------ #
+    #  Vulnerability-Indicative CFG Fragment Extraction (SmartBugBert)
+    # ------------------------------------------------------------------ #
+
+    def extract_vulnerability_fragments(self) -> Dict[str, List[Dict]]:
+        """
+        Extract CFG fragments that indicate potential vulnerabilities.
+
+        Based on SmartBugBert (2504.05002v2) methodology of identifying
+        vulnerability patterns in control flow graph basic blocks.
+
+        Returns dict mapping vulnerability type to list of fragment dicts,
+        each containing block_id, opcodes, and pattern description.
+        """
+        if not self.basic_blocks:
+            self.analyze_control_flow()
+
+        fragments: Dict[str, List[Dict]] = {
+            "reentrancy": [],
+            "selfdestruct": [],
+            "timestamp_dependency": [],
+            "arithmetic_overflow": [],
+            "delegatecall": [],
+            "access_control": [],
+        }
+
+        block_opcodes = {}
+        for bid, block in self.basic_blocks.items():
+            opcodes = []
+            for instr in block.metadata.get("raw_instructions", []):
+                name = self._get_instruction_name(instr)
+                opcodes.append(name)
+            block_opcodes[bid] = opcodes
+
+        for bid, opcodes in block_opcodes.items():
+            block = self.basic_blocks[bid]
+
+            # Reentrancy: CALL/CALLCODE followed by SSTORE in same or successor blocks
+            call_ops = {"CALL", "CALLCODE"}
+            if any(op in call_ops for op in opcodes):
+                has_sstore_after = "SSTORE" in opcodes
+                if not has_sstore_after:
+                    for succ_id in block.successors:
+                        if succ_id in block_opcodes and "SSTORE" in block_opcodes[succ_id]:
+                            has_sstore_after = True
+                            break
+                if has_sstore_after:
+                    fragments["reentrancy"].append({
+                        "block_id": bid,
+                        "opcodes": opcodes,
+                        "pattern": "External call followed by state modification (SSTORE)",
+                        "severity": "high",
+                    })
+
+            # Self-destruct vulnerability
+            if "SELFDESTRUCT" in opcodes:
+                fragments["selfdestruct"].append({
+                    "block_id": bid,
+                    "opcodes": opcodes,
+                    "pattern": "SELFDESTRUCT opcode present",
+                    "severity": "critical",
+                })
+
+            # Timestamp dependency
+            if "TIMESTAMP" in opcodes:
+                fragments["timestamp_dependency"].append({
+                    "block_id": bid,
+                    "opcodes": opcodes,
+                    "pattern": "Block timestamp used in execution logic",
+                    "severity": "medium",
+                })
+
+            # Arithmetic without overflow checks (ADD/SUB/MUL without LT/GT/EQ + JUMPI)
+            arith_ops = {"ADD", "SUB", "MUL", "DIV"}
+            check_ops = {"LT", "GT", "EQ", "ISZERO"}
+            if any(op in arith_ops for op in opcodes):
+                has_check = any(op in check_ops for op in opcodes) and "JUMPI" in opcodes
+                if not has_check:
+                    fragments["arithmetic_overflow"].append({
+                        "block_id": bid,
+                        "opcodes": opcodes,
+                        "pattern": "Arithmetic operation without overflow/underflow check",
+                        "severity": "medium",
+                    })
+
+            # Delegatecall vulnerability
+            if "DELEGATECALL" in opcodes:
+                fragments["delegatecall"].append({
+                    "block_id": bid,
+                    "opcodes": opcodes,
+                    "pattern": "DELEGATECALL used - potential storage manipulation",
+                    "severity": "high",
+                })
+
+            # Access control: CALLER check missing before sensitive operations
+            sensitive_ops = {"SELFDESTRUCT", "DELEGATECALL", "SSTORE"}
+            if any(op in sensitive_ops for op in opcodes):
+                has_caller_check = False
+                for pred_id in block.predecessors:
+                    if pred_id in block_opcodes:
+                        pred_ops = block_opcodes[pred_id]
+                        if "CALLER" in pred_ops and "EQ" in pred_ops:
+                            has_caller_check = True
+                            break
+                if not has_caller_check and "CALLER" not in opcodes:
+                    fragments["access_control"].append({
+                        "block_id": bid,
+                        "opcodes": opcodes,
+                        "pattern": "Sensitive operation without caller verification",
+                        "severity": "high",
+                    })
+
+        # Remove empty categories
+        return {k: v for k, v in fragments.items() if v}
+
 
 # ---------------------------------------------------------------------------
 # Convenience Function

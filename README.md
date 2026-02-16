@@ -1,17 +1,27 @@
-# Smart Contract Bytecode-to-Solidity Decompiler
+# Smart Contract Bytecode-to-Solidity Decompiler & Security Analyzer
 
-A two-stage pipeline for decompiling EVM smart contract bytecode into human-readable Solidity code, powered by a fine-tuned Llama 3.2 3B model.
+A comprehensive smart contract analysis system combining LLM-powered bytecode decompilation with vulnerability detection, malicious contract classification, and automated security audit report generation.
 
 **Paper:** [Decompiling Smart Contracts with a Large Language Model](reference/2506.19624v1.pdf) (arXiv:2506.19624v1)
 
 ## Architecture
 
 ```
-EVM Bytecode → Static Analysis → TAC (Three-Address Code) → Fine-tuned LLM → Solidity
+EVM Bytecode → Static Analysis → TAC → Fine-tuned LLM → Solidity
+     │                                                       │
+     ├─→ Opcode Feature Extraction → Malicious Classification │
+     │                                                       │
+     ├─→ CFG Pattern Matching → Vulnerability Detection       │
+     │                                                       ▼
+     └──────────────────────────────────────────→ Audit Report
 ```
 
-1. **Bytecode → TAC** — `src/bytecode_analyzer.py` disassembles EVM bytecode, constructs control-flow graphs, and emits Three-Address Code  
-2. **TAC → Solidity** — A LoRA fine-tuned Llama 3.2 3B translates TAC into readable Solidity  
+The system implements four analysis pipelines coordinated by `PipelineOrchestrator`:
+
+1. **Bytecode → TAC → Solidity** — `BytecodeAnalyzer` disassembles EVM bytecode, constructs control-flow graphs, and emits TAC; a LoRA fine-tuned LLM translates TAC into readable Solidity
+2. **Vulnerability Detection** — `VulnerabilityDetector` scans bytecode and source for reentrancy, timestamp dependence, overflow, delegatecall, access control, and selfdestruct vulnerabilities
+3. **Malicious Classification** — `MaliciousContractClassifier` uses opcode frequency features + LightGBM with LIME explainability to classify contracts as malicious or legitimate
+4. **Audit Report Generation** — `AuditReportGenerator` aggregates all findings into a comprehensive security audit with risk scoring
 
 ## Quick Start
 
@@ -95,17 +105,24 @@ ls results/
 ## Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (~380 tests across 8 files)
 python -m pytest
 
 # Verbose output
 python -m pytest -v
 
-# Run only bytecode analyzer tests
+# Run specific module tests
 python -m pytest tests/test_bytecode_analyzer.py -v
-
-# Run only dataset pipeline tests
 python -m pytest tests/test_dataset_pipeline.py -v
+python -m pytest tests/test_vulnerability_detector.py -v
+python -m pytest tests/test_malicious_classifier.py -v
+python -m pytest tests/test_audit_report.py -v
+python -m pytest tests/test_pipeline_orchestrator.py -v
+python -m pytest tests/test_opcode_features.py -v
+python -m pytest tests/test_e2e.py -v
+
+# Run with coverage
+python -m pytest --cov=src tests/
 ```
 
 ## Project Structure
@@ -117,17 +134,34 @@ python -m pytest tests/test_dataset_pipeline.py -v
 ├── pyproject.toml             # Project config (pytest, black, mypy)
 │
 ├── src/                       # Core library
-│   ├── __init__.py
-│   ├── bytecode_analyzer.py   # EVM bytecode → TAC conversion
-│   ├── dataset_pipeline.py    # Etherscan data collection, parsing, DB
+│   ├── __init__.py            # Package exports (v2.0.0)
+│   ├── bytecode_analyzer.py   # EVM bytecode → TAC conversion, CFG construction
+│   ├── dataset_pipeline.py    # Etherscan data collection, Solidity parsing, DB
 │   ├── local_compiler.py      # Local solc compilation (py-solc-x)
 │   ├── model_setup.py         # Model config, LoRA fine-tuning, inference
 │   ├── training_pipeline.py   # Evaluation metrics (semantic similarity, edit distance)
+│   ├── opcode_features.py     # Opcode frequency, TF-IDF, entropy-based features
+│   ├── vulnerability_detector.py  # Vulnerability scanning (6 types, 5 severities)
+│   ├── malicious_classifier.py    # Malicious contract classification + LIME explainability
+│   ├── audit_report.py        # Security audit report generation + risk scoring
+│   ├── pipeline_orchestrator.py   # Coordinates all analysis stages
+│   ├── selector_resolver.py   # 4-byte selector → function signature (4-tier lookup)
 │   └── settings.yaml          # API keys config
 │
-├── tests/                     # Unit tests (pytest)
-│   ├── test_bytecode_analyzer.py   # 130 tests for bytecode analysis
-│   └── test_dataset_pipeline.py    # 65 tests for dataset pipeline
+├── tests/                     # Unit & integration tests (pytest, ~380 tests)
+│   ├── test_bytecode_analyzer.py   # ~128 tests: parsing, CFG, TAC, stack sim
+│   ├── test_dataset_pipeline.py    # ~75 tests: data collection, function pairing
+│   ├── test_opcode_features.py     # ~34 tests: feature extraction, TF-IDF
+│   ├── test_vulnerability_detector.py  # ~27 tests: vulnerability scanning
+│   ├── test_malicious_classifier.py    # ~17 tests: classification, explainability
+│   ├── test_audit_report.py        # ~23 tests: audit reports, risk scoring
+│   ├── test_pipeline_orchestrator.py   # ~19 tests: pipeline orchestration
+│   └── test_e2e.py                 # ~15 tests: end-to-end integration
+│
+├── web/                       # Flask web application
+│   ├── app.py                 # Server: decompilation, vuln scan, classify, audit
+│   ├── templates/index.html   # Decompiler UI
+│   └── static/                # Frontend assets (app.js, style.css)
 │
 ├── scripts/                   # Debug & utility scripts
 │   ├── demo.py
@@ -135,16 +169,25 @@ python -m pytest tests/test_dataset_pipeline.py -v
 │   ├── inspect_bytecode.py
 │   └── debug_*.py             # Ad-hoc debugging scripts
 │
+├── train_common.sh            # Shared multi-GPU training config
+├── run_train_torchrun.sh      # Multi-GPU DDP training (torchrun)
+├── run_train_deepspeed.sh     # DeepSpeed training
+├── ds_config.json             # DeepSpeed configuration
+│
 ├── data/                      # Generated datasets (gitignored)
 ├── models/                    # Trained models (gitignored)
 ├── results/                   # Evaluation results (gitignored)
+├── test_data/                 # Test fixtures
 ├── docs/                      # Documentation
 │   ├── architecture.md        # System design & data flow
 │   ├── model-details.md       # Model config, LoRA, quantization
 │   ├── data-format.md         # JSONL schema, TAC format, DB schema
+│   ├── dataset-generation.md  # Dataset quality analysis & recommendations
+│   ├── training-recommendations.md  # Model selection & multi-GPU training
+│   ├── runbook.md             # Installation, training, inference guide
 │   └── contributing.md        # Development setup & guidelines
 ├── demo_dataset.jsonl         # Sample training data (3 examples)
-└── reference/                 # Research paper PDF
+└── reference/                 # Research paper PDF, enhancement plans
 ```
 
 ## CLI Reference

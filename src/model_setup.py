@@ -1082,6 +1082,88 @@ class SmartContractDecompiler:
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# DPO Training Support (Smart-LLaMA-DPO approach, 2506.18245v1)
+# ---------------------------------------------------------------------------
+
+
+class DPOTrainingConfig:
+    """Configuration for Direct Preference Optimization training."""
+
+    def __init__(
+        self,
+        beta: float = 0.1,
+        learning_rate: float = 1e-5,
+        num_epochs: int = 3,
+        batch_size: int = 4,
+        max_length: int = 2048,
+        max_prompt_length: int = 1024,
+        gradient_accumulation_steps: int = 4,
+    ):
+        self.beta = beta
+        self.learning_rate = learning_rate
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self.max_prompt_length = max_prompt_length
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+
+
+class DPODatasetBuilder:
+    """
+    Builds DPO preference pairs from decompilation outputs.
+
+    Creates (prompt, chosen, rejected) triples where:
+    - prompt: TAC input
+    - chosen: high-quality decompiled Solidity (verified source)
+    - rejected: lower-quality output (baseline model output)
+    """
+
+    @staticmethod
+    def build_preference_pairs(
+        dataset: List[Dict],
+        baseline_outputs: Optional[List[str]] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Build DPO preference pairs from a dataset.
+
+        Each item in dataset should have 'input' (TAC) and 'output' (ground truth Solidity).
+        baseline_outputs provides the rejected completions (model's own outputs before DPO).
+        """
+        pairs = []
+        for i, item in enumerate(dataset):
+            prompt = item.get("input", "")
+            chosen = item.get("output", "")
+
+            if baseline_outputs and i < len(baseline_outputs):
+                rejected = baseline_outputs[i]
+            else:
+                # Create a degraded version as rejected
+                rejected = DPODatasetBuilder._degrade_output(chosen)
+
+            if prompt and chosen and rejected and chosen != rejected:
+                pairs.append({
+                    "prompt": prompt,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                })
+
+        return pairs
+
+    @staticmethod
+    def _degrade_output(solidity: str) -> str:
+        """Create a degraded version of Solidity for rejected output."""
+        degraded = solidity
+        # Remove comments
+        lines = [l for l in degraded.split("\n") if not l.strip().startswith("//")]
+        degraded = "\n".join(lines)
+        # Replace meaningful names with generic ones
+        degraded = degraded.replace("owner", "var1")
+        degraded = degraded.replace("balance", "var2")
+        degraded = degraded.replace("transfer", "func1")
+        return degraded
+
+
 def main():
     """Example usage of the model training pipeline."""
     logging.basicConfig(level=logging.INFO)

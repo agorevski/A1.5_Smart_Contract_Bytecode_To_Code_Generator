@@ -29,18 +29,25 @@ pip install -r requirements.txt
 ## Testing
 
 ```bash
-python -m pytest                              # all tests
+python -m pytest                              # all tests (~380 across 8 files)
 python -m pytest tests/test_bytecode_analyzer.py -v  # specific module
+python -m pytest tests/test_vulnerability_detector.py -v  # vulnerability detection
+python -m pytest tests/test_e2e.py -v                # end-to-end integration
 python -m pytest --cov=src tests/             # with coverage
 ```
 
 ## Areas for Contribution
 
-- **Bytecode analysis**: improved pattern recognition, new opcode support
-- **Data pipeline**: additional data sources, better dedup strategies
-- **Model**: alternative architectures, training improvements
-- **Tests**: edge cases, integration tests
-- **Docs**: examples, corrections
+- **Bytecode analysis**: improved pattern recognition, new opcode support, CFG enhancements
+- **Data pipeline**: additional data sources, better dedup strategies, dataset quality (see `docs/dataset-generation.md`)
+- **Model**: alternative architectures, training improvements (see `docs/training-recommendations.md`)
+- **Vulnerability detection**: new vulnerability types, improved pattern matching
+- **Malicious classification**: enhanced features, model improvements, explainability
+- **Audit reports**: richer findings, better risk scoring
+- **Pipeline orchestration**: new stages, parallel execution, caching
+- **Web application**: UI improvements, new API endpoints
+- **Tests**: edge cases, integration tests, new module coverage
+- **Docs**: examples, corrections, tutorials
 
 ## License
 

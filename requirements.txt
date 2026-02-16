@@ -6,6 +6,9 @@ accelerate
 peft
 bitsandbytes
 
+# DPO / RLHF training (Smart-LLaMA-DPO approach)
+trl
+
 # Ethereum and blockchain libraries
 web3
 py-evm
@@ -24,6 +27,11 @@ scikit-learn
 nltk
 rouge-score
 sentence-transformers
+
+# Malicious contract classifier (Explainable AI approach)
+lightgbm
+lime
+shap
 
 # Visualization and logging
 matplotlib
@@ -45,6 +53,9 @@ tqdm
 click
 pyyaml
 jsonlines
+
+# Report generation
+jinja2
 
 # Development and testing
 pytest

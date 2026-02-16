@@ -1,13 +1,19 @@
-# Cline Rules for Smart Contract Decompilation Project
+# Cline Rules for Smart Contract Decompilation & Security Analysis Project
 
 ## Project Overview
 
-This repository implements smart contract decompilation using Llama 3.2 3B, converting EVM bytecode into human-readable Solidity code through a two-stage pipeline:
+This repository (v2.0) implements smart contract decompilation and security analysis, combining LLM-powered bytecode decompilation with vulnerability detection, malicious contract classification, and automated audit report generation. The system is coordinated by a `PipelineOrchestrator` that runs four analysis stages:
 
-1. **Bytecode-to-TAC**: Static analysis converts EVM bytecode to Three-Address Code (TAC)
-2. **TAC-to-Solidity**: Fine-tuned LLM generates readable Solidity from TAC
+1. **Bytecode-to-TAC**: Static analysis converts EVM bytecode to Three-Address Code (TAC) via `BytecodeAnalyzer`
+2. **TAC-to-Solidity**: Fine-tuned LLM generates readable Solidity from TAC via `SmartContractDecompiler`
+3. **Vulnerability Detection**: CFG pattern matching + optional LLM analysis via `VulnerabilityDetector`
+4. **Malicious Classification**: Opcode frequency features + ML classification via `MaliciousContractClassifier`
+5. **Audit Report Generation**: Aggregates all findings into a comprehensive security audit via `AuditReportGenerator`
 
-Research paper: "Decompiling Smart Contracts with a Large Language Model" (arXiv:2506.19624v1)
+Research papers:
+- "Decompiling Smart Contracts with a Large Language Model" (arXiv:2506.19624v1)
+- SmartBugBert, Smart-LLaMA-DPO, SAEL, LLMBugScanner (vulnerability/malicious detection)
+- Explainable AI opcode analysis (malicious classification)
 
 ## Technology Stack
 
@@ -18,40 +24,96 @@ Research paper: "Decompiling Smart Contracts with a Large Language Model" (arXiv
 - **PEFT** (>=0.6.0): Parameter-Efficient Fine-Tuning (LoRA)
 - **Accelerate** (>=0.24.0): Distributed training support
 - **bitsandbytes** (>=0.41.0): 8-bit quantization
+- **trl**: DPO/RLHF training (Smart-LLaMA-DPO approach)
 
 ### Blockchain Libraries
 
 - **web3** (>=6.11.0): Ethereum interaction
-- **pyevmasm** (>=0.2.3): EVM disassembly
+- **evmdasm**: EVM disassembly
 - **eth-utils**, **eth-abi**: Ethereum utilities
 - **py-evm**: EVM implementation
+- **py-solc-x**: Local Solidity compilation
 
-### Data Science
+### Data Science & ML
 
 - **numpy**, **pandas**, **scipy**, **scikit-learn**: Data processing
 - **nltk**, **rouge-score**, **sentence-transformers**: Evaluation metrics
+- **lightgbm**: Gradient boosting for malicious classification
+- **lime**, **shap**: Explainable AI for classification predictions
+
+### Visualization & Logging
+
+- **matplotlib**, **seaborn**: Visualization
+- **wandb**, **tensorboard**: Training monitoring
+
+### Web Application
+
+- **Flask**: Web server for the decompiler UI
+- **jinja2**: Template rendering for audit reports
 
 ## Project Structure
 
 ### Core Modules (`src/`)
 
-- `bytecode_analyzer.py`: EVM bytecode → TAC conversion with control flow analysis
-- `dataset_pipeline.py`: Data collection and preprocessing from Etherscan
-- `model_setup.py`: Model configuration, LoRA fine-tuning, inference
-- `training_pipeline.py`: End-to-end training orchestration
+- `bytecode_analyzer.py`: EVM bytecode → TAC conversion with control flow analysis, CFG construction, dominance analysis, loop detection
+- `dataset_pipeline.py`: Data collection from Etherscan, Solidity parsing, function pair extraction, SQLite persistence
+- `model_setup.py`: Model configuration, LoRA fine-tuning, 4-bit quantization, inference
+- `training_pipeline.py`: Evaluation metrics (semantic similarity, BLEU, ROUGE, edit distance, token accuracy, structural preservation)
+- `opcode_features.py`: Opcode-level ML feature extraction (frequency counting, TF-IDF, entropy-based supervised binning)
+- `vulnerability_detector.py`: Smart contract vulnerability detection (reentrancy, timestamp, overflow, delegatecall, access control, selfdestruct)
+- `malicious_classifier.py`: Binary malicious/legitimate classification using opcode features + LightGBM with LIME explainability
+- `audit_report.py`: Comprehensive security audit report generation with risk scoring
+- `pipeline_orchestrator.py`: Coordinates all analysis stages (classify → decompile → detect vulnerabilities → audit report)
+- `local_compiler.py`: Local Solidity compilation via py-solc-x for data augmentation with multi-version support
+- `selector_resolver.py`: 4-byte EVM function selector → human-readable signature resolution (4-tier lookup: built-in, SQLite, JSON cache, 4byte.directory API)
+- `settings.yaml`: API keys configuration (ETHERSCAN_API_KEY, HF_TOKEN)
+
+### Training & Data Scripts
+
+- `train.py`: End-to-end training CLI (collect → build pairs → split → fine-tune → evaluate)
+- `download_hf_contracts.py`: HuggingFace dataset download → solc compilation → TAC generation → JSONL export
+- `train_common.sh`: Shared configuration for multi-GPU training (auto-detects seq length and batch size)
+- `run_train_torchrun.sh`: Multi-GPU DDP training via torchrun
+- `run_train_deepspeed.sh`: DeepSpeed training with ZeRO optimization
+- `ds_config.json`: DeepSpeed configuration (BF16, ZeRO Stage 0)
+
+### Web Application (`web/`)
+
+- `app.py`: Flask server with SSE streaming decompilation, GPU stats, vulnerability scanning, classification, and audit report endpoints
+- `templates/index.html`: Decompiler UI
+- `static/app.js`, `static/style.css`: Frontend assets
+
+### Tests (`tests/`)
+
+- `test_bytecode_analyzer.py`: ~128 tests for bytecode analysis, CFG, TAC conversion
+- `test_dataset_pipeline.py`: ~75 tests for data collection, parsing, function pair extraction
+- `test_opcode_features.py`: ~34 tests for opcode feature extraction, TF-IDF, entropy binning
+- `test_vulnerability_detector.py`: ~27 tests for vulnerability detection and severity scoring
+- `test_malicious_classifier.py`: ~17 tests for malicious classification and explainability
+- `test_audit_report.py`: ~23 tests for audit report generation and risk scoring
+- `test_pipeline_orchestrator.py`: ~19 tests for pipeline orchestration and batch analysis
+- `test_e2e.py`: ~15 tests for end-to-end cross-module integration
 
 ### Documentation (`docs/`)
 
-- Comprehensive guides for installation, usage, training, evaluation
-- Security applications, troubleshooting, comparisons with traditional decompilers
-- Contributing guidelines and limitations
+- `architecture.md`: System design, data flow, module responsibilities
+- `model-details.md`: Model configuration, LoRA, quantization, training defaults
+- `data-format.md`: JSONL schema, TAC format, database schema
+- `dataset-generation.md`: Dataset quality analysis and improvement recommendations
+- `training-recommendations.md`: Model selection guide (Qwen 2.5 Coder 32B recommended), multi-GPU training
+- `runbook.md`: Installation, training, inference, and web app operational guide
+- `contributing.md`: Development setup and guidelines
 
 ### Supporting Files
 
-- `demo.py`: Demonstration script
-- `demo_dataset.jsonl`: Sample training data
+- `demo_dataset.jsonl`: Sample training data (3 examples)
+- `pyproject.toml`: Project config (pytest, black, mypy)
 - `requirements.txt`: Python dependencies
-- `reference/`: Research paper PDF
+- `reference/`: Research paper PDF, enhancement plan
+- `scripts/`: Debug and utility scripts (demo.py, inspect/debug tools)
+- `data/`: Generated datasets and contracts.db (gitignored)
+- `models/`: Trained model checkpoints (gitignored)
+- `results/`: Evaluation results (gitignored)
 
 ## Code Style & Patterns
 
@@ -218,14 +280,22 @@ if torch.cuda.is_available():
 2. **Add type hints**: Maintain type safety throughout
 3. **Include logging**: Add appropriate log messages
 4. **Error handling**: Implement try-except with fallbacks
-5. **Test with demo**: Verify using `demo.py`
+5. **Add tests**: Create pytest tests in `tests/` following class-based grouping
+6. **Run tests**: Verify with `python -m pytest -v`
 
 ### When Modifying Bytecode Analysis
 
-- Consider impact on TAC generation
+- Consider impact on TAC generation and downstream modules (vulnerability_detector, pipeline_orchestrator)
 - Test with various bytecode patterns (loops, conditionals, storage)
 - Validate control flow graph construction
 - Check jump target resolution accuracy
+
+### When Modifying Security Analysis Modules
+
+- Vulnerability detector, malicious classifier, and audit report are tightly coupled via `PipelineOrchestrator`
+- Changes to `VulnerabilityType` or `Severity` enums affect `audit_report.py` risk scoring
+- `MaliciousContractClassifier` depends on `OpcodeFeatureExtractor` — changes to feature extraction affect classification
+- Test end-to-end via `test_e2e.py` after any security module changes
 
 ### When Changing Model Configuration
 
@@ -267,28 +337,29 @@ pc = getattr(instr, 'pc', fallback_index)
 
 ## Testing & Validation
 
-### Unit Tests
+Tests use pytest with class-based grouping. ~380 tests across 8 files.
 
-- Test control flow analysis with known patterns
-- Validate TAC instruction conversion
-- Check function boundary detection
-- Verify basic block construction
-
-### Integration Tests
-
-- End-to-end bytecode → TAC → Solidity pipeline
-- Test with real contract bytecode
-- Validate against verified source code
-
-### Demo Script Usage
+### Running Tests
 
 ```bash
-# Run demonstration
-python demo.py
-
-# Check logs
-cat demo.log
+python -m pytest                                        # all tests
+python -m pytest -v                                     # verbose
+python -m pytest tests/test_bytecode_analyzer.py -v     # specific module
+python -m pytest --cov=src tests/                       # with coverage
 ```
+
+### Test Coverage by Module
+
+| Test File | Tests | Coverage |
+|-----------|-------|----------|
+| `test_bytecode_analyzer.py` | ~128 | Parsing, CFG, TAC conversion, stack simulation, edge cases |
+| `test_dataset_pipeline.py` | ~75 | Source parsing, function extraction, selector matching, DB ops |
+| `test_opcode_features.py` | ~34 | Opcode normalization, TF-IDF, entropy binning, feature extraction |
+| `test_vulnerability_detector.py` | ~27 | Pattern scanning, severity scoring, report generation |
+| `test_malicious_classifier.py` | ~17 | Heuristic/ML classification, model fitting, explainability |
+| `test_audit_report.py` | ~23 | Finding aggregation, risk scoring, report serialization |
+| `test_pipeline_orchestrator.py` | ~19 | Stage execution, batch analysis, error handling |
+| `test_e2e.py` | ~15 | Cross-module integration, pipeline consistency |
 
 ## Security Considerations
 
@@ -366,13 +437,13 @@ def analyze_control_flow(self) -> Dict[str, BasicBlock]:
 
 - CUDA out of memory → Reduce batch size or use gradient checkpointing
 - Poor decompilation quality → Check TAC representation, retrain with more data
-- Bytecode parsing errors → Validate bytecode format, check pyevmasm version
+- Bytecode parsing errors → Validate bytecode format, check evmdasm version
 - Model loading failures → Verify HF_TOKEN, check model availability
 
 ### Where to Look
 
-- `docs/troubleshooting.md`: Comprehensive troubleshooting guide
-- `demo.log`: Runtime logs from demonstration
+- `docs/training-recommendations.md`: Model selection and training troubleshooting
+- `docs/dataset-generation.md`: Dataset quality issues and fixes
 - GitHub Issues: Community-reported problems and solutions
 
 ## Research Context
@@ -400,3 +471,104 @@ This codebase implements the methodology from:
 - Keep model checkpoints organized by date/version
 - Document any deviations from paper methodology
 - Test with diverse contract types (tokens, DeFi, NFTs)
+
+## GitHub Copilot Instructions
+
+### Context for AI Assistants
+
+This is a Python ML/blockchain project. When generating code for this repository:
+
+1. **Always use type hints and dataclasses** — every public function must have type annotations; use `dataclass` for structured data, `Enum` for constants
+2. **Follow existing logging patterns** — use `logging.getLogger(__name__)` per module, not `print()`
+3. **Implement error handling with fallbacks** — wrap risky operations in try/except with fallback behavior, never silently swallow exceptions
+4. **Use the existing module architecture** — new analysis capabilities should integrate via `PipelineOrchestrator`; new data types should be dataclasses exported from `src/__init__.py`
+5. **Tests are pytest class-based** — group tests in `class TestXxx:` with `test_` methods; place in `tests/test_<module>.py`
+6. **Format with black** (line-length=100) and type-check with mypy
+
+### Key Code Patterns to Follow
+
+```python
+# Dataclass with Optional fields
+@dataclass
+class NewResult:
+    name: str
+    score: float
+    details: Optional[Dict] = None
+
+# Enum for constants
+class NewType(Enum):
+    TYPE_A = "type_a"
+    TYPE_B = "type_b"
+
+# Module-level convenience function wrapping class
+def analyze_something(bytecode: str) -> NewResult:
+    analyzer = SomeAnalyzer()
+    return analyzer.analyze(bytecode)
+
+# Logging pattern
+class SomeAnalyzer:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+    def analyze(self, data: str) -> NewResult:
+        try:
+            result = self._do_analysis(data)
+            self.logger.info(f"Analysis complete: {result.name}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Analysis failed: {e}")
+            return self._fallback_analysis(data)
+```
+
+### Build & Test Commands
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run all tests (pytest with verbose output and short tracebacks)
+python -m pytest
+
+# Run specific test module
+python -m pytest tests/test_bytecode_analyzer.py -v
+
+# Format code
+black src/ tests/ --line-length 100
+
+# Type check
+mypy src/
+
+# Train model (quick test)
+python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
+
+# Download training data
+python download_hf_contracts.py --limit 20
+
+# Run web app
+python web/app.py
+```
+
+### Module Dependency Graph
+
+```
+bytecode_analyzer ──→ opcode_features ──→ malicious_classifier ──┐
+        │                                                         │
+        ├──→ vulnerability_detector ──────────────────────────────┤
+        │                                                         │
+        └──→ model_setup ──→ training_pipeline                    │
+                                                                  ▼
+dataset_pipeline ──→ local_compiler                     audit_report
+selector_resolver                                             │
+                                                              ▼
+                                                   pipeline_orchestrator
+```
+
+### Important Conventions
+
+- **Bytecode format**: Always handle with/without `0x` prefix: `bytecode[2:] if bytecode.startswith('0x') else bytecode`
+- **Selector format**: 4-byte hex with `0x` prefix (e.g., `0xa9059cbb`)
+- **Config via dataclass**: Use `@dataclass` classes like `PipelineConfig`, `ModelConfig`, `TrainingConfig` — not raw dicts
+- **Exports in `__init__.py`**: All public classes must be listed in `src/__init__.py` `__all__`
+- **JSONL training format**: `{"input": "<TAC>", "output": "<Solidity>", "metadata": {...}}`
+- **Database**: SQLite via `sqlite3` module (no ORM); tables: `contracts`, `function_pairs`
+- **Version**: Current version is `2.0.0` (set in `src/__init__.py`)

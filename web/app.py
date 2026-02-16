@@ -502,6 +502,111 @@ def api_health():
         "model_loaded": decompiler is not None,
     })
 
+
+# ---------------------------------------------------------------------------
+# Security Analysis Endpoints (new research-based features)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/vulnerability-scan", methods=["POST"])
+def api_vulnerability_scan():
+    """Scan bytecode for vulnerabilities using CFG analysis."""
+    from src.vulnerability_detector import VulnerabilityDetector
+
+    data = request.get_json(silent=True) or {}
+    bytecode = data.get("bytecode", "")
+    contract_address = data.get("contract_address", "")
+
+    if not bytecode:
+        return jsonify({"error": "No bytecode provided"}), 400
+
+    try:
+        detector = VulnerabilityDetector()
+        report = detector.scan_from_bytecode(bytecode, contract_address)
+        return jsonify({
+            "success": True,
+            "has_vulnerabilities": report.has_vulnerabilities,
+            "risk_score": report.risk_score,
+            "summary": report.summary,
+            "vulnerabilities": [
+                {
+                    "type": v.vulnerability_type.value,
+                    "detected": v.detected,
+                    "confidence": v.confidence,
+                    "severity": v.severity.value,
+                    "explanation": v.explanation,
+                    "location": v.location,
+                    "recommendation": v.recommendation,
+                }
+                for v in report.vulnerabilities
+            ],
+        })
+    except Exception as e:
+        logger.error("Vulnerability scan failed: %s", traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/classify", methods=["POST"])
+def api_classify():
+    """Classify contract as malicious or legitimate."""
+    from src.malicious_classifier import MaliciousContractClassifier
+
+    data = request.get_json(silent=True) or {}
+    bytecode = data.get("bytecode", "")
+    contract_address = data.get("contract_address", "")
+
+    if not bytecode:
+        return jsonify({"error": "No bytecode provided"}), 400
+
+    try:
+        classifier = MaliciousContractClassifier()
+        result = classifier.classify_from_bytecode(bytecode, contract_address)
+        return jsonify({
+            "success": True,
+            "is_malicious": result.is_malicious,
+            "confidence": result.confidence,
+            "explanation": result.explanation,
+            "feature_importance": result.feature_importance,
+        })
+    except Exception as e:
+        logger.error("Classification failed: %s", traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/audit-report", methods=["POST"])
+def api_audit_report():
+    """Generate comprehensive security audit report."""
+    from src.vulnerability_detector import VulnerabilityDetector
+    from src.malicious_classifier import MaliciousContractClassifier
+    from src.audit_report import AuditReportGenerator
+
+    data = request.get_json(silent=True) or {}
+    bytecode = data.get("bytecode", "")
+    contract_address = data.get("contract_address", "")
+
+    if not bytecode:
+        return jsonify({"error": "No bytecode provided"}), 400
+
+    try:
+        detector = VulnerabilityDetector()
+        classifier = MaliciousContractClassifier()
+        generator = AuditReportGenerator(
+            decompiler=decompiler,
+            vulnerability_detector=detector,
+            malicious_classifier=classifier,
+        )
+        report = generator.generate_report(
+            bytecode, contract_address,
+            include_decompilation=(decompiler is not None),
+        )
+        return jsonify({
+            "success": True,
+            "report": report.to_dict(),
+        })
+    except Exception as e:
+        logger.error("Audit report failed: %s", traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------

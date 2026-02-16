@@ -1,7 +1,7 @@
 [project]
 name = "smart-contract-decompiler"
-version = "1.0.0"
-description = "Smart contract decompilation using Llama 3.2 3B — EVM bytecode to Solidity via TAC"
+version = "2.0.0"
+description = "Smart contract decompilation and security analysis — EVM bytecode to Solidity via TAC, with vulnerability detection, malicious classification, and audit reports"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
