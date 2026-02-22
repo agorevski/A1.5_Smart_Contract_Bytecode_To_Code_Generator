@@ -36,6 +36,8 @@ from datasets import Dataset as HFDataset
 import numpy as np
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ModelConfig:
@@ -212,7 +214,6 @@ class SmartContractModelTrainer:
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.logger = logging.getLogger(__name__)
 
         self.tokenizer = None
         self.model = None
@@ -242,7 +243,7 @@ class SmartContractModelTrainer:
         if self.tokenizer is not None and self.peft_model is not None and not force_reload:
             return self.tokenizer, self.peft_model
 
-        self.logger.info("Setting up model with LoRA...")
+        logger.info("Setting up model with LoRA...")
 
         # Enable TF32 for matmuls on Ampere+ GPUs (~2x faster than FP32 precision)
         if torch.cuda.is_available():
@@ -331,7 +332,7 @@ class SmartContractModelTrainer:
         valid_targets = [t for t in target_modules if t in module_name_str]
         if not valid_targets:
             # Fall back to auto-detecting linear layers
-            self.logger.info("Default target modules not found; using auto-detection for LoRA targets")
+            logger.info("Default target modules not found; using auto-detection for LoRA targets")
             target_modules = "all-linear"
 
         # Configure LoRA
@@ -352,7 +353,7 @@ class SmartContractModelTrainer:
 
         self.peft_model.print_trainable_parameters()
 
-        self.logger.info("Model setup completed successfully")
+        logger.info("Model setup completed successfully")
         return self.tokenizer, self.peft_model
 
     def create_training_arguments(
@@ -383,7 +384,7 @@ class SmartContractModelTrainer:
             gradient_accumulation_steps = max(1, train_dataset_size // batch_size)
             if gradient_accumulation_steps == 0:
                 gradient_accumulation_steps = 1
-            self.logger.info(
+            logger.info(
                 f"Auto-adjusted gradient_accumulation_steps to {gradient_accumulation_steps} "
                 f"for dataset size {train_dataset_size}"
             )
@@ -393,7 +394,7 @@ class SmartContractModelTrainer:
         total_steps = steps_per_epoch * num_epochs
         if warmup_steps > total_steps // 2:
             warmup_steps = max(0, total_steps // 5)
-            self.logger.info(f"Auto-adjusted warmup_steps to {warmup_steps}")
+            logger.info(f"Auto-adjusted warmup_steps to {warmup_steps}")
 
         # For small datasets, use epoch-based saving/eval instead of step-based
         is_small = train_dataset_size > 0 and train_dataset_size < 200
@@ -418,7 +419,7 @@ class SmartContractModelTrainer:
                     use_bf16 = False
                 # else: both False, full precision
             except Exception as e:
-                self.logger.warning(f"Could not read DeepSpeed config for precision settings: {e}")
+                logger.warning(f"Could not read DeepSpeed config for precision settings: {e}")
                 # Fall back to auto-detection below
                 if has_cuda:
                     gpu_cap = torch.cuda.get_device_capability()
@@ -469,7 +470,7 @@ class SmartContractModelTrainer:
         # DeepSpeed integration
         if deepspeed_config:
             args["deepspeed"] = deepspeed_config
-            self.logger.info(f"DeepSpeed enabled with config: {deepspeed_config}")
+            logger.info(f"DeepSpeed enabled with config: {deepspeed_config}")
 
         if save_strategy == "steps":
             args["save_steps"] = save_steps
@@ -503,7 +504,7 @@ class SmartContractModelTrainer:
             use_deepspeed=deepspeed_config is not None
         )
 
-        self.logger.info("Loading training dataset...")
+        logger.info("Loading training dataset...")
         train_dataset = SmartContractDataset(
             train_dataset_path,
             tokenizer,
@@ -512,7 +513,7 @@ class SmartContractModelTrainer:
 
         eval_dataset = None
         if eval_dataset_path and Path(eval_dataset_path).exists():
-            self.logger.info("Loading evaluation dataset...")
+            logger.info("Loading evaluation dataset...")
             eval_dataset = SmartContractDataset(
                 eval_dataset_path,
                 tokenizer,
@@ -567,7 +568,7 @@ class SmartContractModelTrainer:
             data_collator=data_collator,
         )
 
-        self.logger.info(
+        logger.info(
             f"Starting training on {len(train_dataset)} examples for {num_epochs} epochs..."
         )
         if resume_from_checkpoint:
@@ -584,7 +585,7 @@ class SmartContractModelTrainer:
         with open(config_path, "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
 
-        self.logger.info(f"Training completed. Model saved to {final_model_path}")
+        logger.info(f"Training completed. Model saved to {final_model_path}")
         return str(final_model_path)
 
     def save_model(self, path: str):
@@ -602,7 +603,7 @@ class SmartContractModelTrainer:
         with open(config_path, "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
 
-        self.logger.info(f"Model saved to {save_path}")
+        logger.info(f"Model saved to {save_path}")
 
     def load_model(self, path: str, for_inference: bool = True) -> Tuple[AutoTokenizer, PeftModel]:
         """Load a previously trained model.
@@ -679,11 +680,11 @@ class SmartContractModelTrainer:
             try:
                 import flash_attn  # noqa: F401
                 attn_impl = "flash_attention_2"
-                self.logger.info("Flash Attention 2 available — enabling")
+                logger.info("Flash Attention 2 available — enabling")
             except ImportError:
                 # Try SDPA (PyTorch 2.x built-in efficient attention)
                 attn_impl = "sdpa"
-                self.logger.info("flash_attn not installed — using PyTorch SDPA")
+                logger.info("flash_attn not installed — using PyTorch SDPA")
 
         # ---- Build load kwargs ----
         load_kwargs = {
@@ -713,7 +714,7 @@ class SmartContractModelTrainer:
             # Enable KV cache (was disabled for training)
             if hasattr(self.peft_model.config, "use_cache"):
                 self.peft_model.config.use_cache = True
-                self.logger.info("KV cache enabled for inference")
+                logger.info("KV cache enabled for inference")
 
             # torch.compile for fused kernels (PyTorch 2.0+)
             if has_cuda:
@@ -723,13 +724,13 @@ class SmartContractModelTrainer:
                         mode="reduce-overhead",
                         fullgraph=False,
                     )
-                    self.logger.info("torch.compile() applied (mode=reduce-overhead)")
+                    logger.info("torch.compile() applied (mode=reduce-overhead)")
                 except Exception as e:
-                    self.logger.warning("torch.compile() failed, skipping: %s", e)
+                    logger.warning("torch.compile() failed, skipping: %s", e)
 
         device = next(self.peft_model.parameters()).device
         dtype_name = str(compute_dtype).split(".")[-1]
-        self.logger.info(
+        logger.info(
             "Model loaded from %s (device: %s, dtype: %s, attn: %s)",
             load_path, device, dtype_name, attn_impl or "eager",
         )
@@ -747,7 +748,6 @@ class SmartContractDecompiler:
         self.trainer = SmartContractModelTrainer(ModelConfig())
         self.tokenizer, self.model = self.trainer.load_model(model_path)
         self.model.eval()
-        self.logger = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------ #
     #  Token-aware TAC truncation
@@ -995,7 +995,7 @@ class SmartContractDecompiler:
         num_blocks = len(analyzer.basic_blocks)
         num_functions = len(analyzer.functions)
 
-        self.logger.info(
+        logger.info(
             "Contract analysis: %d instructions, %d blocks, %d functions",
             num_instructions, num_blocks, num_functions,
         )
@@ -1024,10 +1024,10 @@ class SmartContractDecompiler:
                     temperature=temperature,
                 )
                 function_solidity[fname] = sol
-                self.logger.info("Decompiled %s (%d TAC tokens → %d output chars)",
+                logger.info("Decompiled %s (%d TAC tokens → %d output chars)",
                                  fname, self._count_tokens(tac_str), len(sol))
             except Exception as e:
-                self.logger.error("Failed to decompile %s: %s", fname, e)
+                logger.error("Failed to decompile %s: %s", fname, e)
                 function_errors[fname] = str(e)
                 function_solidity[fname] = f"// Decompilation failed: {e}"
 

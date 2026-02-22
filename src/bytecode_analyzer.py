@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from evmdasm import EvmBytecode
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Enums & Data Classes
 # ---------------------------------------------------------------------------
@@ -180,7 +182,6 @@ class BytecodeAnalyzer:
         self.basic_blocks: Dict[str, BasicBlock] = {}
         self.functions: Dict[str, Function] = {}
         self.variable_counter: int = 0
-        self.logger = logging.getLogger(__name__)
 
         # Pre-built lookup: PC → instruction index (populated after parsing)
         self._pc_to_index: Dict[int, int] = {}
@@ -201,9 +202,9 @@ class BytecodeAnalyzer:
             for i, instr in enumerate(self.instructions):
                 self._pc_to_index[self._get_pc(instr, i)] = i
 
-            self.logger.info("Parsed %d instructions from bytecode", len(self.instructions))
+            logger.info("Parsed %d instructions from bytecode", len(self.instructions))
         except Exception as e:
-            self.logger.error("Failed to parse bytecode: %s", e)
+            logger.error("Failed to parse bytecode: %s", e)
             self.instructions = []
 
     # ------------------------------------------------------------------ #
@@ -267,24 +268,24 @@ class BytecodeAnalyzer:
         Returns:
             Dictionary mapping block IDs to :class:`BasicBlock` objects.
         """
-        self.logger.info("Starting comprehensive control flow analysis")
+        logger.info("Starting comprehensive control flow analysis")
         try:
             jump_targets = self._detect_jump_targets()
-            self.logger.info("Detected %d jump targets", len(jump_targets))
+            logger.info("Detected %d jump targets", len(jump_targets))
 
             blocks = self._construct_basic_blocks(jump_targets)
-            self.logger.info("Constructed %d basic blocks", len(blocks))
+            logger.info("Constructed %d basic blocks", len(blocks))
 
             self._analyze_block_relationships(blocks)
-            self.logger.info("Completed block relationship analysis")
+            logger.info("Completed block relationship analysis")
 
             self._perform_advanced_analysis(blocks)
-            self.logger.info("Completed advanced control flow analysis")
+            logger.info("Completed advanced control flow analysis")
 
             self.basic_blocks = blocks
             return blocks
         except Exception as e:
-            self.logger.error("Control flow analysis failed: %s", e)
+            logger.error("Control flow analysis failed: %s", e)
             return self._fallback_control_flow_analysis()
 
     # ------------------------------------------------------------------ #
@@ -631,7 +632,7 @@ class BytecodeAnalyzer:
 
     def _fallback_control_flow_analysis(self) -> Dict[str, BasicBlock]:
         """Create a single basic block containing all instructions."""
-        self.logger.warning("Using fallback control flow analysis")
+        logger.warning("Using fallback control flow analysis")
         if not self.instructions:
             return {}
         first_pc = self._get_pc(self.instructions[0], 0)
@@ -652,7 +653,7 @@ class BytecodeAnalyzer:
     def identify_functions(self) -> Dict[str, Function]:
         """Identify functions by scanning the dispatcher for ``PUSH4 … EQ … JUMPI`` patterns."""
         functions: Dict[str, Function] = {}
-        self.logger.info("Identifying functions from bytecode dispatcher")
+        logger.info("Identifying functions from bytecode dispatcher")
 
         for i, instr in enumerate(self.instructions):
             if self._get_instruction_name(instr) != "PUSH4":
@@ -675,9 +676,9 @@ class BytecodeAnalyzer:
             functions[fname] = Function(
                 name=fname, selector=selector, basic_blocks=[], entry_block=entry,
             )
-            self.logger.debug("Identified function %s → %04x", selector, jump_target)
+            logger.debug("Identified function %s → %04x", selector, jump_target)
 
-        self.logger.info("Identified %d functions from dispatcher", len(functions))
+        logger.info("Identified %d functions from dispatcher", len(functions))
 
         if not functions and self.basic_blocks:
             entry = next(iter(self.basic_blocks))
@@ -685,7 +686,7 @@ class BytecodeAnalyzer:
                 name="fallback", selector=None,
                 basic_blocks=list(self.basic_blocks.values()), entry_block=entry,
             )
-            self.logger.info("No functions found – created fallback function")
+            logger.info("No functions found – created fallback function")
 
         self.functions = functions
         return functions
@@ -1215,7 +1216,7 @@ class BytecodeAnalyzer:
         Each TAC string is small enough to fit within the model's
         context window.
         """
-        self.logger.info("Starting per-function TAC generation")
+        logger.info("Starting per-function TAC generation")
         self.analyze_control_flow()
         self.identify_functions()
         self._convert_and_integrate_tac()
@@ -1232,13 +1233,13 @@ class BytecodeAnalyzer:
     def generate_tac_representation(self) -> str:
         """Run the full pipeline and return a formatted TAC string."""
         try:
-            self.logger.info("Starting comprehensive TAC generation")
+            logger.info("Starting comprehensive TAC generation")
             self.analyze_control_flow()
             self.identify_functions()
             self._convert_and_integrate_tac()
             return self._format_integrated_tac_output()
         except Exception as e:
-            self.logger.error("TAC generation failed: %s", e)
+            logger.error("TAC generation failed: %s", e)
             return self._generate_fallback_tac()
 
     def _convert_and_integrate_tac(self) -> None:
@@ -1351,7 +1352,7 @@ class BytecodeAnalyzer:
         lines.append("")
 
     def _generate_fallback_tac(self) -> str:
-        self.logger.warning("Using fallback TAC generation")
+        logger.warning("Using fallback TAC generation")
         lines: List[str] = [
             "// Three-Address Code Representation (Fallback Mode)",
             "// Basic analysis due to errors in comprehensive mode",
@@ -1367,7 +1368,7 @@ class BytecodeAnalyzer:
                     for t in items:
                         lines.append(f"  {self._format_tac_instruction(t)}")
         except Exception as e:
-            self.logger.error("Fallback TAC generation also failed: %s", e)
+            logger.error("Fallback TAC generation also failed: %s", e)
             lines.append("// Error: Unable to generate TAC representation")
             lines.append(f"// {e}")
         return "\n".join(lines)

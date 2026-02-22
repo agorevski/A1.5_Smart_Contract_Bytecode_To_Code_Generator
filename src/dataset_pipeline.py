@@ -36,6 +36,8 @@ from .local_compiler import (
 )
 import yaml
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ContractData:
@@ -80,7 +82,6 @@ class EtherscanAPI:
         self.api_key = api_key
         self.base_url = base_url
         self.session = requests.Session()
-        self.logger = logging.getLogger(__name__)
 
     def get_contract_source(self, address: str) -> Optional[ContractData]:
         """Get verified contract source code from Etherscan.
@@ -142,7 +143,7 @@ class EtherscanAPI:
             )
 
         except Exception as e:
-            self.logger.error(f"Failed to get contract {address}: {e}")
+            logger.error(f"Failed to get contract {address}: {e}")
             return None
 
     def get_verified_contracts_batch(
@@ -165,7 +166,7 @@ class EtherscanAPI:
             contracts: List[str] = []
             return contracts[:limit]
         except Exception as e:
-            self.logger.error(f"Failed to get contracts batch: {e}")
+            logger.error(f"Failed to get contracts batch: {e}")
             return []
 
 
@@ -174,7 +175,6 @@ class SolidityParser:
 
     def __init__(self):
         """Initialize the Solidity parser."""
-        self.logger = logging.getLogger(__name__)
 
     def extract_functions(
         self, source_code: str, contract_name: Optional[str] = None
@@ -208,7 +208,7 @@ class SolidityParser:
                     functions.append(func)
 
         except Exception as e:
-            self.logger.error(f"Failed to parse Solidity code: {e}")
+            logger.error(f"Failed to parse Solidity code: {e}")
 
         return functions
 
@@ -254,7 +254,7 @@ class SolidityParser:
                                     combined_source += file_data["content"] + "\n\n"
                             source_code = combined_source
                     except (json.JSONDecodeError, IndexError):
-                        self.logger.warning(
+                        logger.warning(
                             "Failed to parse JSON-encoded source code"
                         )
 
@@ -297,7 +297,7 @@ class SolidityParser:
                         "body": source_code[body_start:body_end],
                     }
                 )
-                self.logger.debug(
+                logger.debug(
                     f"Extracted {contract_info['type']} {contract_info['name']}"
                 )
 
@@ -368,7 +368,7 @@ class SolidityParser:
                     )
 
             except Exception as e:
-                self.logger.warning(
+                logger.warning(
                     f"Failed to extract function {func_info['name']}: {e}"
                 )
                 continue
@@ -486,7 +486,7 @@ class SolidityParser:
             }
         )
 
-        self.logger.debug(f"Extracted function {name} ({visibility})")
+        logger.debug(f"Extracted function {name} ({visibility})")
 
     def _extract_visibility(self, function_code: str) -> str:
         """Extract function visibility from the function signature.
@@ -536,7 +536,6 @@ class DatasetBuilder:
         self.parser = SolidityParser()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
-        self.logger = logging.getLogger(__name__)
 
         self.db_path = self.output_dir / "contracts.db"
         self._init_database()
@@ -623,9 +622,9 @@ class DatasetBuilder:
                         self._store_contract(contract_data)
                         collected += 1
                 except Exception as e:
-                    self.logger.error(f"Failed to process contract {address}: {e}")
+                    logger.error(f"Failed to process contract {address}: {e}")
 
-        self.logger.info(
+        logger.info(
             f"Collected {collected} contracts out of {len(contract_addresses)} addresses"
         )
         return collected
@@ -690,7 +689,7 @@ class DatasetBuilder:
             try:
                 contract_data = self.etherscan.get_contract_source(addr)
                 if contract_data is None:
-                    self.logger.warning(
+                    logger.warning(
                         f"Skipping {addr}: not verified or unavailable"
                     )
                     continue
@@ -702,7 +701,7 @@ class DatasetBuilder:
 
                 source_files = parse_etherscan_source(raw_source)
                 if not source_files:
-                    self.logger.warning(f"Skipping {addr}: empty source")
+                    logger.warning(f"Skipping {addr}: empty source")
                     continue
 
                 combined_source = "\n\n".join(source_files.values())
@@ -718,14 +717,14 @@ class DatasetBuilder:
                 )
 
                 if not configs:
-                    self.logger.warning(
+                    logger.warning(
                         f"Skipping {addr}: no compatible compiler found"
                     )
                     continue
 
                 solidity_functions = self.parser.extract_functions(combined_source)
                 if not solidity_functions:
-                    self.logger.warning(
+                    logger.warning(
                         f"Skipping {addr}: no functions extracted from source"
                     )
                     continue
@@ -739,7 +738,7 @@ class DatasetBuilder:
                     opt = cfg["optimizer_enabled"]
                     runs = cfg["optimizer_runs"]
 
-                    self.logger.info(
+                    logger.info(
                         f"  Compiling {addr} with solc {ver} "
                         f"(opt={'on' if opt else 'off'}, runs={runs})"
                     )
@@ -751,7 +750,7 @@ class DatasetBuilder:
                         comp = compile_source(first_source, ver, opt, runs)
 
                     if not comp.success:
-                        self.logger.warning(
+                        logger.warning(
                             f"  Compilation failed for {addr} with solc {ver}: "
                             + "; ".join(comp.errors[:2])
                         )
@@ -764,7 +763,7 @@ class DatasetBuilder:
                             analyzer.analyze_control_flow()
                             bytecode_functions = analyzer.identify_functions()
                         except Exception as e:
-                            self.logger.warning(
+                            logger.warning(
                                 f"  TAC analysis failed for {cname}: {e}"
                             )
                             continue
@@ -790,17 +789,17 @@ class DatasetBuilder:
                                 self._store_function_pair(pair)
                                 total_pairs += 1
 
-                    self.logger.info(
+                    logger.info(
                         f"  {addr} solc {ver}: contributed pairs so far = {total_pairs}"
                     )
 
                 self._store_contract(contract_data)
 
             except Exception as e:
-                self.logger.error(f"Failed to process {addr}: {e}")
-                self.logger.debug(traceback.format_exc())
+                logger.error(f"Failed to process {addr}: {e}")
+                logger.debug(traceback.format_exc())
 
-        self.logger.info(f"Total function pairs created: {total_pairs}")
+        logger.info(f"Total function pairs created: {total_pairs}")
         return total_pairs
 
     # ------------------------------------------------------------------ #
@@ -847,12 +846,12 @@ class DatasetBuilder:
                     )
 
                 except Exception as e:
-                    self.logger.error(f"Failed to process contract {address}: {e}")
+                    logger.error(f"Failed to process contract {address}: {e}")
 
             conn.commit()
 
         conn.close()
-        self.logger.info(f"Created {total_pairs} function pairs")
+        logger.info(f"Created {total_pairs} function pairs")
         return total_pairs
 
     def _create_function_pairs(
@@ -871,16 +870,16 @@ class DatasetBuilder:
         pairs: List[FunctionPair] = []
 
         try:
-            self.logger.info(f"Analyzing bytecode for {address}")
+            logger.info(f"Analyzing bytecode for {address}")
             analyzer = BytecodeAnalyzer(bytecode)
             analyzer.analyze_control_flow()
             bytecode_functions = analyzer.identify_functions()
 
-            self.logger.info(f"Parsing Solidity source for {address}")
+            logger.info(f"Parsing Solidity source for {address}")
             solidity_functions = self.parser.extract_functions(source_code)
 
             if not solidity_functions:
-                self.logger.warning(f"No Solidity functions found for {address}")
+                logger.warning(f"No Solidity functions found for {address}")
                 return pairs
 
             solidity_with_selectors = self._add_selectors_to_solidity_functions(
@@ -891,7 +890,7 @@ class DatasetBuilder:
                 solidity_with_selectors, bytecode_functions, analyzer
             )
 
-            self.logger.info(f"Matched {len(matched_pairs)} functions for {address}")
+            logger.info(f"Matched {len(matched_pairs)} functions for {address}")
 
             for match in matched_pairs:
                 try:
@@ -899,11 +898,11 @@ class DatasetBuilder:
                     if pair:
                         pairs.append(pair)
                 except Exception as e:
-                    self.logger.error(f"Failed to build training pair: {e}")
+                    logger.error(f"Failed to build training pair: {e}")
                     continue
 
             if not pairs and solidity_functions:
-                self.logger.info(
+                logger.info(
                     f"No matched functions, creating whole-contract pair for {address}"
                 )
                 fallback_pair = self._create_fallback_pair(
@@ -913,8 +912,8 @@ class DatasetBuilder:
                     pairs.append(fallback_pair)
 
         except Exception as e:
-            self.logger.error(f"Failed to create function pairs for {address}: {e}")
-            self.logger.error(f"Error traceback: {traceback.format_exc()}")
+            logger.error(f"Failed to create function pairs for {address}: {e}")
+            logger.error(f"Error traceback: {traceback.format_exc()}")
 
         return pairs
 
@@ -960,11 +959,11 @@ class DatasetBuilder:
                 selector_hash = Web3.keccak(text=canonical)[:4]
                 func["selector"] = "0x" + selector_hash.hex()
 
-                self.logger.debug(
+                logger.debug(
                     f"Calculated selector {func['selector']} for {canonical}"
                 )
             except Exception as e:
-                self.logger.warning(
+                logger.warning(
                     f"Failed to calculate selector for {func['name']}: {e}"
                 )
                 func["selector"] = None
@@ -1008,11 +1007,11 @@ class DatasetBuilder:
                         "selector": selector,
                     }
                 )
-                self.logger.debug(
+                logger.debug(
                     f"Matched function {sol_func['name']} with selector {selector}"
                 )
             else:
-                self.logger.debug(
+                logger.debug(
                     f"No bytecode match for {sol_func['name']} (selector: {selector})"
                 )
 
@@ -1078,7 +1077,7 @@ class DatasetBuilder:
                 tac_lines.append("")
 
         except Exception as e:
-            self.logger.error(f"Failed to extract TAC for function: {e}")
+            logger.error(f"Failed to extract TAC for function: {e}")
             tac_lines.append(f"  // Error extracting TAC: {e}")
 
         return "\n".join(tac_lines)
@@ -1186,7 +1185,7 @@ class DatasetBuilder:
                 metadata={"whole_contract": True, "fallback_pair": True},
             )
         except Exception as e:
-            self.logger.error(f"Failed to create fallback pair: {e}")
+            logger.error(f"Failed to create fallback pair: {e}")
             return None
 
     # ------------------------------------------------------------------ #
@@ -1277,7 +1276,7 @@ class DatasetBuilder:
 
         conn.close()
 
-        self.logger.info(f"Dataset filtered to {final_count} function pairs")
+        logger.info(f"Dataset filtered to {final_count} function pairs")
         return final_count
 
     def export_dataset(self, output_format: str = "jsonl") -> str:
@@ -1326,7 +1325,7 @@ class DatasetBuilder:
         elif output_format == "parquet":
             df.to_parquet(filepath, index=False)
 
-        self.logger.info(f"Dataset exported to {filepath}")
+        logger.info(f"Dataset exported to {filepath}")
         return str(filepath)
 
     def get_dataset_statistics(self) -> Dict:

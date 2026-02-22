@@ -34,6 +34,8 @@ from .bytecode_analyzer import BytecodeAnalyzer
 from .dataset_pipeline import DatasetBuilder
 from .model_setup import SmartContractModelTrainer, ModelConfig, SmartContractDecompiler
 
+logger = logging.getLogger(__name__)
+
 @dataclass
 class EvaluationMetrics:
     """Container for evaluation metrics as described in the paper."""
@@ -98,8 +100,6 @@ class SmartContractEvaluator:
         Raises:
             Exception: If sentence transformer model fails to load.
         """
-        self.logger = logging.getLogger(__name__)
-        
         # Initialize evaluation models
         self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
@@ -130,7 +130,7 @@ class SmartContractEvaluator:
             return float(similarity)
             
         except Exception as e:
-            self.logger.error(f"Error computing semantic similarity: {e}")
+            logger.error(f"Error computing semantic similarity: {e}")
             return 0.0
     
     def compute_normalized_edit_distance(self, original: str, decompiled: str) -> float:
@@ -156,7 +156,7 @@ class SmartContractEvaluator:
             return 1.0 - distance
             
         except Exception as e:
-            self.logger.error(f"Error computing edit distance: {e}")
+            logger.error(f"Error computing edit distance: {e}")
             return 1.0
     
     def compute_bleu_score(self, original: str, decompiled: str) -> float:
@@ -184,7 +184,7 @@ class SmartContractEvaluator:
             return float(score)
             
         except Exception as e:
-            self.logger.error(f"Error computing BLEU score: {e}")
+            logger.error(f"Error computing BLEU score: {e}")
             return 0.0
     
     def compute_rouge_score(self, original: str, decompiled: str) -> float:
@@ -202,7 +202,7 @@ class SmartContractEvaluator:
             return float(scores['rougeL'].fmeasure)
             
         except Exception as e:
-            self.logger.error(f"Error computing ROUGE score: {e}")
+            logger.error(f"Error computing ROUGE score: {e}")
             return 0.0
     
     def compute_token_accuracy(self, original: str, decompiled: str) -> float:
@@ -229,7 +229,7 @@ class SmartContractEvaluator:
             return len(intersection) / len(union) if union else 1.0
             
         except Exception as e:
-            self.logger.error(f"Error computing token accuracy: {e}")
+            logger.error(f"Error computing token accuracy: {e}")
             return 0.0
     
     def analyze_structural_preservation(self, original: str, decompiled: str) -> float:
@@ -279,7 +279,7 @@ class SmartContractEvaluator:
             return max(0.0, 1.0 - (total_difference / total_count))
             
         except Exception as e:
-            self.logger.error(f"Error analyzing structural preservation: {e}")
+            logger.error(f"Error analyzing structural preservation: {e}")
             return 0.0
     
     def extract_function_metadata(self, code: str) -> Dict[str, Any]:
@@ -312,7 +312,7 @@ class SmartContractEvaluator:
             return metadata
             
         except Exception as e:
-            self.logger.error(f"Error extracting metadata: {e}")
+            logger.error(f"Error extracting metadata: {e}")
             return {}
     
     def evaluate_function(self, original: str, decompiled: str, metadata: Optional[Dict] = None) -> EvaluationMetrics:
@@ -385,7 +385,6 @@ class SmartContractTrainingPipeline:
                 including API keys, paths, and hyperparameters.
         """
         self.config = config
-        self.logger = logging.getLogger(__name__)
         
         # Create output directories
         for dir_path in [config.data_dir, config.models_dir, config.results_dir]:
@@ -420,7 +419,7 @@ class SmartContractTrainingPipeline:
             FileNotFoundError: If contract_addresses_file is specified
                 but does not exist.
         """
-        self.logger.info("Starting dataset collection and preparation...")
+        logger.info("Starting dataset collection and preparation...")
         
         # Load contract addresses
         if self.config.contract_addresses_file:
@@ -434,25 +433,25 @@ class SmartContractTrainingPipeline:
                 "0xA0b86a33E6411a3b4E4c3c4C4e4b5b5b5b5b5b5b",  # Example addresses
                 # Add more real verified contract addresses here
             ]
-            self.logger.warning("Using sample contract addresses. Please provide a comprehensive list.")
+            logger.warning("Using sample contract addresses. Please provide a comprehensive list.")
         
         # Collect contracts
-        self.logger.info(f"Collecting {len(contract_addresses)} contracts...")
+        logger.info(f"Collecting {len(contract_addresses)} contracts...")
         collected = self.dataset_builder.collect_contracts(contract_addresses)
         
         # Process to function pairs
-        self.logger.info("Processing contracts to function pairs...")
+        logger.info("Processing contracts to function pairs...")
         total_pairs = self.dataset_builder.process_contracts_to_function_pairs()
         
         # Filter and clean dataset
-        self.logger.info("Filtering and cleaning dataset...")
+        logger.info("Filtering and cleaning dataset...")
         filtered_pairs = self.dataset_builder.filter_and_clean_dataset(
             min_length=self.config.min_function_length,
             max_length=self.config.max_sequence_length
         )
         
         if filtered_pairs < 1000:  # Minimum viable dataset size
-            self.logger.warning(f"Dataset too small ({filtered_pairs} pairs). Consider collecting more contracts.")
+            logger.warning(f"Dataset too small ({filtered_pairs} pairs). Consider collecting more contracts.")
         
         # Export dataset
         dataset_path = self.dataset_builder.export_dataset("jsonl")
@@ -462,7 +461,7 @@ class SmartContractTrainingPipeline:
         
         # Print statistics
         stats = self.dataset_builder.get_dataset_statistics()
-        self.logger.info(f"Dataset statistics: {stats}")
+        logger.info(f"Dataset statistics: {stats}")
         
         return train_path, val_path, test_path
     
@@ -508,7 +507,7 @@ class SmartContractTrainingPipeline:
                 for item in data_split:
                     f.write(json.dumps(item) + '\n')
         
-        self.logger.info(f"Dataset split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
+        logger.info(f"Dataset split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
         
         return str(train_path), str(val_path), str(test_path)
     
@@ -523,7 +522,7 @@ class SmartContractTrainingPipeline:
             Path to the directory containing the trained model weights
             and configuration.
         """
-        self.logger.info("Starting model training...")
+        logger.info("Starting model training...")
         
         model_path = self.model_trainer.train(
             train_dataset_path=train_path,
@@ -533,7 +532,7 @@ class SmartContractTrainingPipeline:
             num_epochs=self.config.num_epochs
         )
         
-        self.logger.info(f"Model training completed. Model saved to {model_path}")
+        logger.info(f"Model training completed. Model saved to {model_path}")
         return model_path
     
     def evaluate_model(self, model_path: str, test_path: str) -> Dict[str, Any]:
@@ -551,7 +550,7 @@ class SmartContractTrainingPipeline:
             Dictionary containing aggregate statistics (mean, std, median,
             min, max, percentiles) for all metrics.
         """
-        self.logger.info("Starting model evaluation...")
+        logger.info("Starting model evaluation...")
         
         # Load test data
         test_data = []
@@ -596,7 +595,7 @@ class SmartContractTrainingPipeline:
                 })
                 
             except Exception as e:
-                self.logger.error(f"Error evaluating function: {e}")
+                logger.error(f"Error evaluating function: {e}")
                 continue
         
         # Compute aggregate statistics
@@ -610,7 +609,7 @@ class SmartContractTrainingPipeline:
                 'detailed_results': results
             }, f, indent=2)
         
-        self.logger.info(f"Evaluation completed. Results saved to {results_path}")
+        logger.info(f"Evaluation completed. Results saved to {results_path}")
         return aggregate_stats
     
     def _compute_aggregate_statistics(self, results: List[Dict]) -> Dict[str, Any]:
@@ -687,7 +686,7 @@ class SmartContractTrainingPipeline:
             Dictionary containing final evaluation results with aggregate
             statistics for all metrics.
         """
-        self.logger.info("Starting complete smart contract decompilation pipeline...")
+        logger.info("Starting complete smart contract decompilation pipeline...")
         
         # Step 1: Collect and prepare dataset
         train_path, val_path, test_path = self.collect_and_prepare_dataset()
@@ -698,10 +697,10 @@ class SmartContractTrainingPipeline:
         # Step 3: Evaluate model
         evaluation_results = self.evaluate_model(model_path, test_path)
         
-        self.logger.info("Pipeline completed successfully!")
-        self.logger.info(f"Key results:")
-        self.logger.info(f"- Semantic similarity: {evaluation_results.get('semantic_similarity', {}).get('mean', 'N/A'):.3f}")
-        self.logger.info(f"- Edit distance: {evaluation_results.get('normalized_edit_distance', {}).get('mean', 'N/A'):.3f}")
+        logger.info("Pipeline completed successfully!")
+        logger.info(f"Key results:")
+        logger.info(f"- Semantic similarity: {evaluation_results.get('semantic_similarity', {}).get('mean', 'N/A'):.3f}")
+        logger.info(f"- Edit distance: {evaluation_results.get('normalized_edit_distance', {}).get('mean', 'N/A'):.3f}")
         
         return evaluation_results
 
