@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import json as _json
 
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+from flask_cors import CORS
 
 from src.bytecode_analyzer import BytecodeAnalyzer
 from src.model_setup import SmartContractDecompiler, ModelConfig
@@ -40,6 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Security: limit request payload to 1 MB
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Global decompiler instance (loaded once at startup)
 decompiler: SmartContractDecompiler = None  # type: ignore[assignment]
@@ -255,6 +259,11 @@ def api_decompile():
     bytecode = data["bytecode"].strip()
     if not bytecode:
         return jsonify({"error": "Bytecode is empty."}), 400
+
+    # Security: limit bytecode length (max 100 KB of hex = 50 KB of actual bytecode)
+    MAX_BYTECODE_LENGTH = 200_000  # characters of hex
+    if len(bytecode) > MAX_BYTECODE_LENGTH:
+        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
 
     # Normalise — ensure 0x prefix
     if not bytecode.startswith("0x"):
@@ -519,6 +528,10 @@ def api_vulnerability_scan():
     if not bytecode:
         return jsonify({"error": "No bytecode provided"}), 400
 
+    MAX_BYTECODE_LENGTH = 200_000
+    if len(bytecode) > MAX_BYTECODE_LENGTH:
+        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
+
     try:
         detector = VulnerabilityDetector()
         report = detector.scan_from_bytecode(bytecode, contract_address)
@@ -557,6 +570,10 @@ def api_classify():
     if not bytecode:
         return jsonify({"error": "No bytecode provided"}), 400
 
+    MAX_BYTECODE_LENGTH = 200_000
+    if len(bytecode) > MAX_BYTECODE_LENGTH:
+        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
+
     try:
         classifier = MaliciousContractClassifier()
         result = classifier.classify_from_bytecode(bytecode, contract_address)
@@ -586,6 +603,10 @@ def api_audit_report():
     if not bytecode:
         return jsonify({"error": "No bytecode provided"}), 400
 
+    MAX_BYTECODE_LENGTH = 200_000
+    if len(bytecode) > MAX_BYTECODE_LENGTH:
+        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
+
     try:
         detector = VulnerabilityDetector()
         classifier = MaliciousContractClassifier()
@@ -613,4 +634,4 @@ def api_audit_report():
 
 if __name__ == "__main__":
     load_model()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False)

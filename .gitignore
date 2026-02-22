@@ -47,3 +47,6 @@ Thumbs.db
 
 # Environment
 .env
+
+# API keys / secrets (use settings.yaml.example as template)
+src/settings.yaml

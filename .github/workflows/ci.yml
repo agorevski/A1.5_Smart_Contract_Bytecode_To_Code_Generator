@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install linting tools
+        run: pip install black flake8 mypy
+      - name: Check formatting
+        run: black --check src/ tests/ web/
+      - name: Lint
+        run: flake8 src/ tests/ web/ --max-line-length 100 --extend-ignore E501
+      - name: Type check
+        run: mypy src/ --ignore-missing-imports
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install pytest
+          pip install numpy pandas scipy scikit-learn
+          pip install requests pyyaml jsonlines tqdm click jinja2
+          pip install flask lightgbm
+          pip install evmdasm web3 eth-abi eth-utils py-solc-x
+      - name: Run tests
+        run: python -m pytest --tb=short -q

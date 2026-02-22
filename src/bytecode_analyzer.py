@@ -20,8 +20,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from evmdasm import EvmBytecode
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -195,6 +193,13 @@ class BytecodeAnalyzer:
     def _parse_bytecode(self) -> None:
         """Parse EVM bytecode into instruction objects using *evmdasm*."""
         try:
+            try:
+                from evmdasm import EvmBytecode
+            except ImportError:
+                raise ImportError(
+                    "evmdasm is required for bytecode disassembly. "
+                    "Install it with: pip install evmdasm"
+                )
             clean = self.bytecode[2:] if self.bytecode.startswith("0x") else self.bytecode
             evm = EvmBytecode(clean)
             self.instructions = list(evm.disassemble())

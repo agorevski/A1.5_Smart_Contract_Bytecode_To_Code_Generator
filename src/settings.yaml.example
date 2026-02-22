@@ -1,0 +1,8 @@
+# Copy this file to settings.yaml and fill in your API keys.
+# Do NOT commit settings.yaml — it is in .gitignore.
+#
+# Alternatively, set these as environment variables (preferred):
+#   export ETHERSCAN_API_KEY=your_key_here
+#   export HF_TOKEN=your_token_here
+ETHERSCAN_API_KEY: YOUR_KEY_HERE
+HF_TOKEN: YOUR_TOKEN_HERE
