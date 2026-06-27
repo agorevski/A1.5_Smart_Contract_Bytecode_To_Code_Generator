@@ -291,6 +291,16 @@ Key metrics:
 | `pct_above_0.8_similarity` | > 78% |
 | `pct_below_0.4_edit_dist` | > 82% |
 | `edit_distance_mean` | lower is better |
+| `replication_precision_micro` | higher is better; measures recovered facts that are correct |
+| `replication_recall_micro` | higher is better; measures ground-truth facts recovered |
+| `replication_f1_micro` | higher is better; balanced structured replication score |
+
+The replication metrics compare structured Solidity facts extracted from the
+ground-truth function and generated function: ABI/function facts, visibility,
+mutability, modifiers, guards, events, calls, state writes, returns, and control
+flow. The evaluation JSON also includes `replication_by_category_micro` so you
+can see whether failures are concentrated in ABI recovery, state writes, guards,
+calls, or other categories.
 
 ## 6. Use the trained model
 

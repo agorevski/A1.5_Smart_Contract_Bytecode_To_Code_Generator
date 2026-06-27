@@ -59,6 +59,7 @@ The code defaults to 4-bit NF4 loading via `bitsandbytes` (`use_quantization=Tru
 | Semantic similarity (avg) | > 0.82 |
 | Functions > 0.8 similarity | > 78% |
 | Normalized edit distance < 0.4 | > 82% |
+| Structured replication precision/recall/F1 | Track by category; higher is better |
 
 ## Hardware Requirements
 

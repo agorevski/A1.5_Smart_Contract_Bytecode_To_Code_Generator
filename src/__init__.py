@@ -30,6 +30,11 @@ __all__ = [
     "PipelineConfig",
     "PipelineResult",
     "PipelineStage",
+    "PrecisionRecallF1",
+    "ReplicationEvaluation",
+    "aggregate_replication_scores",
+    "evaluate_replication",
+    "extract_solidity_facts",
 ]
 
 # Lazy import mapping: name → (module, attribute)
@@ -52,6 +57,14 @@ _LAZY_IMPORTS = {
     "PipelineConfig": (".pipeline_orchestrator", "PipelineConfig"),
     "PipelineResult": (".pipeline_orchestrator", "PipelineResult"),
     "PipelineStage": (".pipeline_orchestrator", "PipelineStage"),
+    "PrecisionRecallF1": (".replication_metrics", "PrecisionRecallF1"),
+    "ReplicationEvaluation": (".replication_metrics", "ReplicationEvaluation"),
+    "aggregate_replication_scores": (
+        ".replication_metrics",
+        "aggregate_replication_scores",
+    ),
+    "evaluate_replication": (".replication_metrics", "evaluate_replication"),
+    "extract_solidity_facts": (".replication_metrics", "extract_solidity_facts"),
 }
 
 

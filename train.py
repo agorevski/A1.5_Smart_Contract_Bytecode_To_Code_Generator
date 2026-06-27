@@ -328,6 +328,7 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
     """
     from src.training_pipeline import SmartContractEvaluator
     from src.model_setup import SmartContractDecompiler
+    from src.replication_metrics import aggregate_replication_scores
     from dataclasses import asdict
     import torch
     import torch.distributed as dist
@@ -433,6 +434,9 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
         if results:
             sem_sims = [r["metrics"]["semantic_similarity"] for r in results]
             edit_dists = [r["metrics"]["normalized_edit_distance"] for r in results]
+            replication_summary = aggregate_replication_scores(
+                r["metrics"] for r in results
+            )
 
             import numpy as np
 
@@ -449,6 +453,24 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
                     sum(1 for d in edit_dists if d < 0.4) / len(edit_dists)
                 ),
             }
+            if replication_summary:
+                replication_micro = replication_summary.get("micro", {})
+                summary.update(
+                    {
+                        "replication_precision_mean": replication_summary.get("precision_mean"),
+                        "replication_recall_mean": replication_summary.get("recall_mean"),
+                        "replication_f1_mean": replication_summary.get("f1_mean"),
+                        "pct_above_0.8_replication_f1": replication_summary.get(
+                            "pct_above_0_8_f1"
+                        ),
+                        "replication_precision_micro": replication_micro.get("precision"),
+                        "replication_recall_micro": replication_micro.get("recall"),
+                        "replication_f1_micro": replication_micro.get("f1"),
+                        "replication_by_category_micro": replication_summary.get(
+                            "by_category_micro", {}
+                        ),
+                    }
+                )
         else:
             summary = {"num_evaluated": 0, "error": "No successful evaluations"}
 

@@ -141,7 +141,7 @@ uv run pytest --cov=src tests/
 │   ├── dataset_pipeline.py    # Etherscan data collection, Solidity parsing, DB
 │   ├── local_compiler.py      # Local solc compilation (py-solc-x)
 │   ├── model_setup.py         # Model config, LoRA fine-tuning, inference
-│   ├── training_pipeline.py   # Evaluation metrics (semantic similarity, edit distance)
+│   ├── training_pipeline.py   # Evaluation metrics (similarity, edit distance, replication precision/recall)
 │   ├── opcode_features.py     # Opcode frequency, TF-IDF, entropy-based features
 │   ├── vulnerability_detector.py  # Vulnerability scanning (6 types, 5 severities)
 │   ├── malicious_classifier.py    # Malicious contract classification + LIME explainability

@@ -34,12 +34,15 @@ import difflib
 from .bytecode_analyzer import BytecodeAnalyzer
 from .dataset_pipeline import DatasetBuilder
 from .model_setup import SmartContractModelTrainer, ModelConfig, SmartContractDecompiler
+from .replication_metrics import aggregate_replication_scores, evaluate_replication
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class EvaluationMetrics:
     """Container for evaluation metrics as described in the paper."""
+
     semantic_similarity: float
     normalized_edit_distance: float
     bleu_score: float
@@ -48,49 +51,55 @@ class EvaluationMetrics:
     structural_preservation: float
     function_signature_match: bool
     visibility_match: bool
+    replication_precision: float = 0.0
+    replication_recall: float = 0.0
+    replication_f1: float = 0.0
     metadata: Dict[str, Any] = None
+
 
 @dataclass
 class TrainingConfig:
     """Configuration for the complete training pipeline."""
+
     # Data collection
     etherscan_api_key: str
     contract_addresses_file: Optional[str] = None
     target_dataset_size: int = 238446  # As mentioned in paper
-    
+
     # Dataset processing
     min_function_length: int = 50
     max_sequence_length: int = 20000
     train_test_split: float = 0.85
     validation_split: float = 0.1
-    
+
     # Model training
     model_config: ModelConfig = None
     batch_size: int = 4
     learning_rate: float = 2e-4
     num_epochs: int = 3
     gradient_accumulation_steps: int = 4
-    
+
     # Evaluation
     evaluation_sample_size: int = 9731  # As mentioned in paper
-    
+
     # Output directories
     data_dir: str = "data"
     models_dir: str = "models"
     results_dir: str = "results"
-    
+
     def __post_init__(self):
         if self.model_config is None:
             self.model_config = ModelConfig()
 
+
 class SmartContractEvaluator:
     """
     Comprehensive evaluation framework implementing metrics from the paper.
-    
+
     Includes semantic similarity, edit distance, token frequency analysis,
     and structural fidelity measurements.
     """
-    
+
     def __init__(self):
         """Initialize the evaluator with required NLP models and scorers.
 
@@ -104,15 +113,17 @@ class SmartContractEvaluator:
         self.logger = logging.getLogger(__name__)
 
         # Initialize evaluation models
-        self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-        
+        self.semantic_model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.rouge_scorer = rouge_scorer.RougeScorer(
+            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
+        )
+
         # Download required NLTK data
         try:
-            nltk.data.find('tokenizers/punkt')
+            nltk.data.find("tokenizers/punkt")
         except LookupError:
-            nltk.download('punkt')
-    
+            nltk.download("punkt")
+
     def compute_semantic_similarity(self, original: str, decompiled: str) -> float:
         """Compute semantic similarity using sentence transformers.
 
@@ -127,15 +138,15 @@ class SmartContractEvaluator:
         try:
             # Encode both texts
             embeddings = self.semantic_model.encode([original, decompiled])
-            
+
             # Compute cosine similarity
             similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
             return float(similarity)
-            
+
         except Exception as e:
             logger.error(f"Error computing semantic similarity: {e}")
             return 0.0
-    
+
     def compute_normalized_edit_distance(self, original: str, decompiled: str) -> float:
         """Compute normalized edit distance (Levenshtein distance).
 
@@ -149,19 +160,19 @@ class SmartContractEvaluator:
         """
         try:
             # Normalize whitespace
-            original = ' '.join(original.split())
-            decompiled = ' '.join(decompiled.split())
-            
+            original = " ".join(original.split())
+            decompiled = " ".join(decompiled.split())
+
             # Compute edit distance
             distance = difflib.SequenceMatcher(None, original, decompiled).ratio()
-            
+
             # Return as distance (1 - similarity)
             return 1.0 - distance
-            
+
         except Exception as e:
             logger.error(f"Error computing edit distance: {e}")
             return 1.0
-    
+
     def compute_bleu_score(self, original: str, decompiled: str) -> float:
         """Compute BLEU score for code similarity.
 
@@ -178,18 +189,18 @@ class SmartContractEvaluator:
             # Tokenize
             reference = [original.split()]
             candidate = decompiled.split()
-            
+
             # Use smoothing function for short sequences
             smoothing_function = SmoothingFunction().method1
-            
+
             # Compute BLEU score
             score = sentence_bleu(reference, candidate, smoothing_function=smoothing_function)
             return float(score)
-            
+
         except Exception as e:
             logger.error(f"Error computing BLEU score: {e}")
             return 0.0
-    
+
     def compute_rouge_score(self, original: str, decompiled: str) -> float:
         """Compute ROUGE-L score.
 
@@ -202,12 +213,12 @@ class SmartContractEvaluator:
         """
         try:
             scores = self.rouge_scorer.score(original, decompiled)
-            return float(scores['rougeL'].fmeasure)
-            
+            return float(scores["rougeL"].fmeasure)
+
         except Exception as e:
             logger.error(f"Error computing ROUGE score: {e}")
             return 0.0
-    
+
     def compute_token_accuracy(self, original: str, decompiled: str) -> float:
         """Compute token-level accuracy using Jaccard similarity.
 
@@ -222,19 +233,19 @@ class SmartContractEvaluator:
         try:
             original_tokens = set(original.split())
             decompiled_tokens = set(decompiled.split())
-            
+
             if not original_tokens:
                 return 1.0 if not decompiled_tokens else 0.0
-            
+
             intersection = original_tokens.intersection(decompiled_tokens)
             union = original_tokens.union(decompiled_tokens)
-            
+
             return len(intersection) / len(union) if union else 1.0
-            
+
         except Exception as e:
             logger.error(f"Error computing token accuracy: {e}")
             return 0.0
-    
+
     def analyze_structural_preservation(self, original: str, decompiled: str) -> float:
         """Analyze how well control flow and structure are preserved.
 
@@ -252,39 +263,50 @@ class SmartContractEvaluator:
         try:
             # Count key structural elements
             structural_keywords = [
-                'if', 'else', 'for', 'while', 'function', 'return',
-                'require', 'assert', 'revert', '{', '}', '(', ')'
+                "if",
+                "else",
+                "for",
+                "while",
+                "function",
+                "return",
+                "require",
+                "assert",
+                "revert",
+                "{",
+                "}",
+                "(",
+                ")",
             ]
-            
+
             original_counts = {}
             decompiled_counts = {}
-            
+
             for keyword in structural_keywords:
                 original_counts[keyword] = original.count(keyword)
                 decompiled_counts[keyword] = decompiled.count(keyword)
-            
+
             # Compute similarity of structural element counts
             total_difference = 0
             total_count = 0
-            
+
             for keyword in structural_keywords:
                 orig_count = original_counts[keyword]
                 decomp_count = decompiled_counts[keyword]
-                
+
                 if orig_count + decomp_count > 0:
                     difference = abs(orig_count - decomp_count) / max(orig_count + decomp_count, 1)
                     total_difference += difference
                     total_count += 1
-            
+
             if total_count == 0:
                 return 1.0
-            
+
             return max(0.0, 1.0 - (total_difference / total_count))
-            
+
         except Exception as e:
             logger.error(f"Error analyzing structural preservation: {e}")
             return 0.0
-    
+
     def analyze_complexity_preservation(self, original: str, decompiled: str) -> float:
         """Analyze preservation of code complexity and structure.
 
@@ -337,10 +359,10 @@ class SmartContractEvaluator:
             level = 0
             max_level = 0
             for char in code:
-                if char == '{':
+                if char == "{":
                     level += 1
                     max_level = max(max_level, level)
-                elif char == '}':
+                elif char == "}":
                     level = max(0, level - 1)
             return max_level
         except Exception:
@@ -352,7 +374,8 @@ class SmartContractEvaluator:
             # Simple pattern matching for function calls
             # This captures most calls like func_name(...)
             import re
-            pattern = r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*\('
+
+            pattern = r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*\("
             calls = re.findall(pattern, code)
             return len(calls)
         except Exception:
@@ -371,27 +394,29 @@ class SmartContractEvaluator:
         """
         try:
             metadata = {
-                'has_function_keyword': 'function' in code,
-                'visibility': None,
-                'is_payable': 'payable' in code,
-                'is_view': 'view' in code or 'pure' in code,
-                'has_return': 'return' in code,
-                'has_require': 'require' in code
+                "has_function_keyword": "function" in code,
+                "visibility": None,
+                "is_payable": "payable" in code,
+                "is_view": "view" in code or "pure" in code,
+                "has_return": "return" in code,
+                "has_require": "require" in code,
             }
-            
+
             # Extract visibility
-            for visibility in ['private', 'internal', 'external', 'public']:
+            for visibility in ["private", "internal", "external", "public"]:
                 if visibility in code:
-                    metadata['visibility'] = visibility
+                    metadata["visibility"] = visibility
                     break
-            
+
             return metadata
-            
+
         except Exception as e:
             logger.error(f"Error extracting metadata: {e}")
             return {}
-    
-    def evaluate_function(self, original: str, decompiled: str, metadata: Optional[Dict] = None) -> EvaluationMetrics:
+
+    def evaluate_function(
+        self, original: str, decompiled: str, metadata: Optional[Dict] = None
+    ) -> EvaluationMetrics:
         """Comprehensive evaluation of a single function decompilation.
 
         Computes all metrics including semantic similarity, edit distance,
@@ -416,7 +441,12 @@ class SmartContractEvaluator:
         metadata = metadata or {}
 
         # Quality check: Skip evaluation for malformed outputs
-        if not original or not decompiled or len(original.strip()) < 5 or len(decompiled.strip()) < 5:
+        if (
+            not original
+            or not decompiled
+            or len(original.strip()) < 5
+            or len(decompiled.strip()) < 5
+        ):
             return EvaluationMetrics(
                 semantic_similarity=0.0,
                 normalized_edit_distance=1.0,
@@ -426,16 +456,20 @@ class SmartContractEvaluator:
                 structural_preservation=0.0,
                 function_signature_match=False,
                 visibility_match=False,
+                replication_precision=0.0,
+                replication_recall=0.0,
+                replication_f1=0.0,
                 metadata={
-                    'original_metadata': {},
-                    'decompiled_metadata': {},
-                    'function_metadata': metadata,
-                    'quality_issue': 'malformed_input_output',
-                    'evaluation_time': 0.0
-                }
+                    "original_metadata": {},
+                    "decompiled_metadata": {},
+                    "function_metadata": metadata,
+                    "quality_issue": "malformed_input_output",
+                    "evaluation_time": 0.0,
+                },
             )
-        
+
         import time
+
         start_time = time.time()
 
         try:
@@ -449,20 +483,21 @@ class SmartContractEvaluator:
 
             # Enhanced structural preservation with complexity analysis
             # This helps detect if structural elements are preserved properly
-            enhanced_structural_preservation = self.analyze_complexity_preservation(original, decompiled)
+            enhanced_structural_preservation = self.analyze_complexity_preservation(
+                original, decompiled
+            )
+            replication = evaluate_replication(original, decompiled)
 
             # Extract and compare metadata
             original_metadata = self.extract_function_metadata(original)
             decompiled_metadata = self.extract_function_metadata(decompiled)
 
-            function_signature_match = (
-                original_metadata.get('has_function_keyword') ==
-                decompiled_metadata.get('has_function_keyword')
-            )
+            function_signature_match = original_metadata.get(
+                "has_function_keyword"
+            ) == decompiled_metadata.get("has_function_keyword")
 
-            visibility_match = (
-                original_metadata.get('visibility') ==
-                decompiled_metadata.get('visibility')
+            visibility_match = original_metadata.get("visibility") == decompiled_metadata.get(
+                "visibility"
             )
 
             evaluation_time = time.time() - start_time
@@ -476,13 +511,17 @@ class SmartContractEvaluator:
                 structural_preservation=structural_preservation,
                 function_signature_match=function_signature_match,
                 visibility_match=visibility_match,
+                replication_precision=replication.overall.precision,
+                replication_recall=replication.overall.recall,
+                replication_f1=replication.overall.f1,
                 metadata={
-                    'original_metadata': original_metadata,
-                    'decompiled_metadata': decompiled_metadata,
-                    'function_metadata': metadata,
-                    'enhanced_structural_preservation': enhanced_structural_preservation,
-                    'evaluation_time': evaluation_time
-                }
+                    "original_metadata": original_metadata,
+                    "decompiled_metadata": decompiled_metadata,
+                    "function_metadata": metadata,
+                    "enhanced_structural_preservation": enhanced_structural_preservation,
+                    "replication": replication.to_dict(),
+                    "evaluation_time": evaluation_time,
+                },
             )
         except Exception as e:
             # Log error but return zeroed metrics to avoid halting training
@@ -498,24 +537,28 @@ class SmartContractEvaluator:
                 structural_preservation=0.0,
                 function_signature_match=False,
                 visibility_match=False,
+                replication_precision=0.0,
+                replication_recall=0.0,
+                replication_f1=0.0,
                 metadata={
-                    'original_metadata': {},
-                    'decompiled_metadata': {},
-                    'function_metadata': metadata,
-                    'error': str(e),
-                    'traceback': traceback.format_exc(),
-                    'evaluation_time': evaluation_time
-                }
+                    "original_metadata": {},
+                    "decompiled_metadata": {},
+                    "function_metadata": metadata,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "evaluation_time": evaluation_time,
+                },
             )
+
 
 class SmartContractTrainingPipeline:
     """
     Complete training pipeline for smart contract decompilation.
-    
+
     Orchestrates data collection, preprocessing, training, and evaluation
     as described in the paper.
     """
-    
+
     def __init__(self, config: TrainingConfig):
         """Initialize the training pipeline with the given configuration.
 
@@ -525,24 +568,20 @@ class SmartContractTrainingPipeline:
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
-        
+
         # Create output directories
         for dir_path in [config.data_dir, config.models_dir, config.results_dir]:
             Path(dir_path).mkdir(exist_ok=True)
-        
+
         # Initialize components
-        self.dataset_builder = DatasetBuilder(
-            config.etherscan_api_key, 
-            output_dir=config.data_dir
-        )
-        
+        self.dataset_builder = DatasetBuilder(config.etherscan_api_key, output_dir=config.data_dir)
+
         self.model_trainer = SmartContractModelTrainer(
-            config.model_config,
-            output_dir=config.models_dir
+            config.model_config, output_dir=config.models_dir
         )
-        
+
         self.evaluator = SmartContractEvaluator()
-    
+
     def collect_and_prepare_dataset(self) -> Tuple[str, str, str]:
         """Collect contracts and prepare training dataset.
 
@@ -560,10 +599,10 @@ class SmartContractTrainingPipeline:
                 but does not exist.
         """
         logger.info("Starting dataset collection and preparation...")
-        
+
         # Load contract addresses
         if self.config.contract_addresses_file:
-            with open(self.config.contract_addresses_file, 'r') as f:
+            with open(self.config.contract_addresses_file, "r") as f:
                 contract_addresses = [line.strip() for line in f if line.strip()]
         else:
             # For demonstration, create a sample list
@@ -574,37 +613,38 @@ class SmartContractTrainingPipeline:
                 # Add more real verified contract addresses here
             ]
             logger.warning("Using sample contract addresses. Please provide a comprehensive list.")
-        
+
         # Collect contracts
         logger.info(f"Collecting {len(contract_addresses)} contracts...")
         collected = self.dataset_builder.collect_contracts(contract_addresses)
-        
+
         # Process to function pairs
         logger.info("Processing contracts to function pairs...")
         total_pairs = self.dataset_builder.process_contracts_to_function_pairs()
-        
+
         # Filter and clean dataset
         logger.info("Filtering and cleaning dataset...")
         filtered_pairs = self.dataset_builder.filter_and_clean_dataset(
-            min_length=self.config.min_function_length,
-            max_length=self.config.max_sequence_length
+            min_length=self.config.min_function_length, max_length=self.config.max_sequence_length
         )
-        
+
         if filtered_pairs < 1000:  # Minimum viable dataset size
-            logger.warning(f"Dataset too small ({filtered_pairs} pairs). Consider collecting more contracts.")
-        
+            logger.warning(
+                f"Dataset too small ({filtered_pairs} pairs). Consider collecting more contracts."
+            )
+
         # Export dataset
         dataset_path = self.dataset_builder.export_dataset("jsonl")
-        
+
         # Split dataset
         train_path, val_path, test_path = self._split_dataset(dataset_path)
-        
+
         # Print statistics
         stats = self.dataset_builder.get_dataset_statistics()
         logger.info(f"Dataset statistics: {stats}")
-        
+
         return train_path, val_path, test_path
-    
+
     def _split_dataset(self, dataset_path: str) -> Tuple[str, str, str]:
         """Split dataset into train, validation, and test sets.
 
@@ -617,13 +657,15 @@ class SmartContractTrainingPipeline:
         """
         # Load data
         data = []
-        with open(dataset_path, 'r') as f:
+        with open(dataset_path, "r") as f:
             for line in f:
                 data.append(json.loads(line.strip()))
-        
+
         test_ratio = 1.0 - self.config.train_test_split - self.config.validation_split
         if self.config.train_test_split <= 0 or self.config.validation_split < 0 or test_ratio < 0:
-            raise ValueError("train_test_split and validation_split must leave a non-negative test split")
+            raise ValueError(
+                "train_test_split and validation_split must leave a non-negative test split"
+            )
 
         test_count = max(1, round(len(data) * test_ratio)) if test_ratio > 0 else 0
         test_count = min(test_count, max(0, len(data) - 2))
@@ -638,7 +680,8 @@ class SmartContractTrainingPipeline:
 
         val_count = (
             max(1, round(len(data) * self.config.validation_split))
-            if self.config.validation_split > 0 else 0
+            if self.config.validation_split > 0
+            else 0
         )
         val_count = min(val_count, max(0, len(train_val_data) - 1))
         if val_count:
@@ -649,23 +692,29 @@ class SmartContractTrainingPipeline:
             )
         else:
             train_data, val_data = train_val_data, []
-        
+
         # Save splits
         data_dir = Path(self.config.data_dir)
-        
+
         train_path = data_dir / "train_dataset.jsonl"
         val_path = data_dir / "validation_dataset.jsonl"
         test_path = data_dir / "test_dataset.jsonl"
-        
-        for data_split, path in [(train_data, train_path), (val_data, val_path), (test_data, test_path)]:
-            with open(path, 'w') as f:
+
+        for data_split, path in [
+            (train_data, train_path),
+            (val_data, val_path),
+            (test_data, test_path),
+        ]:
+            with open(path, "w") as f:
                 for item in data_split:
-                    f.write(json.dumps(item) + '\n')
-        
-        logger.info(f"Dataset split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
-        
+                    f.write(json.dumps(item) + "\n")
+
+        logger.info(
+            f"Dataset split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test"
+        )
+
         return str(train_path), str(val_path), str(test_path)
-    
+
     def train_model(self, train_path: str, val_path: str) -> str:
         """Train the model on the prepared dataset.
 
@@ -678,7 +727,7 @@ class SmartContractTrainingPipeline:
             and configuration.
         """
         logger.info("Starting model training...")
-        
+
         model_path = self.model_trainer.train(
             train_dataset_path=train_path,
             eval_dataset_path=val_path,
@@ -687,10 +736,10 @@ class SmartContractTrainingPipeline:
             num_epochs=self.config.num_epochs,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
         )
-        
+
         logger.info(f"Model training completed. Model saved to {model_path}")
         return model_path
-    
+
     def evaluate_model(self, model_path: str, test_path: str) -> Dict[str, Any]:
         """Comprehensive evaluation of the trained model.
 
@@ -707,87 +756,85 @@ class SmartContractTrainingPipeline:
             min, max, percentiles) for all metrics.
         """
         logger.info("Starting model evaluation...")
-        
+
         # Load test data
         test_data = []
-        with open(test_path, 'r') as f:
+        with open(test_path, "r") as f:
             for line in f:
                 test_data.append(json.loads(line.strip()))
-        
+
         # Sample for evaluation if dataset is large
         if len(test_data) > self.config.evaluation_sample_size:
             test_data = np.random.choice(
-                test_data, 
-                size=self.config.evaluation_sample_size, 
-                replace=False
+                test_data, size=self.config.evaluation_sample_size, replace=False
             ).tolist()
-        
+
         # Initialize decompiler
         decompiler = SmartContractDecompiler(model_path)
-        
+
         # Evaluate each function
         results = []
-        
+
         for item in tqdm(test_data, desc="Evaluating functions"):
             try:
                 # Generate decompiled code
                 decompiled = decompiler.decompile_tac_to_solidity(
-                    item['input'],
-                    metadata=item.get('metadata', {})
+                    item["input"], metadata=item.get("metadata", {})
                 )
-                
+
                 # Evaluate
                 metrics = self.evaluator.evaluate_function(
-                    item['output'],
-                    decompiled,
-                    item.get('metadata', {})
+                    item["output"], decompiled, item.get("metadata", {})
                 )
-                
-                results.append({
-                    'original': item['output'],
-                    'decompiled': decompiled,
-                    'metrics': asdict(metrics),
-                    'metadata': item.get('metadata', {})
-                })
-                
+
+                results.append(
+                    {
+                        "original": item["output"],
+                        "decompiled": decompiled,
+                        "metrics": asdict(metrics),
+                        "metadata": item.get("metadata", {}),
+                    }
+                )
+
             except Exception as e:
                 self.logger.error(f"Error evaluating function: {e}")
                 # Add error information to continue evaluation
-                results.append({
-                    'original': item.get('output', ''),
-                    'decompiled': '',
-                    'metrics': {
-                        'semantic_similarity': 0.0,
-                        'normalized_edit_distance': 1.0,
-                        'bleu_score': 0.0,
-                        'rouge_l_score': 0.0,
-                        'token_accuracy': 0.0,
-                        'structural_preservation': 0.0,
-                        'function_signature_match': False,
-                        'visibility_match': False,
-                        'metadata': {
-                            'error': str(e),
-                            'traceback': traceback.format_exc()
-                        }
-                    },
-                    'metadata': item.get('metadata', {})
-                })
+                results.append(
+                    {
+                        "original": item.get("output", ""),
+                        "decompiled": "",
+                        "metrics": {
+                            "semantic_similarity": 0.0,
+                            "normalized_edit_distance": 1.0,
+                            "bleu_score": 0.0,
+                            "rouge_l_score": 0.0,
+                            "token_accuracy": 0.0,
+                            "structural_preservation": 0.0,
+                            "function_signature_match": False,
+                            "visibility_match": False,
+                            "replication_precision": 0.0,
+                            "replication_recall": 0.0,
+                            "replication_f1": 0.0,
+                            "metadata": {"error": str(e), "traceback": traceback.format_exc()},
+                        },
+                        "metadata": item.get("metadata", {}),
+                    }
+                )
                 continue
-        
+
         # Compute aggregate statistics
         aggregate_stats = self._compute_aggregate_statistics(results)
-        
+
         # Save detailed results
         results_path = Path(self.config.results_dir) / f"evaluation_results_{int(time.time())}.json"
-        with open(results_path, 'w') as f:
-            json.dump({
-                'aggregate_statistics': aggregate_stats,
-                'detailed_results': results
-            }, f, indent=2)
-        
+        with open(results_path, "w") as f:
+            json.dump(
+                {"aggregate_statistics": aggregate_stats, "detailed_results": results}, f, indent=2
+            )
+
         logger.info(f"Evaluation completed. Results saved to {results_path}")
         return aggregate_stats
-    
+
     def _compute_aggregate_statistics(self, results: List[Dict]) -> Dict[str, Any]:
         """Compute aggregate statistics from evaluation results.
 
@@ -802,56 +849,70 @@ class SmartContractTrainingPipeline:
         """
         if not results:
             return {}
-        
+
         # Extract metric values
         metrics_data = {}
         for result in results:
-            for key, value in result['metrics'].items():
-                if key not in ['metadata']:
+            for key, value in result["metrics"].items():
+                if key not in ["metadata"]:
                     if key not in metrics_data:
                         metrics_data[key] = []
-                    
+
                     if isinstance(value, bool):
                         metrics_data[key].append(float(value))
                     elif isinstance(value, (int, float)):
                         metrics_data[key].append(float(value))
-        
+
         # Compute statistics
         stats = {}
         for metric, values in metrics_data.items():
             if values:
                 stats[metric] = {
-                    'mean': np.mean(values),
-                    'std': np.std(values),
-                    'median': np.median(values),
-                    'min': np.min(values),
-                    'max': np.max(values),
-                    'count': len(values)
+                    "mean": np.mean(values),
+                    "std": np.std(values),
+                    "median": np.median(values),
+                    "min": np.min(values),
+                    "max": np.max(values),
+                    "count": len(values),
                 }
-                
+
                 # Add percentiles for key metrics
-                if metric in ['semantic_similarity', 'normalized_edit_distance']:
-                    stats[metric]['percentiles'] = {
-                        '25th': np.percentile(values, 25),
-                        '75th': np.percentile(values, 75),
-                        '90th': np.percentile(values, 90),
-                        '95th': np.percentile(values, 95)
+                if metric in ["semantic_similarity", "normalized_edit_distance"]:
+                    stats[metric]["percentiles"] = {
+                        "25th": np.percentile(values, 25),
+                        "75th": np.percentile(values, 75),
+                        "90th": np.percentile(values, 90),
+                        "95th": np.percentile(values, 95),
                     }
-        
+
         # Add paper-specific metrics
-        if 'semantic_similarity' in metrics_data:
-            semantic_values = metrics_data['semantic_similarity']
-            stats['paper_metrics'] = {
-                'functions_above_0_8_semantic_similarity': sum(1 for v in semantic_values if v > 0.8) / len(semantic_values),
-                'functions_above_0_9_semantic_similarity': sum(1 for v in semantic_values if v > 0.9) / len(semantic_values),
+        if "semantic_similarity" in metrics_data:
+            semantic_values = metrics_data["semantic_similarity"]
+            stats["paper_metrics"] = {
+                "functions_above_0_8_semantic_similarity": sum(
+                    1 for v in semantic_values if v > 0.8
+                )
+                / len(semantic_values),
+                "functions_above_0_9_semantic_similarity": sum(
+                    1 for v in semantic_values if v > 0.9
+                )
+                / len(semantic_values),
             }
-        
-        if 'normalized_edit_distance' in metrics_data:
-            edit_values = metrics_data['normalized_edit_distance']
-            stats['paper_metrics']['functions_below_0_4_edit_distance'] = sum(1 for v in edit_values if v < 0.4) / len(edit_values)
-        
+
+        if "normalized_edit_distance" in metrics_data:
+            edit_values = metrics_data["normalized_edit_distance"]
+            stats["paper_metrics"]["functions_below_0_4_edit_distance"] = sum(
+                1 for v in edit_values if v < 0.4
+            ) / len(edit_values)
+
+        replication_stats = aggregate_replication_scores(
+            result.get("metrics", {}) for result in results
+        )
+        if replication_stats:
+            stats["replication_metrics"] = replication_stats
+
         return stats
-    
+
     def run_complete_pipeline(self) -> Dict[str, Any]:
         """Run the complete training and evaluation pipeline.
 
@@ -863,22 +924,27 @@ class SmartContractTrainingPipeline:
             statistics for all metrics.
         """
         logger.info("Starting complete smart contract decompilation pipeline...")
-        
+
         # Step 1: Collect and prepare dataset
         train_path, val_path, test_path = self.collect_and_prepare_dataset()
-        
+
         # Step 2: Train model
         model_path = self.train_model(train_path, val_path)
-        
+
         # Step 3: Evaluate model
         evaluation_results = self.evaluate_model(model_path, test_path)
-        
+
         logger.info("Pipeline completed successfully!")
         logger.info(f"Key results:")
-        logger.info(f"- Semantic similarity: {evaluation_results.get('semantic_similarity', {}).get('mean', 'N/A'):.3f}")
-        logger.info(f"- Edit distance: {evaluation_results.get('normalized_edit_distance', {}).get('mean', 'N/A'):.3f}")
-        
+        logger.info(
+            f"- Semantic similarity: {evaluation_results.get('semantic_similarity', {}).get('mean', 'N/A'):.3f}"
+        )
+        logger.info(
+            f"- Edit distance: {evaluation_results.get('normalized_edit_distance', {}).get('mean', 'N/A'):.3f}"
+        )
+
         return evaluation_results
+
 
 def main():
     """Run an example demonstration of the complete training pipeline.
@@ -889,31 +955,31 @@ def main():
     """
     # Setup logging
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    
+
     # Check for API key
-    api_key = os.getenv('ETHERSCAN_API_KEY')
+    api_key = os.getenv("ETHERSCAN_API_KEY")
     if not api_key:
         print("Please set ETHERSCAN_API_KEY environment variable")
         return
-    
+
     # Create configuration
     config = TrainingConfig(
         etherscan_api_key=api_key,
         target_dataset_size=1000,  # Smaller for demo
         evaluation_sample_size=100,  # Smaller for demo
         num_epochs=1,  # Quick training for demo
-        batch_size=2   # Smaller batch for demo
+        batch_size=2,  # Smaller batch for demo
     )
-    
+
     # Run pipeline
     pipeline = SmartContractTrainingPipeline(config)
     results = pipeline.run_complete_pipeline()
-    
+
     print("\nFinal Results:")
     print(json.dumps(results, indent=2))
+
 
 if __name__ == "__main__":
     main()
