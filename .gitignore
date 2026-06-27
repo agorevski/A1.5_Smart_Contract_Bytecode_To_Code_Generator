@@ -29,8 +29,9 @@ checkpoints/
 wandb/
 
 # Data (large files — regenerate with download_hf_contracts.py)
-data/*.db
+data/*.db*
 data/*.jsonl
+scripts/data/*.db*
 
 # Keep demo dataset for reference
 !demo_dataset.jsonl

@@ -570,7 +570,10 @@ class TestFilterAndCleanDataset:
         )
         long_enough = FunctionPair(
             function_name="l", tac_representation="t" * 100,
-            solidity_code="x" * 100,
+            solidity_code=(
+                "function l() public returns (uint256) { "
+                "uint256 x = 1; uint256 y = x + 1; return y; }"
+            ),
             function_signature="function l()", visibility="public",
             is_payable=False, is_view=False, contract_address="0x2",
         )

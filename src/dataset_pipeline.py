@@ -12,7 +12,7 @@ import os
 import hashlib
 import logging
 import traceback
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
@@ -37,6 +37,29 @@ from .local_compiler import (
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_function_signature_parts(signature: str) -> Optional[Tuple[str, str]]:
+    """Return (function_name, params_text) from a Solidity function signature."""
+    match = re.search(r"\bfunction\s+(\w+)\s*\(", signature)
+    if not match:
+        return None
+
+    open_pos = signature.find("(", match.start())
+    if open_pos == -1:
+        return None
+
+    depth = 1
+    for pos in range(open_pos + 1, len(signature)):
+        ch = signature[pos]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return match.group(1), signature[open_pos + 1 : pos].strip()
+
+    return None
 
 
 @dataclass
@@ -470,10 +493,7 @@ class SolidityParser:
         is_payable = "payable" in full_function
         is_view = "view" in full_function or "pure" in full_function
 
-        signature_match = re.search(r"function\s+\w+\s*\([^)]*\)", full_function)
-        signature = (
-            signature_match.group(0) if signature_match else f"function {name}()"
-        )
+        signature = self._extract_function_signature(full_function, name)
 
         functions.append(
             {
@@ -487,6 +507,29 @@ class SolidityParser:
         )
 
         logger.debug(f"Extracted function {name} ({visibility})")
+
+    @staticmethod
+    def _extract_function_signature(full_function: str, name: str) -> str:
+        """Extract ``function name(...)`` while preserving tuple parameters."""
+        match = re.search(r"\bfunction\s+\w+\s*\(", full_function)
+        if not match:
+            return f"function {name}()"
+
+        open_pos = full_function.find("(", match.start())
+        if open_pos == -1:
+            return f"function {name}()"
+
+        depth = 1
+        for pos in range(open_pos + 1, len(full_function)):
+            ch = full_function[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return full_function[match.start() : pos + 1]
+
+        return f"function {name}()"
 
     def _extract_visibility(self, function_code: str) -> str:
         """Extract function visibility from the function signature.
@@ -536,6 +579,7 @@ class DatasetBuilder:
         self.parser = SolidityParser()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.logger = logging.getLogger(__name__)
 
         self.db_path = self.output_dir / "contracts.db"
         self._init_database()
@@ -901,15 +945,23 @@ class DatasetBuilder:
                     logger.error(f"Failed to build training pair: {e}")
                     continue
 
+            # Issue 10: Do NOT create whole-contract fallback pairs.
+            # They produce inconsistent output format (entire contract vs
+            # single function) and confuse the model during training.
+
+            # Issue 4: Generate partial decompilation examples for bytecode
+            # functions that have no Solidity match.  This teaches the model
+            # to express uncertainty rather than hallucinate.
+            partial = self._generate_partial_pairs(
+                address, bytecode_functions, matched_pairs, analyzer,
+            )
+            pairs.extend(partial)
+
             if not pairs and solidity_functions:
-                logger.info(
-                    f"No matched functions, creating whole-contract pair for {address}"
+                self.logger.info(
+                    f"No matched functions for {address} — skipping "
+                    f"(fallback pairs disabled per Issue 10)"
                 )
-                fallback_pair = self._create_fallback_pair(
-                    address, source_code, analyzer
-                )
-                if fallback_pair:
-                    pairs.append(fallback_pair)
 
         except Exception as e:
             logger.error(f"Failed to create function pairs for {address}: {e}")
@@ -918,13 +970,167 @@ class DatasetBuilder:
         return pairs
 
     # ------------------------------------------------------------------ #
+    #  Issue 4 — Partial Decompilation Examples
+    # ------------------------------------------------------------------ #
+
+    def _generate_partial_pairs(
+        self,
+        address: str,
+        bytecode_functions: Dict,
+        matched_pairs: List[Dict],
+        analyzer: "BytecodeAnalyzer",
+    ) -> List[FunctionPair]:
+        """Generate partial decompilation training pairs for unmatched bytecode
+        functions.
+
+        For each bytecode-level function that was *not* matched to a Solidity
+        function, we still emit its TAC and pair it with a partial Solidity
+        template containing uncertainty markers.  This teaches the model to
+        express uncertainty rather than hallucinate complete code.
+
+        Args:
+            address: Contract address.
+            bytecode_functions: All functions identified by the analyzer.
+            matched_pairs: Already-matched pairs (used to determine which
+                selectors are already covered).
+            analyzer: BytecodeAnalyzer instance.
+
+        Returns:
+            List of ``FunctionPair`` objects with partial decompilation output.
+        """
+        matched_selectors = {m["selector"] for m in matched_pairs}
+        pairs: List[FunctionPair] = []
+
+        for fname, func in bytecode_functions.items():
+            if func.selector and func.selector in matched_selectors:
+                continue
+            # Skip the generic "fallback" catch-all
+            if fname == "fallback":
+                continue
+
+            tac = self._extract_tac_for_function(func, analyzer)
+            if not tac or len(tac.strip()) < 20:
+                continue
+
+            # Gather structural hints from the TAC / blocks
+            blocks = self._collect_function_blocks(
+                func.entry_block, analyzer.basic_blocks,
+            )
+            n_blocks = len(blocks)
+            has_storage = any(
+                "storage" in ((getattr(instr, "metadata", None) or {}).get("memory_type", ""))
+                for b in blocks
+                for instr in b.instructions
+            )
+            has_call = any(
+                getattr(instr, "operation", None)
+                and instr.operation.value == "call"
+                for b in blocks
+                for instr in b.instructions
+            )
+
+            sel_label = func.selector or "unknown"
+            hints: List[str] = []
+            hints.append(f"// Partial decompilation — selector: {sel_label}")
+            hints.append(f"// Control flow: {n_blocks} block(s)")
+            if has_storage:
+                hints.append("// Contains storage read/write operations")
+            if has_call:
+                hints.append("// Contains external call(s)")
+
+            solidity_partial = "\n".join([
+                *hints,
+                f"function unknown_{sel_label.replace('0x', '')}(/* params unknown */) public {{",
+                "    // TODO: Full logic not reconstructed",
+                "}",
+            ])
+
+            pairs.append(FunctionPair(
+                function_name=fname,
+                tac_representation=tac,
+                solidity_code=solidity_partial,
+                function_signature=f"function unknown_{sel_label.replace('0x', '')}()",
+                visibility="public",
+                is_payable=False,
+                is_view=False,
+                contract_address=address,
+                metadata={
+                    "partial": True,
+                    "selector": func.selector,
+                    "block_count": n_blocks,
+                },
+            ))
+
+        return pairs
+
+    # ------------------------------------------------------------------ #
     #  Selector helpers
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _parse_solidity_param_types(params_str: str) -> List[str]:
+        """Parse Solidity parameter types with balanced-parenthesis awareness.
+
+        Correctly handles tuple types like ``(uint256,address)[]``,
+        nested tuples ``(uint256,(address,bool))``, and fixed-size arrays
+        ``uint256[3]``.  Only splits on commas at depth 0.
+        """
+        if not params_str or not params_str.strip():
+            return []
+
+        params: List[str] = []
+        depth = 0
+        current: List[str] = []
+        for ch in params_str:
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+            elif ch == ')':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                params.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            params.append(''.join(current).strip())
+
+        types: List[str] = []
+        for param in params:
+            param = param.strip()
+            if not param:
+                continue
+            if param.startswith('('):
+                d = 0
+                end = 0
+                for i, c in enumerate(param):
+                    if c == '(':
+                        d += 1
+                    elif c == ')':
+                        d -= 1
+                        if d == 0:
+                            end = i + 1
+                            break
+                while end < len(param) and param[end] in '[]0123456789':
+                    end += 1
+                types.append(param[:end])
+            else:
+                parts = param.split()
+                type_token = parts[0]
+                if len(parts) > 1 and parts[1].startswith('['):
+                    type_token += parts[1]
+                types.append(type_token)
+
+        return types
 
     def _add_selectors_to_solidity_functions(
         self, functions: List[Dict]
     ) -> List[Dict]:
         """Calculate function selectors for Solidity functions.
+
+        Uses balanced-parenthesis-aware parameter parsing (Issue 9) to
+        correctly handle tuple types and nested tuples.
 
         Mutates each dict in *functions* by adding a ``'selector'`` key.
 
@@ -937,19 +1143,12 @@ class DatasetBuilder:
         for func in functions:
             try:
                 signature = func["signature"]
-                match = re.match(r"function\s+(\w+)\s*\(([^)]*)\)", signature)
-                if match:
-                    func_name = match.group(1)
-                    params_str = match.group(2).strip()
+                parsed = _extract_function_signature_parts(signature)
+                if parsed:
+                    func_name, params_str = parsed
 
                     if params_str:
-                        param_types = []
-                        for param in params_str.split(","):
-                            param = param.strip()
-                            if param:
-                                parts = param.split()
-                                param_type = parts[0]
-                                param_types.append(param_type)
+                        param_types = self._parse_solidity_param_types(params_str)
                         canonical = f"{func_name}({','.join(param_types)})"
                     else:
                         canonical = f"{func_name}()"
@@ -987,6 +1186,7 @@ class DatasetBuilder:
             List of matched function dicts.
         """
         matches: List[Dict] = []
+        self._ensure_analyzer_tac_integrated(analyzer)
 
         solidity_by_selector = {
             f["selector"]: f for f in solidity_functions if f.get("selector")
@@ -1021,6 +1221,23 @@ class DatasetBuilder:
     #  TAC extraction
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _ensure_analyzer_tac_integrated(analyzer: BytecodeAnalyzer) -> None:
+        """Populate block.instructions once after control-flow analysis."""
+        blocks = getattr(analyzer, "basic_blocks", {}) or {}
+        if not blocks:
+            return
+        if any(getattr(block, "instructions", None) for block in blocks.values()):
+            return
+        if not any(
+            (getattr(block, "metadata", {}) or {}).get("raw_instructions")
+            for block in blocks.values()
+        ):
+            return
+        converter = getattr(analyzer, "_convert_and_integrate_tac", None)
+        if callable(converter):
+            converter()
+
     def _extract_tac_for_function(
         self, bytecode_function, analyzer: BytecodeAnalyzer
     ) -> str:
@@ -1036,6 +1253,7 @@ class DatasetBuilder:
         tac_lines: List[str] = []
 
         try:
+            self._ensure_analyzer_tac_integrated(analyzer)
             func_name = bytecode_function.name
             tac_lines.append(f"function {func_name}:")
 
@@ -1083,19 +1301,32 @@ class DatasetBuilder:
         return "\n".join(tac_lines)
 
     def _collect_function_blocks(
-        self, entry_block_id: str, all_blocks: Dict
+        self,
+        entry_block_id: str,
+        all_blocks: Dict,
+        emitted_blocks: Optional[set] = None,
     ) -> List:
         """Collect all basic blocks belonging to a function via graph traversal.
+
+        **Issue 7 — Shared Block Deduplication**: If *emitted_blocks* is
+        provided, blocks that have already been emitted for another function
+        are returned with their ``instructions`` replaced by a single
+        reference comment, preventing TAC bloat and context-window waste.
 
         Args:
             entry_block_id: Entry block ID for the function.
             all_blocks: Dictionary of all basic blocks.
+            emitted_blocks: Optional set of block IDs already emitted.
+                Mutated in-place to track newly emitted blocks.
 
         Returns:
             List of BasicBlock objects in the function.
         """
         if entry_block_id not in all_blocks:
             return []
+
+        if emitted_blocks is None:
+            emitted_blocks = set()
 
         visited: set = set()
         blocks: list = []
@@ -1105,7 +1336,30 @@ class DatasetBuilder:
                 return
             visited.add(block_id)
             block = all_blocks[block_id]
-            blocks.append(block)
+
+            if block_id in emitted_blocks:
+                # Issue 7: emit a lightweight reference instead of the full block
+                from .bytecode_analyzer import BasicBlock as BB, TACInstruction, TACOperationType
+                ref_block = BB(
+                    id=block.id,
+                    instructions=[
+                        TACInstruction(
+                            operation=TACOperationType.NOP,
+                            metadata={"shared_ref": True,
+                                      "comment": f"(see shared block {block_id})"},
+                        )
+                    ],
+                    predecessors=block.predecessors,
+                    successors=block.successors,
+                    start_address=block.start_address,
+                    end_address=block.end_address,
+                    metadata={**block.metadata, "is_shared_ref": True},
+                )
+                blocks.append(ref_block)
+            else:
+                emitted_blocks.add(block_id)
+                blocks.append(block)
+
             for successor in block.successors:
                 traverse(successor)
 
@@ -1240,9 +1494,17 @@ class DatasetBuilder:
     ) -> int:
         """Filter and clean the dataset according to paper specifications.
 
+        Applies multiple quality filters to ensure high-quality training examples:
+
+        - Minimum and maximum length constraints for both TAC and Solidity
+        - Duplicate detection using function signature and content
+        - Code complexity analysis to prioritize interesting functions
+        - Control flow structure analysis for validity
+        - Removal of low-value code patterns
+
         Args:
-            min_length: Minimum Solidity function length (chars).
-            max_length: Maximum TAC representation length (chars, 20 000 as per paper).
+            min_length: Minimum Solidity function length in characters.
+            max_length: Maximum TAC representation length in characters.
 
         Returns:
             Number of function pairs after filtering.
@@ -1250,22 +1512,50 @@ class DatasetBuilder:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
+        # Step 1: Remove extremely short functions
         cursor.execute(
             """
             DELETE FROM function_pairs
-            WHERE LENGTH(solidity_code) < ? OR LENGTH(tac_representation) > ?
+            WHERE LENGTH(solidity_code) < ?
         """,
-            (min_length, max_length),
+            (min_length,),
         )
 
+        # Step 2: Apply max TAC length filter
+        cursor.execute(
+            """
+            DELETE FROM function_pairs
+            WHERE LENGTH(tac_representation) > ?
+        """,
+            (max_length,),
+        )
+
+        # Step 3: Remove duplicates based on signature and substantial content
         cursor.execute(
             """
             DELETE FROM function_pairs
             WHERE id NOT IN (
                 SELECT MIN(id)
                 FROM function_pairs
-                GROUP BY function_signature, SUBSTR(solidity_code, 1, 100)
+                GROUP BY function_signature, SUBSTR(solidity_code, 1, 300)
             )
+        """
+        )
+
+        # Step 4: Additional filtering based on content quality
+        cursor.execute(
+            """
+            DELETE FROM function_pairs
+            WHERE function_name LIKE '%test%' OR function_name LIKE '%Test%'
+        """
+        )
+
+        # Step 5: Filter out functions with overly simple patterns that may not contribute much to learning
+        cursor.execute(
+            """
+            DELETE FROM function_pairs
+            WHERE (LENGTH(solidity_code) - LENGTH(REPLACE(solidity_code, 'return', ''))) < 2
+            AND (LENGTH(solidity_code) - LENGTH(REPLACE(solidity_code, ';', ''))) < 5
         """
         )
 

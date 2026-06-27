@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
+from .abi_enrichment import PANIC_CODES, ERROR_SELECTORS
+
 # ---------------------------------------------------------------------------
 # Enums & Data Classes
 # ---------------------------------------------------------------------------
@@ -174,12 +176,14 @@ class BytecodeAnalyzer:
     identification, and TAC generation.
     """
 
-    def __init__(self, bytecode: str) -> None:
+    def __init__(self, bytecode: str, abi_enricher: Any = None) -> None:
         self.bytecode: str = bytecode
         self.instructions: List = []
         self.basic_blocks: Dict[str, BasicBlock] = {}
         self.functions: Dict[str, Function] = {}
         self.variable_counter: int = 0
+        self.logger = logging.getLogger(__name__)
+        self.abi_enricher = abi_enricher  # Optional ABIEnricher for custom error decoding
 
         # Pre-built lookup: PC → instruction index (populated after parsing)
         self._pc_to_index: Dict[int, int] = {}
@@ -231,8 +235,14 @@ class BytecodeAnalyzer:
     def _get_pc(instr: Any, fallback: int) -> int:
         """Return the program counter of *instr*."""
         if isinstance(instr, dict):
-            return instr.get("pc", fallback)
-        return getattr(instr, "pc", fallback)
+            return instr.get("pc", instr.get("address", fallback))
+        pc = getattr(instr, "pc", None)
+        if pc is not None:
+            return pc
+        addr = getattr(instr, "address", None)
+        if addr is not None:
+            return addr
+        return fallback
 
     @staticmethod
     def _get_operand(instr: Any) -> Optional[Any]:
@@ -685,6 +695,24 @@ class BytecodeAnalyzer:
 
         logger.info("Identified %d functions from dispatcher", len(functions))
 
+        # Issue #6: Detect receive(), fallback(), and internal functions
+        dispatcher_targets = {f.entry_block for f in functions.values()}
+        receive = self._detect_receive_function(dispatcher_targets)
+        if receive:
+            functions["receive"] = receive
+            self.logger.info("Detected receive() function at %s", receive.entry_block)
+
+        fallback_func = self._detect_fallback_function(dispatcher_targets)
+        if fallback_func:
+            functions["fallback_function"] = fallback_func
+            self.logger.info("Detected fallback() function at %s", fallback_func.entry_block)
+
+        internal = self._detect_internal_functions(functions)
+        for iname, ifunc in internal.items():
+            functions[iname] = ifunc
+        if internal:
+            self.logger.info("Detected %d internal function(s)", len(internal))
+
         if not functions and self.basic_blocks:
             entry = next(iter(self.basic_blocks))
             functions["fallback"] = Function(
@@ -695,6 +723,151 @@ class BytecodeAnalyzer:
 
         self.functions = functions
         return functions
+
+    # ------------------------------------------------------------------ #
+    #  Special Function Detection (Issue #6)
+    # ------------------------------------------------------------------ #
+
+    def _detect_receive_function(self, dispatcher_targets: set) -> Optional[Function]:
+        """Detect receive() function: ``CALLDATASIZE ISZERO ... JUMPI`` pattern.
+
+        The receive function is called for plain ETH transfers with no calldata.
+        In the dispatcher, this shows up as a check for CALLDATASIZE == 0
+        followed by a jump to the receive handler.
+        """
+        for i, instr in enumerate(self.instructions):
+            if self._get_instruction_name(instr) != "CALLDATASIZE":
+                continue
+            # Look for ISZERO ... JUMPI within the next few instructions
+            for j in range(i + 1, min(i + 5, len(self.instructions))):
+                if self._get_instruction_name(self.instructions[j]) == "ISZERO":
+                    # Look for a subsequent PUSH + JUMPI
+                    target = None
+                    for k in range(j + 1, min(j + 5, len(self.instructions))):
+                        kname = self._get_instruction_name(self.instructions[k])
+                        if kname.startswith("PUSH"):
+                            target = self._parse_operand_as_int(
+                                self._get_operand(self.instructions[k])
+                            )
+                        elif kname == "JUMPI" and target is not None:
+                            entry = self._block_at_address(target) or f"block_{target:04x}"
+                            if entry not in dispatcher_targets:
+                                return Function(
+                                    name="receive",
+                                    selector=None,
+                                    basic_blocks=[],
+                                    entry_block=entry,
+                                    visibility="external",
+                                    is_payable=True,
+                                )
+                            break
+                    break
+        return None
+
+    def _detect_fallback_function(self, dispatcher_targets: set) -> Optional[Function]:
+        """Detect fallback() function: the default path after all selector comparisons fail.
+
+        After the last PUSH4/EQ/JUMPI dispatcher sequence, the fall-through
+        path is the fallback function. We find the last dispatcher entry and
+        take the fall-through block after its JUMPI.
+        """
+        last_jumpi_pc = None
+        # Find the last PUSH4 ... EQ ... JUMPI in the dispatcher area
+        for i, instr in enumerate(self.instructions):
+            if self._get_instruction_name(instr) != "PUSH4":
+                continue
+            # Check this is a dispatcher pattern
+            target = self._find_dispatch_target(i)
+            if target is not None:
+                # Find the JUMPI in this pattern
+                for j in range(i + 1, min(i + 10, len(self.instructions))):
+                    if self._get_instruction_name(self.instructions[j]) == "JUMPI":
+                        last_jumpi_pc = self._get_pc(self.instructions[j], j)
+                        break
+
+        if last_jumpi_pc is None:
+            return None
+
+        # The fall-through from the last dispatcher JUMPI is the fallback
+        ft = self._get_next_instruction_pc(last_jumpi_pc)
+        if ft is None:
+            return None
+
+        entry = self._block_at_address(ft) or f"block_{ft:04x}"
+        if entry in dispatcher_targets or entry not in self.basic_blocks:
+            return None
+
+        return Function(
+            name="fallback_function",
+            selector=None,
+            basic_blocks=[],
+            entry_block=entry,
+            visibility="external",
+        )
+
+    def _detect_internal_functions(self, known_functions: Dict[str, Function]) -> Dict[str, Function]:
+        """Detect internal functions: JUMPDEST targets called via JUMP from
+        within identified functions but not themselves dispatcher targets.
+
+        Internal functions are blocks that:
+        1. Are JUMP targets (not JUMPI conditional destinations)
+        2. Are NOT entry blocks of already-identified functions
+        3. Are reached from within identified function blocks
+        """
+        known_entries = {f.entry_block for f in known_functions.values()}
+
+        # Collect all blocks reachable from known functions
+        known_block_ids: set = set()
+        for func in known_functions.values():
+            visited: set = set()
+            def _walk(bid: str) -> None:
+                if bid in visited or bid not in self.basic_blocks:
+                    return
+                visited.add(bid)
+                for s in self.basic_blocks[bid].successors:
+                    _walk(s)
+            _walk(func.entry_block)
+            known_block_ids.update(visited)
+
+        internal: Dict[str, Function] = {}
+
+        # Look for JUMP targets within known function blocks that point to
+        # blocks outside the known entry set
+        for bid in list(known_block_ids):
+            block = self.basic_blocks.get(bid)
+            if not block:
+                continue
+            raw = block.metadata.get("raw_instructions", [])
+            if not raw:
+                continue
+            last = raw[-1]
+            last_name = self._get_instruction_name(last)
+            # Only unconditional JUMPs suggest internal function calls
+            if last_name != "JUMP":
+                continue
+
+            for target_bid in block.successors:
+                if target_bid in known_entries:
+                    continue
+                if target_bid in internal:
+                    continue
+                if target_bid not in self.basic_blocks:
+                    continue
+                # This looks like an internal function call
+                target_block = self.basic_blocks[target_bid]
+                # Check it has raw instructions starting with JUMPDEST
+                target_raw = target_block.metadata.get("raw_instructions", [])
+                if target_raw and self._get_instruction_name(target_raw[0]) == "JUMPDEST":
+                    fname = f"internal_{target_bid}"
+                    internal[fname] = Function(
+                        name=fname,
+                        selector=None,
+                        basic_blocks=[],
+                        entry_block=target_bid,
+                        visibility="internal",
+                    )
+
+        return internal
 
     # -- helpers --
 
@@ -943,9 +1116,13 @@ class BytecodeAnalyzer:
         # -- REVERT --
         if name == "REVERT":
             off, sz = _stack_pop(stack), _stack_pop(stack)
+            decoded = self._decode_revert_data(instr, stack)
+            meta: Dict[str, Any] = {"original_op": name}
+            if decoded:
+                meta["revert_decoded"] = decoded
             return TACInstruction(
                 TACOperationType.REVERT, operand1=off, operand2=sz,
-                metadata={"original_op": name},
+                metadata=meta,
             )
 
         # -- STOP --
@@ -1042,6 +1219,87 @@ class BytecodeAnalyzer:
 
         # -- Generic fallback --
         return self._tac_fallback(name, instr, stack)
+
+    # ------------------------------------------------------------------ #
+    #  Revert Data Decoder (Issue #3)
+    # ------------------------------------------------------------------ #
+
+    def _decode_revert_data(self, revert_instr: Any, stack: List[str]) -> Optional[Dict[str, str]]:
+        """Attempt to decode revert error data from preceding MSTORE instructions.
+
+        Looks backward from the REVERT instruction to find a selector written
+        via MSTORE, then matches it against well-known error selectors and
+        custom errors from the ABI enricher.
+
+        Returns:
+            A dict with keys ``type`` and ``message`` if decoded, else ``None``.
+        """
+        revert_pc = self._get_pc(revert_instr, -1)
+        revert_idx = self._pc_to_index.get(revert_pc)
+        if revert_idx is None:
+            return None
+
+        # Scan backward up to 20 instructions looking for a PUSH4/PUSH32 that
+        # contains a known error selector
+        for i in range(revert_idx - 1, max(0, revert_idx - 20) - 1, -1):
+            instr = self.instructions[i]
+            name = self._get_instruction_name(instr)
+            if not name.startswith("PUSH"):
+                continue
+            operand = self._get_operand(instr)
+            if operand is None:
+                continue
+            # Normalize operand to lowercase hex (no 0x prefix).
+            # evmdasm may return int, hex-string, or bare hex.
+            if isinstance(operand, int):
+                operand_str = format(operand, "x")
+            else:
+                operand_str = str(operand).lower().replace("0x", "")
+
+            # Check for Error(string) selector: 08c379a0
+            if "08c379a0" in operand_str:
+                return {"type": "Error(string)", "message": "Error(string)"}
+
+            # Check for Panic(uint256) selector: 4e487b71
+            if "4e487b71" in operand_str:
+                # Try to find the panic code from a nearby PUSH
+                panic_code = self._find_panic_code(i, revert_idx)
+                if panic_code is not None and panic_code in PANIC_CODES:
+                    desc = PANIC_CODES[panic_code]
+                    return {
+                        "type": "Panic",
+                        "code": hex(panic_code),
+                        "message": f"Panic({hex(panic_code)})  // {desc}",
+                    }
+                return {"type": "Panic", "message": "Panic(uint256)"}
+
+            # Check for custom error selectors (4 bytes = 8 hex chars)
+            if len(operand_str) == 8 and self.abi_enricher is not None:
+                error_info = self.abi_enricher.get_error("0x" + operand_str)
+                if error_info is not None:
+                    params = ", ".join(
+                        f"{t} {n}"
+                        for t, n in zip(error_info.input_types, error_info.input_names)
+                    )
+                    return {
+                        "type": "CustomError",
+                        "name": error_info.name,
+                        "message": f"{error_info.name}({params})",
+                    }
+
+        return None
+
+    def _find_panic_code(self, selector_idx: int, revert_idx: int) -> Optional[int]:
+        """Search between *selector_idx* and *revert_idx* for a small PUSH value
+        that represents the panic code."""
+        for i in range(selector_idx + 1, revert_idx):
+            instr = self.instructions[i]
+            name = self._get_instruction_name(instr)
+            if name.startswith("PUSH"):
+                val = self._parse_operand_as_int(self._get_operand(instr))
+                if val is not None and val <= 0xFF:
+                    return val
+        return None
 
     # -- small helpers used by the converter --
 
@@ -1174,6 +1432,9 @@ class BytecodeAnalyzer:
         Returns:
             A human-readable TAC string for *func*.
         """
+        if self.basic_blocks and not any(b.instructions for b in self.basic_blocks.values()):
+            self._convert_and_integrate_tac()
+
         # Collect blocks reachable from the entry block
         reachable_ids: set = set()
 
@@ -1421,6 +1682,9 @@ class BytecodeAnalyzer:
             return f"return memory[{instr.operand1}:{instr.operand2}]"
 
         if op == TACOperationType.REVERT:
+            decoded = meta.get("revert_decoded")
+            if decoded:
+                return f"revert {decoded['message']}"
             return f"revert memory[{instr.operand1}:{instr.operand2}]"
 
         if op == TACOperationType.HALT:
@@ -1432,6 +1696,8 @@ class BytecodeAnalyzer:
             return f"log{tc}(memory[{instr.operand1}:{instr.operand2}])"
 
         if op == TACOperationType.NOP:
+            if meta.get("shared_ref") and meta.get("comment"):
+                return f"// {meta['comment']}"
             return "// nop"
 
         return f"// {op.value}: {meta}"

@@ -88,6 +88,8 @@
   var functionStartTime = 0;
   var gpuPollTimer = null;
   var currentSelectorMap = null; // Stored from last decompilation
+  var totalFunctionCount = 0;
+  var completedFunctionCount = 0;
 
   // ---- Helpers ----
 
@@ -116,6 +118,8 @@
     hide(progressLog);
     progressLogList.innerHTML = "";
     functionStartTime = 0;
+    totalFunctionCount = 0;
+    completedFunctionCount = 0;
   }
 
   function setLoading(on) {
@@ -162,6 +166,26 @@
     }
   }
 
+  function renderFunctionCount() {
+    progressFuncCount.innerHTML =
+      '<span class="func-count-highlight">' +
+      completedFunctionCount +
+      "</span> / " +
+      totalFunctionCount +
+      " decompiled";
+  }
+
+  function markFunctionProcessed() {
+    completedFunctionCount += 1;
+    if (totalFunctionCount > 0) {
+      completedFunctionCount = Math.min(
+        completedFunctionCount,
+        totalFunctionCount
+      );
+    }
+    renderFunctionCount();
+  }
+
   function updateCharCount() {
     const len = inputEl.value.trim().length;
     charCountEl.textContent = len.toLocaleString() + " characters";
@@ -180,7 +204,7 @@
 
   // ---- Progress log helpers ----
 
-  function addLogEntry(fname, status, elapsed) {
+  function addLogEntry(fname, status, elapsed, source, confidence) {
     show(progressLog);
 
     // Check if entry already exists (update it)
@@ -188,15 +212,52 @@
     if (existing) {
       existing.className = status;
       var icon = existing.querySelector(".log-icon");
-      if (status === "completed") {
+      if (status === "in-progress") {
+        icon.textContent = "⟳";
+      } else if (status === "completed") {
         icon.textContent = "✓";
       } else if (status === "error") {
         icon.textContent = "✗";
+      } else if (status === "exact_match") {
+        icon.textContent = "⚡";
+      } else if (status === "pending") {
+        icon.textContent = "○";
       }
       if (elapsed !== undefined) {
         var timeEl = existing.querySelector(".log-time");
         if (timeEl) timeEl.textContent = formatElapsed(elapsed);
       }
+      // Update source badge if provided
+      if (source) {
+        var badgeEl = existing.querySelector(".log-source");
+        if (!badgeEl) {
+          badgeEl = document.createElement("span");
+          badgeEl.className = "log-source";
+          existing.insertBefore(badgeEl, existing.querySelector(".log-time") || null);
+        }
+        badgeEl.className = "log-source " + getSourceClass(source);
+        badgeEl.textContent = getSourceLabel(source);
+        badgeEl.title = getSourceTooltip(source);
+      }
+      // Update confidence badge if provided
+      if (confidence != null) {
+        var confEl = existing.querySelector(".log-confidence");
+        if (!confEl) {
+          confEl = document.createElement("span");
+          confEl.className = "log-confidence";
+          var srcEl = existing.querySelector(".log-source");
+          if (srcEl && srcEl.nextSibling) {
+            existing.insertBefore(confEl, srcEl.nextSibling);
+          } else {
+            existing.insertBefore(confEl, existing.querySelector(".log-time") || null);
+          }
+        }
+        confEl.className = "log-confidence " + getConfidenceClass(confidence);
+        confEl.textContent = Math.round(confidence) + "%";
+        confEl.title = "Confidence: " + confidence.toFixed(1) + "%";
+      }
+      // Auto-scroll
+      progressLog.scrollTop = progressLog.scrollHeight;
       return;
     }
 
@@ -212,6 +273,10 @@
       iconSpan.textContent = "✓";
     } else if (status === "error") {
       iconSpan.textContent = "✗";
+    } else if (status === "exact_match") {
+      iconSpan.textContent = "⚡";
+    } else if (status === "pending") {
+      iconSpan.textContent = "○";
     }
 
     var nameSpan = document.createElement("span");
@@ -220,6 +285,24 @@
 
     li.appendChild(iconSpan);
     li.appendChild(nameSpan);
+
+    // Source badge
+    if (source) {
+      var sourceBadge = document.createElement("span");
+      sourceBadge.className = "log-source " + getSourceClass(source);
+      sourceBadge.textContent = getSourceLabel(source);
+      sourceBadge.title = getSourceTooltip(source);
+      li.appendChild(sourceBadge);
+    }
+
+    // Confidence badge
+    if (confidence != null) {
+      var confBadge = document.createElement("span");
+      confBadge.className = "log-confidence " + getConfidenceClass(confidence);
+      confBadge.textContent = Math.round(confidence) + "%";
+      confBadge.title = "Confidence: " + confidence.toFixed(1) + "%";
+      li.appendChild(confBadge);
+    }
 
     if (elapsed !== undefined) {
       var timeSpan = document.createElement("span");
@@ -232,6 +315,44 @@
 
     // Auto-scroll to bottom
     progressLog.scrollTop = progressLog.scrollHeight;
+  }
+
+  // ---- Source/confidence formatting helpers ----
+
+  function getSourceClass(source) {
+    switch (source) {
+      case "exact_match": return "source-lookup";
+      case "model_inference": return "source-model";
+      case "pending_inference": return "source-pending";
+      case "error": return "source-error";
+      default: return "source-unknown";
+    }
+  }
+
+  function getSourceLabel(source) {
+    switch (source) {
+      case "exact_match": return "DB";
+      case "model_inference": return "LLM";
+      case "pending_inference": return "queued";
+      case "error": return "err";
+      default: return "?";
+    }
+  }
+
+  function getSourceTooltip(source) {
+    switch (source) {
+      case "exact_match": return "Resolved via TAC hash lookup (exact match from database)";
+      case "model_inference": return "Generated by Llama 3.2 3B model inference";
+      case "pending_inference": return "Awaiting model inference";
+      case "error": return "Decompilation failed";
+      default: return "";
+    }
+  }
+
+  function getConfidenceClass(conf) {
+    if (conf >= 80) return "conf-high";
+    if (conf >= 50) return "conf-med";
+    return "conf-low";
   }
 
   // ---- Tab switching ----
@@ -316,6 +437,15 @@
       "Solidity Generation Time",
       (analysis.solidity_generation_time_s || 0) + "s"
     );
+    if (analysis.lookup_available !== undefined) {
+      html += card(
+        "TAC Lookup",
+        analysis.lookup_available ? "Available" : "Unavailable"
+      );
+    }
+    if (analysis.lookup_hits !== undefined) {
+      html += card("Lookup Hits", analysis.lookup_hits);
+    }
 
     if (analysis.model_config) {
       var mc = analysis.model_config;
@@ -600,39 +730,69 @@
         break;
 
       case "analysis_done":
+        totalFunctionCount = data.num_functions || 0;
+        completedFunctionCount = 0;
         progressStage.textContent =
           "Stage 1 complete — " +
-          (data.num_functions || 0) +
+          totalFunctionCount +
           " function(s) found";
         show(progressFunctions);
-        progressFuncCount.innerHTML =
-          '<span class="func-count-highlight">0</span> / ' +
-          (data.num_functions || 0) +
-          " decompiled";
+        renderFunctionCount();
+        break;
+
+      case "lookup":
+        progressStage.textContent = "Checking TAC hash database…";
+        break;
+
+      case "function_resolved":
+        // Per-function lookup result (exact_match or pending_inference)
+        if (data.source === "exact_match") {
+          addLogEntry(
+            data.current_function, "exact_match", undefined,
+            "exact_match", data.confidence
+          );
+          markFunctionProcessed();
+        } else {
+          addLogEntry(
+            data.current_function, "pending", undefined,
+            "pending_inference", null
+          );
+        }
+        break;
+
+      case "lookup_done":
+        progressStage.textContent = msg;
+        break;
+
+      case "all_lookup":
+        progressStage.textContent = "All functions resolved via database lookup!";
+        completedFunctionCount = totalFunctionCount;
+        renderFunctionCount();
+        break;
+
+      case "inference_start":
+        progressStage.textContent = "Stage 2: Decompiling via LLM…";
         break;
 
       case "decompiling":
         progressStage.textContent = "Stage 2: Decompiling via LLM…";
         show(progressFunctions);
-        progressFuncCount.innerHTML =
-          '<span class="func-count-highlight">' +
-          ((data.current_index || 1) - 1) +
-          "</span> / " +
-          (data.total_functions || 0) +
-          " decompiled";
-        addLogEntry(data.current_function, "in-progress");
+        renderFunctionCount();
+        // Update existing pending entry to in-progress, or create new
+        addLogEntry(data.current_function, "in-progress", undefined,
+          "model_inference", null);
         functionStartTime = Date.now();
         break;
 
       case "function_done":
         var elapsed = functionStartTime ? Date.now() - functionStartTime : 0;
-        addLogEntry(data.current_function, "completed", elapsed);
-        progressFuncCount.innerHTML =
-          '<span class="func-count-highlight">' +
-          (data.current_index || 0) +
-          "</span> / " +
-          (data.total_functions || 0) +
-          " decompiled";
+        var status = data.source === "error" ? "error" : "completed";
+        addLogEntry(
+          data.current_function, status, elapsed,
+          data.source || "model_inference",
+          data.confidence != null ? data.confidence : null
+        );
+        markFunctionProcessed();
         break;
 
       case "assembling":

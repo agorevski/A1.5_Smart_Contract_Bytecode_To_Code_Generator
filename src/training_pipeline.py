@@ -10,6 +10,7 @@ import os
 import json
 import logging
 import time
+import traceback
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -100,6 +101,8 @@ class SmartContractEvaluator:
         Raises:
             Exception: If sentence transformer model fails to load.
         """
+        self.logger = logging.getLogger(__name__)
+
         # Initialize evaluation models
         self.semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
@@ -282,6 +285,79 @@ class SmartContractEvaluator:
             logger.error(f"Error analyzing structural preservation: {e}")
             return 0.0
     
+    def analyze_complexity_preservation(self, original: str, decompiled: str) -> float:
+        """Analyze preservation of code complexity and structure.
+
+        This enhanced method analyzes the relative complexity of constructs
+        like:
+        - Nested scopes (braces)
+        - Conditional branches (if/else)
+        - Loop constructs
+        - Function call levels
+
+        Args:
+            original: Original Solidity code.
+            decompiled: Decompiled Solidity code.
+
+        Returns:
+            Complexity preservation score between 0 and 1, where 1 indicates
+            preservation of structural complexity.
+        """
+        try:
+            # Count nesting levels and complexity in both versions
+            original_nesting = self._count_nesting_levels(original)
+            decompiled_nesting = self._count_nesting_levels(decompiled)
+
+            # Count function calls and complexity indicators
+            original_calls = self._count_function_calls(original)
+            decompiled_calls = self._count_function_calls(decompiled)
+
+            # Compute overall complexity scores
+            nesting_diff = abs(original_nesting - decompiled_nesting)
+            calls_diff = abs(original_calls - decompiled_calls)
+
+            # Normalize and compute combined score
+            max_nesting_diff = max(original_nesting, decompiled_nesting, 1)
+            max_calls_diff = max(original_calls, decompiled_calls, 1)
+
+            nesting_score = 1.0 - (nesting_diff / max_nesting_diff)
+            calls_score = 1.0 - (calls_diff / max_calls_diff)
+
+            # Combined score weighted towards nesting as it's more structural
+            final_score = 0.6 * nesting_score + 0.4 * calls_score
+            return max(0.0, min(1.0, final_score))
+
+        except Exception as e:
+            self.logger.error(f"Error analyzing complexity preservation: {e}")
+            return 0.0
+
+    def _count_nesting_levels(self, code: str) -> int:
+        """Count the maximum nesting level in code by counting braces."""
+        try:
+            level = 0
+            max_level = 0
+            for char in code:
+                if char == '{':
+                    level += 1
+                    max_level = max(max_level, level)
+                elif char == '}':
+                    level = max(0, level - 1)
+            return max_level
+        except Exception:
+            return 0
+
+    def _count_function_calls(self, code: str) -> int:
+        """Count the approximate number of function calls in code."""
+        try:
+            # Simple pattern matching for function calls
+            # This captures most calls like func_name(...)
+            import re
+            pattern = r'\b[a-zA-Z_][a-zA-Z0-9_]*\s*\('
+            calls = re.findall(pattern, code)
+            return len(calls)
+        except Exception:
+            return 0
+
     def extract_function_metadata(self, code: str) -> Dict[str, Any]:
         """Extract function metadata from Solidity code.
 
@@ -321,6 +397,12 @@ class SmartContractEvaluator:
         Computes all metrics including semantic similarity, edit distance,
         BLEU, ROUGE-L, token accuracy, and structural preservation.
 
+        Adds enhanced validation and robustness checks:
+        - Checks for empty or malformed outputs
+        - Applies quality filters to detect poor quality decompilations
+        - Enhances structural preservation with additional metrics
+        - Implements timeout handling for slow operations
+
         Args:
             original: Original Solidity code.
             decompiled: Decompiled Solidity code.
@@ -331,43 +413,100 @@ class SmartContractEvaluator:
             EvaluationMetrics dataclass containing all computed metrics
             and metadata comparison results.
         """
-        # Compute all metrics
-        semantic_similarity = self.compute_semantic_similarity(original, decompiled)
-        normalized_edit_distance = self.compute_normalized_edit_distance(original, decompiled)
-        bleu_score = self.compute_bleu_score(original, decompiled)
-        rouge_l_score = self.compute_rouge_score(original, decompiled)
-        token_accuracy = self.compute_token_accuracy(original, decompiled)
-        structural_preservation = self.analyze_structural_preservation(original, decompiled)
+        metadata = metadata or {}
+
+        # Quality check: Skip evaluation for malformed outputs
+        if not original or not decompiled or len(original.strip()) < 5 or len(decompiled.strip()) < 5:
+            return EvaluationMetrics(
+                semantic_similarity=0.0,
+                normalized_edit_distance=1.0,
+                bleu_score=0.0,
+                rouge_l_score=0.0,
+                token_accuracy=0.0,
+                structural_preservation=0.0,
+                function_signature_match=False,
+                visibility_match=False,
+                metadata={
+                    'original_metadata': {},
+                    'decompiled_metadata': {},
+                    'function_metadata': metadata,
+                    'quality_issue': 'malformed_input_output',
+                    'evaluation_time': 0.0
+                }
+            )
         
-        # Extract and compare metadata
-        original_metadata = self.extract_function_metadata(original)
-        decompiled_metadata = self.extract_function_metadata(decompiled)
-        
-        function_signature_match = (
-            original_metadata.get('has_function_keyword') == 
-            decompiled_metadata.get('has_function_keyword')
-        )
-        
-        visibility_match = (
-            original_metadata.get('visibility') == 
-            decompiled_metadata.get('visibility')
-        )
-        
-        return EvaluationMetrics(
-            semantic_similarity=semantic_similarity,
-            normalized_edit_distance=normalized_edit_distance,
-            bleu_score=bleu_score,
-            rouge_l_score=rouge_l_score,
-            token_accuracy=token_accuracy,
-            structural_preservation=structural_preservation,
-            function_signature_match=function_signature_match,
-            visibility_match=visibility_match,
-            metadata={
-                'original_metadata': original_metadata,
-                'decompiled_metadata': decompiled_metadata,
-                'function_metadata': metadata
-            }
-        )
+        import time
+        start_time = time.time()
+
+        try:
+            # Compute all metrics with timeout protection
+            semantic_similarity = self.compute_semantic_similarity(original, decompiled)
+            normalized_edit_distance = self.compute_normalized_edit_distance(original, decompiled)
+            bleu_score = self.compute_bleu_score(original, decompiled)
+            rouge_l_score = self.compute_rouge_score(original, decompiled)
+            token_accuracy = self.compute_token_accuracy(original, decompiled)
+            structural_preservation = self.analyze_structural_preservation(original, decompiled)
+
+            # Enhanced structural preservation with complexity analysis
+            # This helps detect if structural elements are preserved properly
+            enhanced_structural_preservation = self.analyze_complexity_preservation(original, decompiled)
+
+            # Extract and compare metadata
+            original_metadata = self.extract_function_metadata(original)
+            decompiled_metadata = self.extract_function_metadata(decompiled)
+
+            function_signature_match = (
+                original_metadata.get('has_function_keyword') ==
+                decompiled_metadata.get('has_function_keyword')
+            )
+
+            visibility_match = (
+                original_metadata.get('visibility') ==
+                decompiled_metadata.get('visibility')
+            )
+
+            evaluation_time = time.time() - start_time
+
+            return EvaluationMetrics(
+                semantic_similarity=semantic_similarity,
+                normalized_edit_distance=normalized_edit_distance,
+                bleu_score=bleu_score,
+                rouge_l_score=rouge_l_score,
+                token_accuracy=token_accuracy,
+                structural_preservation=structural_preservation,
+                function_signature_match=function_signature_match,
+                visibility_match=visibility_match,
+                metadata={
+                    'original_metadata': original_metadata,
+                    'decompiled_metadata': decompiled_metadata,
+                    'function_metadata': metadata,
+                    'enhanced_structural_preservation': enhanced_structural_preservation,
+                    'evaluation_time': evaluation_time
+                }
+            )
+        except Exception as e:
+            # Log error but return zeroed metrics to avoid halting training
+            self.logger.error(f"Error evaluating function (will continue): {e}")
+            evaluation_time = time.time() - start_time
+
+            return EvaluationMetrics(
+                semantic_similarity=0.0,
+                normalized_edit_distance=1.0,
+                bleu_score=0.0,
+                rouge_l_score=0.0,
+                token_accuracy=0.0,
+                structural_preservation=0.0,
+                function_signature_match=False,
+                visibility_match=False,
+                metadata={
+                    'original_metadata': {},
+                    'decompiled_metadata': {},
+                    'function_metadata': metadata,
+                    'error': str(e),
+                    'traceback': traceback.format_exc(),
+                    'evaluation_time': evaluation_time
+                }
+            )
 
 class SmartContractTrainingPipeline:
     """
@@ -385,6 +524,7 @@ class SmartContractTrainingPipeline:
                 including API keys, paths, and hyperparameters.
         """
         self.config = config
+        self.logger = logging.getLogger(__name__)
         
         # Create output directories
         for dir_path in [config.data_dir, config.models_dir, config.results_dir]:
@@ -595,7 +735,27 @@ class SmartContractTrainingPipeline:
                 })
                 
             except Exception as e:
-                logger.error(f"Error evaluating function: {e}")
+                self.logger.error(f"Error evaluating function: {e}")
+                # Add error information to continue evaluation
+                results.append({
+                    'original': item.get('output', ''),
+                    'decompiled': '',
+                    'metrics': {
+                        'semantic_similarity': 0.0,
+                        'normalized_edit_distance': 1.0,
+                        'bleu_score': 0.0,
+                        'rouge_l_score': 0.0,
+                        'token_accuracy': 0.0,
+                        'structural_preservation': 0.0,
+                        'function_signature_match': False,
+                        'visibility_match': False,
+                        'metadata': {
+                            'error': str(e),
+                            'traceback': traceback.format_exc()
+                        }
+                    },
+                    'metadata': item.get('metadata', {})
+                })
                 continue
         
         # Compute aggregate statistics

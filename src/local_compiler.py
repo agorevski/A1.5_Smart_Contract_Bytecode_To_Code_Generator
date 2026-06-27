@@ -110,13 +110,29 @@ def compatible_versions_for_pragma(
         List of compatible version strings, sorted descending.
     """
     if candidate_versions is None:
-        # Curated set of common versions to try
+        # Curated set: the 5 most commonly deployed solc versions on Ethereum.
+        # These span the major codegen eras so trained models generalise to
+        # the vast majority of on-chain bytecode.
         candidate_versions = [
-            "0.8.28", "0.8.26", "0.8.24", "0.8.22", "0.8.20",
-            "0.8.19", "0.8.17", "0.8.13", "0.8.10", "0.8.7", "0.8.4", "0.8.0",
-            "0.7.6", "0.7.5", "0.7.0",
-            "0.6.12", "0.6.6", "0.6.0",
-            "0.5.17", "0.5.16", "0.5.0",
+            # 0.8.26 – latest widely-adopted release (2024+); modern
+            #           optimiser, latest ABI encoding, PUSH0 opcode.
+            "0.8.26",
+            # 0.8.20 – most popular single version by deployment count
+            #           (2023-2024); first version with PUSH0 support,
+            #           mature Yul/IR pipeline.
+            "0.8.20",
+            # 0.8.10 – early 0.8.x workhorse; built-in overflow checks,
+            #           widely used by major DeFi protocols (Uniswap V3,
+            #           Aave V3, etc.).
+            "0.8.10",
+            # 0.6.12 – dominant pre-0.8 version; last stable 0.6.x,
+            #           huge legacy footprint (SafeMath era, pre-built-in
+            #           overflow). Different ABI encoder defaults.
+            "0.6.12",
+            # 0.5.17 – last 0.5.x release; significant legacy contracts
+            #           (early DeFi, MakerDAO). No receive/fallback split,
+            #           pre-ABIEncoderV2 default, different codegen.
+            "0.5.17",
         ]
 
     compatible = []

@@ -22,12 +22,68 @@ from flask_cors import CORS
 from src.bytecode_analyzer import BytecodeAnalyzer
 from src.model_setup import SmartContractDecompiler, ModelConfig
 from src.selector_resolver import get_resolver
+from src.tac_lookup import TACLookup
+
+# ---------------------------------------------------------------------------
+# Mock Decompiler (for --mockmodel E2E testing)
+# ---------------------------------------------------------------------------
+
+class MockDecompiler:
+    """Fake decompiler that produces plausible Solidity stubs without a GPU.
+
+    Used with ``--mockmodel`` to test the full web pipeline end-to-end
+    without loading the real Llama model.
+    """
+
+    _SIMULATED_DELAY = 0.3  # seconds per function to mimic inference latency
+
+    def decompile_tac_to_solidity(
+        self, tac_input: str, metadata: dict = None, **kwargs
+    ) -> str:
+        time.sleep(self._SIMULATED_DELAY)
+        meta = metadata or {}
+        name = meta.get("function_name", "mockFunc")
+        vis = meta.get("visibility", "public")
+        modifiers = []
+        if meta.get("is_payable"):
+            modifiers.append("payable")
+        if meta.get("is_view"):
+            modifiers.append("view")
+        mod_str = " ".join(modifiers)
+        if mod_str:
+            mod_str = " " + mod_str
+        tac_lines = len(tac_input.splitlines())
+        return (
+            f"function {name}() {vis}{mod_str} {{\n"
+            f"    // [MOCK] Simulated decompilation output\n"
+            f"    // TAC input: {tac_lines} lines, {len(tac_input)} chars\n"
+            f"    revert(\"mock\");\n"
+            f"}}"
+        )
+
+    def decompile_batch(
+        self, tac_inputs: list, metadatas: list = None, **kwargs
+    ) -> list:
+        if metadatas is None:
+            metadatas = [None] * len(tac_inputs)
+        return [
+            self.decompile_tac_to_solidity(tac, meta, **kwargs)
+            for tac, meta in zip(tac_inputs, metadatas)
+        ]
+
+    @staticmethod
+    def _assemble_contract(function_solidity, analyzer):
+        """Reuse the real assembler logic."""
+        return SmartContractDecompiler._assemble_contract(
+            function_solidity, analyzer
+        )
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "final_model")
+TAC_LOOKUP_DB = os.path.join(os.path.dirname(__file__), "..", "data", "tac_lookup.db")
 LOG_LEVEL = logging.INFO
 
 # ---------------------------------------------------------------------------
@@ -45,16 +101,55 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Global decompiler instance (loaded once at startup)
+# Global instances (loaded once at startup)
 decompiler: SmartContractDecompiler = None  # type: ignore[assignment]
 model_config_dict: dict = {}
+tac_lookup: TACLookup = None  # type: ignore[assignment]
+mock_mode: bool = False
 
-def load_model():
-    """Load the trained model into memory."""
-    global decompiler, model_config_dict
-    logger.info("Loading trained model from %s …", MODEL_PATH)
+def load_model(use_mock: bool = False):
+    """Load the trained model and TAC lookup database into memory.
+
+    Args:
+        use_mock: If True, use MockDecompiler instead of the real model.
+    """
+    global decompiler, model_config_dict, tac_lookup, mock_mode
+    mock_mode = use_mock
     start = time.time()
 
+    # Load TAC lookup database (fast exact-match cache)
+    try:
+        tac_lookup = TACLookup(TAC_LOOKUP_DB)
+        if tac_lookup.available:
+            stats = tac_lookup.stats()
+            logger.info(
+                "TAC lookup ready: %d hashes → %d unique bodies",
+                stats.get("tac_hashes", 0),
+                stats.get("unique_bodies", 0),
+            )
+        else:
+            logger.warning("TAC lookup database not available — all functions will use LLM inference")
+    except Exception as e:
+        logger.error("Failed to load TAC lookup DB: %s", e)
+        tac_lookup = None  # type: ignore[assignment]
+
+    if use_mock:
+        logger.info("🧪 MOCK MODE — using MockDecompiler (no GPU required)")
+        decompiler = MockDecompiler()  # type: ignore[assignment]
+        model_config_dict = {
+            "model_name": "MockDecompiler (E2E testing)",
+            "mock_mode": True,
+            "lora_rank": "N/A",
+            "lora_alpha": "N/A",
+            "max_sequence_length": "N/A",
+            "use_quantization": False,
+            "target_modules": [],
+        }
+        elapsed = time.time() - start
+        logger.info("Mock model ready in %.1f seconds", elapsed)
+        return
+
+    logger.info("Loading trained model from %s …", MODEL_PATH)
     try:
         decompiler = SmartContractDecompiler(MODEL_PATH)
         # Read the saved model config for display in the UI
@@ -256,7 +351,11 @@ def api_decompile():
     if not data or "bytecode" not in data:
         return jsonify({"error": "Missing 'bytecode' field in request body."}), 400
 
-    bytecode = data["bytecode"].strip()
+    raw_bytecode = data["bytecode"]
+    if not isinstance(raw_bytecode, str):
+        return jsonify({"error": "'bytecode' must be a hexadecimal string."}), 400
+
+    bytecode = raw_bytecode.strip()
     if not bytecode:
         return jsonify({"error": "Bytecode is empty."}), 400
 
@@ -269,10 +368,14 @@ def api_decompile():
     if not bytecode.startswith("0x"):
         bytecode = "0x" + bytecode
 
-    # Validate hex
-    try:
-        int(bytecode[2:], 16)
-    except ValueError:
+    # Validate hex bytecode. ``int(..., 16)`` accepts signs/underscores, so
+    # validate the string shape directly.
+    hex_body = bytecode[2:]
+    if (
+        not hex_body
+        or len(hex_body) % 2 != 0
+        or any(c not in "0123456789abcdefABCDEF" for c in hex_body)
+    ):
         return jsonify({"error": "Invalid hexadecimal bytecode."}), 400
 
     def _sse(event: str, data: dict) -> str:
@@ -320,144 +423,267 @@ def api_decompile():
                 "tac_generation_time_s": round(tac_time, 3),
             })
 
-            # ---- Stage 2: TAC → Solidity (per-function, sequential) ----
-            if decompiler is None:
-                combined_tac = "\n\n".join(func_tac_map.values())
-                yield _sse("result", {
-                    "tac": combined_tac,
-                    "tac_per_function": func_tac_map,
-                    "solidity": "",
-                    "functions": {},
-                    "selector_map": selector_map,
-                    "analysis": {
-                        "num_instructions": num_instructions,
-                        "num_basic_blocks": num_blocks,
-                        "num_functions": num_functions,
-                        "tac_generation_time_s": round(tac_time, 3),
-                        "solidity_generation_time_s": 0.0,
-                        "model_config": model_config_dict,
-                    },
-                    "model_error": "Model not loaded. Check server logs for details.",
-                })
-                return
-
-            t1 = time.time()
+            # ---- TAC Lookup Stage: exact-match from database ----
             function_solidity = {}
             function_errors = {}
-            total = len(func_names)
+            function_sources = {}   # fname → "exact_match" | "model_inference"
+            lookup_hits = 0
+            unresolved_fnames = []  # functions that need LLM inference
 
-            # --- Batched decompilation for GPU saturation ---
-            # Build metadata list in parallel with TAC list
-            tac_list = []
-            meta_list = []
-            for fname in func_names:
-                tac_list.append(func_tac_map[fname])
-                func_obj = analyzer.functions.get(fname)
-                func_meta = {}
-                if func_obj:
-                    func_meta = {
-                        "function_name": func_obj.name,
-                        "visibility": func_obj.visibility,
-                        "is_payable": func_obj.is_payable,
-                        "is_view": func_obj.is_view,
-                    }
-                meta_list.append(func_meta)
-
-            # Use batched inference when multiple functions exist
-            BATCH_SIZE = 4  # Process up to 4 functions at once
-            use_batch = total > 1 and hasattr(decompiler, "decompile_batch")
-
-            if use_batch:
+            if tac_lookup is not None and tac_lookup.available:
                 yield _sse("progress", {
-                    "stage": "decompiling",
-                    "message": f"Batch-decompiling {total} functions (GPU-optimized)…",
-                    "percent": 20,
-                    "current_function": func_names[0],
-                    "current_index": 1,
-                    "total_functions": total,
+                    "stage": "lookup",
+                    "message": "Checking TAC hash database for exact matches…",
+                    "percent": 16,
                 })
 
-                # Process in batches
-                for batch_start in range(0, total, BATCH_SIZE):
-                    batch_end = min(batch_start + BATCH_SIZE, total)
-                    batch_fnames = func_names[batch_start:batch_end]
-                    batch_tac = tac_list[batch_start:batch_end]
-                    batch_meta = meta_list[batch_start:batch_end]
+                for fname in func_names:
+                    tac_text = func_tac_map[fname]
+                    result = tac_lookup.query(tac_text)
 
-                    pct = 20 + int((batch_start / max(total, 1)) * 70)
+                    if result:
+                        # Exact match found — use verified Solidity from DB
+                        function_solidity[fname] = result["solidity"]
+                        function_sources[fname] = "exact_match"
+                        lookup_hits += 1
+                        logger.info(
+                            "TAC lookup hit for %s (selector=%s, occurrences=%d)",
+                            fname, result.get("selector", "?"),
+                            result.get("occurrences", 0),
+                        )
+                        yield _sse("progress", {
+                            "stage": "function_resolved",
+                            "message": f"Exact match: {fname}",
+                            "percent": 17,
+                            "current_function": fname,
+                            "source": "exact_match",
+                            "confidence": 100,
+                        })
+                    else:
+                        unresolved_fnames.append(fname)
+                        yield _sse("progress", {
+                            "stage": "function_resolved",
+                            "message": f"No match: {fname} — queued for LLM",
+                            "percent": 17,
+                            "current_function": fname,
+                            "source": "pending_inference",
+                        })
+
+                lookup_msg = (
+                    f"{lookup_hits} of {len(func_names)} function(s) "
+                    f"resolved via database lookup"
+                )
+                yield _sse("progress", {
+                    "stage": "lookup_done",
+                    "message": lookup_msg,
+                    "percent": 18,
+                    "lookup_hits": lookup_hits,
+                    "lookup_misses": len(unresolved_fnames),
+                })
+            else:
+                # No lookup DB — all functions need inference
+                unresolved_fnames = list(func_names)
+
+            # ---- Check if all functions resolved via lookup ----
+            if not unresolved_fnames:
+                yield _sse("progress", {
+                    "stage": "all_lookup",
+                    "message": "All functions resolved via database lookup!",
+                    "percent": 95,
+                })
+                gen_time = 0.0
+
+            # ---- Stage 2: TAC → Solidity via LLM (only unresolved) ----
+            elif decompiler is None:
+                # No model loaded, but we may have partial lookup results
+                for fname in unresolved_fnames:
+                    function_solidity[fname] = f"// Function {fname}: model not loaded"
+                    function_sources[fname] = "error"
+                    function_errors[fname] = "Model not loaded"
+
+                if not lookup_hits:
+                    # Nothing resolved at all
+                    combined_tac = "\n\n".join(func_tac_map.values())
+                    yield _sse("result", {
+                        "tac": combined_tac,
+                        "tac_per_function": func_tac_map,
+                        "solidity": "",
+                        "functions": function_solidity,
+                        "selector_map": selector_map,
+                        "analysis": {
+                            "num_instructions": num_instructions,
+                            "num_basic_blocks": num_blocks,
+                            "num_functions": num_functions,
+                            "tac_generation_time_s": round(tac_time, 3),
+                            "solidity_generation_time_s": 0.0,
+                            "lookup_hits": lookup_hits,
+                            "lookup_available": tac_lookup is not None and tac_lookup.available,
+                            "function_sources": function_sources,
+                            "function_errors": function_errors,
+                            "model_config": model_config_dict,
+                        },
+                        "model_error": "Model not loaded. Check server logs for details.",
+                    })
+                    return
+                gen_time = 0.0
+
+            else:
+                # LLM inference for unresolved functions only
+                yield _sse("progress", {
+                    "stage": "inference_start",
+                    "message": f"Decompiling {len(unresolved_fnames)} function(s) via LLM…",
+                    "percent": 20,
+                })
+
+                t1 = time.time()
+                total_unresolved = len(unresolved_fnames)
+
+                # Build TAC/metadata lists for unresolved functions
+                tac_list = []
+                meta_list = []
+                for fname in unresolved_fnames:
+                    tac_list.append(func_tac_map[fname])
+                    func_obj = analyzer.functions.get(fname)
+                    func_meta = {}
+                    if func_obj:
+                        func_meta = {
+                            "function_name": func_obj.name,
+                            "visibility": func_obj.visibility,
+                            "is_payable": func_obj.is_payable,
+                            "is_view": func_obj.is_view,
+                        }
+                    meta_list.append(func_meta)
+
+                # Use batched inference when multiple unresolved functions
+                BATCH_SIZE = 4
+                use_batch = (
+                    total_unresolved > 1
+                    and hasattr(decompiler, "decompile_batch")
+                )
+
+                if use_batch:
                     yield _sse("progress", {
                         "stage": "decompiling",
-                        "message": f"Batch {batch_start // BATCH_SIZE + 1}: "
-                                   f"functions {batch_start + 1}–{batch_end} of {total}",
-                        "percent": pct,
-                        "current_function": batch_fnames[0],
-                        "current_index": batch_start + 1,
-                        "total_functions": total,
+                        "message": (
+                            f"Batch-decompiling {total_unresolved} "
+                            f"functions (GPU-optimized)…"
+                        ),
+                        "percent": 20,
+                        "current_function": unresolved_fnames[0],
+                        "current_index": 1,
+                        "total_functions": total_unresolved,
                     })
 
-                    try:
-                        results = decompiler.decompile_batch(
-                            batch_tac, metadatas=batch_meta
+                    for batch_start in range(0, total_unresolved, BATCH_SIZE):
+                        batch_end = min(
+                            batch_start + BATCH_SIZE, total_unresolved
                         )
-                        for j, fname in enumerate(batch_fnames):
-                            function_solidity[fname] = results[j]
-                    except Exception as e:
-                        logger.error("Batch decompilation failed: %s", e)
-                        # Fall back to sequential for this batch
-                        for j, fname in enumerate(batch_fnames):
-                            try:
-                                sol = decompiler.decompile_tac_to_solidity(
-                                    batch_tac[j], metadata=batch_meta[j]
-                                )
-                                function_solidity[fname] = sol
-                            except Exception as e2:
-                                function_errors[fname] = str(e2)
-                                function_solidity[fname] = f"// Decompilation failed: {e2}"
+                        batch_fnames = unresolved_fnames[batch_start:batch_end]
+                        batch_tac = tac_list[batch_start:batch_end]
+                        batch_meta = meta_list[batch_start:batch_end]
 
-                    pct_done = 20 + int((batch_end / max(total, 1)) * 70)
-                    for fname in batch_fnames:
+                        pct = 20 + int(
+                            (batch_start / max(total_unresolved, 1)) * 70
+                        )
+                        yield _sse("progress", {
+                            "stage": "decompiling",
+                            "message": (
+                                f"Batch {batch_start // BATCH_SIZE + 1}: "
+                                f"functions {batch_start + 1}–{batch_end} "
+                                f"of {total_unresolved}"
+                            ),
+                            "percent": pct,
+                            "current_function": batch_fnames[0],
+                            "current_index": batch_start + 1,
+                            "total_functions": total_unresolved,
+                        })
+
+                        try:
+                            results = decompiler.decompile_batch(
+                                batch_tac, metadatas=batch_meta
+                            )
+                            for j, fname in enumerate(batch_fnames):
+                                function_solidity[fname] = results[j]
+                                function_sources[fname] = "model_inference"
+                        except Exception as e:
+                            logger.error("Batch decompilation failed: %s", e)
+                            for j, fname in enumerate(batch_fnames):
+                                try:
+                                    sol = decompiler.decompile_tac_to_solidity(
+                                        batch_tac[j], metadata=batch_meta[j]
+                                    )
+                                    function_solidity[fname] = sol
+                                    function_sources[fname] = "model_inference"
+                                except Exception as e2:
+                                    function_errors[fname] = str(e2)
+                                    function_solidity[fname] = (
+                                        f"// Decompilation failed: {e2}"
+                                    )
+                                    function_sources[fname] = "error"
+
+                        pct_done = 20 + int(
+                            (batch_end / max(total_unresolved, 1)) * 70
+                        )
+                        for fname in batch_fnames:
+                            yield _sse("progress", {
+                                "stage": "function_done",
+                                "message": f"Completed: {fname}",
+                                "percent": pct_done,
+                                "current_function": fname,
+                                "current_index": batch_end,
+                                "total_functions": total_unresolved,
+                                "source": function_sources.get(fname, "model_inference"),
+                            })
+                else:
+                    for idx, fname in enumerate(unresolved_fnames):
+                        pct = 20 + int(
+                            (idx / max(total_unresolved, 1)) * 70
+                        )
+                        yield _sse("progress", {
+                            "stage": "decompiling",
+                            "message": (
+                                f"Decompiling function "
+                                f"{idx + 1}/{total_unresolved}: {fname}"
+                            ),
+                            "percent": pct,
+                            "current_function": fname,
+                            "current_index": idx + 1,
+                            "total_functions": total_unresolved,
+                        })
+
+                        try:
+                            sol = decompiler.decompile_tac_to_solidity(
+                                tac_list[idx], metadata=meta_list[idx]
+                            )
+                            function_solidity[fname] = sol
+                            function_sources[fname] = "model_inference"
+                        except Exception as e:
+                            logger.error(
+                                "Failed to decompile %s: %s", fname, e
+                            )
+                            function_errors[fname] = str(e)
+                            function_solidity[fname] = (
+                                f"// Decompilation failed: {e}"
+                            )
+                            function_sources[fname] = "error"
+
+                        pct_done = 20 + int(
+                            ((idx + 1) / max(total_unresolved, 1)) * 70
+                        )
                         yield _sse("progress", {
                             "stage": "function_done",
-                            "message": f"Completed: {fname}",
+                            "message": (
+                                f"Completed {idx + 1}/{total_unresolved}: "
+                                f"{fname}"
+                            ),
                             "percent": pct_done,
                             "current_function": fname,
-                            "current_index": batch_end,
-                            "total_functions": total,
+                            "current_index": idx + 1,
+                            "total_functions": total_unresolved,
+                            "source": function_sources.get(fname, "model_inference"),
                         })
-            else:
-                # Sequential fallback (single function or no batch support)
-                for idx, fname in enumerate(func_names):
-                    pct = 15 + int((idx / max(total, 1)) * 80)
-                    yield _sse("progress", {
-                        "stage": "decompiling",
-                        "message": f"Decompiling function {idx + 1}/{total}: {fname}",
-                        "percent": pct,
-                        "current_function": fname,
-                        "current_index": idx + 1,
-                        "total_functions": total,
-                    })
 
-                    try:
-                        sol = decompiler.decompile_tac_to_solidity(
-                            tac_list[idx], metadata=meta_list[idx]
-                        )
-                        function_solidity[fname] = sol
-                    except Exception as e:
-                        logger.error("Failed to decompile %s: %s", fname, e)
-                        function_errors[fname] = str(e)
-                        function_solidity[fname] = f"// Decompilation failed: {e}"
-
-                    pct_done = 15 + int(((idx + 1) / max(total, 1)) * 80)
-                    yield _sse("progress", {
-                        "stage": "function_done",
-                        "message": f"Completed {idx + 1}/{total}: {fname}",
-                        "percent": pct_done,
-                        "current_function": fname,
-                        "current_index": idx + 1,
-                        "total_functions": total,
-                    })
-
-            gen_time = time.time() - t1
+                gen_time = time.time() - t1
 
             # Assemble contract
             yield _sse("progress", {
@@ -466,7 +692,31 @@ def api_decompile():
                 "percent": 97,
             })
 
-            assembled = decompiler._assemble_contract(function_solidity, analyzer)
+            ordered_function_solidity = {
+                fname: function_solidity[fname]
+                for fname in func_names
+                if fname in function_solidity
+            }
+
+            if decompiler is not None:
+                assembled = decompiler._assemble_contract(
+                    ordered_function_solidity, analyzer
+                )
+            else:
+                # No model — assemble manually from lookup results
+                parts = []
+                for fname in func_names:
+                    sol = ordered_function_solidity.get(fname, "")
+                    if sol:
+                        parts.append(f"// --- {fname} ---\n{sol}")
+                assembled = (
+                    "// SPDX-License-Identifier: UNLICENSED\n"
+                    "pragma solidity ^0.8.0;\n\n"
+                    "contract DecompiledContract {\n"
+                    + "\n\n".join(f"    {line}" for p in parts for line in p.split("\n"))
+                    + "\n}\n"
+                )
+
             combined_tac = "\n\n".join(func_tac_map.values())
 
             analysis = {
@@ -475,6 +725,9 @@ def api_decompile():
                 "num_functions": num_functions,
                 "tac_generation_time_s": round(tac_time, 3),
                 "solidity_generation_time_s": round(gen_time, 3),
+                "lookup_hits": lookup_hits,
+                "lookup_available": tac_lookup is not None and tac_lookup.available,
+                "function_sources": function_sources,
                 "function_errors": function_errors,
                 "model_config": model_config_dict,
             }
@@ -483,10 +736,13 @@ def api_decompile():
                 "tac": combined_tac,
                 "tac_per_function": func_tac_map,
                 "solidity": assembled,
-                "functions": function_solidity,
+                "functions": ordered_function_solidity,
                 "selector_map": selector_map,
                 "analysis": analysis,
-                "model_error": None,
+                "model_error": (
+                    "Model not loaded. Some functions could not be decompiled."
+                    if decompiler is None and unresolved_fnames else None
+                ),
             })
 
         except Exception as e:
@@ -509,6 +765,7 @@ def api_health():
     return jsonify({
         "status": "ok",
         "model_loaded": decompiler is not None,
+        "mock_mode": mock_mode,
     })
 
 
@@ -633,5 +890,20 @@ def api_audit_report():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    load_model()
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Smart Contract Bytecode Decompiler — Web UI"
+    )
+    parser.add_argument(
+        "--mockmodel",
+        action="store_true",
+        help="Use a fake model for E2E testing (no GPU required)",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=5000, help="Port number")
+    parser.add_argument("--debug", action="store_true", help="Flask debug mode")
+    args = parser.parse_args()
+    load_model(use_mock=args.mockmodel)
+    app.run(host=args.host, port=args.port, debug=args.debug)
+    app.run(host=args.host, port=args.port, debug=args.debug)

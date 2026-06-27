@@ -20,6 +20,7 @@ py-solc-x>=2.0,<3
 # Data processing and analysis
 numpy>=1.24,<2
 pandas>=2.0,<3
+pyarrow
 scipy>=1.10,<2
 scikit-learn>=1.3,<2
 

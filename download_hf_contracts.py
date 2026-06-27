@@ -38,7 +38,7 @@ import sqlite3
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
@@ -47,6 +47,7 @@ from web3 import Web3
 
 from src.bytecode_analyzer import BytecodeAnalyzer
 from src.dataset_pipeline import SolidityParser
+from src.abi_enrichment import ABIEnricher, StorageLayoutResolver
 from src.local_compiler import (
     compile_source,
     compile_multi_file,
@@ -111,7 +112,17 @@ TRIVIAL_PATTERNS = [
     re.compile(r"^\s*\{\s*return\s+\w+\s*;\s*\}\s*$", re.DOTALL),
     re.compile(r"^\s*\{\s*return\s+\d+\s*;\s*\}\s*$", re.DOTALL),
     re.compile(r"^\s*\{\s*\}\s*$", re.DOTALL),
+    # Issue 5: expanded trivial patterns
+    re.compile(r"^\s*\{\s*return\s+\w+(\.\w+)*\s*;\s*\}\s*$", re.DOTALL),       # return obj.prop;
+    re.compile(r"^\s*\{\s*\w+\s*=\s*\w+\s*;\s*\}\s*$", re.DOTALL),              # x = y;
+    re.compile(r"^\s*\{\s*emit\s+\w+\([^)]*\)\s*;\s*\}\s*$", re.DOTALL),        # emit Event(...);
+    re.compile(r"^\s*\{\s*return\s+(true|false)\s*;\s*\}\s*$", re.DOTALL),       # return true/false;
+    re.compile(r"^\s*\{\s*return\s+\w+\([^)]*\)\s*;\s*\}\s*$", re.DOTALL),      # return func(x);
+    re.compile(r"^\s*\{\s*_\s*;\s*\}\s*$", re.DOTALL),                           # modifier { _; }
 ]
+
+# Minimum meaningful non-whitespace token count for a function body
+MIN_MEANINGFUL_TOKENS = 15
 
 PROXY_PATTERN = re.compile(r"\bdelegatecall\b")
 
@@ -168,8 +179,18 @@ def hash_source_code(source: str) -> str:
 
 
 def is_trivial_function(body: str) -> bool:
-    """Check if a function body is too trivial to be useful training data."""
-    return any(pat.match(body) for pat in TRIVIAL_PATTERNS)
+    """Check if a function body is too trivial to be useful training data.
+
+    A function is trivial if it matches any TRIVIAL_PATTERNS regex, or if
+    the body has fewer than MIN_MEANINGFUL_TOKENS non-whitespace tokens.
+    """
+    if any(pat.match(body) for pat in TRIVIAL_PATTERNS):
+        return True
+    # Token-count heuristic: split on whitespace and punctuation-ish boundaries
+    tokens = re.findall(r"[A-Za-z_]\w*|[0-9]+|[^\s\w]", body)
+    if len(tokens) < MIN_MEANINGFUL_TOKENS:
+        return True
+    return False
 
 
 def is_proxy_only(body: str) -> bool:
@@ -646,10 +667,13 @@ def _compile_one_job(
     opt_enabled: bool,
     runs: int,
     min_body_length: int,
+    abi_json: str = "",
 ) -> List[Dict]:
     """Compile one (contract, version, optimizer) combo and return pairs.
 
     Quality filters applied: min body length, trivial getters, proxy forwarders.
+    ABI enrichment (Issue #8) and storage layout (Issue #2) annotations are
+    applied when data is available.
     """
     logging.disable(logging.CRITICAL)
     try:
@@ -668,6 +692,26 @@ def _compile_one_job(
         if not comp.success:
             return []
 
+        # Issue #8: Build ABI enricher from contract ABI
+        abi_enricher = None
+        if abi_json:
+            try:
+                abi_enricher = ABIEnricher(abi_json)
+                if not abi_enricher.has_data():
+                    abi_enricher = None
+            except Exception:
+                abi_enricher = None
+
+        # Issue #2: Build storage layout resolver from source
+        combined_source = "\n\n".join(source_files.values())
+        storage_resolver = None
+        try:
+            storage_resolver = StorageLayoutResolver(combined_source)
+            if not storage_resolver.has_data():
+                storage_resolver = None
+        except Exception:
+            storage_resolver = None
+
         pairs: List[Dict] = []
         for cname, compiled in comp.contracts.items():
             bytecode_hex = "0x" + compiled.runtime_bytecode
@@ -685,7 +729,9 @@ def _compile_one_job(
                 f for f in solidity_functions if f.get("contract_name", "") == cname
             ] or solidity_functions
 
-            for m in _match_functions(contract_sol_funcs, bytecode_functions, analyzer):
+            for m in _match_functions(contract_sol_funcs, bytecode_functions, analyzer,
+                                       compiler_version=solc_version, optimizer_enabled=opt_enabled,
+                                       abi_enricher=abi_enricher, storage_resolver=storage_resolver):
                 sol_body = m["solidity_function"]["body"]
                 if len(sol_body.strip()) < min_body_length:
                     continue
@@ -763,10 +809,21 @@ def compile_and_generate(
                 cur.execute("UPDATE contracts SET processed = TRUE WHERE address = ?", (addr,))
             conn.commit()
 
+    # Fetch ABI data for contracts that have it (Issue #8)
+    abi_by_address: Dict[str, str] = {}
+    with _db_connection(db_path) as conn:
+        for addr in prepared:
+            row = conn.execute(
+                "SELECT abi FROM contracts WHERE address = ?", (addr,)
+            ).fetchone()
+            if row and row[0]:
+                abi_by_address[addr] = row[0]
+
     # Build compile jobs: each (contract x version x optimizer_flag)
     compile_jobs = [
         (addr, prep["source_files"], prep["solidity_functions"],
-         ver, opt, prep["runs"], min_body_length)
+         ver, opt, prep["runs"], min_body_length,
+         abi_by_address.get(addr, ""))
         for addr, prep in prepared.items()
         for ver in prep["compatible_versions"]
         for opt in (True, False)
@@ -828,12 +885,11 @@ def compile_and_generate(
             if not sel:
                 continue
             sig = func.get("signature", "")
-            match = re.match(r"function\s+(\w+)\s*\(([^)]*)\)", sig)
-            if match:
-                func_name = match.group(1)
-                params_str = match.group(2).strip()
+            parsed = _extract_function_signature_parts(sig)
+            if parsed:
+                func_name, params_str = parsed
                 if params_str:
-                    param_types = [p.strip().split()[0] for p in params_str.split(",") if p.strip()]
+                    param_types = _parse_solidity_param_types(params_str)
                     canonical = f"{func_name}({','.join(param_types)})"
                 else:
                     canonical = f"{func_name}()"
@@ -859,17 +915,108 @@ def compile_and_generate(
 # Pair building, matching & storage
 # ---------------------------------------------------------------------------
 
+def _parse_solidity_param_types(params_str: str) -> List[str]:
+    """Parse Solidity parameter types with balanced-parenthesis awareness.
+
+    Correctly handles tuple types like ``(uint256,address)[]``,
+    nested tuples ``(uint256,(address,bool))``, and fixed-size arrays
+    ``uint256[3]``. Only splits on commas that are at depth 0 (not
+    inside parentheses).
+    """
+    if not params_str or not params_str.strip():
+        return []
+
+    # Split on commas at depth 0 only
+    params: List[str] = []
+    depth = 0
+    current: List[str] = []
+    for ch in params_str:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            params.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        params.append(''.join(current).strip())
+
+    # Extract the type from each parameter (first whitespace-delimited token,
+    # but keep tuple parentheses and array brackets together)
+    types: List[str] = []
+    for param in params:
+        param = param.strip()
+        if not param:
+            continue
+        if param.startswith('('):
+            # Tuple type — find the end of the tuple (including trailing [] etc.)
+            d = 0
+            end = 0
+            for i, c in enumerate(param):
+                if c == '(':
+                    d += 1
+                elif c == ')':
+                    d -= 1
+                    if d == 0:
+                        end = i + 1
+                        break
+            # Include trailing array brackets like [] or [3]
+            while end < len(param) and param[end] in '[]0123456789':
+                end += 1
+            types.append(param[:end])
+        else:
+            # Regular type — first whitespace token, but include [] brackets
+            parts = param.split()
+            type_token = parts[0]
+            # Handle "uint256 [3]" (space before bracket) — merge next part
+            if len(parts) > 1 and parts[1].startswith('['):
+                type_token += parts[1]
+            types.append(type_token)
+
+    return types
+
+
+def _extract_function_signature_parts(signature: str) -> Optional[Tuple[str, str]]:
+    """Return (function_name, params_text) from a Solidity function signature."""
+    match = re.search(r"\bfunction\s+(\w+)\s*\(", signature)
+    if not match:
+        return None
+
+    open_pos = signature.find("(", match.start())
+    if open_pos == -1:
+        return None
+
+    depth = 1
+    for pos in range(open_pos + 1, len(signature)):
+        ch = signature[pos]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return match.group(1), signature[open_pos + 1 : pos].strip()
+
+    return None
+
+
 def _add_selectors(functions: List[Dict]) -> List[Dict]:
-    """Compute 4-byte function selectors for each Solidity function."""
+    """Compute 4-byte function selectors for each Solidity function.
+
+    Uses balanced-parenthesis-aware parameter parsing (Issue 9) to correctly
+    handle tuple types and nested tuples.
+    """
     for func in functions:
         try:
             signature = func["signature"]
-            match = re.match(r"function\s+(\w+)\s*\(([^)]*)\)", signature)
-            if match:
-                func_name = match.group(1)
-                params_str = match.group(2).strip()
+            parsed = _extract_function_signature_parts(signature)
+            if parsed:
+                func_name, params_str = parsed
                 if params_str:
-                    param_types = [p.strip().split()[0] for p in params_str.split(",") if p.strip()]
+                    param_types = _parse_solidity_param_types(params_str)
                     canonical = f"{func_name}({','.join(param_types)})"
                 else:
                     canonical = f"{func_name}()"
@@ -886,30 +1033,67 @@ def _match_functions(
     solidity_functions: List[Dict],
     bytecode_functions: Dict,
     analyzer,
+    compiler_version: str = "",
+    optimizer_enabled: bool = False,
+    abi_enricher: Optional['ABIEnricher'] = None,
+    storage_resolver: Optional['StorageLayoutResolver'] = None,
 ) -> List[Dict]:
     """Match Solidity functions to bytecode functions by selector."""
+    _ensure_tac_integrated(analyzer)
     sol_by_sel = {f["selector"]: f for f in solidity_functions if f.get("selector")}
     bc_by_sel = {f.selector: f for f in bytecode_functions.values() if f.selector}
 
     matches = []
     for selector, sol_func in sol_by_sel.items():
         if selector in bc_by_sel:
+            tac = _extract_tac(bc_by_sel[selector], analyzer,
+                               compiler_version=compiler_version,
+                               optimizer_enabled=optimizer_enabled)
+            # Issue #8 & #2: Enrich TAC with ABI types and storage annotations
+            if abi_enricher or storage_resolver:
+                from src.abi_enrichment import enrich_tac_with_abi
+                tac = enrich_tac_with_abi(tac, selector, abi_enricher, storage_resolver)
             matches.append({
                 "solidity_function": sol_func,
                 "bytecode_function": bc_by_sel[selector],
-                "tac": _extract_tac(bc_by_sel[selector], analyzer),
+                "tac": tac,
                 "selector": selector,
             })
     return matches
 
 
-def _extract_tac(bytecode_function, analyzer) -> str:
-    """Generate TAC text for a single bytecode function."""
+def _ensure_tac_integrated(analyzer) -> None:
+    """Populate analyzer basic blocks with TAC instructions once."""
+    blocks = getattr(analyzer, "basic_blocks", {}) or {}
+    if not blocks:
+        return
+    if any(getattr(block, "instructions", None) for block in blocks.values()):
+        return
+    if not any(
+        (getattr(block, "metadata", {}) or {}).get("raw_instructions")
+        for block in blocks.values()
+    ):
+        return
+    converter = getattr(analyzer, "_convert_and_integrate_tac", None)
+    if callable(converter):
+        converter()
+
+
+def _extract_tac(bytecode_function, analyzer, compiler_version: str = "", optimizer_enabled: bool = False) -> str:
+    """Generate TAC text for a single bytecode function.
+
+    Issue 1: Includes compiler version annotation in the TAC header so the
+    model can learn version-specific patterns.
+    """
     lines: List[str] = []
     try:
+        _ensure_tac_integrated(analyzer)
         lines.append(f"function {bytecode_function.name}:")
         if bytecode_function.selector:
             lines.append(f"  // Selector: {bytecode_function.selector}")
+        if compiler_version:
+            opt_str = "with optimizer" if optimizer_enabled else "no optimizer"
+            lines.append(f"  // Compiler: solc {compiler_version} ({opt_str})")
         lines.append(f"  // Entry block: {bytecode_function.entry_block}")
 
         blocks = bytecode_function.basic_blocks or []
@@ -1122,12 +1306,14 @@ def main():
                         help="Only export existing pairs to JSONL.")
     parser.add_argument("--limit", type=int, default=0,
                         help="Max contracts to download (0 = all).")
-    parser.add_argument("--max-compiler-versions", type=int, default=0,
-                        help="Max solc versions per contract (0 = all compatible).")
+    parser.add_argument("--max-compiler-versions", type=int, default=5,
+                        help="Max solc versions per contract (default: 5). "
+                             "Each version is compiled with optimizer on+off, "
+                             "so 5 versions = up to 10 compile jobs per contract.")
     parser.add_argument("--workers", type=int, default=0,
                         help="Parallel workers (0 = auto-detect CPU count).")
-    parser.add_argument("--max-body-dupes", type=int, default=5,
-                        help="Max copies of any normalized function body (default: 5).")
+    parser.add_argument("--max-body-dupes", type=int, default=2,
+                        help="Max copies of any normalized function body (default: 2).")
     parser.add_argument("--min-body-length", type=int, default=50,
                         help="Min Solidity body length to keep (default: 50 chars).")
     parser.add_argument("--cache-dir", type=str, default=None,

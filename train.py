@@ -25,6 +25,18 @@ Usage:
 
     # Use a specific contract addresses file
     python train.py --addresses data/contract_addresses.txt
+
+    # Evaluate a previously trained model (auto-detects data/test_dataset.jsonl)
+    python train.py --eval-only --model-path models/smart_contract_decompiler
+
+    # Evaluate with a specific test dataset
+    python train.py --eval-only --model-path models/smart_contract_decompiler --test-dataset data/test_dataset.jsonl
+
+    # Evaluate after re-splitting a source dataset
+    python train.py --eval-only --model-path models/smart_contract_decompiler --dataset data/my_dataset.jsonl
+
+    # Multi-GPU evaluation with torchrun (shards test data across GPUs)
+    torchrun --nproc_per_node=4 train.py --eval-only --model-path models/smart_contract_decompiler
 """
 
 import argparse
@@ -242,6 +254,7 @@ def train_model(
     resume_from: str = None,
     use_quantization: bool = True,
     deepspeed_config: str = None,
+    enable_memory_monitoring: bool = False,
 ) -> str:
     """Fine-tune the model and return path to saved model."""
     # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
@@ -284,6 +297,7 @@ def train_model(
         num_epochs=num_epochs,
         resume_from_checkpoint=resume_from,
         deepspeed_config=deepspeed_config,
+        enable_memory_monitoring=enable_memory_monitoring,
     )
 
     logger.info(f"Training complete. Model saved to {model_path}")
@@ -291,15 +305,40 @@ def train_model(
 
 
 def evaluate_model(model_path: str, test_path: str, results_dir: str = "results") -> dict:
-    """Evaluate the trained model on the test set."""
+    """Evaluate the trained model on the test set.
+
+    Supports multi-GPU evaluation when launched via torchrun.  Each rank loads
+    the model onto its assigned GPU, evaluates a shard of the test data, and
+    rank 0 gathers all results for aggregation and saving.
+    """
     from src.training_pipeline import SmartContractEvaluator
     from src.model_setup import SmartContractDecompiler
     from dataclasses import asdict
     import torch
+    import torch.distributed as dist
     import gc
 
     logger = logging.getLogger(__name__)
-    Path(results_dir).mkdir(exist_ok=True)
+
+    # ── Distributed setup ────────────────────────────────────────
+    distributed = "LOCAL_RANK" in os.environ
+    rank = 0
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = 1
+
+    if distributed:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        logger.info(f"Distributed eval: rank {rank}/{world_size}")
+
+    # Only rank 0 creates the results directory
+    if rank == 0:
+        Path(results_dir).mkdir(exist_ok=True)
 
     # Clear CUDA state from training before loading for inference
     gc.collect()
@@ -315,9 +354,18 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
             if line:
                 test_data.append(json.loads(line))
 
-    logger.info(f"Evaluating on {len(test_data)} test examples...")
+    total_examples = len(test_data)
 
-    # Initialize
+    # Shard test data across ranks
+    if world_size > 1:
+        test_data = test_data[rank::world_size]
+        logger.info(
+            f"Rank {rank}: evaluating {len(test_data)}/{total_examples} examples"
+        )
+    else:
+        logger.info(f"Evaluating on {total_examples} test examples...")
+
+    # Initialize model on this rank's GPU
     decompiler = SmartContractDecompiler(model_path)
     evaluator = SmartContractEvaluator()
 
@@ -343,43 +391,66 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
             )
 
             logger.info(
-                f"  [{i+1}/{len(test_data)}] "
+                f"  [rank {rank}] [{i+1}/{len(test_data)}] "
                 f"sem_sim={metrics.semantic_similarity:.3f} "
                 f"edit_dist={metrics.normalized_edit_distance:.3f}"
             )
         except Exception as e:
-            logger.error(f"  [{i+1}/{len(test_data)}] Error: {e}")
+            logger.error(f"  [rank {rank}] [{i+1}/{len(test_data)}] Error: {e}")
 
-    # Aggregate
-    if results:
-        sem_sims = [r["metrics"]["semantic_similarity"] for r in results]
-        edit_dists = [r["metrics"]["normalized_edit_distance"] for r in results]
+    # ── Gather results from all ranks ────────────────────────────
+    if distributed and world_size > 1:
+        # Serialize results to JSON string for gathering
+        results_json = json.dumps(results)
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, results_json)
 
-        import numpy as np
+        if rank == 0:
+            # Merge all shards
+            results = []
+            for shard_json in gathered:
+                results.extend(json.loads(shard_json))
+            logger.info(f"Gathered {len(results)} results from {world_size} ranks")
 
-        summary = {
-            "num_evaluated": len(results),
-            "semantic_similarity_mean": float(np.mean(sem_sims)),
-            "semantic_similarity_std": float(np.std(sem_sims)),
-            "edit_distance_mean": float(np.mean(edit_dists)),
-            "edit_distance_std": float(np.std(edit_dists)),
-            "pct_above_0.8_similarity": float(
-                sum(1 for s in sem_sims if s > 0.8) / len(sem_sims)
-            ),
-            "pct_below_0.4_edit_dist": float(
-                sum(1 for d in edit_dists if d < 0.4) / len(edit_dists)
-            ),
-        }
+    # Only rank 0 aggregates and saves
+    if rank == 0:
+        # Aggregate
+        if results:
+            sem_sims = [r["metrics"]["semantic_similarity"] for r in results]
+            edit_dists = [r["metrics"]["normalized_edit_distance"] for r in results]
+
+            import numpy as np
+
+            summary = {
+                "num_evaluated": len(results),
+                "semantic_similarity_mean": float(np.mean(sem_sims)),
+                "semantic_similarity_std": float(np.std(sem_sims)),
+                "edit_distance_mean": float(np.mean(edit_dists)),
+                "edit_distance_std": float(np.std(edit_dists)),
+                "pct_above_0.8_similarity": float(
+                    sum(1 for s in sem_sims if s > 0.8) / len(sem_sims)
+                ),
+                "pct_below_0.4_edit_dist": float(
+                    sum(1 for d in edit_dists if d < 0.4) / len(edit_dists)
+                ),
+            }
+        else:
+            summary = {"num_evaluated": 0, "error": "No successful evaluations"}
+
+        # Save
+        results_path = Path(results_dir) / f"eval_{int(time.time())}.json"
+        with open(results_path, "w") as f:
+            json.dump({"summary": summary, "details": results}, f, indent=2)
+
+        logger.info(f"Evaluation results saved to {results_path}")
+        logger.info(f"Summary: {json.dumps(summary, indent=2)}")
     else:
-        summary = {"num_evaluated": 0, "error": "No successful evaluations"}
+        summary = {}
 
-    # Save
-    results_path = Path(results_dir) / f"eval_{int(time.time())}.json"
-    with open(results_path, "w") as f:
-        json.dump({"summary": summary, "details": results}, f, indent=2)
+    # Clean up distributed process group if we initialized it
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
-    logger.info(f"Evaluation results saved to {results_path}")
-    logger.info(f"Summary: {json.dumps(summary, indent=2)}")
     return summary
 
 
@@ -450,10 +521,32 @@ def main():
         "--skip-eval", action="store_true", help="Skip evaluation after training"
     )
     parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Only run evaluation (skip collection and training)",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Path to trained model directory (required for --eval-only)",
+    )
+    parser.add_argument(
+        "--test-dataset",
+        type=str,
+        default=None,
+        help="Path to test JSONL dataset (optional, auto-detected if omitted)",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=0,
         help="Local rank passed by DeepSpeed launcher (do not set manually)",
+    )
+    parser.add_argument(
+        "--enable-memory-monitoring",
+        action="store_true",
+        help="Enable memory usage monitoring during training",
     )
 
     args = parser.parse_args()
@@ -482,12 +575,52 @@ def main():
     setup_logging()
     logger = logging.getLogger(__name__)
 
+    if args.enable_memory_monitoring:
+        logger.info("Memory monitoring enabled")
+
     settings = load_settings()
 
     logger.info("=" * 60)
     logger.info("Smart Contract Decompilation — E2E Training Pipeline")
     logger.info("=" * 60)
     logger.info(f"Mode: {'small/test' if args.small else 'full'}")
+
+    # ── Eval-only mode ───────────────────────────────────────────
+    if args.eval_only:
+        if not args.model_path:
+            logger.error("--model-path is required when using --eval-only.")
+            sys.exit(1)
+        if not Path(args.model_path).exists():
+            logger.error(f"Model path does not exist: {args.model_path}")
+            sys.exit(1)
+
+        # Resolve test dataset
+        test_path = args.test_dataset
+        if not test_path:
+            if args.dataset:
+                # Re-split the provided dataset to obtain the test split
+                _, _, test_path = split_dataset(args.dataset, args.data_dir)
+            else:
+                # Auto-detect from previous run
+                candidate = Path(args.data_dir) / "test_dataset.jsonl"
+                if candidate.exists():
+                    test_path = str(candidate)
+
+        if not test_path or not Path(test_path).exists():
+            logger.error(
+                "No test dataset found. Provide --test-dataset, --dataset, "
+                "or ensure data/test_dataset.jsonl exists from a previous run."
+            )
+            sys.exit(1)
+
+        logger.info(f"Eval-only mode. Model: {args.model_path}")
+        logger.info(f"Test dataset: {test_path}")
+        evaluate_model(args.model_path, test_path)
+
+        logger.info("=" * 60)
+        logger.info("Evaluation complete!")
+        logger.info("=" * 60)
+        return
 
     # ── Step 1: Dataset ──────────────────────────────────────────
     if args.skip_collection:
@@ -552,6 +685,7 @@ def main():
         resume_from=args.resume,
         use_quantization=use_quant,
         deepspeed_config=args.deepspeed,
+        enable_memory_monitoring=args.enable_memory_monitoring,
     )
 
     # ── Step 3: Evaluation ───────────────────────────────────────

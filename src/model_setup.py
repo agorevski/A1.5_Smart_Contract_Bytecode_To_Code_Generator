@@ -8,6 +8,7 @@ including Low-Rank Adaptation (LoRA) fine-tuning with rank 16 targeting specific
 import os
 import json
 import logging
+import inspect
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,8 @@ from transformers import (
     AutoConfig,
     TrainingArguments,
     Trainer,
+    TrainerCallback,
+    EarlyStoppingCallback,
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig,
     GenerationConfig,
@@ -203,6 +206,35 @@ class SmartContractDataset(Dataset):
         tokenized["labels"] = tokenized["input_ids"].copy()
 
         return tokenized
+
+
+class MemoryLoggingCallback(TrainerCallback):
+    """Log CPU and GPU memory usage at Trainer logging intervals."""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        try:
+            import resource
+
+            max_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            message = f"Memory usage: peak_rss={max_rss_mb:.1f} MiB"
+
+            if torch.cuda.is_available():
+                device = torch.cuda.current_device()
+                allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+                reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+                max_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                message += (
+                    f", cuda_allocated={allocated_mb:.1f} MiB"
+                    f", cuda_reserved={reserved_mb:.1f} MiB"
+                    f", cuda_peak_allocated={max_allocated_mb:.1f} MiB"
+                )
+
+            self.logger.info(message)
+        except Exception as e:
+            self.logger.debug("Memory logging failed: %s", e)
 
 
 class SmartContractModelTrainer:
@@ -434,6 +466,13 @@ class SmartContractModelTrainer:
             else:
                 use_fp16 = True
 
+        training_arg_params = inspect.signature(TrainingArguments.__init__).parameters
+        eval_strategy_arg = (
+            "eval_strategy"
+            if "eval_strategy" in training_arg_params
+            else "evaluation_strategy"
+        )
+
         args = {
             "output_dir": str(self.output_dir / "checkpoints"),
             "num_train_epochs": num_epochs,
@@ -445,13 +484,12 @@ class SmartContractModelTrainer:
             "weight_decay": weight_decay,
             "max_grad_norm": max_grad_norm,
             "warmup_steps": warmup_steps,
-            "lr_scheduler_type": "linear",
+            "lr_scheduler_type": "cosine_with_restarts",
             "logging_steps": logging_steps_final,
             "save_strategy": save_strategy,
             "dataloader_pin_memory": True,
             "dataloader_num_workers": 4,
             "dataloader_persistent_workers": True,
-            "group_by_length": True,
             "remove_unused_columns": False,
             "push_to_hub": False,
             "report_to": "none",
@@ -461,7 +499,12 @@ class SmartContractModelTrainer:
             "gradient_checkpointing": True,
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "dataloader_drop_last": False,
+            "save_total_limit": 2,
+            "logging_nan_inf_filter": True,
+            "logging_first_step": True,
         }
+        if "group_by_length" in training_arg_params:
+            args["group_by_length"] = True
 
         # For DDP with quantized models, disable unused parameter detection
         if self.config.use_quantization and has_cuda:
@@ -477,15 +520,15 @@ class SmartContractModelTrainer:
 
         if do_eval:
             if is_small:
-                args["eval_strategy"] = "epoch"
+                args[eval_strategy_arg] = "epoch"
             else:
                 args["eval_steps"] = eval_steps
-                args["eval_strategy"] = "steps"
+                args[eval_strategy_arg] = "steps"
             args["load_best_model_at_end"] = True
             args["metric_for_best_model"] = "eval_loss"
             args["greater_is_better"] = False
         else:
-            args["eval_strategy"] = "no"
+            args[eval_strategy_arg] = "no"
 
         return TrainingArguments(**args)
 
@@ -498,6 +541,7 @@ class SmartContractModelTrainer:
         num_epochs: int = 3,
         resume_from_checkpoint: Optional[str] = None,
         deepspeed_config: Optional[str] = None,
+        enable_memory_monitoring: bool = False,
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
         tokenizer, peft_model = self.setup_model(
@@ -526,6 +570,9 @@ class SmartContractModelTrainer:
         def custom_data_collator(features):
             # Find max length in this batch
             max_len = max(len(f["input_ids"]) for f in features)
+
+            max_len = min(max_len, self.config.max_sequence_length)
+
             pad_token_id = tokenizer.pad_token_id
 
             batch_input_ids = []
@@ -533,9 +580,9 @@ class SmartContractModelTrainer:
             batch_labels = []
 
             for f in features:
-                ids = f["input_ids"]
-                mask = f.get("attention_mask", [1] * len(ids))
-                labels = f["labels"]
+                ids = f["input_ids"][:max_len]
+                mask = f.get("attention_mask", [1] * len(f["input_ids"]))[:max_len]
+                labels = f["labels"][:max_len]
                 pad_len = max_len - len(ids)
 
                 batch_input_ids.append(ids + [pad_token_id] * pad_len)
@@ -560,12 +607,24 @@ class SmartContractModelTrainer:
             deepspeed_config=deepspeed_config,
         )
 
+        callbacks = []
+        if do_eval:
+            callbacks.append(
+                EarlyStoppingCallback(
+                    early_stopping_patience=3,
+                    early_stopping_threshold=0.001,
+                )
+            )
+        if enable_memory_monitoring:
+            callbacks.append(MemoryLoggingCallback(self.logger))
+
         trainer = Trainer(
             model=peft_model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             data_collator=data_collator,
+            callbacks=callbacks or None,
         )
 
         logger.info(
@@ -694,9 +753,15 @@ class SmartContractModelTrainer:
         }
         if quantization_config:
             load_kwargs["quantization_config"] = quantization_config
-            load_kwargs["device_map"] = "auto"
+            if "LOCAL_RANK" in os.environ:
+                load_kwargs["device_map"] = {"": int(os.environ["LOCAL_RANK"])}
+            else:
+                load_kwargs["device_map"] = "auto"
         elif has_cuda:
-            load_kwargs["device_map"] = "auto"
+            if "LOCAL_RANK" in os.environ:
+                load_kwargs["device_map"] = {"": int(os.environ["LOCAL_RANK"])}
+            else:
+                load_kwargs["device_map"] = "auto"
         # CPU-only: no device_map, loads to CPU automatically
 
         if attn_impl:
