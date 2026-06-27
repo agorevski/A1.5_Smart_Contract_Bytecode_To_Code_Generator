@@ -18,7 +18,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -515,10 +515,29 @@ class SelectorResolver:
 
 # Shared default instance
 _default_resolver: Optional[SelectorResolver] = None
+_resolver_cache: Dict[Tuple[bool, float, str, str], SelectorResolver] = {}
 
-def get_resolver(*, use_remote: bool = True) -> SelectorResolver:
-    """Return or create the default shared resolver instance."""
+
+def get_resolver(
+    *,
+    use_remote: bool = True,
+    timeout: float = 3.0,
+    db_path: Optional[Path] = None,
+    json_path: Optional[Path] = None,
+) -> SelectorResolver:
+    """Return a shared resolver for the requested configuration."""
     global _default_resolver
-    if _default_resolver is None:
-        _default_resolver = SelectorResolver(use_remote=use_remote)
-    return _default_resolver
+    resolved_db = db_path or _DEFAULT_DB_PATH
+    resolved_json = json_path or _DEFAULT_JSON_PATH
+    key = (use_remote, timeout, str(resolved_db), str(resolved_json))
+    resolver = _resolver_cache.get(key)
+    if resolver is None:
+        resolver = SelectorResolver(
+            use_remote=use_remote,
+            timeout=timeout,
+            db_path=resolved_db,
+            json_path=resolved_json,
+        )
+        _resolver_cache[key] = resolver
+    _default_resolver = resolver
+    return resolver

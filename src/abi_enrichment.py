@@ -28,6 +28,109 @@ logger = logging.getLogger(__name__)
 # Issue #8: ABI Enrichment
 # ---------------------------------------------------------------------------
 
+
+def normalize_hex(value) -> str:
+    """Return lowercase hex with exactly one ``0x`` prefix."""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (bytes, bytearray)):
+        text = value.hex()
+    elif hasattr(value, "hex"):
+        text = value.hex()
+    else:
+        text = str(value)
+
+    text = text.strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    return "0x" + text
+
+
+def _split_top_level_commas(value: str) -> List[str]:
+    """Split a Solidity tuple component list on commas outside nested tuples."""
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for ch in value:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _find_matching_paren(value: str) -> int:
+    depth = 0
+    for idx, ch in enumerate(value):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def _extract_type_token(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    parts = value.split()
+    token = parts[0]
+    if len(parts) > 1 and parts[1].startswith("["):
+        token += parts[1]
+    return token
+
+
+def canonicalize_abi_type(type_name: str) -> str:
+    """Canonicalize a Solidity ABI type for selector/topic hashing.
+
+    Handles aliases (``uint``/``int``/``fixed``/``ufixed``), tuple components
+    recursively, and array suffixes.
+    """
+    typ = (type_name or "").strip()
+    if not typ:
+        return typ
+
+    if typ.startswith("("):
+        end = _find_matching_paren(typ)
+        if end != -1:
+            inner = typ[1:end]
+            rest = typ[end + 1 :].strip()
+            suffix_match = re.match(r"((?:\[[0-9]*\])*)", rest)
+            suffix = suffix_match.group(1) if suffix_match else ""
+            components = [
+                canonicalize_abi_type(part)
+                for part in _split_top_level_commas(inner)
+                if part
+            ]
+            return f"({','.join(components)}){suffix}"
+
+    token = _extract_type_token(typ)
+    match = re.match(r"^(.+?)(\[[0-9]*\])*$", token.replace(" ", ""))
+    if match:
+        base = match.group(1)
+        suffix = token.replace(" ", "")[len(base):]
+    else:
+        base = token.replace(" ", "")
+        suffix = ""
+
+    aliases = {
+        "uint": "uint256",
+        "int": "int256",
+        "fixed": "fixed128x18",
+        "ufixed": "ufixed128x18",
+        "byte": "bytes1",
+    }
+    return aliases.get(base, base) + suffix
+
 # Well-known error selectors
 ERROR_SELECTORS = {
     "08c379a0": "Error(string)",
@@ -138,7 +241,7 @@ class ABIEnricher:
         output_types = [self._resolve_type(out) for out in outputs]
 
         canonical = f"{name}({','.join(input_types)})"
-        selector = "0x" + Web3.keccak(text=canonical)[:4].hex()
+        selector = normalize_hex(Web3.keccak(text=canonical)[:4])
 
         self.functions[selector] = ABIFunctionInfo(
             name=name,
@@ -161,7 +264,7 @@ class ABIEnricher:
         indexed = [inp.get("indexed", False) for inp in inputs]
 
         canonical = f"{name}({','.join(input_types)})"
-        topic0 = "0x" + Web3.keccak(text=canonical).hex()
+        topic0 = normalize_hex(Web3.keccak(text=canonical))
 
         self.events[topic0] = ABIEventInfo(
             name=name,
@@ -182,7 +285,7 @@ class ABIEnricher:
         input_names = [inp.get("name", f"param{i}") for i, inp in enumerate(inputs)]
 
         canonical = f"{name}({','.join(input_types)})"
-        selector = "0x" + Web3.keccak(text=canonical)[:4].hex()
+        selector = normalize_hex(Web3.keccak(text=canonical)[:4])
 
         self.errors[selector] = ABIErrorInfo(
             name=name,
@@ -205,8 +308,8 @@ class ABIEnricher:
             )
             # Preserve array suffix: tuple[] → (...)[]
             suffix = typ[5:]  # everything after "tuple"
-            return f"({inner}){suffix}"
-        return typ
+            return canonicalize_abi_type(f"({inner}){suffix}")
+        return canonicalize_abi_type(typ)
 
     def get_function(self, selector: str) -> Optional[ABIFunctionInfo]:
         """Look up function info by 4-byte selector."""

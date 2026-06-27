@@ -5,7 +5,7 @@ Download Smart Contracts from HuggingFace & Generate Training Data
 Downloads verified Solidity contracts from the andstor/smart_contracts
 dataset on HuggingFace, compiles each with every compatible solc version
 (optimizer on + off), generates TAC via BytecodeAnalyzer, and exports
-training pairs in {"input": "<TAC>", "output": "<Solidity>"} format.
+JSONL training pairs with TAC input, Solidity output, and compiler metadata.
 
 Deduplication strategy (multi-layer):
   1. Contract-level: address PRIMARY KEY + source_hash dedup
@@ -38,7 +38,7 @@ import sqlite3
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from huggingface_hub import HfApi, hf_hub_download
@@ -47,14 +47,20 @@ from web3 import Web3
 
 from src.bytecode_analyzer import BytecodeAnalyzer
 from src.dataset_pipeline import SolidityParser
-from src.abi_enrichment import ABIEnricher, StorageLayoutResolver
+from src.abi_enrichment import (
+    ABIEnricher,
+    StorageLayoutResolver,
+    canonicalize_abi_type,
+    normalize_hex,
+)
 from src.local_compiler import (
     compile_source,
     compile_multi_file,
-    compatible_versions_for_pragma,
+    compatible_versions_for_pragmas,
     install_solc_version,
     parse_etherscan_source,
     parse_pragma,
+    version_satisfies_all_pragmas,
     _normalize_version,
 )
 
@@ -66,6 +72,7 @@ LOG_FILE = "download_hf_contracts.log"
 DB_PATH = Path("data/contracts.db")
 FLUSH_SIZE = 200
 BATCH_INSERT_SIZE = 500
+HF_DATASET_REPO = "andstor/smart_contracts"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -178,6 +185,15 @@ def hash_source_code(source: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
+def _write_manifest(path: Path, payload: Dict[str, Any]) -> None:
+    """Write a deterministic JSON manifest."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 def is_trivial_function(body: str) -> bool:
     """Check if a function body is too trivial to be useful training data.
 
@@ -250,6 +266,10 @@ def init_database(db_path: Path = DB_PATH):
                 optimization_enabled BOOLEAN,
                 optimization_runs INTEGER,
                 processed BOOLEAN DEFAULT FALSE,
+                compile_status TEXT DEFAULT 'pending',
+                attempt_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                processed_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -292,6 +312,10 @@ def init_database(db_path: Path = DB_PATH):
             ("contract_name", "TEXT"),
             ("source", "TEXT DEFAULT 'etherscan'"),
             ("source_hash", "TEXT"),
+            ("compile_status", "TEXT DEFAULT 'pending'"),
+            ("attempt_count", "INTEGER DEFAULT 0"),
+            ("last_error", "TEXT"),
+            ("processed_at", "TIMESTAMP"),
         ])
         _add_columns(cur, "function_pairs", [
             ("body_hash", "TEXT"),
@@ -465,10 +489,17 @@ def get_body_hash_counts(db_path: Path = DB_PATH) -> Dict[str, int]:
 # Phase 1 -- Download from HuggingFace
 # ---------------------------------------------------------------------------
 
-def _get_parquet_files(config: str = "flattened", split: str = "train") -> List[str]:
+def _get_parquet_files(
+    config: str = "flattened",
+    split: str = "train",
+    revision: Optional[str] = None,
+) -> List[str]:
     """List Parquet files in the HuggingFace dataset repo."""
     api = HfApi()
-    all_files = api.list_repo_files("andstor/smart_contracts", repo_type="dataset")
+    kwargs: Dict[str, Any] = {"repo_type": "dataset"}
+    if revision:
+        kwargs["revision"] = revision
+    all_files = api.list_repo_files(HF_DATASET_REPO, **kwargs)
     prefix = f"data/{config}/{split}/"
     return sorted(f for f in all_files if f.startswith(prefix) and f.endswith(".parquet"))
 
@@ -485,6 +516,72 @@ def _flush_batch(cur: sqlite3.Cursor, batch: list) -> int:
     return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
 
 
+def _mark_contract_status(
+    db_path: Path,
+    addresses: List[str],
+    status: str,
+    *,
+    processed: bool,
+    last_error: str = "",
+) -> None:
+    """Record compile outcome without conflating failures with success."""
+    if not addresses:
+        return
+    with _db_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.executemany(
+            """
+            UPDATE contracts
+            SET processed = ?,
+                compile_status = ?,
+                attempt_count = COALESCE(attempt_count, 0) + 1,
+                last_error = ?,
+                processed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE processed_at END
+            WHERE address = ?
+            """,
+            [
+                (processed, status, last_error or None, processed, addr)
+                for addr in addresses
+            ],
+        )
+        conn.commit()
+
+
+def _record_contract_outcomes(
+    db_path: Path,
+    outcomes: Dict[str, Dict[str, Any]],
+) -> Dict[str, int]:
+    """Persist per-contract outcomes and return status counts."""
+    status_to_addresses: Dict[Tuple[str, bool, str], List[str]] = {}
+    for addr, outcome in outcomes.items():
+        pair_count = int(outcome.get("pairs", 0) or 0)
+        failures = outcome.get("failures", []) or []
+        if pair_count > 0:
+            key = ("processed", True, "")
+        elif failures:
+            first_failure = failures[0]
+            key = (
+                first_failure.get("status", "compile_failed"),
+                False,
+                first_failure.get("error", "") or "compile job failed",
+            )
+        else:
+            key = ("no_pairs", False, "compile jobs produced no matched pairs")
+        status_to_addresses.setdefault(key, []).append(addr)
+
+    counts: Dict[str, int] = {}
+    for (status, processed, error), addresses in status_to_addresses.items():
+        _mark_contract_status(
+            db_path,
+            addresses,
+            status,
+            processed=processed,
+            last_error=error,
+        )
+        counts[status] = counts.get(status, 0) + len(addresses)
+    return counts
+
+
 def _parse_opt_used(value) -> bool:
     """Coerce optimization_used to bool."""
     if isinstance(value, bool):
@@ -498,18 +595,37 @@ def download_contracts(
     limit: int = 0,
     db_path: Path = DB_PATH,
     cache_dir: Optional[str] = None,
+    hf_revision: Optional[str] = None,
+    manifest_path: Optional[Path] = None,
 ) -> int:
     """Download contracts from HuggingFace with source-code-level dedup.
 
     Parquet files are cached locally (default: ~/.cache/huggingface/hub/).
     On rerun, cached files are reused without re-downloading.
     """
-    logger.info("Listing Parquet files from andstor/smart_contracts (flattened/train)...")
-    parquet_files = _get_parquet_files("flattened", "train")
+    logger.info(
+        "Listing Parquet files from %s (flattened/train, revision=%s)...",
+        HF_DATASET_REPO,
+        hf_revision or "default",
+    )
+    parquet_files = _get_parquet_files("flattened", "train", revision=hf_revision)
     if not parquet_files:
         logger.error("No Parquet files found!")
         return 0
     logger.info(f"Found {len(parquet_files)} Parquet file(s)")
+    _write_manifest(
+        manifest_path or Path(db_path).with_name("hf_download_manifest.json"),
+        {
+            "dataset_repo": HF_DATASET_REPO,
+            "revision": hf_revision or "default",
+            "config": "flattened",
+            "split": "train",
+            "parquet_files": parquet_files,
+            "limit": limit,
+            "cache_dir": cache_dir,
+            "code_version": os.environ.get("GITHUB_SHA", "unknown"),
+        },
+    )
 
     existing_hashes = get_existing_source_hashes(db_path)
     logger.info(f"Loaded {len(existing_hashes)} existing source hashes for dedup")
@@ -529,10 +645,11 @@ def download_contracts(
 
             try:
                 local_path = hf_hub_download(
-                    repo_id="andstor/smart_contracts",
+                    repo_id=HF_DATASET_REPO,
                     filename=pq_file,
                     repo_type="dataset",
                     cache_dir=cache_dir,
+                    revision=hf_revision,
                 )
                 logger.info(f"  Cached at: {local_path}")
                 df = pd.read_parquet(local_path)
@@ -633,15 +750,19 @@ def _prepare_contract(
 
         combined_source = "\n\n".join(source_files.values())
         pragmas = parse_pragma(combined_source)
-        pragma = pragmas[0] if pragmas else ">=0.4.0"
+        pragma_constraints = pragmas or [">=0.4.0"]
 
-        compatible = compatible_versions_for_pragma(pragma)
+        compatible = compatible_versions_for_pragmas(pragma_constraints)
         if not compatible:
             return None
 
         if orig_version:
             norm_orig = _normalize_version(orig_version)
-            if norm_orig and norm_orig not in compatible:
+            if (
+                norm_orig
+                and norm_orig not in compatible
+                and version_satisfies_all_pragmas(norm_orig, pragma_constraints)
+            ):
                 compatible.insert(0, norm_orig)
 
         if max_compiler_versions > 0:
@@ -672,8 +793,8 @@ def _compile_one_job(
     runs: int,
     min_body_length: int,
     abi_json: str = "",
-) -> List[Dict]:
-    """Compile one (contract, version, optimizer) combo and return pairs.
+) -> Dict[str, Any]:
+    """Compile one (contract, version, optimizer) combo and return outcome.
 
     Quality filters applied: min body length, trivial getters, proxy forwarders.
     ABI enrichment (Issue #8) and storage layout (Issue #2) annotations are
@@ -682,7 +803,11 @@ def _compile_one_job(
     logging.disable(logging.CRITICAL)
     try:
         if not install_solc_version(solc_version):
-            return []
+            return {
+                "pairs": [],
+                "status": "compile_failed",
+                "error": f"failed to install solc {solc_version}",
+            }
 
         try:
             if len(source_files) > 1:
@@ -690,11 +815,15 @@ def _compile_one_job(
             else:
                 first_src = next(iter(source_files.values()))
                 comp = compile_source(first_src, solc_version, opt_enabled, runs)
-        except Exception:
-            return []
+        except Exception as e:
+            return {"pairs": [], "status": "compile_failed", "error": str(e)}
 
         if not comp.success:
-            return []
+            return {
+                "pairs": [],
+                "status": "compile_failed",
+                "error": "; ".join(comp.errors) if comp.errors else "solc compilation failed",
+            }
 
         # Issue #8: Build ABI enricher from contract ABI
         abi_enricher = None
@@ -717,6 +846,7 @@ def _compile_one_job(
             storage_resolver = None
 
         pairs: List[Dict] = []
+        analysis_errors: List[str] = []
         for cname, compiled in comp.contracts.items():
             bytecode_hex = "0x" + compiled.runtime_bytecode
             if len(bytecode_hex) < 10:
@@ -726,7 +856,8 @@ def _compile_one_job(
                 analyzer = BytecodeAnalyzer(bytecode_hex)
                 analyzer.analyze_control_flow()
                 bytecode_functions = analyzer.identify_functions()
-            except Exception:
+            except Exception as e:
+                analysis_errors.append(str(e))
                 continue
 
             contract_sol_funcs = [
@@ -746,9 +877,17 @@ def _compile_one_job(
                 if pair:
                     pairs.append(pair)
 
-        return pairs
-    except Exception:
-        return []
+        if pairs:
+            return {"pairs": pairs, "status": "processed", "error": ""}
+        if analysis_errors:
+            return {
+                "pairs": [],
+                "status": "analysis_failed",
+                "error": "; ".join(analysis_errors[:3]),
+            }
+        return {"pairs": [], "status": "no_pairs", "error": "no matched functions"}
+    except Exception as e:
+        return {"pairs": [], "status": "compile_failed", "error": str(e)}
 
 
 def compile_and_generate(
@@ -798,20 +937,25 @@ def compile_and_generate(
                 }
                 for fut in as_completed(futures):
                     addr = futures[fut]
-                    result = fut.result()
+                    try:
+                        result = fut.result()
+                    except Exception:
+                        result = None
                     if result:
                         prepared[addr] = result
                     else:
                         no_work_addresses.append(addr)
                     pbar.update(1)
 
-    # Mark contracts with no work as processed
+    # Track contracts with no compilable work without marking them successful.
     if no_work_addresses:
-        with _db_connection(db_path) as conn:
-            cur = conn.cursor()
-            for addr in no_work_addresses:
-                cur.execute("UPDATE contracts SET processed = TRUE WHERE address = ?", (addr,))
-            conn.commit()
+        _mark_contract_status(
+            db_path,
+            no_work_addresses,
+            "no_pairs",
+            processed=False,
+            last_error="prepare produced no compile jobs",
+        )
 
     # Fetch ABI data for contracts that have it (Issue #8)
     abi_by_address: Dict[str, str] = {}
@@ -828,7 +972,7 @@ def compile_and_generate(
         (addr, prep["source_files"], prep["solidity_functions"],
          ver, opt, prep["runs"], min_body_length,
          abi_by_address.get(addr, ""))
-        for addr, prep in prepared.items()
+        for addr, prep in sorted(prepared.items())
         for ver in prep["compatible_versions"]
         for opt in (True, False)
     ]
@@ -839,6 +983,10 @@ def compile_and_generate(
         f"({total_jobs // max(len(prepared), 1)} avg jobs/contract)"
     )
     if total_jobs == 0:
+        _record_contract_outcomes(
+            db_path,
+            {addr: {"pairs": 0, "failures": []} for addr in prepared},
+        )
         return 0
 
     # Phase 2b: compile in parallel (batched to avoid memory/IPC flood)
@@ -846,44 +994,69 @@ def compile_and_generate(
     total_db_deduped = 0
     errors_count = 0
     pair_buffer: List[Dict] = []
+    contract_outcomes: Dict[str, Dict[str, Any]] = {
+        addr: {"pairs": 0, "failures": []} for addr in prepared
+    }
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         with tqdm(total=total_jobs, desc="Compiling variants", unit="job") as pbar:
             for batch_start in range(0, total_jobs, SUBMIT_BATCH):
                 batch_jobs = compile_jobs[batch_start : batch_start + SUBMIT_BATCH]
-                futures = {executor.submit(_compile_one_job, *job): job[0] for job in batch_jobs}
+                futures = {
+                    executor.submit(_compile_one_job, *job): (batch_start + idx, job[0])
+                    for idx, job in enumerate(batch_jobs)
+                }
+                batch_results: Dict[int, Tuple[str, Dict[str, Any]]] = {}
 
                 for fut in as_completed(futures):
+                    job_idx, addr = futures[fut]
                     try:
-                        pairs = fut.result()
-                        if pairs:
-                            pair_buffer.extend(pairs)
-                            total_pairs += len(pairs)
-                    except Exception:
+                        result = fut.result()
+                        if isinstance(result, list):
+                            result = {
+                                "pairs": result,
+                                "status": "processed" if result else "no_pairs",
+                                "error": "",
+                            }
+                        batch_results[job_idx] = (addr, result)
+                    except Exception as e:
+                        batch_results[job_idx] = (
+                            addr,
+                            {"pairs": [], "status": "compile_failed", "error": str(e)},
+                        )
+
+                    pbar.set_postfix(pairs=total_pairs, errors=errors_count, refresh=False)
+                    pbar.update(1)
+
+                for job_idx in sorted(batch_results):
+                    addr, result = batch_results[job_idx]
+                    pairs = result.get("pairs", []) or []
+                    status = result.get("status", "no_pairs")
+                    if pairs:
+                        pair_buffer.extend(pairs)
+                        total_pairs += len(pairs)
+                        contract_outcomes[addr]["pairs"] += len(pairs)
+                    elif status not in ("no_pairs", "processed"):
                         errors_count += 1
+                        contract_outcomes[addr]["failures"].append(
+                            {"status": status, "error": result.get("error", "")}
+                        )
 
                     if len(pair_buffer) >= FLUSH_SIZE:
                         inserted = _store_pairs_batch(db_path, pair_buffer)
                         total_db_deduped += len(pair_buffer) - inserted
                         pair_buffer = []
 
-                    pbar.set_postfix(pairs=total_pairs, errors=errors_count, refresh=False)
-                    pbar.update(1)
-
     if pair_buffer:
         inserted = _store_pairs_batch(db_path, pair_buffer)
         total_db_deduped += len(pair_buffer) - inserted
 
-    # Mark prepared contracts as processed
-    with _db_connection(db_path) as conn:
-        cur = conn.cursor()
-        for addr in prepared:
-            cur.execute("UPDATE contracts SET processed = TRUE WHERE address = ?", (addr,))
-        conn.commit()
+    outcome_counts = _record_contract_outcomes(db_path, contract_outcomes)
 
     # Harvest selectors from all prepared contracts into the registry
     all_selectors: List[tuple] = []
-    for prep in prepared.values():
+    for addr in sorted(prepared):
+        prep = prepared[addr]
         for func in prep.get("solidity_functions", []):
             sel = func.get("selector")
             if not sel:
@@ -912,6 +1085,7 @@ def compile_and_generate(
         f"{total_pairs} pairs generated, {total_db_deduped} deduped at DB insert, "
         f"{errors_count} errors"
     )
+    logger.info("Contract outcomes: %s", outcome_counts)
     return total_pairs
 
 
@@ -971,7 +1145,7 @@ def _parse_solidity_param_types(params_str: str) -> List[str]:
             # Include trailing array brackets like [] or [3]
             while end < len(param) and param[end] in '[]0123456789':
                 end += 1
-            types.append(param[:end])
+            types.append(canonicalize_abi_type(param[:end]))
         else:
             # Regular type — first whitespace token, but include [] brackets
             parts = param.split()
@@ -979,7 +1153,7 @@ def _parse_solidity_param_types(params_str: str) -> List[str]:
             # Handle "uint256 [3]" (space before bracket) — merge next part
             if len(parts) > 1 and parts[1].startswith('['):
                 type_token += parts[1]
-            types.append(type_token)
+            types.append(canonicalize_abi_type(type_token))
 
     return types
 
@@ -1027,7 +1201,7 @@ def _add_selectors(functions: List[Dict]) -> List[Dict]:
             else:
                 canonical = signature.replace("function ", "").strip()
 
-            func["selector"] = "0x" + Web3.keccak(text=canonical)[:4].hex()
+            func["selector"] = normalize_hex(Web3.keccak(text=canonical)[:4])
         except Exception:
             func["selector"] = None
     return functions
@@ -1219,12 +1393,10 @@ def export_training_data(
     output_path: str = "data/hf_training_dataset.jsonl",
     max_body_dupes: int = 5,
     db_path: Path = DB_PATH,
+    hf_revision: Optional[str] = None,
+    manifest_path: Optional[Path] = None,
 ) -> str:
-    """Export function pairs as JSONL, deduped at export time.
-
-    Uses ROW_NUMBER() partitioned by pair_norm_hash to keep at most
-    `max_body_dupes` rows per semantic pair.
-    """
+    """Export function pairs as deterministic JSONL with body-level caps."""
     with _db_connection(db_path) as conn:
         rows = conn.execute("""
             SELECT function_name, tac_representation, solidity_code,
@@ -1233,17 +1405,42 @@ def export_training_data(
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (
-                           PARTITION BY COALESCE(pair_norm_hash, body_hash, hash)
-                           ORDER BY created_at
-                       ) AS rn
-                FROM function_pairs
+                           PARTITION BY COALESCE(body_hash, hash)
+                           ORDER BY COALESCE(pair_norm_hash, ''),
+                                    COALESCE(tac_hash, ''),
+                                    COALESCE(contract_address, ''),
+                                    COALESCE(function_signature, ''),
+                                    COALESCE(function_name, ''),
+                                    id
+                       ) AS body_rn
+                FROM (
+                    SELECT *,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY COALESCE(pair_norm_hash, hash)
+                              ORDER BY COALESCE(body_hash, ''),
+                                       COALESCE(tac_hash, ''),
+                                       COALESCE(contract_address, ''),
+                                       COALESCE(function_signature, ''),
+                                       COALESCE(function_name, ''),
+                                       id
+                          ) AS pair_rn
+                    FROM function_pairs
+                )
+                WHERE pair_rn = 1
             )
-            WHERE rn <= ?
+            WHERE body_rn <= ?
+            ORDER BY COALESCE(body_hash, ''),
+                     COALESCE(pair_norm_hash, ''),
+                     COALESCE(tac_hash, ''),
+                     COALESCE(contract_address, ''),
+                     COALESCE(function_signature, ''),
+                     COALESCE(function_name, '')
         """, (max_body_dupes,)).fetchall()
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     count = 0
+    solc_versions: Set[str] = set()
     with open(output_path, "w", encoding="utf-8") as f:
         for (func_name, tac, solidity, sig, vis,
              is_pay, is_view, addr, meta_str, body_hash) in rows:
@@ -1261,10 +1458,15 @@ def export_training_data(
             }
             if meta_str:
                 try:
-                    record["metadata"].update(json.loads(meta_str))
+                    parsed_meta = json.loads(meta_str)
+                    if isinstance(parsed_meta, dict):
+                        record["metadata"].update(parsed_meta)
+                        compiler_version = parsed_meta.get("compiler_version")
+                        if compiler_version:
+                            solc_versions.add(compiler_version)
                 except json.JSONDecodeError:
                     pass
-            f.write(json.dumps(record) + "\n")
+            f.write(json.dumps(record, sort_keys=True) + "\n")
             count += 1
 
     logger.info(f"Exported {count} training pairs to {output_path}")
@@ -1285,7 +1487,23 @@ def export_training_data(
     logger.info(
         f"Dedup stats: {total_in_db} total in DB, {unique_pairs} unique pairs, "
         f"{unique_bodies} unique bodies, {unique_tacs} unique TACs, "
-        f"{count} exported (max {max_body_dupes} per semantic pair)"
+        f"{count} exported (max {max_body_dupes} per normalized body)"
+    )
+    _write_manifest(
+        manifest_path or Path(f"{output_path}.manifest.json"),
+        {
+            "dataset_repo": HF_DATASET_REPO,
+            "hf_revision": hf_revision or "default",
+            "output_path": output_path,
+            "max_body_dupes": max_body_dupes,
+            "rows_exported": count,
+            "total_pairs_in_db": total_in_db,
+            "unique_pairs": unique_pairs,
+            "unique_bodies": unique_bodies,
+            "unique_tacs": unique_tacs,
+            "solc_versions": sorted(solc_versions),
+            "code_version": os.environ.get("GITHUB_SHA", "unknown"),
+        },
     )
     return output_path
 
@@ -1322,6 +1540,8 @@ def main():
                         help="Min Solidity body length to keep (default: 50 chars).")
     parser.add_argument("--cache-dir", type=str, default=None,
                         help="HuggingFace cache dir for Parquet files.")
+    parser.add_argument("--hf-revision", type=str, default=None,
+                        help="HuggingFace dataset revision/commit to pin downloads.")
     parser.add_argument("--output", type=str, default="data/hf_training_dataset.jsonl",
                         help="Output JSONL file path.")
     parser.add_argument("--export-selectors", type=str, default=None,
@@ -1350,7 +1570,12 @@ def main():
     if not args.compile_only and not args.export_only:
         logger.info("\n--- Phase 1: Download from HuggingFace ---")
         before = count_contracts(db_path)
-        download_contracts(limit=args.limit, db_path=db_path, cache_dir=args.cache_dir)
+        download_contracts(
+            limit=args.limit,
+            db_path=db_path,
+            cache_dir=args.cache_dir,
+            hf_revision=args.hf_revision,
+        )
         after = count_contracts(db_path)
         logger.info(f"Database now has {after} contracts (was {before}, added {after - before})")
         if args.download_only:
@@ -1389,6 +1614,7 @@ def main():
             output_path=args.output,
             max_body_dupes=args.max_body_dupes,
             db_path=db_path,
+            hf_revision=args.hf_revision,
         )
         logger.info(f"Training data written to: {out}")
     else:

@@ -34,9 +34,49 @@ from .local_compiler import (
     install_solc_version,
     _normalize_version,
 )
+from .abi_enrichment import canonicalize_abi_type, normalize_hex
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_comments(text: str) -> str:
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return text
+
+
+def normalize_solidity_body(body: str) -> str:
+    return _collapse_whitespace(_strip_comments(body)).lower()
+
+
+def normalize_tac(tac: str) -> str:
+    text = re.sub(r"//[^\n]*", "", tac)
+    return _collapse_whitespace(text).lower()
+
+
+def _md5(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def hash_source_code(source: str) -> str:
+    return hashlib.sha256(_collapse_whitespace(source).encode()).hexdigest()
+
+
+def hash_normalized_body(body: str) -> str:
+    return _md5(normalize_solidity_body(body))
+
+
+def hash_normalized_tac(tac: str) -> str:
+    return _md5(normalize_tac(tac))
+
+
+def hash_normalized_pair(tac: str, body: str) -> str:
+    return _md5(normalize_tac(tac) + "|" + normalize_solidity_body(body))
 
 
 def _extract_function_signature_parts(signature: str) -> Optional[Tuple[str, str]]:
@@ -601,6 +641,7 @@ class DatasetBuilder:
                 compiler_version TEXT,
                 optimization_enabled BOOLEAN,
                 optimization_runs INTEGER,
+                source_hash TEXT,
                 processed BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -621,14 +662,56 @@ class DatasetBuilder:
                 is_view BOOLEAN,
                 metadata TEXT,
                 hash TEXT UNIQUE,
+                body_hash TEXT,
+                tac_hash TEXT,
+                pair_norm_hash TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (contract_address) REFERENCES contracts (address)
             )
         """
         )
 
+        self._add_columns(
+            cursor,
+            "contracts",
+            [("source_hash", "TEXT")],
+        )
+        self._add_columns(
+            cursor,
+            "function_pairs",
+            [
+                ("body_hash", "TEXT"),
+                ("tac_hash", "TEXT"),
+                ("pair_norm_hash", "TEXT"),
+            ],
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_source_hash "
+            "ON contracts(source_hash)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_body_hash "
+            "ON function_pairs(body_hash)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_tac_hash "
+            "ON function_pairs(tac_hash)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_pair_norm_hash "
+            "ON function_pairs(pair_norm_hash)"
+        )
+
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _add_columns(cursor: sqlite3.Cursor, table: str, columns: List[Tuple[str, str]]) -> None:
+        for name, col_type in columns:
+            try:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+            except sqlite3.OperationalError:
+                pass
 
     # ------------------------------------------------------------------ #
     #  Contract Collection
@@ -686,8 +769,8 @@ class DatasetBuilder:
             """
             INSERT OR REPLACE INTO contracts
             (address, source_code, bytecode, compiler_version,
-             optimization_enabled, optimization_runs)
-            VALUES (?, ?, ?, ?, ?, ?)
+             optimization_enabled, optimization_runs, source_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 contract_data.address,
@@ -696,6 +779,7 @@ class DatasetBuilder:
                 contract_data.compiler_version,
                 contract_data.optimization_enabled,
                 contract_data.optimization_runs,
+                hash_source_code(contract_data.source_code),
             ),
         )
 
@@ -750,10 +834,10 @@ class DatasetBuilder:
 
                 combined_source = "\n\n".join(source_files.values())
                 pragmas = parse_pragma(combined_source)
-                pragma = pragmas[0] if pragmas else ">=0.4.0"
+                pragma_constraints = pragmas or [">=0.4.0"]
 
                 configs = select_compilation_configs(
-                    pragma,
+                    pragma_constraints,
                     original_version=original_version,
                     original_optimizer=original_opt,
                     original_runs=original_runs,
@@ -1114,13 +1198,13 @@ class DatasetBuilder:
                             break
                 while end < len(param) and param[end] in '[]0123456789':
                     end += 1
-                types.append(param[:end])
+                types.append(canonicalize_abi_type(param[:end]))
             else:
                 parts = param.split()
                 type_token = parts[0]
                 if len(parts) > 1 and parts[1].startswith('['):
                     type_token += parts[1]
-                types.append(type_token)
+                types.append(canonicalize_abi_type(type_token))
 
         return types
 
@@ -1156,7 +1240,7 @@ class DatasetBuilder:
                     canonical = signature.replace("function ", "").strip()
 
                 selector_hash = Web3.keccak(text=canonical)[:4]
-                func["selector"] = "0x" + selector_hash.hex()
+                func["selector"] = normalize_hex(selector_hash)
 
                 logger.debug(
                     f"Calculated selector {func['selector']} for {canonical}"
@@ -1454,6 +1538,9 @@ class DatasetBuilder:
         """
         content = f"{pair.tac_representation}{pair.solidity_code}"
         hash_value = hashlib.md5(content.encode()).hexdigest()
+        body_hash = hash_normalized_body(pair.solidity_code)
+        tac_hash = hash_normalized_tac(pair.tac_representation)
+        pair_norm_hash = hash_normalized_pair(pair.tac_representation, pair.solidity_code)
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -1463,8 +1550,9 @@ class DatasetBuilder:
                 """
                 INSERT INTO function_pairs
                 (contract_address, function_name, tac_representation, solidity_code,
-                 function_signature, visibility, is_payable, is_view, metadata, hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 function_signature, visibility, is_payable, is_view, metadata, hash,
+                 body_hash, tac_hash, pair_norm_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     pair.contract_address,
@@ -1477,6 +1565,9 @@ class DatasetBuilder:
                     pair.is_view,
                     json.dumps(pair.metadata) if pair.metadata else None,
                     hash_value,
+                    body_hash,
+                    tac_hash,
+                    pair_norm_hash,
                 ),
             )
             conn.commit()
@@ -1583,13 +1674,32 @@ class DatasetBuilder:
         query = """
             SELECT function_name, tac_representation, solidity_code, function_signature,
                    visibility, is_payable, is_view, contract_address, metadata
-            FROM function_pairs
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(pair_norm_hash, hash)
+                           ORDER BY COALESCE(body_hash, ''),
+                                    COALESCE(tac_hash, ''),
+                                    COALESCE(contract_address, ''),
+                                    COALESCE(function_signature, ''),
+                                    COALESCE(function_name, ''),
+                                    id
+                       ) AS pair_rn
+                FROM function_pairs
+            )
+            WHERE pair_rn = 1
+            ORDER BY COALESCE(body_hash, ''),
+                     COALESCE(pair_norm_hash, ''),
+                     COALESCE(tac_hash, ''),
+                     COALESCE(contract_address, ''),
+                     COALESCE(function_signature, ''),
+                     COALESCE(function_name, ''),
+                     id
         """
         df = pd.read_sql_query(query, conn)
         conn.close()
 
-        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"smart_contract_dataset_{timestamp}.{output_format}"
+        filename = f"smart_contract_dataset.{output_format}"
         filepath = self.output_dir / filename
 
         if output_format == "jsonl":
@@ -1622,7 +1732,7 @@ class DatasetBuilder:
                         "output": row["solidity_code"],
                         "metadata": metadata,
                     }
-                    f.write(json.dumps(record) + "\n")
+                    f.write(json.dumps(record, sort_keys=True) + "\n")
 
         elif output_format == "csv":
             df.to_csv(filepath, index=False)

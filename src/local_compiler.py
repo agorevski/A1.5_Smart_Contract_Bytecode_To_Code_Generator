@@ -12,7 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import solcx
 from solcx.exceptions import SolcError
@@ -76,6 +76,59 @@ def install_solc_version(version: str) -> bool:
         return False
 
 
+def strip_solidity_comments(source_code: str) -> str:
+    """Remove Solidity comments while preserving string literals."""
+    result: List[str] = []
+    i = 0
+    in_string: Optional[str] = None
+    escaped = False
+
+    while i < len(source_code):
+        ch = source_code[i]
+        nxt = source_code[i + 1] if i + 1 < len(source_code) else ""
+
+        if in_string:
+            result.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            in_string = ch
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < len(source_code) and source_code[i] != "\n":
+                i += 1
+            if i < len(source_code):
+                result.append("\n")
+                i += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < len(source_code) and not (
+                source_code[i] == "*" and source_code[i + 1] == "/"
+            ):
+                result.append("\n" if source_code[i] == "\n" else " ")
+                i += 1
+            i = i + 2 if i + 1 < len(source_code) else len(source_code)
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
 def parse_pragma(source_code: str) -> List[str]:
     """Extract pragma solidity version constraints from source code.
 
@@ -85,13 +138,36 @@ def parse_pragma(source_code: str) -> List[str]:
     Returns:
         List of version constraint strings, e.g. ['^0.8.0', '>=0.7.0 <0.9.0'].
     """
+    source_code = strip_solidity_comments(source_code)
     pragmas = []
     for match in re.finditer(
-        r"pragma\s+solidity\s+([^;]+);", source_code, re.MULTILINE
+        r"^\s*pragma\s+solidity\s+([^;]+);", source_code, re.MULTILINE
     ):
         constraint = match.group(1).strip()
         pragmas.append(constraint)
     return pragmas
+
+
+def version_satisfies_all_pragmas(version: str, pragma_constraints: List[str]) -> bool:
+    """Return True when *version* satisfies every pragma constraint."""
+    constraints = pragma_constraints or [">=0.4.0"]
+    return all(_version_matches_pragma(version, pragma) for pragma in constraints)
+
+
+def compatible_versions_for_pragmas(
+    pragma_constraints: List[str],
+    candidate_versions: Optional[List[str]] = None,
+) -> List[str]:
+    """Determine solc versions satisfying the intersection of all pragmas."""
+    constraints = pragma_constraints or [">=0.4.0"]
+    compatible = compatible_versions_for_pragma(constraints[0], candidate_versions)
+    if len(constraints) == 1:
+        return compatible
+    return [
+        version
+        for version in compatible
+        if version_satisfies_all_pragmas(version, constraints[1:])
+    ]
 
 
 def compatible_versions_for_pragma(
@@ -516,7 +592,7 @@ def parse_etherscan_source(raw_source: str) -> Dict[str, str]:
 
 
 def select_compilation_configs(
-    pragma_constraint: str,
+    pragma_constraint: Union[str, List[str]],
     original_version: Optional[str] = None,
     original_optimizer: Optional[bool] = None,
     original_runs: Optional[int] = None,
@@ -528,7 +604,7 @@ def select_compilation_configs(
     Always includes the original settings if provided, plus variants.
 
     Args:
-        pragma_constraint: Pragma version constraint from source.
+        pragma_constraint: Pragma version constraint(s) from source.
         original_version: Original compiler version used (from Etherscan).
         original_optimizer: Original optimizer setting.
         original_runs: Original optimizer runs.
@@ -538,11 +614,18 @@ def select_compilation_configs(
         List of config dicts with keys: version, optimizer_enabled, optimizer_runs.
     """
     configs = []
+    pragma_constraints = (
+        list(pragma_constraint)
+        if isinstance(pragma_constraint, (list, tuple))
+        else [pragma_constraint]
+    )
+    if not pragma_constraints:
+        pragma_constraints = [">=0.4.0"]
 
     # 1. Always include the original config if available
     if original_version:
         norm_ver = _normalize_version(original_version)
-        if norm_ver:
+        if norm_ver and version_satisfies_all_pragmas(norm_ver, pragma_constraints):
             configs.append(
                 {
                     "version": norm_ver,
@@ -552,7 +635,7 @@ def select_compilation_configs(
             )
 
     # 2. Find compatible versions for augmentation
-    compatible = compatible_versions_for_pragma(pragma_constraint)
+    compatible = compatible_versions_for_pragmas(pragma_constraints)
 
     # Deduplicate against original
     existing_versions = {c["version"] for c in configs}

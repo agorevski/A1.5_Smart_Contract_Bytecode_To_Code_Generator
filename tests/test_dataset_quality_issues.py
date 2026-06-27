@@ -567,10 +567,10 @@ class TestIssue06_SpecialFunctionHandling:
         """_detect_fallback_function should locate the fall-through after last PUSH4/EQ/JUMPI."""
         from src.bytecode_analyzer import BytecodeAnalyzer
 
-        # 63 aabbccdd = PUSH4, 14=EQ, 60 20=PUSH1 0x20, 57=JUMPI
-        # 5b=JUMPDEST at PC 9, 00=STOP (fallback)
+        # Selector is derived from CALLDATALOAD(0) via SHR before PUSH4/EQ/JUMPI.
+        # 5b=JUMPDEST at PC 0x10, 00=STOP (fallback)
         # ... pad to 0x20 ... 5b 00 (dispatcher target)
-        pre = "63aabbccdd146020575b00"
+        pre = "60003560e01c8063aabbccdd146020575b00"
         padding = "fe" * (0x20 - len(pre) // 2)
         post = "5b00"
         bytecode = "0x" + pre + padding + post
@@ -738,7 +738,6 @@ class TestIssue08_ABIDataUsage:
     def test_abi_enricher_parses_functions(self):
         """ABIEnricher should parse function entries and compute selectors."""
         from src.abi_enrichment import ABIEnricher
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -755,7 +754,7 @@ class TestIssue08_ABIDataUsage:
         enricher = ABIEnricher(abi_json)
         assert enricher.has_data()
 
-        expected_sel = "0x" + Web3.keccak(text="transfer(address,uint256)")[:4].hex()
+        expected_sel = "0xa9059cbb"
         func = enricher.get_function(expected_sel)
         assert func is not None
         assert func.name == "transfer"
@@ -766,7 +765,6 @@ class TestIssue08_ABIDataUsage:
     def test_abi_enricher_parses_events(self):
         """ABIEnricher should parse event entries and compute topic0."""
         from src.abi_enrichment import ABIEnricher
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -780,9 +778,7 @@ class TestIssue08_ABIDataUsage:
             }
         ])
         enricher = ABIEnricher(abi_json)
-        expected_topic = "0x" + Web3.keccak(
-            text="Transfer(address,address,uint256)"
-        ).hex()
+        expected_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         event = enricher.get_event_by_topic(expected_topic)
         assert event is not None
         assert event.name == "Transfer"
@@ -843,7 +839,6 @@ class TestIssue08_ABIDataUsage:
     def test_format_function_header(self):
         """format_function_header should produce a named function with typed params."""
         from src.abi_enrichment import ABIEnricher
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -858,14 +853,13 @@ class TestIssue08_ABIDataUsage:
             }
         ])
         enricher = ABIEnricher(abi_json)
-        sel = "0x" + Web3.keccak(text="transfer(address,uint256)")[:4].hex()
+        sel = "0xa9059cbb"
         header = enricher.format_function_header(sel)
         assert header == "function transfer(address to, uint256 amount):"
 
     def test_format_return_annotation(self):
         """format_return_annotation should produce a return type comment."""
         from src.abi_enrichment import ABIEnricher
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -877,14 +871,13 @@ class TestIssue08_ABIDataUsage:
             }
         ])
         enricher = ABIEnricher(abi_json)
-        sel = "0x" + Web3.keccak(text="balanceOf(address)")[:4].hex()
+        sel = "0x70a08231"
         ret = enricher.format_return_annotation(sel)
         assert ret == "// Returns: uint256"
 
     def test_format_param_annotations(self):
         """format_param_annotations should produce indexed parameter comments."""
         from src.abi_enrichment import ABIEnricher
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -899,7 +892,7 @@ class TestIssue08_ABIDataUsage:
             }
         ])
         enricher = ABIEnricher(abi_json)
-        sel = "0x" + Web3.keccak(text="transfer(address,uint256)")[:4].hex()
+        sel = "0xa9059cbb"
         params = enricher.format_param_annotations(sel)
         assert len(params) == 2
         assert "param[0] at 0x04: address to" in params[0]
@@ -908,7 +901,6 @@ class TestIssue08_ABIDataUsage:
     def test_format_event_annotation(self):
         """format_event_annotation should produce a readable event comment."""
         from src.abi_enrichment import ABIEnricher
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -922,7 +914,7 @@ class TestIssue08_ABIDataUsage:
             }
         ])
         enricher = ABIEnricher(abi_json)
-        topic = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex()
+        topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         annotation = enricher.format_event_annotation(topic)
         assert "Transfer" in annotation
         assert "indexed" in annotation
@@ -943,7 +935,6 @@ class TestIssue08_ABIDataUsage:
     def test_enrich_tac_with_abi_function_header(self):
         """enrich_tac_with_abi should replace function header with ABI info."""
         from src.abi_enrichment import ABIEnricher, enrich_tac_with_abi
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -958,7 +949,7 @@ class TestIssue08_ABIDataUsage:
             }
         ])
         enricher = ABIEnricher(abi_json)
-        sel = "0x" + Web3.keccak(text="transfer(address,uint256)")[:4].hex()
+        sel = "0xa9059cbb"
 
         tac = (
             f"function func_{sel}:\n"
@@ -1030,18 +1021,14 @@ class TestIssue09_SelectorComputation:
     def test_selector_computation_simple(self):
         """Verify that _add_selectors correctly handles simple parameters."""
         from download_hf_contracts import _add_selectors
-        from web3 import Web3
 
         funcs = [{"signature": "function transfer(address to, uint256 amount)", "name": "transfer"}]
         result = _add_selectors(funcs)
-        expected_canonical = "transfer(address,uint256)"
-        expected_selector = "0x" + Web3.keccak(text=expected_canonical)[:4].hex()
-        assert result[0]["selector"] == expected_selector
+        assert result[0]["selector"] == "0xa9059cbb"
 
     def test_parse_solidity_param_types_for_tuple_selector(self):
         """Verify _parse_solidity_param_types produces correct types for tuple."""
         from download_hf_contracts import _parse_solidity_param_types
-        from web3 import Web3
 
         params = "(uint256,address) bar"
         types = _parse_solidity_param_types(params)
@@ -1320,7 +1307,6 @@ class TestABIEnrichmentEndToEnd:
     def test_enrich_tac_combined(self):
         """Test combining ABI and storage enrichment on a TAC string."""
         from src.abi_enrichment import ABIEnricher, StorageLayoutResolver, enrich_tac_with_abi
-        from web3 import Web3
 
         abi_json = json.dumps([
             {
@@ -1353,7 +1339,7 @@ class TestABIEnrichmentEndToEnd:
 
         enricher = ABIEnricher(abi_json)
         resolver = StorageLayoutResolver(source)
-        sel = "0x" + Web3.keccak(text="transfer(address,uint256)")[:4].hex()
+        sel = "0xa9059cbb"
 
         tac = (
             f"function func_{sel}:\n"
@@ -1392,3 +1378,323 @@ class TestABIEnrichmentEndToEnd:
         """Empty TAC should return empty."""
         from src.abi_enrichment import enrich_tac_with_abi
         assert enrich_tac_with_abi("", "0x12345678") == ""
+
+
+# ---------------------------------------------------------------------------
+# GitHub issue regressions #27, #29, #33, #34, #35, #36, #44, #53, #54
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubIssue27_ABITypeCanonicalSelectors:
+    def test_uint_alias_selector_matches_uint256(self):
+        from download_hf_contracts import _add_selectors
+
+        funcs = [{"signature": "function transfer(address to, uint amount)", "name": "transfer"}]
+        assert _add_selectors(funcs)[0]["selector"] == "0xa9059cbb"
+
+    def test_int_alias_and_tuple_arrays_are_canonicalized(self):
+        from download_hf_contracts import _parse_solidity_param_types
+        from src.dataset_pipeline import DatasetBuilder
+
+        assert _parse_solidity_param_types("(uint,int[])[] data") == [
+            "(uint256,int256[])[]"
+        ]
+
+        with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
+            builder = DatasetBuilder.__new__(DatasetBuilder)
+            result = builder._add_selectors_to_solidity_functions(
+                [{"signature": "function foo(int value)", "name": "foo"}]
+            )
+        assert result[0]["selector"] == "0x4c970b2f"  # foo(int256)
+
+
+class TestGitHubIssue29_BodyDuplicateExportCap:
+    def test_export_caps_same_body_across_distinct_pairs(self, tmp_path):
+        from download_hf_contracts import (
+            _md5,
+            _store_pairs_batch,
+            export_training_data,
+            hash_normalized_body,
+            hash_normalized_pair,
+            hash_normalized_tac,
+            init_database,
+        )
+
+        db_path = tmp_path / "body-cap.db"
+        init_database(db_path)
+        sol = "function same() public { uint256 x = 1; uint256 y = x + 1; emit Done(y); }"
+        pairs = []
+        for idx in range(3):
+            tac = f"function same:\n  block_{idx}:\n    temp = {idx}"
+            pairs.append({
+                "contract_address": f"0x{idx}",
+                "function_name": "same",
+                "tac_representation": tac,
+                "solidity_code": sol,
+                "function_signature": "function same()",
+                "visibility": "public",
+                "is_payable": False,
+                "is_view": False,
+                "metadata": "{}",
+                "hash": _md5(tac + sol),
+                "body_hash": hash_normalized_body(sol),
+                "tac_hash": hash_normalized_tac(tac),
+                "pair_norm_hash": hash_normalized_pair(tac, sol),
+            })
+
+        assert _store_pairs_batch(db_path, pairs) == 3
+        output = tmp_path / "body-cap.jsonl"
+        export_training_data(
+            str(output),
+            max_body_dupes=1,
+            db_path=db_path,
+            manifest_path=tmp_path / "body-cap.manifest.json",
+        )
+        assert len(output.read_text().splitlines()) == 1
+
+
+class TestGitHubIssue33_DeterministicHuggingFaceExport:
+    def test_hf_revision_passed_to_listing(self):
+        from download_hf_contracts import _get_parquet_files
+
+        with patch("download_hf_contracts.HfApi") as api_cls:
+            api = api_cls.return_value
+            api.list_repo_files.return_value = [
+                "data/flattened/train/b.parquet",
+                "data/flattened/test/ignored.parquet",
+                "README.md",
+                "data/flattened/train/a.parquet",
+            ]
+            files = _get_parquet_files("flattened", "train", revision="abc123")
+
+        api.list_repo_files.assert_called_once_with(
+            "andstor/smart_contracts", repo_type="dataset", revision="abc123"
+        )
+        assert files == [
+            "data/flattened/train/a.parquet",
+            "data/flattened/train/b.parquet",
+        ]
+
+    def test_export_bytes_are_stable_for_different_insert_orders(self, tmp_path):
+        from download_hf_contracts import (
+            _md5,
+            _store_pairs_batch,
+            export_training_data,
+            hash_normalized_body,
+            hash_normalized_pair,
+            hash_normalized_tac,
+            init_database,
+        )
+
+        def make_pair(idx):
+            sol = f"function f{idx}() public {{ uint256 x = {idx}; emit Done(x); }}"
+            tac = f"function f{idx}:\n  block:\n    temp = {idx}"
+            return {
+                "contract_address": f"0x{idx}",
+                "function_name": f"f{idx}",
+                "tac_representation": tac,
+                "solidity_code": sol,
+                "function_signature": f"function f{idx}()",
+                "visibility": "public",
+                "is_payable": False,
+                "is_view": False,
+                "metadata": json.dumps({"compiler_version": "0.8.20"}),
+                "hash": _md5(tac + sol),
+                "body_hash": hash_normalized_body(sol),
+                "tac_hash": hash_normalized_tac(tac),
+                "pair_norm_hash": hash_normalized_pair(tac, sol),
+            }
+
+        pairs = [make_pair(2), make_pair(1), make_pair(3)]
+        outputs = []
+        for name, ordered_pairs in (("a", pairs), ("b", list(reversed(pairs)))):
+            db_path = tmp_path / f"{name}.db"
+            init_database(db_path)
+            _store_pairs_batch(db_path, ordered_pairs)
+            output = tmp_path / f"{name}.jsonl"
+            export_training_data(
+                str(output),
+                max_body_dupes=5,
+                db_path=db_path,
+                manifest_path=tmp_path / f"{name}.manifest.json",
+            )
+            outputs.append(output.read_bytes())
+
+        assert outputs[0] == outputs[1]
+
+
+class TestGitHubIssue34_DatasetBuilderSemanticSchema:
+    def test_schema_has_semantic_hash_columns_and_index(self, tmp_path):
+        from src.dataset_pipeline import DatasetBuilder
+
+        builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
+        conn = sqlite3.connect(builder.db_path)
+        contract_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(contracts)").fetchall()
+        }
+        pair_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(function_pairs)").fetchall()
+        }
+        indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(function_pairs)").fetchall()
+        }
+        conn.close()
+
+        assert "source_hash" in contract_cols
+        assert {"body_hash", "tac_hash", "pair_norm_hash"} <= pair_cols
+        assert "idx_dataset_pair_norm_hash" in indexes
+
+    def test_dataset_builder_semantic_pair_dedup(self, tmp_path):
+        from src.dataset_pipeline import DatasetBuilder, FunctionPair
+
+        builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "dedup"))
+        first = FunctionPair(
+            function_name="f",
+            tac_representation="function f:\n  temp = 1 // compiler note\n",
+            solidity_code="{ return X; // comment\n}",
+            function_signature="function f()",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
+            contract_address="0x1",
+        )
+        second = FunctionPair(
+            function_name="f",
+            tac_representation="FUNCTION f:\n temp = 1",
+            solidity_code="{   return x; }",
+            function_signature="function f()",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
+            contract_address="0x2",
+        )
+
+        builder._store_function_pair(first)
+        builder._store_function_pair(second)
+
+        conn = sqlite3.connect(builder.db_path)
+        count, body_hash, tac_hash, pair_hash = conn.execute(
+            "SELECT COUNT(*), MIN(body_hash), MIN(tac_hash), MIN(pair_norm_hash) "
+            "FROM function_pairs"
+        ).fetchone()
+        conn.close()
+        assert count == 1
+        assert body_hash and tac_hash and pair_hash
+
+
+class TestGitHubIssue35_ContractOutcomeTracking:
+    def test_no_output_status_is_not_marked_processed(self, tmp_path):
+        from download_hf_contracts import _mark_contract_status, init_database
+
+        db_path = tmp_path / "status.db"
+        init_database(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO contracts (address, source_code, bytecode) VALUES (?, ?, ?)",
+            ("0xabc", "contract C {}", "0x"),
+        )
+        conn.commit()
+        conn.close()
+
+        _mark_contract_status(
+            db_path,
+            ["0xabc"],
+            "no_pairs",
+            processed=False,
+            last_error="compile jobs produced no matched pairs",
+        )
+
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT processed, compile_status, attempt_count, last_error "
+            "FROM contracts WHERE address = ?",
+            ("0xabc",),
+        ).fetchone()
+        conn.close()
+        assert row[0] == 0
+        assert row[1] == "no_pairs"
+        assert row[2] == 1
+        assert "no matched pairs" in row[3]
+
+
+class TestGitHubIssue36_MultiFilePragmaIntersection:
+    def test_compatible_versions_satisfy_all_pragmas(self):
+        from src.local_compiler import compatible_versions_for_pragmas
+
+        versions = compatible_versions_for_pragmas(
+            ["^0.8.0", ">=0.8.20 <0.9.0"],
+            candidate_versions=["0.8.26", "0.8.20", "0.8.10"],
+        )
+        assert versions == ["0.8.26", "0.8.20"]
+
+    def test_original_version_not_selected_when_outside_intersection(self):
+        from src.local_compiler import select_compilation_configs
+
+        configs = select_compilation_configs(
+            ["^0.8.0", ">=0.8.20 <0.9.0"],
+            original_version="0.8.10",
+            original_optimizer=True,
+            original_runs=200,
+            max_configs=3,
+        )
+        versions = [cfg["version"] for cfg in configs]
+        assert "0.8.10" not in versions
+        assert "0.8.20" in versions
+
+    def test_no_intersection_returns_no_versions(self):
+        from src.local_compiler import compatible_versions_for_pragmas
+
+        assert compatible_versions_for_pragmas(
+            ["^0.7.0", "^0.8.0"],
+            candidate_versions=["0.8.20", "0.7.6"],
+        ) == []
+
+
+class TestGitHubIssue44_Web3HexNormalization:
+    def test_selector_hex_has_single_prefix(self):
+        from src.abi_enrichment import normalize_hex
+        from web3 import Web3
+
+        selector = normalize_hex(Web3.keccak(text="transfer(address,uint256)")[:4])
+        assert selector == "0xa9059cbb"
+        assert not selector.startswith("0x0x")
+
+    def test_abi_error_selector_has_single_prefix(self):
+        from src.abi_enrichment import ABIEnricher
+
+        enricher = ABIEnricher(json.dumps([{
+            "type": "error",
+            "name": "InsufficientBalance",
+            "inputs": [{"name": "required", "type": "uint"}],
+        }]))
+        selector = list(enricher.errors)[0]
+        assert selector.startswith("0x")
+        assert not selector.startswith("0x0x")
+
+
+class TestGitHubIssue53_PragmaCommentStripping:
+    def test_parse_pragma_ignores_line_and_block_comments(self):
+        from src.local_compiler import parse_pragma
+
+        source = """
+        // pragma solidity ^0.5.0;
+        /* pragma solidity ^0.6.0; */
+        pragma solidity ^0.8.20;
+        contract C {}
+        """
+        assert parse_pragma(source) == ["^0.8.20"]
+
+
+class TestGitHubIssue54_SelectorResolverRemoteConfig:
+    def test_get_resolver_respects_use_remote_call_order(self):
+        from src import selector_resolver as sr
+
+        sr._default_resolver = None
+        sr._resolver_cache.clear()
+        offline = sr.get_resolver(use_remote=False)
+        online = sr.get_resolver(use_remote=True)
+        offline_again = sr.get_resolver(use_remote=False)
+
+        assert offline.use_remote is False
+        assert online.use_remote is True
+        assert offline_again.use_remote is False
