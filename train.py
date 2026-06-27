@@ -319,7 +319,13 @@ def train_model(
     return model_path
 
 
-def evaluate_model(model_path: str, test_path: str, results_dir: str = "results") -> dict:
+def evaluate_model(
+    model_path: str,
+    test_path: str,
+    results_dir: str = "results",
+    latest_results_path: str = "latest_results.txt",
+    eval_limit: int = None,
+) -> dict:
     """Evaluate the trained model on the test set.
 
     Supports multi-GPU evaluation when launched via torchrun.  Each rank loads
@@ -328,6 +334,7 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
     """
     from src.training_pipeline import SmartContractEvaluator
     from src.model_setup import SmartContractDecompiler
+    from src.evaluation_report import write_latest_results_report
     from src.replication_metrics import aggregate_replication_scores
     from dataclasses import asdict
     import torch
@@ -335,6 +342,9 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
     import gc
 
     logger = logging.getLogger(__name__)
+    started_at = time.time()
+    if eval_limit is not None and eval_limit < 0:
+        raise ValueError("--eval-limit must be non-negative")
 
     # ── Distributed setup ────────────────────────────────────────
     distributed = "LOCAL_RANK" in os.environ
@@ -369,6 +379,13 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
             line = line.strip()
             if line:
                 test_data.append(json.loads(line))
+
+    dataset_rows = len(test_data)
+    if eval_limit is not None:
+        test_data = test_data[:eval_limit]
+        logger.info(
+            f"Evaluation limited to {len(test_data)}/{dataset_rows} examples"
+        )
 
     total_examples = len(test_data)
 
@@ -442,6 +459,10 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
 
             summary = {
                 "num_evaluated": len(results),
+                "test_dataset_rows": dataset_rows,
+                "eval_limit": eval_limit,
+                "model_path": model_path,
+                "test_dataset": test_path,
                 "semantic_similarity_mean": float(np.mean(sem_sims)),
                 "semantic_similarity_std": float(np.std(sem_sims)),
                 "edit_distance_mean": float(np.mean(edit_dists)),
@@ -472,12 +493,36 @@ def evaluate_model(model_path: str, test_path: str, results_dir: str = "results"
                     }
                 )
         else:
-            summary = {"num_evaluated": 0, "error": "No successful evaluations"}
+            summary = {
+                "num_evaluated": 0,
+                "test_dataset_rows": dataset_rows,
+                "eval_limit": eval_limit,
+                "model_path": model_path,
+                "test_dataset": test_path,
+                "error": "No successful evaluations",
+            }
 
         # Save
         results_path = Path(results_dir) / f"eval_{int(time.time())}.json"
+        if latest_results_path:
+            summary["latest_results_path"] = latest_results_path
         with open(results_path, "w") as f:
             json.dump({"summary": summary, "details": results}, f, indent=2)
+
+        if latest_results_path:
+            latest_path = write_latest_results_report(
+                summary=summary,
+                model_path=model_path,
+                test_dataset_path=test_path,
+                results_json_path=str(results_path),
+                latest_results_path=latest_results_path,
+                started_at=started_at,
+                finished_at=time.time(),
+                argv=sys.argv,
+                eval_limit=eval_limit,
+                world_size=world_size,
+            )
+            logger.info(f"Latest results report saved to {latest_path}")
 
         logger.info(f"Evaluation results saved to {results_path}")
         logger.info(f"Summary: {json.dumps(summary, indent=2)}")
@@ -581,6 +626,18 @@ def main():
         help="Path to test JSONL dataset (optional, auto-detected if omitted)",
     )
     parser.add_argument(
+        "--latest-results",
+        type=str,
+        default="latest_results.txt",
+        help="Path for the human-readable latest evaluation report",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        default=None,
+        help="Evaluate only the first N test examples (useful for smoke demos)",
+    )
+    parser.add_argument(
         "--local_rank",
         type=int,
         default=0,
@@ -658,7 +715,12 @@ def main():
 
         logger.info(f"Eval-only mode. Model: {args.model_path}")
         logger.info(f"Test dataset: {test_path}")
-        evaluate_model(args.model_path, test_path)
+        evaluate_model(
+            args.model_path,
+            test_path,
+            latest_results_path=args.latest_results,
+            eval_limit=args.eval_limit,
+        )
 
         logger.info("=" * 60)
         logger.info("Evaluation complete!")
@@ -740,7 +802,12 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        evaluate_model(model_path, test_path)
+        evaluate_model(
+            model_path,
+            test_path,
+            latest_results_path=args.latest_results,
+            eval_limit=args.eval_limit,
+        )
     else:
         logger.info("Skipping evaluation (--skip-eval).")
 

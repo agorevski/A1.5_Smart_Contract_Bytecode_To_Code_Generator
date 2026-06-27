@@ -262,6 +262,24 @@ uv run python train.py \
   --test-dataset data/test_dataset.jsonl
 ```
 
+Every evaluation writes two artifacts:
+
+- `results/eval_<timestamp>.json` — full machine-readable summary and details.
+- `latest_results.txt` — check-in friendly human-readable quality report with
+  run metadata, model/config size, training/eval parameters, target checks, and
+  replication precision/recall/F1.
+
+For a quick report-generation smoke demo against the latest local model, limit
+the eval size:
+
+```bash
+uv run python train.py \
+  --eval-only \
+  --model-path models/final_model_378 \
+  --test-dataset data/test_dataset.jsonl \
+  --eval-limit 3
+```
+
 If you trained with `run_train_torchrun.sh`, evaluate afterward because the wrapper skips evaluation:
 
 ```bash
