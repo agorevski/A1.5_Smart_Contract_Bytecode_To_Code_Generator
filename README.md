@@ -102,6 +102,8 @@ python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --sma
 ls results/
 ```
 
+For the full operator guide, including current-data sufficiency checks, data regeneration, training, evaluation, and model usage, see [docs/runbook.md](docs/runbook.md).
+
 ## Running Tests
 
 ```bash
@@ -182,9 +184,8 @@ python -m pytest --cov=src tests/
 │   ├── architecture.md        # System design & data flow
 │   ├── model-details.md       # Model config, LoRA, quantization
 │   ├── data-format.md         # JSONL schema, TAC format, DB schema
-│   ├── dataset-generation.md  # Dataset quality analysis & recommendations
 │   ├── training-recommendations.md  # Model selection & multi-GPU training
-│   ├── runbook.md             # Installation, training, inference guide
+│   ├── runbook.md             # E2E training, evaluation, and inference guide
 │   └── contributing.md        # Development setup & guidelines
 ├── demo_dataset.jsonl         # Sample training data (3 examples)
 └── reference/                 # Research paper PDF, enhancement plans
@@ -236,7 +237,7 @@ Alternatively, set these in `src/settings.yaml`.
 
 - **Base model:** Llama 3.2 3B (`meta-llama/Llama-3.2-3B`)
 - **Fine-tuning:** LoRA (r=16, α=32, dropout=0.1)
-- **Quantization:** 8-bit via bitsandbytes
+- **Quantization:** 4-bit NF4 via bitsandbytes
 - **Target metrics:** Semantic similarity > 0.8, Edit distance < 0.4
 
 See [docs/model-details.md](docs/model-details.md) for more.

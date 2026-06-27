@@ -1,240 +1,353 @@
-# Runbook
+# E2E Training and Inference Runbook
 
-## Prerequisites
+This runbook explains how to train the TAC-to-Solidity model with the codebase as it exists today, how to decide whether the available data is enough, how to generate more valid data, and how to use the trained model afterward.
 
-| Requirement | Minimum | Recommended |
-|-------------|---------|-------------|
-| Python | 3.10+ | 3.11 |
-| GPU (training) | 16 GB VRAM, CUDA-compatible | RTX 8000 / A100 |
-| GPU (inference) | 4 GB VRAM | 8 GB+ |
-| RAM | 16 GB | 32 GB+ |
-| Disk | 10 GB | 50 GB (models + datasets) |
+## Quick answer: do I have enough data today?
 
-CPU-only is supported for inference and `--tiny` training but is significantly slower.
+Yes, if `data/hf_training_dataset.jsonl` is present in your worktree. The prepared worktree inspected for this runbook contained:
 
-## 1. Installation
+| File | Rows | Purpose |
+|------|-----:|---------|
+| `data/hf_training_dataset.jsonl` | 11,412 | Source dataset for training and re-splitting |
+| `data/train_dataset.jsonl` | 8,678 | Current train split |
+| `data/val_dataset.jsonl` | 1,022 | Current validation split |
+| `data/test_dataset.jsonl` | 1,712 | Current test split |
+| `demo_dataset.jsonl` | 3 | Smoke-test/demo only |
+
+That is enough to kick off a real training run and validate the end-to-end pipeline. It is not enough to claim paper-scale coverage or production-quality decompilation. The paper-scale target referenced in the codebase is 238,446 TAC-to-Solidity function pairs, so the current 11,412-pair dataset is roughly 5% of that scale.
+
+Generated data, models, and results are gitignored. A clean clone will not include `data/*.jsonl`, `data/*.db*`, `models/`, or `results/`; regenerate them with the commands below.
+
+## Recommended path
+
+| Goal | Data | Command pattern |
+|------|------|-----------------|
+| Verify the pipeline quickly | Existing JSONL or small generated set | `python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
+| Train a baseline with current data | `data/hf_training_dataset.jsonl` | `python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
+| Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
+| Build more data first | Hugging Face verified contracts | `python download_hf_contracts.py --limit 1000 --max-compiler-versions 3` |
+| Reproduce paper-scale intent | Large generated dataset | Scale `download_hf_contracts.py` until pair counts approach the target, then train/evaluate |
+
+## 1. Install and configure
 
 ```bash
-git clone https://github.com/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator.git
-cd A1.5_Smart_Contract_Bytecode_To_Code_Generator
-
 python -m venv venv
-# Windows
-venv\Scripts\activate
-# Linux/macOS
 source venv/bin/activate
-
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### Environment Variables
+Requirements:
 
-Set these before training or data collection:
+| Resource | Minimum | Notes |
+|----------|---------|-------|
+| Python | 3.10+ | Project metadata targets Python 3.10 |
+| GPU for training | CUDA GPU, 16 GB+ VRAM recommended | `--tiny` can run CPU-only but is only a smoke test |
+| GPU for inference | CUDA GPU, 4 GB+ VRAM recommended | CPU works but is slow |
+| Disk | 10 GB+ | More if generating large datasets/checkpoints |
+
+Environment variables:
 
 ```bash
-export HF_TOKEN="hf_..."           # HuggingFace token (required for Llama access)
-export ETHERSCAN_API_KEY="..."     # Only if collecting from Etherscan directly
+export HF_TOKEN="hf_..."        # Required for gated base models such as Llama
+export ETHERSCAN_API_KEY="..."  # Only needed for train.py's Etherscan collection path
 ```
 
-Alternatively, add them to `src/settings.yaml`.
+You can also copy `src/settings.yaml.example` to `src/settings.yaml`, but environment variables are easier to keep out of source control.
 
----
+## 2. Check what data you have
 
-## 2. Prepare Training Data
-
-Download verified Solidity contracts from HuggingFace, compile with compatible solc versions, generate TAC, and export training pairs:
+Run this before training:
 
 ```bash
-# Quick test (20 contracts)
+wc -l data/*.jsonl demo_dataset.jsonl 2>/dev/null || true
+du -h data/*.jsonl demo_dataset.jsonl 2>/dev/null || true
+```
+
+Validate that a JSONL file contains usable training pairs:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("data/hf_training_dataset.jsonl")
+if not path.exists():
+    raise SystemExit(f"Missing dataset: {path}. Generate it with download_hf_contracts.py first.")
+bad_json = missing_io = rows = 0
+for line in path.open():
+    if not line.strip():
+        continue
+    rows += 1
+    try:
+        item = json.loads(line)
+    except json.JSONDecodeError:
+        bad_json += 1
+        continue
+    if not item.get("input") or not item.get("output"):
+        missing_io += 1
+
+print({"rows": rows, "bad_json": bad_json, "missing_input_or_output": missing_io})
+PY
+```
+
+A valid training row looks like:
+
+```json
+{"input": "<TAC representation>", "output": "<Solidity code>", "metadata": {"function_name": "transfer"}}
+```
+
+Use `demo_dataset.jsonl` only for smoke tests. Three examples are not enough for meaningful fine-tuning.
+
+## 3. Generate or refresh training data
+
+The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles them with compatible `solc` versions, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, and exports JSONL.
+
+```bash
+# Quick data-generation test
 python download_hf_contracts.py --limit 20
 
-# Production run (all available contracts)
+# Larger run with bounded compiler-version expansion
+python download_hf_contracts.py --limit 1000 --max-compiler-versions 3
+
+# Full Hugging Face-backed generation
 python download_hf_contracts.py
 ```
 
-The pipeline runs three phases automatically. Run them independently if needed:
+Run phases independently when debugging or resuming:
 
 ```bash
-python download_hf_contracts.py --download-only      # Phase 1: fetch from HuggingFace
-python download_hf_contracts.py --compile-only        # Phase 2: compile + generate TAC pairs
-python download_hf_contracts.py --export-only         # Phase 3: deduplicate + export JSONL
+python download_hf_contracts.py --download-only
+python download_hf_contracts.py --compile-only
+python download_hf_contracts.py --export-only
 ```
 
-**Key flags:**
+Useful flags:
 
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `--limit N` | all | Max contracts to download |
-| `--max-compiler-versions N` | all | Solc versions per contract |
-| `--workers N` | auto | Parallel compilation workers |
-| `--max-body-dupes N` | 5 | Duplicate function body cap |
-| `--min-body-length N` | 50 | Min Solidity body length (chars) |
-| `--output PATH` | `data/hf_training_dataset.jsonl` | Output JSONL path |
+| Flag | Default | Use |
+|------|---------|-----|
+| `--limit N` | all | Cap downloaded contracts for test runs |
+| `--max-compiler-versions N` | all compatible | Limit compiler-version expansion per contract |
+| `--workers N` | CPU count | Parallel compile workers |
+| `--max-body-dupes N` | 5 | Cap repeated normalized Solidity bodies |
+| `--min-body-length N` | 50 | Filter short/trivial bodies |
+| `--output PATH` | `data/hf_training_dataset.jsonl` | Export JSONL target |
+| `--db PATH` | `data/contracts.db` | SQLite state/cache path |
 
-**Output:** `data/hf_training_dataset.jsonl` — each line: `{"input": "<TAC>", "output": "<Solidity>", "metadata": {...}}`
+Expected outputs:
 
----
+- `data/contracts.db`: downloaded contracts, generated function pairs, and selector registry.
+- `data/hf_training_dataset.jsonl`: training-ready TAC-to-Solidity pairs.
 
-## 3. Train the Model
+If you want to use the older Etherscan path in `train.py`, provide `ETHERSCAN_API_KEY` and a `data/contract_addresses.txt` file, then run without `--skip-collection`. For most runs, prefer the Hugging Face generator followed by `train.py --skip-collection --dataset ...`.
 
-### Single GPU
+## 4. Kick off training
+
+### Smoke test
+
+Use this to verify the pipeline without spending GPU time on the gated Llama model:
 
 ```bash
-# Standard training (Llama 3.2 3B, LoRA, 3 epochs)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
-
-# Quick test (1 epoch, small batch)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
-
-# Fast E2E smoke test (facebook/opt-125m, no GPU needed)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
+python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --tiny \
+  --skip-eval
 ```
 
-### Multi-GPU (DDP via torchrun)
+`--tiny` switches to `facebook/opt-125m`, one epoch, and batch size 2. It is for plumbing validation only.
+
+### Small current-data run
 
 ```bash
-./run_train_torchrun.sh                           # 4 GPUs (default)
-NGPUS=2 ./run_train_torchrun.sh                   # 2 GPUs
-DATASET=./data/custom.jsonl ./run_train_torchrun.sh
+python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --small
 ```
 
-### Multi-GPU (DeepSpeed)
+`--small` keeps the normal base model but uses one epoch and batch size 2.
+
+### Baseline current-data run
 
 ```bash
-./run_train_deepspeed.sh                          # ZeRO Stage 0 + BF16
-NGPUS=2 DS_CONFIG=ds_config_z3.json ./run_train_deepspeed.sh  # ZeRO Stage 3
+python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --epochs 3 \
+  --batch-size 4 \
+  --lr 2e-4 \
+  --max-seq-length 2048
 ```
 
-> **Note:** For Llama 3.2 3B + LoRA, torchrun DDP is ~40-60% faster than DeepSpeed. Use DeepSpeed for 7B+ models or when GPU memory is constrained.
+This re-splits the source JSONL into `data/train_dataset.jsonl`, `data/val_dataset.jsonl`, and `data/test_dataset.jsonl`, trains the LoRA adapter, saves to `models/final_model/`, and runs evaluation unless `--skip-eval` is set.
 
-### Training flags
-
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--epochs N` | 3 | Overridden to 1 by `--small`/`--tiny` |
-| `--batch-size N` | 4 | Overridden to 2 by `--small`/`--tiny` |
-| `--lr FLOAT` | 2e-4 | Learning rate (cosine schedule) |
-| `--max-seq-length N` | 2048 | Shell scripts auto-detect from dataset |
-| `--model-name NAME` | `meta-llama/Llama-3.2-3B` | Any HF model ID |
-| `--skip-eval` | — | Skip post-training evaluation |
-| `--deepspeed PATH` | — | Enable DeepSpeed with config file |
-| `--resume PATH` | — | Resume from checkpoint |
-
-### Using alternative models
+### Multi-GPU with torchrun
 
 ```bash
-# Qwen 2.5 Coder 32B (recommended upgrade — see docs/training-recommendations.md)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
-    --model-name Qwen/Qwen2.5-Coder-32B --batch-size 2 --max-seq-length 4096
-
-# StarCoder2 15B (fast iteration)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
-    --model-name bigcode/starcoder2-15b --batch-size 4 --max-seq-length 4096
+NGPUS=4 \
+DATASET=./data/hf_training_dataset.jsonl \
+MODEL=meta-llama/Llama-3.2-3B \
+EPOCHS=3 \
+LR=2e-4 \
+./run_train_torchrun.sh
 ```
 
-**Output:** Trained model saved to `models/final_model/`
+`train_common.sh` auto-detects `MAX_SEQ_LEN` from the dataset and computes `BATCH_SIZE` unless you override them:
 
----
+```bash
+NGPUS=2 MAX_SEQ_LEN=4096 BATCH_SIZE=2 ./run_train_torchrun.sh
+```
 
-## 4. Evaluate
+The wrapper currently passes `--skip-eval`; run evaluation afterward with the eval-only command below.
 
-Evaluation runs automatically after training unless `--skip-eval` is passed. Metrics are written to `results/`.
+### DeepSpeed
 
-| Metric | Target |
-|--------|--------|
-| Semantic similarity (avg) | > 0.82 |
-| Functions > 0.8 similarity | > 78% |
-| Normalized edit distance < 0.4 | > 82% |
+DeepSpeed is optional and is not installed by default from `requirements.txt`. Install it only when you need it for larger models or memory-constrained distributed runs.
 
----
+```bash
+python -m pip install deepspeed
+NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_deepspeed.sh
+```
 
-## 5. Run Inference
+For Llama 3.2 3B + LoRA, torchrun DDP is usually simpler and faster. Use DeepSpeed primarily for larger models or when ZeRO sharding is needed.
 
-### Python API
+### Resume from a checkpoint
+
+```bash
+python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --resume models/checkpoints/checkpoint-1000
+```
+
+## 5. Evaluate
+
+Training evaluates automatically unless `--skip-eval` is passed. Results are written to `results/eval_<timestamp>.json`.
+
+Evaluate an existing model:
+
+```bash
+python train.py \
+  --eval-only \
+  --model-path models/final_model \
+  --test-dataset data/test_dataset.jsonl
+```
+
+If you trained with `run_train_torchrun.sh`, evaluate afterward because the wrapper skips evaluation:
+
+```bash
+torchrun --nproc_per_node=4 train.py \
+  --eval-only \
+  --model-path models/final_model \
+  --test-dataset data/test_dataset.jsonl
+```
+
+Inspect result summaries:
+
+```bash
+python - <<'PY'
+import glob, json
+for path in sorted(glob.glob("results/eval_*.json")):
+    with open(path) as f:
+        data = json.load(f)
+    print(path, json.dumps(data.get("summary", data), indent=2))
+PY
+```
+
+Key metrics:
+
+| Metric | Good target |
+|--------|-------------|
+| `semantic_similarity_mean` | > 0.82 |
+| `pct_above_0.8_similarity` | > 78% |
+| `pct_below_0.4_edit_dist` | > 82% |
+| `edit_distance_mean` | lower is better |
+
+## 6. Use the trained model
+
+Fresh training saves to `models/final_model/`.
+
+### Python API: TAC to Solidity
 
 ```python
 from src.model_setup import SmartContractDecompiler
 
 decompiler = SmartContractDecompiler("models/final_model")
 
-# Single function
 solidity = decompiler.decompile_tac_to_solidity(
-    tac_input="function func_0xa9059cbb:\n  block_0x0080:\n    ...",
-    max_new_tokens=1024,
-    temperature=0.1,
-)
-
-# Batch
-results = decompiler.decompile_batch(
-    tac_inputs=["func1_tac", "func2_tac"],
+    tac_input="function transfer(address to, uint256 amount):\n  // ... TAC ...",
     max_new_tokens=1024,
 )
+print(solidity)
 ```
 
-### Full Security Analysis Pipeline
+### Python API: bytecode to contract-level output
 
 ```python
-from src.pipeline_orchestrator import PipelineOrchestrator, PipelineConfig, PipelineStage
+from src.model_setup import SmartContractDecompiler
 
-config = PipelineConfig(
-    stages=[
-        PipelineStage.CLASSIFY,
-        PipelineStage.DECOMPILE,
-        PipelineStage.DETECT_VULNERABILITIES,
-        PipelineStage.AUDIT_REPORT,
-    ]
-)
-orchestrator = PipelineOrchestrator(config)
+decompiler = SmartContractDecompiler("models/final_model")
+result = decompiler.decompile_contract("0x60806040...")
 
-result = orchestrator.analyze(bytecode="0x60806040...", contract_address="0x1234...")
-
-print(result.classification_result)   # malicious/legitimate + confidence
-print(result.vulnerability_report)    # vulnerabilities + risk score
-print(result.decompiled_source)       # TAC output
+print(result["solidity"])
+print(result["analysis"])
 ```
 
-### Web UI
+### Existing nonstandard artifact paths
+
+The inspected worktree contained `models/final_model_378/`. You can load it explicitly:
+
+```python
+from src.model_setup import SmartContractDecompiler
+
+decompiler = SmartContractDecompiler("models/final_model_378")
+```
+
+The web app expects `models/final_model/`. If you want the web app to use a nonstandard artifact, copy or symlink it:
+
+```bash
+ln -sfn final_model_378 models/final_model
+```
+
+### Web app
 
 ```bash
 python web/app.py
-# Opens at http://localhost:5000
 ```
 
-The web app requires a trained model at `models/final_model/`. If absent, decompilation returns TAC only (no Solidity generation).
+Open `http://localhost:5000`. If `models/final_model/` is missing, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
 
-**API endpoints:**
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/decompile` | POST | SSE-streaming decompilation |
-| `/api/vulnerability-scan` | POST | Vulnerability scan |
-| `/api/classify` | POST | Malicious/legitimate classification |
-| `/api/audit-report` | POST | Full security audit |
-| `/api/gpu-stats` | GET | GPU utilization and memory |
-| `/api/health` | GET | Server status |
-
-All POST endpoints accept `{"bytecode": "0x..."}`.
-
----
-
-## 6. Run Tests
+## 7. Preflight checklist
 
 ```bash
-python -m pytest                    # all ~380 tests
-python -m pytest -v                 # verbose
-python -m pytest -x                 # stop on first failure
-python -m pytest tests/test_e2e.py  # end-to-end only
-```
+# CLI help should load
+python train.py --help
+python download_hf_contracts.py --help
 
----
+# Dataset should exist and have rows
+test -s data/hf_training_dataset.jsonl && wc -l data/hf_training_dataset.jsonl
+
+# GPU visibility
+python - <<'PY'
+import torch
+print({"cuda": torch.cuda.is_available(), "gpus": torch.cuda.device_count()})
+PY
+
+# solc versions installed through py-solc-x
+python - <<'PY'
+from solcx import get_installed_solc_versions
+print(get_installed_solc_versions())
+PY
+```
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| CUDA out of memory | Reduce `--batch-size` or `--max-seq-length`; use `--tiny` for smoke tests |
-| `HF_TOKEN` required | Set env var or add to `src/settings.yaml` |
-| No training pairs generated | Check solc: `python -c "from solcx import get_installed_solc_versions; print(get_installed_solc_versions())"` |
-| Multi-GPU quantization error | Use `torchrun` or `deepspeed` — not bare `python` with `DataParallel` |
-| Web app shows no Solidity | Train a model first; the app needs `models/final_model/` |
-| Slow DeepSpeed training | Switch to `run_train_torchrun.sh` for small models (3B + LoRA) |
+| Problem | Likely cause | Fix |
+|---------|--------------|-----|
+| `No dataset found` | `--skip-collection` was used without a JSONL path | Pass `--dataset data/hf_training_dataset.jsonl` or generate data first |
+| `HF_TOKEN` or model access error | Base model is gated | Set `HF_TOKEN`, request model access, or use `--tiny` for smoke tests |
+| No training pairs generated | Contracts failed parsing/compilation or all pairs were filtered | Check `download_hf_contracts.log`, reduce filters, verify solc install, run with a small `--limit` first |
+| CUDA out of memory | Batch/sequence/model too large | Lower `--batch-size`, lower `--max-seq-length`, use `--small`, or choose a smaller model |
+| Multi-GPU quantization issues | Bare `python train.py` with quantized model across GPUs | Use `run_train_torchrun.sh` or restrict `CUDA_VISIBLE_DEVICES=0` |
+| Web app shows TAC only | `models/final_model/` is absent | Train a model or symlink/copy the trained artifact to `models/final_model/` |
+| Evaluation cannot find test data | Split files are absent | Re-run training once with `--skip-collection --dataset ... --skip-eval`, or pass `--test-dataset` explicitly |

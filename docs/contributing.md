@@ -39,7 +39,7 @@ python -m pytest --cov=src tests/             # with coverage
 ## Areas for Contribution
 
 - **Bytecode analysis**: improved pattern recognition, new opcode support, CFG enhancements
-- **Data pipeline**: additional data sources, better dedup strategies, dataset quality (see `docs/dataset-generation.md`)
+- **Data pipeline**: additional data sources, better dedup strategies, dataset quality (see `docs/runbook.md` and `docs/data-format.md`)
 - **Model**: alternative architectures, training improvements (see `docs/training-recommendations.md`)
 - **Vulnerability detection**: new vulnerability types, improved pattern matching
 - **Malicious classification**: enhanced features, model improvements, explainability

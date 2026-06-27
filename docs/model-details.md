@@ -27,28 +27,28 @@ LoRA decomposes weight updates as: $W' = W + \frac{BA}{\alpha}$ where $B \in \ma
 
 ## Quantization
 
-8-bit loading via `bitsandbytes` reduces GPU memory from ~12 GB (FP32) to ~3.5 GB.
+4-bit NF4 loading via `bitsandbytes` keeps the base model small enough for LoRA fine-tuning on a single CUDA GPU while preserving the normal Hugging Face/PEFT training flow.
 
 ## Training Defaults
 
 | Parameter | Value |
 |-----------|-------|
 | Batch size | 4 per device |
-| Gradient accumulation | 8 steps |
-| Effective batch size | 32 |
+| Gradient accumulation | 4 steps |
+| Effective batch size | 16 |
 | Learning rate | 2e-4 (cosine schedule) |
 | Optimizer | AdamW |
 | Epochs | 3 |
-| Max sequence length | 4,096 tokens |
+| Max sequence length | 2,048 tokens |
 
 ## Inference
 
 | Parameter | Default |
 |-----------|---------|
-| Temperature | 0.3 |
-| Top-p | 0.9 |
-| Max new tokens | 512 |
-| Repetition penalty | 1.1 |
+| Temperature | 0.1 |
+| Sampling | Greedy by default |
+| Max new tokens | 1,024 |
+| Repetition penalty | 1.15 |
 
 ## Target Metrics
 
@@ -62,5 +62,5 @@ LoRA decomposes weight updates as: $W' = W + \frac{BA}{\alpha}$ where $B \in \ma
 
 | Operation | Min VRAM |
 |-----------|----------|
-| Inference (8-bit) | 4 GB |
-| Training (8-bit + LoRA) | 16 GB |
+| Inference (4-bit) | 4 GB |
+| Training (4-bit + LoRA) | 16 GB |

@@ -151,8 +151,8 @@ Automatically restricts to GPU 0 when using quantized models.
 ### 2. Multi-GPU DDP (`torchrun`)
 
 ```bash
-./run_train.sh              # defaults: 4 GPUs, batch_size=4
-NGPUS=2 ./run_train.sh      # override GPU count
+./run_train_torchrun.sh              # defaults: 4 GPUs, batch_size=4
+NGPUS=2 ./run_train_torchrun.sh      # override GPU count
 ```
 
 Standard PyTorch Distributed Data Parallel — each GPU holds a full copy of optimizer states and gradients.
@@ -532,4 +532,4 @@ A recommended iterative approach:
 4. **Phase 3** — Optionally scale to **70B** (Qwen 2.5 72B preferred over Llama 3.1 70B) using DeepSpeed ZeRO-3 across all 4 GPUs for maximum quality.
 5. **Phase 4** — Compare 32B vs 70B results. The 70B may show diminishing returns relative to training cost for this domain-specific task.
 
-> **Critical insight**: Dataset quality improvements (see `docs/dataset-generation.md`) will almost always yield larger gains than scaling from 32B → 70B. Prioritize data quality before model size.
+> **Critical insight**: Dataset quality improvements (see `docs/runbook.md` and `docs/data-format.md`) will almost always yield larger gains than scaling from 32B -> 70B. Prioritize data quality before model size.
