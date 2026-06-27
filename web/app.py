@@ -12,6 +12,7 @@ import time
 import traceback
 import ipaddress
 import threading
+import hmac
 
 # Add project root to path so we can import src modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -154,13 +155,18 @@ def _is_loopback_request() -> bool:
         return remote_addr in {"localhost"}
 
 
+def _api_key_matches(candidate: str) -> bool:
+    return bool(WEB_API_KEY and candidate and hmac.compare_digest(candidate, WEB_API_KEY))
+
+
 def _require_protected_api_access():
-    """Require API-key auth for non-local heavy API access."""
+    """Require API-key auth for protected API access."""
     if WEB_API_KEY:
         auth_header = request.headers.get("Authorization", "")
-        bearer_token = auth_header.removeprefix("Bearer ").strip()
+        auth_scheme, _, auth_token = auth_header.partition(" ")
+        bearer_token = auth_token.strip() if auth_scheme.lower() == "bearer" else ""
         api_key = request.headers.get("X-API-Key", "")
-        if api_key == WEB_API_KEY or bearer_token == WEB_API_KEY:
+        if _api_key_matches(api_key) or _api_key_matches(bearer_token):
             return None
         return _error_response("Unauthorized API request.", 401)
 
@@ -203,6 +209,54 @@ def _normalize_bytecode_from_request(data: dict | None):
         return None, _error_response("Invalid hexadecimal bytecode.", 400)
 
     return bytecode, None
+
+
+def _parse_optional_bool(value):
+    """Parse optional bool-like request values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"true", "1", "yes", "y", "enabled", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "disabled", "off"}:
+        return False
+    return None
+
+
+def _compiler_metadata_from_request(data: dict | None) -> dict:
+    """Extract optional compiler metadata supplied with an inference request."""
+    if not isinstance(data, dict):
+        return {}
+
+    metadata = {}
+    supplied_metadata = data.get("metadata")
+    if isinstance(supplied_metadata, dict):
+        metadata.update(supplied_metadata)
+
+    for key in ("compiler_version", "solc_version", "evm_version"):
+        value = data.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+        if value not in (None, ""):
+            metadata[key] = value
+
+    optimizer_enabled = _parse_optional_bool(data.get("optimizer_enabled"))
+    if optimizer_enabled is not None:
+        metadata["optimizer_enabled"] = optimizer_enabled
+
+    optimizer_runs = data.get("optimizer_runs")
+    if isinstance(optimizer_runs, str):
+        optimizer_runs = optimizer_runs.strip()
+    if optimizer_runs not in (None, ""):
+        metadata["optimizer_runs"] = optimizer_runs
+
+    return metadata
 
 
 def _is_model_artifact(path: str) -> bool:
@@ -463,6 +517,10 @@ def index():
 @app.route("/api/gpu-stats", methods=["GET"])
 def api_gpu_stats():
     """Return current GPU statistics (utilisation, memory, temperature, etc.)."""
+    access_error = _require_protected_api_access()
+    if access_error:
+        return access_error
+
     return jsonify(_get_gpu_stats())
 
 @app.route("/api/decompile", methods=["POST"])
@@ -470,7 +528,10 @@ def api_decompile():
     """
     Decompile EVM bytecode using per-function pipeline with SSE streaming.
 
-    Expects JSON: { "bytecode": "0x..." }
+    Expects JSON: { "bytecode": "0x..." }. Optional compiler metadata can be
+    provided as top-level fields or inside ``metadata``:
+    ``compiler_version``, ``optimizer_enabled``, ``optimizer_runs``,
+    ``evm_version``.
     Returns a Server-Sent Events stream with progress updates followed
     by the final result.
 
@@ -487,6 +548,7 @@ def api_decompile():
     bytecode, validation_error = _normalize_bytecode_from_request(data)
     if validation_error:
         return validation_error
+    request_metadata = _compiler_metadata_from_request(data)
 
     if not DECOMPILE_SEMAPHORE.acquire(blocking=False):
         return _error_response(
@@ -636,6 +698,7 @@ def api_decompile():
                             "function_sources": function_sources,
                             "function_errors": function_errors,
                             "model_config": model_config_dict,
+                            "compiler_metadata": request_metadata,
                         },
                         "model_error": "Model not loaded. Check server logs for details.",
                     })
@@ -659,14 +722,14 @@ def api_decompile():
                 for fname in unresolved_fnames:
                     tac_list.append(func_tac_map[fname])
                     func_obj = analyzer.functions.get(fname)
-                    func_meta = {}
+                    func_meta = dict(request_metadata)
                     if func_obj:
-                        func_meta = {
+                        func_meta.update({
                             "function_name": func_obj.name,
                             "visibility": func_obj.visibility,
                             "is_payable": func_obj.is_payable,
                             "is_view": func_obj.is_view,
-                        }
+                        })
                     meta_list.append(func_meta)
 
                 # Use batched inference when multiple unresolved functions
@@ -845,6 +908,7 @@ def api_decompile():
                 "function_sources": function_sources,
                 "function_errors": function_errors,
                 "model_config": model_config_dict,
+                "compiler_metadata": request_metadata,
             }
 
             yield _sse("result", {

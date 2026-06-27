@@ -106,21 +106,26 @@ For the full operator guide, including current-data sufficiency checks, data reg
 
 ## Running Tests
 
+The pytest configuration disables Web3's unrelated `pytest_ethereum` entry
+point so repository tests collect consistently in supported `uv` environments.
+
 ```bash
-# Run all tests (~380 tests across 8 files)
+# Run all tests
 uv run pytest
 
 # Verbose output
 uv run pytest -v
 
-# Run specific module tests
+# Run specific module tests (examples)
 uv run pytest tests/test_bytecode_analyzer.py -v
 uv run pytest tests/test_dataset_pipeline.py -v
+uv run pytest tests/test_docs_consistency.py -v
 uv run pytest tests/test_vulnerability_detector.py -v
 uv run pytest tests/test_malicious_classifier.py -v
 uv run pytest tests/test_audit_report.py -v
 uv run pytest tests/test_pipeline_orchestrator.py -v
 uv run pytest tests/test_opcode_features.py -v
+uv run pytest tests/test_web_app.py -v
 uv run pytest tests/test_e2e.py -v
 
 # Run with coverage
@@ -150,15 +155,20 @@ uv run pytest --cov=src tests/
 │   ├── selector_resolver.py   # 4-byte selector → function signature (4-tier lookup)
 │   └── settings.yaml          # API keys config
 │
-├── tests/                     # Unit & integration tests (pytest, ~380 tests)
-│   ├── test_bytecode_analyzer.py   # ~128 tests: parsing, CFG, TAC, stack sim
-│   ├── test_dataset_pipeline.py    # ~75 tests: data collection, function pairing
-│   ├── test_opcode_features.py     # ~34 tests: feature extraction, TF-IDF
-│   ├── test_vulnerability_detector.py  # ~27 tests: vulnerability scanning
-│   ├── test_malicious_classifier.py    # ~17 tests: classification, explainability
-│   ├── test_audit_report.py        # ~23 tests: audit reports, risk scoring
-│   ├── test_pipeline_orchestrator.py   # ~19 tests: pipeline orchestration
-│   └── test_e2e.py                 # ~15 tests: end-to-end integration
+├── tests/                     # Unit, integration, docs, and web tests (pytest)
+│   ├── test_bytecode_analyzer.py   # Bytecode parsing, CFG, TAC, stack sim
+│   ├── test_dataset_pipeline.py    # Data collection and function pairing
+│   ├── test_dataset_quality_issues.py  # Dataset quality regression coverage
+│   ├── test_docs_consistency.py    # README/runbook workflow drift checks
+│   ├── test_opcode_features.py     # Feature extraction, TF-IDF, entropy
+│   ├── test_prompt_metadata.py     # Prompt compiler metadata coverage
+│   ├── test_vulnerability_detector.py  # Vulnerability scanning
+│   ├── test_malicious_classifier.py    # Classification and explainability
+│   ├── test_audit_report.py        # Audit reports and risk scoring
+│   ├── test_pipeline_orchestrator.py   # Pipeline orchestration
+│   ├── test_replication_metrics.py # Research replication metrics
+│   ├── test_web_app.py             # Web API auth and UI integration
+│   └── test_e2e.py                 # End-to-end integration
 │
 ├── web/                       # Flask web application
 │   ├── app.py                 # Server: decompilation, vuln scan, classify, audit
@@ -198,14 +208,18 @@ uv run pytest --cov=src tests/
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--limit N` | `0` (all) | Max contracts to download |
-| `--max-compiler-versions N` | `0` (all) | Max solc versions per contract |
+| `--max-compiler-versions N` | `5` | Max solc versions per contract; each compiles optimizer on/off |
 | `--workers N` | auto | Parallel compilation workers |
-| `--max-body-dupes N` | `5` | Max copies of same function body |
+| `--max-body-dupes N` | `2` | Max copies of same function body |
 | `--min-body-length N` | `50` | Min Solidity body length |
+| `--cache-dir PATH` | HuggingFace default | Cache directory for Parquet files |
+| `--hf-revision REV` | latest | HuggingFace dataset revision/commit to pin downloads |
 | `--download-only` | — | Only download, skip compilation |
 | `--compile-only` | — | Only compile downloaded contracts |
 | `--export-only` | — | Only export existing pairs to JSONL |
 | `--output PATH` | `data/hf_training_dataset.jsonl` | Output file |
+| `--export-selectors PATH` | — | Export selector registry JSON |
+| `--import-selectors PATH` | — | Import selector registry JSON before processing |
 | `--db PATH` | `data/contracts.db` | SQLite database path |
 
 ### `train.py`
@@ -223,6 +237,7 @@ uv run pytest --cov=src tests/
 | `--model-name NAME` | `meta-llama/Llama-3.2-3B` | Base model |
 | `--skip-eval` | — | Skip post-training evaluation |
 | `--dataset-only` | — | Only build dataset, skip training |
+| `--no-compiler-metadata` | — | Omit compiler/optimizer metadata from prompts |
 
 ## Environment Variables
 
@@ -230,6 +245,9 @@ uv run pytest --cov=src tests/
 |----------|----------|-------------|
 | `HF_TOKEN` | For Llama access | HuggingFace token (gated model) |
 | `ETHERSCAN_API_KEY` | For Etherscan collection | Only needed with `train.py` without `--skip-collection` |
+| `WEB_API_KEY` | Shared/remote web deployments | Protects API endpoints and GPU telemetry; the browser UI has an in-memory API key field |
+| `WEB_HOST` | Optional | Web bind address, default `127.0.0.1`; use with `WEB_API_KEY` for non-loopback hosts |
+| `WEB_CORS_ORIGINS` | Optional | Comma-separated allowed API origins, default `http://127.0.0.1:5000,http://localhost:5000` |
 
 Alternatively, set these in `src/settings.yaml`.
 

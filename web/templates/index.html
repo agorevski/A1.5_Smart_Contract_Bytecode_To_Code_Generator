@@ -35,11 +35,52 @@
           <button id="btn-clear" class="btn btn-secondary" title="Clear input">✕ Clear</button>
         </div>
       </div>
+      <div class="api-key-panel">
+        <label for="api-key-input">
+          API key
+          <span>Required when the server sets WEB_API_KEY; kept in memory only</span>
+        </label>
+        <input
+          id="api-key-input"
+          type="password"
+          placeholder="Enter WEB_API_KEY for protected API calls"
+          autocomplete="off"
+        />
+      </div>
       <textarea
         id="bytecode-input"
         placeholder="Paste EVM bytecode here (with or without 0x prefix)&#10;&#10;Example: 0x608060405234801561001057600080fd5b50..."
         spellcheck="false"
       ></textarea>
+      <div class="compiler-metadata">
+        <label>
+          Solidity compiler
+          <input
+            id="compiler-version-input"
+            type="text"
+            placeholder="optional, e.g. 0.8.20"
+            autocomplete="off"
+          />
+        </label>
+        <label>
+          Optimizer
+          <select id="optimizer-enabled-input">
+            <option value="">Unknown</option>
+            <option value="true">Enabled</option>
+            <option value="false">Disabled</option>
+          </select>
+        </label>
+        <label>
+          Optimizer runs
+          <input
+            id="optimizer-runs-input"
+            type="number"
+            min="0"
+            step="1"
+            placeholder="optional"
+          />
+        </label>
+      </div>
       <div class="input-footer">
         <span id="char-count" class="char-count">0 characters</span>
         <button id="btn-decompile" class="btn btn-primary">⚡ Decompile</button>

@@ -11,6 +11,10 @@
   const btnDecompile = document.getElementById("btn-decompile");
   const btnSample = document.getElementById("btn-sample");
   const btnClear = document.getElementById("btn-clear");
+  const apiKeyInput = document.getElementById("api-key-input");
+  const compilerVersionInput = document.getElementById("compiler-version-input");
+  const optimizerEnabledInput = document.getElementById("optimizer-enabled-input");
+  const optimizerRunsInput = document.getElementById("optimizer-runs-input");
   const loadingEl = document.getElementById("loading");
   const errorBanner = document.getElementById("error-banner");
   const errorText = document.getElementById("error-text");
@@ -109,6 +113,15 @@
   }
   function hideError() {
     hide(errorBanner);
+  }
+
+  function apiHeaders(baseHeaders) {
+    var headers = Object.assign({}, baseHeaders || {});
+    var apiKey = apiKeyInput ? apiKeyInput.value.trim() : "";
+    if (apiKey) {
+      headers.Authorization = "Bearer " + apiKey;
+    }
+    return headers;
   }
 
   function resetProgress() {
@@ -615,6 +628,14 @@
       return;
     }
 
+    if (data.auth_required) {
+      gpuCards.innerHTML =
+        '<div class="gpu-placeholder">API key required to view GPU telemetry.</div>';
+      gpuStatusDot.className = "gpu-status-dot offline";
+      gpuStatusDot.title = "API key required";
+      return;
+    }
+
     if (!data.cuda_available || data.gpus.length === 0) {
       gpuCards.innerHTML =
         '<div class="gpu-placeholder">No CUDA GPU detected' +
@@ -721,12 +742,24 @@
   }
 
   function pollGpuStats() {
-    fetch("/api/gpu-stats")
+    fetch("/api/gpu-stats", { headers: apiHeaders() })
       .then(function (resp) {
+        if (!resp.ok) {
+          return resp.json().catch(function () {
+            return {};
+          }).then(function (data) {
+            var message = data.error || "Unable to fetch GPU stats.";
+            if (resp.status === 401 || resp.status === 403) {
+              renderGpuStats({ auth_required: true });
+              return null;
+            }
+            throw new Error(message);
+          });
+        }
         return resp.json();
       })
       .then(function (data) {
-        renderGpuStats(data);
+        if (data) renderGpuStats(data);
       })
       .catch(function () {
         renderGpuStats(null);
@@ -848,6 +881,26 @@
       return;
     }
 
+    var requestBody = { bytecode: bytecode };
+    var compilerVersion = compilerVersionInput
+      ? compilerVersionInput.value.trim()
+      : "";
+    var optimizerEnabled = optimizerEnabledInput
+      ? optimizerEnabledInput.value
+      : "";
+    var optimizerRuns = optimizerRunsInput
+      ? optimizerRunsInput.value.trim()
+      : "";
+    if (compilerVersion) {
+      requestBody.compiler_version = compilerVersion;
+    }
+    if (optimizerEnabled) {
+      requestBody.optimizer_enabled = optimizerEnabled === "true";
+    }
+    if (optimizerRuns) {
+      requestBody.optimizer_runs = optimizerRuns;
+    }
+
     clearResultRevealTimer();
     setLoading(true);
     currentSelectorMap = null;
@@ -859,8 +912,8 @@
     // (EventSource only supports GET, so we parse the stream manually)
     fetch("/api/decompile", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bytecode: bytecode }),
+      headers: apiHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(requestBody),
       signal: activeDecompileController.signal,
     })
       .then(function (response) {
@@ -1014,6 +1067,9 @@
   btnSample.addEventListener("click", function () {
     abortActiveDecompile();
     inputEl.value = SAMPLE_BYTECODE;
+    if (compilerVersionInput) compilerVersionInput.value = "0.8.24";
+    if (optimizerEnabledInput) optimizerEnabledInput.value = "";
+    if (optimizerRunsInput) optimizerRunsInput.value = "";
     isSampleLoaded = true;
     updateCharCount();
     updateOriginalTab();
@@ -1023,6 +1079,9 @@
   btnClear.addEventListener("click", function () {
     abortActiveDecompile();
     inputEl.value = "";
+    if (compilerVersionInput) compilerVersionInput.value = "";
+    if (optimizerEnabledInput) optimizerEnabledInput.value = "";
+    if (optimizerRunsInput) optimizerRunsInput.value = "";
     isSampleLoaded = false;
     updateCharCount();
     updateOriginalTab();
@@ -1044,6 +1103,10 @@
   });
 
   btnDismissError.addEventListener("click", hideError);
+
+  if (apiKeyInput) {
+    apiKeyInput.addEventListener("change", pollGpuStats);
+  }
 
   inputEl.addEventListener("input", updateCharCount);
 

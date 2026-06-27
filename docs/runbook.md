@@ -124,11 +124,18 @@ Useful flags:
 | Flag | Default | Use |
 |------|---------|-----|
 | `--limit N` | all | Cap downloaded contracts for test runs |
-| `--max-compiler-versions N` | all compatible | Limit compiler-version expansion per contract |
+| `--max-compiler-versions N` | 5 | Limit compiler-version expansion per contract; optimizer on/off doubles compile jobs |
 | `--workers N` | CPU count | Parallel compile workers |
-| `--max-body-dupes N` | 5 | Cap repeated normalized Solidity bodies |
+| `--max-body-dupes N` | 2 | Cap repeated normalized Solidity bodies |
 | `--min-body-length N` | 50 | Filter short/trivial bodies |
+| `--cache-dir PATH` | HuggingFace default | Cache Parquet downloads in a custom directory |
+| `--hf-revision REV` | latest | Pin the Hugging Face dataset revision/commit |
+| `--download-only` | — | Download contracts without compiling |
+| `--compile-only` | — | Compile already-downloaded contracts |
+| `--export-only` | — | Export existing pairs to JSONL |
 | `--output PATH` | `data/hf_training_dataset.jsonl` | Export JSONL target |
+| `--export-selectors PATH` | — | Export selector registry JSON |
+| `--import-selectors PATH` | — | Import selector registry JSON before processing |
 | `--db PATH` | `data/contracts.db` | SQLite state/cache path |
 
 Expected outputs:
@@ -177,7 +184,12 @@ uv run python train.py \
   --max-seq-length 2048
 ```
 
-This re-splits the source JSONL into `data/train_dataset.jsonl`, `data/val_dataset.jsonl`, and `data/test_dataset.jsonl`, trains the LoRA adapter, saves to `models/final_model/`, and runs evaluation unless `--skip-eval` is set.
+This re-splits the source JSONL into `data/train_dataset.jsonl`,
+`data/val_dataset.jsonl`, and `data/test_dataset.jsonl`, trains the LoRA
+adapter, saves to `models/final_model/`, and runs evaluation unless
+`--skip-eval` is set. Compiler version and optimizer metadata are included in
+prompts by default when dataset rows contain them; use
+`--no-compiler-metadata` only for an ablation run.
 
 ### Recommended <=8B code model: Qwen2.5-Coder-7B-Instruct
 
@@ -333,10 +345,20 @@ decompiler = SmartContractDecompiler("models/final_model")
 
 solidity = decompiler.decompile_tac_to_solidity(
     tac_input="function transfer(address to, uint256 amount):\n  // ... TAC ...",
+    metadata={
+        "compiler_version": "0.8.20",
+        "optimizer_enabled": True,
+        "optimizer_runs": 200,
+    },
     max_new_tokens=1024,
 )
 print(solidity)
 ```
+
+Passing compiler metadata is recommended when you know it. Solidity language
+semantics and bytecode shape vary by compiler version and optimizer settings,
+so the training and inference prompts include `compiler_version`,
+`optimizer_enabled`, `optimizer_runs`, and `evm_version` when present.
 
 ### Python API: bytecode to contract-level output
 
@@ -344,7 +366,12 @@ print(solidity)
 from src.model_setup import SmartContractDecompiler
 
 decompiler = SmartContractDecompiler("models/final_model")
-result = decompiler.decompile_contract("0x60806040...")
+result = decompiler.decompile_contract(
+    "0x60806040...",
+    compiler_version="0.8.20",
+    optimizer_enabled=True,
+    optimizer_runs=200,
+)
 
 print(result["solidity"])
 print(result["analysis"])
@@ -375,12 +402,33 @@ uv run python web/app.py
 
 Open `http://localhost:5000`. If no model artifact can be resolved, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
 
+For a shared host, set an API key and restrict CORS to trusted browser
+origins. The UI includes an API key field that sends an in-memory
+`Authorization: Bearer ...` header to protected endpoints; it does not persist
+the key in browser storage.
+
+```bash
+WEB_API_KEY='choose-a-long-random-value' \
+WEB_HOST=0.0.0.0 \
+WEB_CORS_ORIGINS=https://decompiler.example.com \
+uv run python web/app.py
+```
+
+Without `WEB_API_KEY`, protected API routes are loopback-only. With
+`WEB_API_KEY`, `/api/decompile`, security-analysis APIs, and `/api/gpu-stats`
+require `Authorization: Bearer <key>` or `X-API-Key: <key>`. GPU telemetry
+includes host hardware details, memory, thermals, power, fan, and clock data,
+so expose it only to trusted users.
+
 ## 7. Preflight checklist
 
 ```bash
 # CLI help should load
 uv run python train.py --help
 uv run python download_hf_contracts.py --help
+
+# Repository tests should collect without third-party pytest plugin side effects
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest --collect-only -q
 
 # Dataset should exist and have rows
 test -s data/hf_training_dataset.jsonl && wc -l data/hf_training_dataset.jsonl
