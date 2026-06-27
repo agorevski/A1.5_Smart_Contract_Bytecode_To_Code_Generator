@@ -27,6 +27,17 @@ The paper used **Llama 3.2 3B** — a deliberately small model chosen for practi
 
 ## Recommended Models (Ranked)
 
+### Best <=8B Pick: Qwen 2.5 Coder 7B Instruct
+
+**Model ID**: `Qwen/Qwen2.5-Coder-7B-Instruct`
+
+- **Why**: Purpose-built for code generation and instruction following, with much stronger code/Solidity priors than the current general-purpose Llama 3.2 3B baseline while still fitting comfortably on a single 48 GB RTX 8000 in full fp16 LoRA mode.
+- **Context length**: 128K tokens natively, so the model family has ample headroom for longer TAC/function examples than the current 2K setup.
+- **Local smoke result**: A bounded local run on this repository completed successfully with `use_quantization=False`, batch size 1, one epoch, and max sequence length 1024. The run trained 40,370,176 LoRA parameters on top of 7,655,986,688 total parameters and produced train loss 1.087 / eval loss 1.129 on the tiny smoke split.
+- **Recommendation**: Use this as the first practical upgrade before moving to 14B/32B. It is large enough to test whether code-specialized pretraining materially improves TAC-to-Solidity quality without the operational cost of 32B+ experiments.
+
+> Current CLI note: `train.py` only disables quantization for `--tiny`. For full fp16 Qwen training, call `train_model(..., use_quantization=False)` from Python or add a `--no-quantization` CLI flag.
+
 ### 🥇 Top Pick: Qwen 2.5 Coder 32B
 
 **Model ID**: `Qwen/Qwen2.5-Coder-32B`
@@ -51,6 +62,7 @@ The paper used **Llama 3.2 3B** — a deliberately small model chosen for practi
 
 | Model | Size | Strengths |
 |---|---|---|
+| **Qwen2.5-Coder-Instruct** | 7B | Best <=8B practical upgrade; local full-fp16 LoRA smoke run succeeded |
 | **CodeLlama 34B** | 34B | Strong code model, Llama architecture (minimal code changes) |
 | **StarCoder2 15B** | 15B | Trained on The Stack v2, excellent code understanding, very efficient |
 | **Llama 3.1 8B** | 8B | 2.5× bigger than current, minimal infrastructure changes, fast iteration |

@@ -181,6 +181,37 @@ python train.py \
 
 This re-splits the source JSONL into `data/train_dataset.jsonl`, `data/val_dataset.jsonl`, and `data/test_dataset.jsonl`, trains the LoRA adapter, saves to `models/final_model/`, and runs evaluation unless `--skip-eval` is set.
 
+### Recommended <=8B code model: Qwen2.5-Coder-7B-Instruct
+
+For a stronger code-specialized base model that still fits comfortably on the available RTX 8000 GPUs, use `Qwen/Qwen2.5-Coder-7B-Instruct`. A local full-fp16 LoRA smoke run completed successfully on this repository with a tiny TAC/Solidity subset, batch size 1, one epoch, and `max_seq_length=1024`.
+
+The current CLI has no explicit `--no-quantization` flag; full fp16 requires calling the Python API and setting `use_quantization=False`:
+
+```python
+from train import setup_logging, split_dataset, train_model
+
+setup_logging("train_qwen.log")
+train_path, val_path, _ = split_dataset(
+    "data/hf_training_dataset.jsonl",
+    "data",
+)
+
+model_path = train_model(
+    train_path=train_path,
+    val_path=val_path,
+    output_dir="models",
+    batch_size=1,
+    learning_rate=2e-4,
+    num_epochs=1,
+    max_seq_length=1024,
+    model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
+    use_quantization=False,
+)
+print(model_path)
+```
+
+For longer runs on this hardware, start with batch size 1-2, sequence length 2048-4096, and compare against the Llama 3.2 3B baseline using the same train/validation/test split.
+
 ### Multi-GPU with torchrun
 
 ```bash
