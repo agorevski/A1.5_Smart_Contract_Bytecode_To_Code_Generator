@@ -116,6 +116,10 @@ def format_latest_results_report(
             "Quality Summary",
             "---------------",
             f"Examples evaluated: {_metric(summary, 'num_evaluated', integer=True)}",
+            f"Examples attempted: {_metric(summary, 'num_attempted', integer=True)}",
+            f"Examples succeeded: {_metric(summary, 'num_succeeded', integer=True)}",
+            f"Examples failed: {_metric(summary, 'num_failed', integer=True)}",
+            f"Failure rate: {_percent_metric(summary, 'failure_rate')}",
             f"Semantic similarity mean: {_metric(summary, 'semantic_similarity_mean')}",
             f"Semantic similarity std: {_metric(summary, 'semantic_similarity_std')}",
             f"Edit distance mean: {_metric(summary, 'edit_distance_mean')}",
@@ -129,6 +133,27 @@ def format_latest_results_report(
             f"Replication recall micro: {_metric(summary, 'replication_recall_micro')}",
             f"Replication F1 micro: {_metric(summary, 'replication_f1_micro')}",
             f"Functions > 0.8 replication F1: {_percent_metric(summary, 'pct_above_0.8_replication_f1')}",
+        ]
+    )
+
+    if any(
+        key in summary
+        for key in (
+            "solidity_valid_mean",
+            "solidity_compiler_checked_mean",
+            "solidity_ast_valid_mean",
+        )
+    ):
+        lines.extend(
+            [
+                f"Solidity valid outputs: {_percent_metric(summary, 'solidity_valid_mean')}",
+                f"Solidity compiler-checked outputs: {_percent_metric(summary, 'solidity_compiler_checked_mean')}",
+                f"Solidity AST-valid outputs: {_percent_metric(summary, 'solidity_ast_valid_mean')}",
+            ]
+        )
+
+    lines.extend(
+        [
             "",
             "Target Checks",
             "-------------",
@@ -165,6 +190,31 @@ def format_latest_results_report(
                     ]
                 )
             )
+
+    confidence_intervals = _summary_confidence_intervals(summary)
+    if confidence_intervals:
+        lines.extend(["", "Confidence Intervals", "--------------------"])
+        lines.append("metric | mean | 95% CI | n")
+        lines.append("--- | ---: | ---: | ---:")
+        for metric, interval in sorted(confidence_intervals.items()):
+            lines.append(
+                " | ".join(
+                    [
+                        metric,
+                        _format_number(interval.get("mean")),
+                        _format_ci(interval),
+                        str(interval.get("n", "n/a")),
+                    ]
+                )
+            )
+
+    metadata_segments = summary.get("metadata_segments")
+    if isinstance(metadata_segments, Mapping):
+        _append_metadata_segment_report(lines, metadata_segments)
+
+    baseline_comparison = summary.get("baseline_comparison") or summary.get("regression_comparison")
+    if isinstance(baseline_comparison, Mapping):
+        _append_baseline_comparison(lines, baseline_comparison)
 
     if summary.get("error"):
         lines.extend(["", "Evaluation Error", "----------------", str(summary["error"])])
@@ -368,3 +418,132 @@ def _target_line(metric: str, value: Any, operator: str, target: float) -> str:
     passed = isinstance(value, (int, float)) and value >= target
     status = "PASS" if passed else "FAIL"
     return f"{metric}: {status} ({_format_number(value)} {operator} {_format_number(target)})"
+
+
+def _summary_confidence_intervals(summary: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    intervals: Dict[str, Mapping[str, Any]] = {}
+    direct = summary.get("confidence_intervals")
+    if isinstance(direct, Mapping):
+        for metric, interval in direct.items():
+            if isinstance(interval, Mapping):
+                intervals[str(metric)] = interval
+
+    for metric, value in summary.items():
+        if not isinstance(value, Mapping):
+            continue
+        interval = value.get("confidence_interval_95")
+        if isinstance(interval, Mapping):
+            intervals[f"{metric}_mean"] = interval
+    return intervals
+
+
+def _format_ci(interval: Mapping[str, Any]) -> str:
+    low = interval.get("low")
+    high = interval.get("high")
+    if not isinstance(low, (int, float)) or not isinstance(high, (int, float)):
+        return "n/a"
+    return f"[{_format_number(low)}, {_format_number(high)}]"
+
+
+def _append_metadata_segment_report(lines: list[str], metadata_segments: Mapping[str, Any]) -> None:
+    coverage = metadata_segments.get("coverage")
+    if isinstance(coverage, Mapping) and coverage:
+        lines.extend(["", "Metadata Segment Coverage", "-------------------------"])
+        lines.append("field | known | unknown | top values")
+        lines.append("--- | ---: | ---: | ---")
+        for field_name, field_coverage in sorted(coverage.items()):
+            if not isinstance(field_coverage, Mapping):
+                continue
+            values = field_coverage.get("values")
+            top_values = _format_top_segment_values(values if isinstance(values, Mapping) else {})
+            lines.append(
+                " | ".join(
+                    [
+                        str(field_name),
+                        str(field_coverage.get("known", 0)),
+                        str(field_coverage.get("unknown", 0)),
+                        top_values,
+                    ]
+                )
+            )
+
+    segments = metadata_segments.get("segments")
+    if not isinstance(segments, Mapping) or not segments:
+        return
+
+    lines.extend(["", "Per-Segment Metrics", "-------------------"])
+    lines.append("segment | count | semantic | edit distance | replication F1 | Solidity valid")
+    lines.append("--- | ---: | ---: | ---: | ---: | ---:")
+    for field_name, field_segments in sorted(segments.items()):
+        if not isinstance(field_segments, Mapping):
+            continue
+        for value, segment in sorted(field_segments.items()):
+            if not isinstance(segment, Mapping):
+                continue
+            metrics = segment.get("metrics")
+            metrics = metrics if isinstance(metrics, Mapping) else {}
+            lines.append(
+                " | ".join(
+                    [
+                        f"{field_name}={value}",
+                        str(segment.get("count", 0)),
+                        _segment_metric(metrics, "semantic_similarity"),
+                        _segment_metric(metrics, "normalized_edit_distance"),
+                        _segment_metric(metrics, "replication_f1"),
+                        _segment_percent_metric(metrics, "solidity_valid"),
+                    ]
+                )
+            )
+
+
+def _format_top_segment_values(values: Mapping[str, Any], *, limit: int = 4) -> str:
+    pairs = sorted(
+        ((str(value), count) for value, count in values.items()),
+        key=lambda item: (-int(item[1]), item[0]) if isinstance(item[1], int) else (0, item[0]),
+    )
+    return ", ".join(f"{value} ({count})" for value, count in pairs[:limit]) or "n/a"
+
+
+def _segment_metric(metrics: Mapping[str, Any], metric: str) -> str:
+    value = metrics.get(metric)
+    if isinstance(value, Mapping):
+        return _format_number(value.get("mean"))
+    return "n/a"
+
+
+def _segment_percent_metric(metrics: Mapping[str, Any], metric: str) -> str:
+    value = metrics.get(metric)
+    if isinstance(value, Mapping):
+        mean = value.get("mean")
+        if isinstance(mean, (int, float)):
+            return f"{mean * 100:.2f}%"
+    return "n/a"
+
+
+def _append_baseline_comparison(lines: list[str], comparison: Mapping[str, Any]) -> None:
+    lines.extend(["", "Baseline / Regression Comparison", "--------------------------------"])
+    lines.append(f"Metrics compared: {comparison.get('num_metrics_compared', 0)}")
+    lines.append(f"Improvements: {comparison.get('num_improvements', 0)}")
+    lines.append(f"Regressions: {comparison.get('num_regressions', 0)}")
+
+    comparisons = comparison.get("comparisons")
+    if not isinstance(comparisons, Mapping) or not comparisons:
+        return
+
+    lines.append("")
+    lines.append("metric | current | baseline | delta | status")
+    lines.append("--- | ---: | ---: | ---: | ---")
+    for metric, item in sorted(comparisons.items()):
+        if not isinstance(item, Mapping):
+            continue
+        lines.append(
+            " | ".join(
+                [
+                    str(metric),
+                    _format_number(item.get("current")),
+                    _format_number(item.get("baseline")),
+                    _format_number(item.get("delta")),
+                    str(item.get("status", "unknown")),
+                ]
+            )
+        )

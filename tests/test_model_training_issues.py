@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import train
 from src import model_setup
@@ -7,6 +8,9 @@ from src.model_setup import (
     ModelConfig,
     SmartContractDataset,
     SmartContractDecompiler,
+    TokenizationCacheConfig,
+    TrainingInstrumentationCallback,
+    TrainingInstrumentationConfig,
     detect_max_sequence_length,
 )
 from src.training_pipeline import (
@@ -32,6 +36,33 @@ class CharacterTokenizer:
 
     def encode(self, text, add_special_tokens=False):
         return list(text)
+
+
+class CountingTokenizer:
+    pad_token = "<pad>"
+    pad_token_id = 0
+    eos_token = "</s>"
+    eos_token_id = 1
+    name_or_path = "counting-tokenizer"
+    model_max_length = 2048
+
+    def __init__(self):
+        self.calls = 0
+        self._vocab = {"<pad>": 0, "</s>": 1, "static": 2}
+
+    def __len__(self):
+        return len(self._vocab)
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+    def __call__(self, text, **_kwargs):
+        self.calls += 1
+        return {"input_ids": text.split()}
+
+    def encode(self, text, add_special_tokens=False):
+        self.calls += 1
+        return text.split()
 
 
 def _write_jsonl(path: Path, rows):
@@ -341,3 +372,296 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
 
     assert len(shared_locations) == 2
     assert len(set(shared_locations)) == 1
+
+
+def test_tokenized_dataset_cache_reuses_examples_and_max_length_invalidates(tmp_path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    rows = [
+        {"input": "tac one", "output": "sol one", "metadata": {"function_name": "a"}},
+        {"input": "tac two", "output": "sol two", "metadata": {"function_name": "b"}},
+    ]
+    _write_jsonl(dataset_path, rows)
+    cache_config = TokenizationCacheConfig(
+        enabled=True,
+        cache_dir=str(tmp_path / "token-cache"),
+    )
+
+    tokenizer = CountingTokenizer()
+    dataset = SmartContractDataset(
+        str(dataset_path),
+        tokenizer,
+        max_length=64,
+        tokenization_cache=cache_config,
+    )
+    build_calls = tokenizer.calls
+    first_item = dataset[0]
+
+    assert build_calls > 0
+    assert tokenizer.calls == build_calls
+
+    second_tokenizer = CountingTokenizer()
+    cached_dataset = SmartContractDataset(
+        str(dataset_path),
+        second_tokenizer,
+        max_length=64,
+        tokenization_cache=cache_config,
+    )
+
+    assert second_tokenizer.calls == 0
+    assert cached_dataset[0] == first_item
+    assert second_tokenizer.calls == 0
+
+    changed_length_tokenizer = CountingTokenizer()
+    SmartContractDataset(
+        str(dataset_path),
+        changed_length_tokenizer,
+        max_length=32,
+        tokenization_cache=cache_config,
+    )
+
+    changed_vocab_tokenizer = CountingTokenizer()
+    changed_vocab_tokenizer._vocab["new-token"] = 3
+    SmartContractDataset(
+        str(dataset_path),
+        changed_vocab_tokenizer,
+        max_length=64,
+        tokenization_cache=cache_config,
+    )
+
+    assert changed_length_tokenizer.calls > 0
+    assert changed_vocab_tokenizer.calls > 0
+
+
+def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprint(tmp_path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    rows = [
+        {
+            "input": "tac",
+            "output": "uint256 amount = 1; return amount;",
+            "metadata": {"compiler_version": "0.8.20", "optimizer_enabled": True},
+        }
+    ]
+    _write_jsonl(dataset_path, rows)
+    cache_dir = tmp_path / "token-cache"
+    cache_config = TokenizationCacheConfig(enabled=True, cache_dir=str(cache_dir))
+
+    SmartContractDataset(
+        str(dataset_path),
+        CountingTokenizer(),
+        max_length=64,
+        include_compiler_metadata=True,
+        augment_names=False,
+        tokenization_cache=cache_config,
+    )
+    initial_cache_files = set(cache_dir.glob("*.jsonl"))
+
+    compiler_flag_tokenizer = CountingTokenizer()
+    SmartContractDataset(
+        str(dataset_path),
+        compiler_flag_tokenizer,
+        max_length=64,
+        include_compiler_metadata=False,
+        augment_names=False,
+        tokenization_cache=cache_config,
+    )
+    after_compiler_flag_files = set(cache_dir.glob("*.jsonl"))
+
+    augment_flag_tokenizer = CountingTokenizer()
+    SmartContractDataset(
+        str(dataset_path),
+        augment_flag_tokenizer,
+        max_length=64,
+        include_compiler_metadata=True,
+        augment_names=True,
+        tokenization_cache=cache_config,
+    )
+    after_augment_flag_files = set(cache_dir.glob("*.jsonl"))
+
+    _write_jsonl(
+        dataset_path,
+        rows + [{"input": "new tac", "output": "new sol", "metadata": {}}],
+    )
+    changed_data_tokenizer = CountingTokenizer()
+    SmartContractDataset(
+        str(dataset_path),
+        changed_data_tokenizer,
+        max_length=64,
+        include_compiler_metadata=True,
+        augment_names=False,
+        tokenization_cache=cache_config,
+    )
+    after_dataset_change_files = set(cache_dir.glob("*.jsonl"))
+
+    assert compiler_flag_tokenizer.calls > 0
+    assert augment_flag_tokenizer.calls > 0
+    assert changed_data_tokenizer.calls > 0
+    assert len(after_compiler_flag_files) == len(initial_cache_files) + 1
+    assert len(after_augment_flag_files) == len(after_compiler_flag_files) + 1
+    assert len(after_dataset_change_files) == len(after_augment_flag_files) + 1
+
+
+def test_non_quantized_ddp_setup_loads_without_device_map_and_moves_to_local_rank(
+    tmp_path, monkeypatch
+):
+    captured_load_kwargs = {}
+    set_device_calls = []
+
+    class FakeTokenizer:
+        pad_token = "<pad>"
+        pad_token_id = 0
+        eos_token = "</s>"
+        eos_token_id = 1
+
+        def __len__(self):
+            return 8
+
+    class FakeModel:
+        def __init__(self):
+            self.config = SimpleNamespace(vocab_size=128)
+            self.device = None
+
+        def named_modules(self):
+            return [("layers.0.q_proj", object())]
+
+        def to(self, device):
+            self.device = device
+            return self
+
+        def print_trainable_parameters(self):
+            pass
+
+    def fake_from_pretrained(_model_name, **kwargs):
+        captured_load_kwargs.update(kwargs)
+        return FakeModel()
+
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setattr(model_setup.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(model_setup.torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(
+        model_setup.torch.cuda,
+        "set_device",
+        lambda rank: set_device_calls.append(rank),
+    )
+    monkeypatch.setattr(
+        model_setup.AutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        model_setup.AutoModelForCausalLM,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+    monkeypatch.setattr(model_setup, "get_peft_model", lambda model, _config: model)
+
+    trainer = model_setup.SmartContractModelTrainer(
+        ModelConfig(use_quantization=False),
+        output_dir=str(tmp_path / "models"),
+    )
+    _tokenizer, model = trainer.setup_model()
+
+    assert "device_map" not in captured_load_kwargs
+    assert str(model.device) == "cuda:2"
+    assert set_device_calls == [2]
+
+
+def test_training_instrumentation_writes_throughput_summary_and_csv(tmp_path):
+    summary_path = tmp_path / "throughput.json"
+    csv_path = tmp_path / "throughput.csv"
+    callback = TrainingInstrumentationCallback(
+        TrainingInstrumentationConfig(
+            enable_throughput_metrics=True,
+            throughput_summary_path=str(summary_path),
+            throughput_csv_path=str(csv_path),
+            max_throughput_records=2,
+        ),
+        output_dir=tmp_path,
+        train_dataset_size=4,
+    )
+    args = SimpleNamespace(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+        world_size=1,
+    )
+    state = SimpleNamespace(global_step=0, max_steps=2, num_input_tokens_seen=0)
+
+    callback.on_train_begin(args, state, None)
+    state.global_step = 1
+    state.num_input_tokens_seen = 10
+    callback.on_step_end(args, state, None)
+    state.global_step = 2
+    state.num_input_tokens_seen = 20
+    callback.on_step_end(args, state, None)
+    callback.on_train_end(args, state, None)
+
+    summary = json.loads(summary_path.read_text())
+    csv_lines = csv_path.read_text().splitlines()
+
+    assert summary["steps"] == 2
+    assert summary["estimated_samples"] == 4
+    assert summary["input_tokens_seen"] == 20
+    assert len(summary["records"]) == 2
+    assert csv_lines[0].startswith("step,elapsed_seconds,steps_per_second")
+    assert len(csv_lines) == 3
+
+
+def test_training_instrumentation_starts_bounded_torch_profiler(
+    tmp_path, monkeypatch
+):
+    events = []
+    captured_profile_kwargs = {}
+    captured_schedule_kwargs = {}
+
+    class FakeProfiler:
+        def start(self):
+            events.append("start")
+
+        def step(self):
+            events.append("step")
+
+        def stop(self):
+            events.append("stop")
+
+    def fake_schedule(**kwargs):
+        captured_schedule_kwargs.update(kwargs)
+        return ("schedule", kwargs)
+
+    def fake_profile(**kwargs):
+        captured_profile_kwargs.update(kwargs)
+        return FakeProfiler()
+
+    trace_dir = tmp_path / "profiler-trace"
+    monkeypatch.setattr(model_setup.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(model_setup.torch.profiler, "schedule", fake_schedule)
+    monkeypatch.setattr(
+        model_setup.torch.profiler,
+        "tensorboard_trace_handler",
+        lambda path: ("trace-handler", path),
+    )
+    monkeypatch.setattr(model_setup.torch.profiler, "profile", fake_profile)
+
+    callback = TrainingInstrumentationCallback(
+        TrainingInstrumentationConfig(
+            enable_torch_profiler=True,
+            profiler_trace_dir=str(trace_dir),
+            profiler_wait_steps=0,
+            profiler_warmup_steps=0,
+            profiler_active_steps=2,
+            profiler_repeat=1,
+        ),
+        output_dir=tmp_path,
+    )
+
+    args = SimpleNamespace()
+    state = SimpleNamespace(global_step=1)
+    callback.on_train_begin(args, state, None)
+    callback.on_step_end(args, state, None)
+    callback.on_train_end(args, state, None)
+
+    assert events == ["start", "step", "stop"]
+    assert captured_schedule_kwargs == {"wait": 0, "warmup": 0, "active": 2, "repeat": 1}
+    assert captured_profile_kwargs["on_trace_ready"] == (
+        "trace-handler",
+        str(trace_dir),
+    )
+    assert trace_dir.exists()

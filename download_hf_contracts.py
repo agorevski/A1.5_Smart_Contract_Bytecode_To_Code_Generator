@@ -26,15 +26,21 @@ Usage:
     python download_hf_contracts.py --max-compiler-versions 3
     python download_hf_contracts.py --max-body-dupes 5       # cap duplicates
     python download_hf_contracts.py --min-body-length 50     # quality filter
+    python download_hf_contracts.py --validate-jsonl data/hf_training_dataset.jsonl
 """
 
 import argparse
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import subprocess
+import sys
+import time
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -73,6 +79,8 @@ DB_PATH = Path("data/contracts.db")
 FLUSH_SIZE = 200
 BATCH_INSERT_SIZE = 500
 HF_DATASET_REPO = "andstor/smart_contracts"
+MANIFEST_SCHEMA_VERSION = 1
+REPO_ROOT = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -185,6 +193,17 @@ def hash_source_code(source: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
+def _now_utc_iso() -> str:
+    """Return a UTC timestamp suitable for manifests."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _make_run_id(prefix: str) -> str:
+    """Generate a stable-enough run identifier for linking manifests/diagnostics."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{prefix}-{stamp}-{os.getpid()}"
+
+
 def _write_manifest(path: Path, payload: Dict[str, Any]) -> None:
     """Write a deterministic JSON manifest."""
     path = Path(path)
@@ -192,6 +211,130 @@ def _write_manifest(path: Path, payload: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
+
+
+def _run_git(args: List[str]) -> Optional[str]:
+    """Run a small git command for manifest provenance."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _get_git_state() -> Dict[str, Any]:
+    """Capture best-effort git state for dataset lineage manifests."""
+    commit = _run_git(["rev-parse", "HEAD"])
+    if not commit:
+        return {"available": False}
+    status_short = _run_git(["status", "--short"]) or ""
+    return {
+        "available": True,
+        "repository_root": _run_git(["rev-parse", "--show-toplevel"]) or str(REPO_ROOT),
+        "commit": commit,
+        "branch": _run_git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "dirty": bool(status_short),
+        "status_short": status_short.splitlines()[:100],
+    }
+
+
+def _command_context(command_args: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Build command provenance; callers may pass args for programmatic runs."""
+    args = list(sys.argv[1:] if command_args is None else command_args)
+    executable = Path(sys.argv[0]).name if sys.argv else "python"
+    return {
+        "cwd": str(Path.cwd()),
+        "executable": executable,
+        "args": args,
+        "argv": [executable, *args],
+    }
+
+
+def _base_manifest(
+    kind: str,
+    *,
+    status: str,
+    started_at: str,
+    duration_seconds: float,
+    command_args: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Common manifest envelope for download/compile/export stages."""
+    return {
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "manifest_kind": kind,
+        "status": status,
+        "generated_at": _now_utc_iso(),
+        "started_at": started_at,
+        "duration_seconds": round(duration_seconds, 3),
+        "command": _command_context(command_args),
+        "git": _get_git_state(),
+    }
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    """Hash a file artifact if it exists."""
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _jsonl_row_count(path: Path) -> int:
+    """Count non-empty JSONL rows."""
+    with open(path, "r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
+def _artifact_summary(path: Path, row_count: Optional[int] = None) -> Dict[str, Any]:
+    """Return path/size/hash metadata for an emitted artifact."""
+    path = Path(path)
+    summary: Dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if path.exists() and path.is_file():
+        summary.update({
+            "bytes": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        })
+    if row_count is not None:
+        summary["row_count"] = row_count
+    return summary
+
+
+def _resolve_hf_revision(hf_revision: Optional[str]) -> Optional[str]:
+    """Resolve a Hugging Face dataset revision to a commit SHA when available."""
+    try:
+        info = HfApi().repo_info(
+            repo_id=HF_DATASET_REPO,
+            repo_type="dataset",
+            revision=hf_revision,
+        )
+    except Exception:
+        return None
+    return getattr(info, "sha", None)
+
+
+def _hf_lineage(hf_revision: Optional[str], resolved_revision: Optional[str] = None) -> Dict[str, Any]:
+    """Source lineage block for the Hugging Face verified-contracts dataset."""
+    return {
+        "type": "huggingface_dataset",
+        "repo": HF_DATASET_REPO,
+        "config": "flattened",
+        "split": "train",
+        "requested_revision": hf_revision or "default",
+        "resolved_revision": resolved_revision,
+    }
 
 
 def is_trivial_function(body: str) -> bool:
@@ -306,6 +449,22 @@ def init_database(db_path: Path = DB_PATH):
             )
         """)
 
+        # Per-run compile failures/no-output diagnostics for reproducibility.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS compile_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                contract_address TEXT,
+                compiler_version TEXT,
+                optimizer_enabled BOOLEAN,
+                optimization_runs INTEGER,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (contract_address) REFERENCES contracts (address)
+            )
+        """)
+
         # Migration: add columns that may not exist yet
         _add_columns(cur, "contracts", [
             ("abi", "TEXT"),
@@ -330,6 +489,8 @@ def init_database(db_path: Path = DB_PATH):
             ("idx_pair_norm_hash", True,  "function_pairs(pair_norm_hash)"),
             ("idx_source_hash",    False, "contracts(source_hash)"),
             ("idx_sel_reg_sel",    False, "selector_registry(selector)"),
+            ("idx_compile_diag_run", False, "compile_diagnostics(run_id)"),
+            ("idx_compile_diag_status", False, "compile_diagnostics(status)"),
         ])
 
         conn.commit()
@@ -485,6 +646,248 @@ def get_body_hash_counts(db_path: Path = DB_PATH) -> Dict[str, int]:
     return {r[0]: r[1] for r in rows}
 
 
+def _db_table_counts(db_path: Path = DB_PATH) -> Dict[str, int]:
+    """Return row counts for known data-generation tables."""
+    counts: Dict[str, int] = {}
+    with _db_connection(db_path) as conn:
+        for table in ("contracts", "function_pairs", "selector_registry", "compile_diagnostics"):
+            try:
+                counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.OperationalError:
+                counts[table] = 0
+    return counts
+
+
+def _contract_source_counts(db_path: Path = DB_PATH) -> Dict[str, int]:
+    with _db_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(source, 'unknown'), COUNT(*) FROM contracts GROUP BY COALESCE(source, 'unknown')"
+        ).fetchall()
+    return {source: count for source, count in rows}
+
+
+def _contract_status_counts(db_path: Path = DB_PATH) -> Dict[str, int]:
+    with _db_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(compile_status, 'pending'), COUNT(*) "
+            "FROM contracts GROUP BY COALESCE(compile_status, 'pending')"
+        ).fetchall()
+    return {status: count for status, count in rows}
+
+
+def _db_duplicate_stats(
+    db_path: Path = DB_PATH,
+    max_body_dupes: int = 2,
+    sample_limit: int = 5,
+) -> Dict[str, Any]:
+    """Compute duplicate stats from the SQLite pair table."""
+    with _db_connection(db_path) as conn:
+        total_pairs = conn.execute("SELECT COUNT(*) FROM function_pairs").fetchone()[0]
+        unique_pairs = conn.execute(
+            "SELECT COUNT(DISTINCT COALESCE(pair_norm_hash, hash)) FROM function_pairs"
+        ).fetchone()[0]
+        unique_bodies = conn.execute(
+            "SELECT COUNT(DISTINCT COALESCE(body_hash, hash)) FROM function_pairs"
+        ).fetchone()[0]
+        unique_tacs = conn.execute(
+            "SELECT COUNT(DISTINCT tac_hash) FROM function_pairs WHERE tac_hash IS NOT NULL"
+        ).fetchone()[0]
+        over_cap_count, rows_over_cap = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(cnt - ?), 0)
+            FROM (
+                SELECT COUNT(*) AS cnt
+                FROM function_pairs
+                GROUP BY COALESCE(body_hash, hash)
+            )
+            WHERE cnt > ?
+            """,
+            (max_body_dupes, max_body_dupes),
+        ).fetchone()
+        top_rows = conn.execute(
+            """
+            SELECT COALESCE(body_hash, hash) AS body_key, COUNT(*) AS cnt
+            FROM function_pairs
+            GROUP BY COALESCE(body_hash, hash)
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC, body_key
+            LIMIT ?
+            """,
+            (sample_limit,),
+        ).fetchall()
+        top_bodies = []
+        for body_key, count in top_rows:
+            samples = conn.execute(
+                """
+                SELECT function_name, function_signature, contract_address
+                FROM function_pairs
+                WHERE COALESCE(body_hash, hash) = ?
+                ORDER BY COALESCE(contract_address, ''),
+                         COALESCE(function_signature, ''),
+                         COALESCE(function_name, '')
+                LIMIT ?
+                """,
+                (body_key, sample_limit),
+            ).fetchall()
+            top_bodies.append({
+                "body_hash": body_key,
+                "count": count,
+                "over_cap_by": max(count - max_body_dupes, 0),
+                "samples": [
+                    {
+                        "function_name": name,
+                        "function_signature": sig,
+                        "contract_address": addr,
+                    }
+                    for name, sig, addr in samples
+                ],
+            })
+
+    return {
+        "total_pairs": total_pairs,
+        "unique_pairs": unique_pairs,
+        "duplicate_pair_rows": max(total_pairs - unique_pairs, 0),
+        "unique_bodies": unique_bodies,
+        "duplicate_body_rows": max(total_pairs - unique_bodies, 0),
+        "unique_tacs": unique_tacs,
+        "body_cap": max_body_dupes,
+        "body_hashes_over_cap": over_cap_count,
+        "rows_over_body_cap": rows_over_cap,
+        "top_duplicate_bodies": top_bodies,
+    }
+
+
+def _export_selection_stats(db_path: Path = DB_PATH, max_body_dupes: int = 2) -> Dict[str, int]:
+    """Mirror export SQL to count rows dropped by pair dedup and body caps."""
+    with _db_connection(db_path) as conn:
+        total, pair_kept, exported, pair_dropped, body_dropped = conn.execute(
+            """
+            WITH pair_ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(pair_norm_hash, hash)
+                           ORDER BY COALESCE(body_hash, ''),
+                                    COALESCE(tac_hash, ''),
+                                    COALESCE(contract_address, ''),
+                                    COALESCE(function_signature, ''),
+                                    COALESCE(function_name, ''),
+                                    id
+                       ) AS pair_rn
+                FROM function_pairs
+            ),
+            body_ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(body_hash, hash)
+                           ORDER BY COALESCE(pair_norm_hash, ''),
+                                    COALESCE(tac_hash, ''),
+                                    COALESCE(contract_address, ''),
+                                    COALESCE(function_signature, ''),
+                                    COALESCE(function_name, ''),
+                                    id
+                       ) AS body_rn
+                FROM pair_ranked
+                WHERE pair_rn = 1
+            )
+            SELECT
+                (SELECT COUNT(*) FROM function_pairs),
+                (SELECT COUNT(*) FROM pair_ranked WHERE pair_rn = 1),
+                (SELECT COUNT(*) FROM body_ranked WHERE body_rn <= ?),
+                (SELECT COUNT(*) FROM pair_ranked WHERE pair_rn > 1),
+                (SELECT COUNT(*) FROM body_ranked WHERE body_rn > ?)
+            """,
+            (max_body_dupes, max_body_dupes),
+        ).fetchone()
+    return {
+        "total_pairs_in_db": total,
+        "rows_after_pair_dedup": pair_kept,
+        "rows_exported": exported,
+        "pair_duplicate_rows_dropped": pair_dropped,
+        "body_cap_rows_dropped": body_dropped,
+    }
+
+
+def _store_compile_diagnostics(db_path: Path, diagnostics: List[Dict[str, Any]]) -> int:
+    """Persist compile/analysis failure diagnostics for a generation run."""
+    if not diagnostics:
+        return 0
+    values = [
+        (
+            d.get("run_id"),
+            d.get("contract_address"),
+            d.get("compiler_version"),
+            d.get("optimizer_enabled"),
+            d.get("optimization_runs"),
+            d.get("status") or "unknown",
+            d.get("error") or "",
+        )
+        for d in diagnostics
+    ]
+    with _db_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.executemany(
+            """
+            INSERT INTO compile_diagnostics
+                (run_id, contract_address, compiler_version, optimizer_enabled,
+                 optimization_runs, status, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        conn.commit()
+    return len(values)
+
+
+def _summarize_compile_diagnostics(
+    db_path: Path = DB_PATH,
+    run_id: Optional[str] = None,
+    limit: int = 10,
+) -> Dict[str, Any]:
+    """Summarize stored compile diagnostics by status/error with sample contracts."""
+    where = ""
+    params: List[Any] = []
+    if run_id:
+        where = "WHERE run_id = ?"
+        params.append(run_id)
+
+    with _db_connection(db_path) as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM compile_diagnostics {where}",
+            params,
+        ).fetchone()[0]
+        status_rows = conn.execute(
+            f"SELECT status, COUNT(*) FROM compile_diagnostics {where} GROUP BY status",
+            params,
+        ).fetchall()
+        top_rows = conn.execute(
+            f"""
+            SELECT status, COALESCE(error, ''), COUNT(*), GROUP_CONCAT(contract_address)
+            FROM compile_diagnostics
+            {where}
+            GROUP BY status, COALESCE(error, '')
+            ORDER BY COUNT(*) DESC, status, COALESCE(error, '')
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+
+    top_errors = []
+    for status, error, count, addresses in top_rows:
+        sample_addresses = [a for a in (addresses or "").split(",") if a][:5]
+        top_errors.append({
+            "status": status,
+            "error": error,
+            "count": count,
+            "sample_contract_addresses": sample_addresses,
+        })
+    return {
+        "run_id": run_id,
+        "total_diagnostics": total,
+        "status_counts": {status: count for status, count in status_rows},
+        "top_errors": top_errors,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 -- Download from HuggingFace
 # ---------------------------------------------------------------------------
@@ -582,6 +985,50 @@ def _record_contract_outcomes(
     return counts
 
 
+def _write_compile_manifest(
+    db_path: Path,
+    manifest_path: Path,
+    *,
+    run_id: str,
+    status: str,
+    started_at: str,
+    duration_seconds: float,
+    parameters: Dict[str, Any],
+    summary: Dict[str, Any],
+    status_counts: Dict[str, Any],
+    drop_counts: Dict[str, Any],
+    command_args: Optional[List[str]] = None,
+    hf_revision: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Write a compile-stage manifest and return its payload for tests."""
+    manifest = _base_manifest(
+        "hf_compile",
+        status=status,
+        started_at=started_at,
+        duration_seconds=duration_seconds,
+        command_args=command_args,
+    )
+    manifest.update({
+        "run_id": run_id,
+        "lineage": {
+            "source": _hf_lineage(hf_revision),
+            "database": str(db_path),
+        },
+        "parameters": parameters,
+        "artifacts": {"database": _artifact_summary(db_path)},
+        "row_counts": _db_table_counts(db_path),
+        "status_counts": {
+            **status_counts,
+            "contracts": _contract_status_counts(db_path),
+        },
+        "drop_counts": drop_counts,
+        "summary": summary,
+        "failure_diagnostics": _summarize_compile_diagnostics(db_path, run_id=run_id),
+    })
+    _write_manifest(manifest_path, manifest)
+    return manifest
+
+
 def _parse_opt_used(value) -> bool:
     """Coerce optimization_used to bool."""
     if isinstance(value, bool):
@@ -597,35 +1044,42 @@ def download_contracts(
     cache_dir: Optional[str] = None,
     hf_revision: Optional[str] = None,
     manifest_path: Optional[Path] = None,
+    command_args: Optional[List[str]] = None,
 ) -> int:
     """Download contracts from HuggingFace with source-code-level dedup.
 
     Parquet files are cached locally (default: ~/.cache/huggingface/hub/).
     On rerun, cached files are reused without re-downloading.
     """
+    started_at = _now_utc_iso()
+    start_time = time.perf_counter()
     logger.info(
         "Listing Parquet files from %s (flattened/train, revision=%s)...",
         HF_DATASET_REPO,
         hf_revision or "default",
     )
+    resolved_revision = _resolve_hf_revision(hf_revision)
     parquet_files = _get_parquet_files("flattened", "train", revision=hf_revision)
     if not parquet_files:
         logger.error("No Parquet files found!")
+        manifest = _base_manifest(
+            "hf_download",
+            status="no_source_files",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - start_time,
+            command_args=command_args,
+        )
+        manifest.update({
+            "lineage": {"source": _hf_lineage(hf_revision, resolved_revision)},
+            "parameters": {"limit": limit, "cache_dir": cache_dir},
+            "artifacts": {"database": _artifact_summary(db_path)},
+            "row_counts": _db_table_counts(db_path),
+            "status_counts": {},
+            "drop_counts": {"missing_parquet_files": 1},
+        })
+        _write_manifest(manifest_path or Path(db_path).with_name("hf_download_manifest.json"), manifest)
         return 0
     logger.info(f"Found {len(parquet_files)} Parquet file(s)")
-    _write_manifest(
-        manifest_path or Path(db_path).with_name("hf_download_manifest.json"),
-        {
-            "dataset_repo": HF_DATASET_REPO,
-            "revision": hf_revision or "default",
-            "config": "flattened",
-            "split": "train",
-            "parquet_files": parquet_files,
-            "limit": limit,
-            "cache_dir": cache_dir,
-            "code_version": os.environ.get("GITHUB_SHA", "unknown"),
-        },
-    )
 
     existing_hashes = get_existing_source_hashes(db_path)
     logger.info(f"Loaded {len(existing_hashes)} existing source hashes for dedup")
@@ -636,8 +1090,11 @@ def download_contracts(
     inserted = 0
     ignored = 0
     skipped = 0
+    skipped_non_solidity = 0
+    skipped_short_source = 0
     deduped = 0
     total_seen = 0
+    download_errors: List[Dict[str, str]] = []
 
     try:
         for pq_idx, pq_file in enumerate(parquet_files):
@@ -655,6 +1112,7 @@ def download_contracts(
                 df = pd.read_parquet(local_path)
             except Exception as e:
                 logger.warning(f"Failed to download/read {pq_file}: {e}")
+                download_errors.append({"parquet_file": pq_file, "error": str(e)})
                 continue
 
             logger.info(f"  Loaded {len(df)} rows from {pq_file}")
@@ -667,11 +1125,13 @@ def download_contracts(
 
                 if str(row.get("language", "")).strip().lower() != "solidity":
                     skipped += 1
+                    skipped_non_solidity += 1
                     continue
 
                 src = str(row.get("source_code", "") or "")
                 if len(src.strip()) < 20:
                     skipped += 1
+                    skipped_short_source += 1
                     continue
 
                 src_hash = hash_source_code(src)
@@ -727,6 +1187,44 @@ def download_contracts(
         f"Download complete: {inserted} stored, {ignored} ignored, "
         f"{deduped} source-deduped, {skipped} skipped, {total_seen} total"
     )
+
+    status = "completed" if inserted or total_seen else "completed_no_rows"
+    manifest = _base_manifest(
+        "hf_download",
+        status=status,
+        started_at=started_at,
+        duration_seconds=time.perf_counter() - start_time,
+        command_args=command_args,
+    )
+    manifest.update({
+        "lineage": {
+            "source": _hf_lineage(hf_revision, resolved_revision),
+            "parquet_files": parquet_files,
+        },
+        "parameters": {"limit": limit, "cache_dir": cache_dir},
+        "artifacts": {"database": _artifact_summary(db_path)},
+        "row_counts": {
+            **_db_table_counts(db_path),
+            "source_rows_seen": total_seen,
+            "contracts_inserted": inserted,
+        },
+        "status_counts": {
+            "inserted": inserted,
+            "insert_ignored": ignored,
+            "source_deduped": deduped,
+            "skipped": skipped,
+            "download_errors": len(download_errors),
+        },
+        "drop_counts": {
+            "non_solidity": skipped_non_solidity,
+            "short_or_empty_source": skipped_short_source,
+            "source_deduped": deduped,
+            "insert_ignored": ignored,
+            "download_read_errors": len(download_errors),
+        },
+        "diagnostics": {"download_errors": download_errors[:20]},
+    })
+    _write_manifest(manifest_path or Path(db_path).with_name("hf_download_manifest.json"), manifest)
     return inserted
 
 
@@ -896,12 +1394,19 @@ def compile_and_generate(
     max_body_dupes: int = 5,
     min_body_length: int = 50,
     db_path: Path = DB_PATH,
+    manifest_path: Optional[Path] = None,
+    command_args: Optional[List[str]] = None,
+    hf_revision: Optional[str] = None,
+    run_id: Optional[str] = None,
 ) -> int:
     """Compile unprocessed contracts and generate TAC->Solidity pairs.
 
     Dedup is handled deterministically by DB unique indexes and
     ROW_NUMBER() at export time (not in-memory frequency caps).
     """
+    started_at = _now_utc_iso()
+    start_time = time.perf_counter()
+    run_id = run_id or _make_run_id("compile")
     with _db_connection(db_path) as conn:
         rows = conn.execute(
             "SELECT address, source_code, compiler_version, "
@@ -912,6 +1417,32 @@ def compile_and_generate(
     total_contracts = len(rows)
     logger.info(f"Found {total_contracts} unprocessed contracts to compile")
     if total_contracts == 0:
+        _write_compile_manifest(
+            db_path,
+            manifest_path or Path(db_path).with_name("hf_compile_manifest.json"),
+            run_id=run_id,
+            status="skipped_no_unprocessed_contracts",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - start_time,
+            parameters={
+                "max_compiler_versions": max_compiler_versions,
+                "workers": workers,
+                "max_body_dupes": max_body_dupes,
+                "min_body_length": min_body_length,
+            },
+            summary={
+                "contracts_selected": 0,
+                "contracts_prepared": 0,
+                "compile_jobs": 0,
+                "pairs_generated": 0,
+                "pairs_inserted": 0,
+                "db_pair_duplicates": 0,
+            },
+            status_counts={},
+            drop_counts={},
+            command_args=command_args,
+            hf_revision=hf_revision,
+        )
         return 0
 
     if workers <= 0:
@@ -956,6 +1487,18 @@ def compile_and_generate(
             processed=False,
             last_error="prepare produced no compile jobs",
         )
+        _store_compile_diagnostics(
+            db_path,
+            [
+                {
+                    "run_id": run_id,
+                    "contract_address": addr,
+                    "status": "prepare_no_jobs",
+                    "error": "prepare produced no compile jobs",
+                }
+                for addr in no_work_addresses
+            ],
+        )
 
     # Fetch ABI data for contracts that have it (Issue #8)
     abi_by_address: Dict[str, str] = {}
@@ -983,17 +1526,51 @@ def compile_and_generate(
         f"({total_jobs // max(len(prepared), 1)} avg jobs/contract)"
     )
     if total_jobs == 0:
-        _record_contract_outcomes(
+        outcome_counts = _record_contract_outcomes(
             db_path,
             {addr: {"pairs": 0, "failures": []} for addr in prepared},
+        )
+        _write_compile_manifest(
+            db_path,
+            manifest_path or Path(db_path).with_name("hf_compile_manifest.json"),
+            run_id=run_id,
+            status="completed_no_compile_jobs",
+            started_at=started_at,
+            duration_seconds=time.perf_counter() - start_time,
+            parameters={
+                "max_compiler_versions": max_compiler_versions,
+                "workers": workers,
+                "max_body_dupes": max_body_dupes,
+                "min_body_length": min_body_length,
+            },
+            summary={
+                "contracts_selected": total_contracts,
+                "contracts_prepared": len(prepared),
+                "prepare_no_jobs": len(no_work_addresses),
+                "compile_jobs": 0,
+                "pairs_generated": 0,
+                "pairs_inserted": 0,
+                "db_pair_duplicates": 0,
+            },
+            status_counts={"contract_outcomes": outcome_counts, "compile_jobs": {}},
+            drop_counts={
+                "prepare_no_jobs": len(no_work_addresses),
+                "compile_or_analysis_errors": 0,
+                "db_pair_duplicates": 0,
+            },
+            command_args=command_args,
+            hf_revision=hf_revision,
         )
         return 0
 
     # Phase 2b: compile in parallel (batched to avoid memory/IPC flood)
     total_pairs = 0
+    total_inserted = 0
     total_db_deduped = 0
     errors_count = 0
     pair_buffer: List[Dict] = []
+    diagnostics_buffer: List[Dict[str, Any]] = []
+    job_status_counts: Dict[str, int] = {}
     contract_outcomes: Dict[str, Dict[str, Any]] = {
         addr: {"pairs": 0, "failures": []} for addr in prepared
     }
@@ -1003,13 +1580,13 @@ def compile_and_generate(
             for batch_start in range(0, total_jobs, SUBMIT_BATCH):
                 batch_jobs = compile_jobs[batch_start : batch_start + SUBMIT_BATCH]
                 futures = {
-                    executor.submit(_compile_one_job, *job): (batch_start + idx, job[0])
+                    executor.submit(_compile_one_job, *job): (batch_start + idx, job)
                     for idx, job in enumerate(batch_jobs)
                 }
-                batch_results: Dict[int, Tuple[str, Dict[str, Any]]] = {}
+                batch_results: Dict[int, Tuple[tuple, Dict[str, Any]]] = {}
 
                 for fut in as_completed(futures):
-                    job_idx, addr = futures[fut]
+                    job_idx, job = futures[fut]
                     try:
                         result = fut.result()
                         if isinstance(result, list):
@@ -1018,10 +1595,10 @@ def compile_and_generate(
                                 "status": "processed" if result else "no_pairs",
                                 "error": "",
                             }
-                        batch_results[job_idx] = (addr, result)
+                        batch_results[job_idx] = (job, result)
                     except Exception as e:
                         batch_results[job_idx] = (
-                            addr,
+                            job,
                             {"pairs": [], "status": "compile_failed", "error": str(e)},
                         )
 
@@ -1029,9 +1606,11 @@ def compile_and_generate(
                     pbar.update(1)
 
                 for job_idx in sorted(batch_results):
-                    addr, result = batch_results[job_idx]
+                    job, result = batch_results[job_idx]
+                    addr = job[0]
                     pairs = result.get("pairs", []) or []
                     status = result.get("status", "no_pairs")
+                    job_status_counts[status] = job_status_counts.get(status, 0) + 1
                     if pairs:
                         pair_buffer.extend(pairs)
                         total_pairs += len(pairs)
@@ -1041,15 +1620,31 @@ def compile_and_generate(
                         contract_outcomes[addr]["failures"].append(
                             {"status": status, "error": result.get("error", "")}
                         )
+                        diagnostics_buffer.append({
+                            "run_id": run_id,
+                            "contract_address": addr,
+                            "compiler_version": job[3],
+                            "optimizer_enabled": job[4],
+                            "optimization_runs": job[5],
+                            "status": status,
+                            "error": result.get("error", ""),
+                        })
 
                     if len(pair_buffer) >= FLUSH_SIZE:
                         inserted = _store_pairs_batch(db_path, pair_buffer)
+                        total_inserted += inserted
                         total_db_deduped += len(pair_buffer) - inserted
                         pair_buffer = []
+                    if len(diagnostics_buffer) >= FLUSH_SIZE:
+                        _store_compile_diagnostics(db_path, diagnostics_buffer)
+                        diagnostics_buffer = []
 
     if pair_buffer:
         inserted = _store_pairs_batch(db_path, pair_buffer)
+        total_inserted += inserted
         total_db_deduped += len(pair_buffer) - inserted
+    if diagnostics_buffer:
+        _store_compile_diagnostics(db_path, diagnostics_buffer)
 
     outcome_counts = _record_contract_outcomes(db_path, contract_outcomes)
 
@@ -1086,6 +1681,42 @@ def compile_and_generate(
         f"{errors_count} errors"
     )
     logger.info("Contract outcomes: %s", outcome_counts)
+    _write_compile_manifest(
+        db_path,
+        manifest_path or Path(db_path).with_name("hf_compile_manifest.json"),
+        run_id=run_id,
+        status="completed_with_errors" if errors_count else "completed",
+        started_at=started_at,
+        duration_seconds=time.perf_counter() - start_time,
+        parameters={
+            "max_compiler_versions": max_compiler_versions,
+            "workers": workers,
+            "max_body_dupes": max_body_dupes,
+            "min_body_length": min_body_length,
+        },
+        summary={
+            "contracts_selected": total_contracts,
+            "contracts_prepared": len(prepared),
+            "prepare_no_jobs": len(no_work_addresses),
+            "compile_jobs": total_jobs,
+            "pairs_generated": total_pairs,
+            "pairs_inserted": total_inserted,
+            "db_pair_duplicates": total_db_deduped,
+            "selectors_harvested": len(all_selectors),
+        },
+        status_counts={
+            "compile_jobs": job_status_counts,
+            "contract_outcomes": outcome_counts,
+        },
+        drop_counts={
+            "prepare_no_jobs": len(no_work_addresses),
+            "no_pair_jobs": job_status_counts.get("no_pairs", 0),
+            "compile_or_analysis_errors": errors_count,
+            "db_pair_duplicates": total_db_deduped,
+        },
+        command_args=command_args,
+        hf_revision=hf_revision,
+    )
     return total_pairs
 
 
@@ -1385,6 +2016,122 @@ def _store_pairs_batch(db_path: Path, pairs: List[Dict]) -> int:
     return after - before
 
 
+def validate_jsonl_body_duplicate_cap(
+    jsonl_path: Path,
+    max_body_dupes: int = 2,
+    sample_limit: int = 5,
+) -> Dict[str, Any]:
+    """Recompute normalized target-body duplicates directly from exported JSONL."""
+    path = Path(jsonl_path)
+    counts: Counter[str] = Counter()
+    samples: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    invalid_records: List[Dict[str, Any]] = []
+    missing_targets: List[Dict[str, Any]] = []
+    row_count = 0
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            row_count += 1
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                invalid_records.append({"line_number": line_number, "error": str(exc)})
+                continue
+            target = record.get("output", record.get("solidity_code"))
+            if not isinstance(target, str):
+                missing_targets.append({"line_number": line_number})
+                continue
+            normalized = normalize_solidity_body(target)
+            body_hash = _md5(normalized)
+            counts[body_hash] += 1
+            if len(samples[body_hash]) < sample_limit:
+                metadata = record.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                samples[body_hash].append({
+                    "line_number": line_number,
+                    "function_name": metadata.get("function_name"),
+                    "function_signature": metadata.get("function_signature"),
+                    "contract_address": metadata.get("contract_address"),
+                    "output_preview": _collapse_whitespace(target)[:200],
+                })
+
+    violations = []
+    for body_hash, count in counts.items():
+        if count > max_body_dupes:
+            violations.append({
+                "body_hash": body_hash,
+                "count": count,
+                "over_cap_by": count - max_body_dupes,
+                "samples": samples[body_hash],
+            })
+    violations.sort(key=lambda item: (-item["count"], item["body_hash"]))
+
+    status = "passed"
+    if invalid_records or missing_targets:
+        status = "invalid"
+    elif violations:
+        status = "failed"
+
+    return {
+        "path": str(path),
+        "status": status,
+        "max_body_dupes": max_body_dupes,
+        "rows_checked": row_count,
+        "unique_normalized_bodies": len(counts),
+        "duplicate_body_rows": sum(max(count - 1, 0) for count in counts.values()),
+        "body_hashes_over_cap": len(violations),
+        "rows_over_cap": sum(item["over_cap_by"] for item in violations),
+        "violations": violations[:sample_limit],
+        "invalid_records": invalid_records[:sample_limit],
+        "missing_targets": missing_targets[:sample_limit],
+    }
+
+
+def format_duplicate_cap_error(validation: Dict[str, Any]) -> str:
+    """Format duplicate-cap validation failures with actionable samples."""
+    path = validation.get("path", "<jsonl>")
+    cap = validation.get("max_body_dupes")
+    lines = [
+        f"{path}: normalized body duplicate-cap validation {validation.get('status')} "
+        f"(cap={cap})"
+    ]
+    if validation.get("invalid_records"):
+        lines.append("Invalid JSONL records:")
+        for item in validation["invalid_records"]:
+            lines.append(f"  line {item['line_number']}: {item['error']}")
+    if validation.get("missing_targets"):
+        lines.append("Rows without an output/solidity_code target:")
+        for item in validation["missing_targets"]:
+            lines.append(f"  line {item['line_number']}")
+    for idx, item in enumerate(validation.get("violations", []), start=1):
+        lines.append(
+            f"  {idx}. body_hash={item['body_hash']} count={item['count']} "
+            f"over_cap_by={item['over_cap_by']}"
+        )
+        for sample in item.get("samples", []):
+            label = sample.get("function_signature") or sample.get("function_name") or "<unknown>"
+            lines.append(
+                f"     line {sample['line_number']}: {label} "
+                f"{sample.get('output_preview', '')[:120]}"
+            )
+    return "\n".join(lines)
+
+
+def enforce_jsonl_body_duplicate_cap(
+    jsonl_path: Path,
+    max_body_dupes: int = 2,
+    sample_limit: int = 5,
+) -> Dict[str, Any]:
+    """Validate an exported JSONL body cap and raise with top samples on failure."""
+    validation = validate_jsonl_body_duplicate_cap(jsonl_path, max_body_dupes, sample_limit)
+    if validation["status"] != "passed":
+        raise ValueError(format_duplicate_cap_error(validation))
+    return validation
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 -- Export training data
 # ---------------------------------------------------------------------------
@@ -1395,8 +2142,13 @@ def export_training_data(
     db_path: Path = DB_PATH,
     hf_revision: Optional[str] = None,
     manifest_path: Optional[Path] = None,
+    command_args: Optional[List[str]] = None,
+    validate_body_dupes: bool = True,
 ) -> str:
     """Export function pairs as deterministic JSONL with body-level caps."""
+    started_at = _now_utc_iso()
+    start_time = time.perf_counter()
+    selection_stats = _export_selection_stats(db_path, max_body_dupes=max_body_dupes)
     with _db_connection(db_path) as conn:
         rows = conn.execute("""
             SELECT function_name, tac_representation, solidity_code,
@@ -1472,39 +2224,65 @@ def export_training_data(
     logger.info(f"Exported {count} training pairs to {output_path}")
 
     # Report dedup stats
-    with _db_connection(db_path) as conn:
-        total_in_db = conn.execute("SELECT COUNT(*) FROM function_pairs").fetchone()[0]
-        unique_pairs = conn.execute(
-            "SELECT COUNT(DISTINCT COALESCE(pair_norm_hash, body_hash, hash)) FROM function_pairs"
-        ).fetchone()[0]
-        unique_bodies = conn.execute(
-            "SELECT COUNT(DISTINCT COALESCE(body_hash, hash)) FROM function_pairs"
-        ).fetchone()[0]
-        unique_tacs = conn.execute(
-            "SELECT COUNT(DISTINCT tac_hash) FROM function_pairs WHERE tac_hash IS NOT NULL"
-        ).fetchone()[0]
+    duplicate_stats = _db_duplicate_stats(db_path, max_body_dupes=max_body_dupes)
+    total_in_db = duplicate_stats["total_pairs"]
+    unique_pairs = duplicate_stats["unique_pairs"]
+    unique_bodies = duplicate_stats["unique_bodies"]
+    unique_tacs = duplicate_stats["unique_tacs"]
 
     logger.info(
         f"Dedup stats: {total_in_db} total in DB, {unique_pairs} unique pairs, "
         f"{unique_bodies} unique bodies, {unique_tacs} unique TACs, "
         f"{count} exported (max {max_body_dupes} per normalized body)"
     )
-    _write_manifest(
-        manifest_path or Path(f"{output_path}.manifest.json"),
-        {
-            "dataset_repo": HF_DATASET_REPO,
-            "hf_revision": hf_revision or "default",
+    validation_stats = (
+        validate_jsonl_body_duplicate_cap(output_path, max_body_dupes=max_body_dupes)
+        if validate_body_dupes
+        else {"status": "skipped", "max_body_dupes": max_body_dupes}
+    )
+    manifest_status = "completed" if validation_stats["status"] in ("passed", "skipped") else "failed"
+    manifest = _base_manifest(
+        "hf_export",
+        status=manifest_status,
+        started_at=started_at,
+        duration_seconds=time.perf_counter() - start_time,
+        command_args=command_args,
+    )
+    manifest.update({
+        "lineage": {
+            "source": _hf_lineage(hf_revision),
+            "database": str(db_path),
+            "source_counts": _contract_source_counts(db_path),
+        },
+        "parameters": {
             "output_path": output_path,
             "max_body_dupes": max_body_dupes,
-            "rows_exported": count,
-            "total_pairs_in_db": total_in_db,
-            "unique_pairs": unique_pairs,
-            "unique_bodies": unique_bodies,
-            "unique_tacs": unique_tacs,
-            "solc_versions": sorted(solc_versions),
-            "code_version": os.environ.get("GITHUB_SHA", "unknown"),
+            "validate_body_dupes": validate_body_dupes,
         },
-    )
+        "artifacts": {
+            "jsonl": _artifact_summary(output_path, row_count=count),
+            "database": _artifact_summary(db_path),
+        },
+        "row_counts": {
+            **_db_table_counts(db_path),
+            "rows_exported": count,
+        },
+        "status_counts": {
+            "contracts": _contract_status_counts(db_path),
+            "validation": {validation_stats["status"]: 1},
+        },
+        "drop_counts": {
+            "pair_duplicate_rows": selection_stats["pair_duplicate_rows_dropped"],
+            "body_cap_rows": selection_stats["body_cap_rows_dropped"],
+        },
+        "duplicate_stats": duplicate_stats,
+        "export_selection": selection_stats,
+        "validation": {"body_duplicate_cap": validation_stats},
+        "solc_versions": sorted(solc_versions),
+    })
+    _write_manifest(manifest_path or Path(f"{output_path}.manifest.json"), manifest)
+    if validation_stats["status"] not in ("passed", "skipped"):
+        raise ValueError(format_duplicate_cap_error(validation_stats))
     return output_path
 
 
@@ -1548,19 +2326,49 @@ def main():
                         help="Export selector registry to JSON file (e.g. data/selectors.json).")
     parser.add_argument("--import-selectors", type=str, default=None,
                         help="Import selector registry from JSON file before processing.")
+    parser.add_argument("--manifest-dir", type=str, default=None,
+                        help="Directory for phase manifests (download/compile/export).")
+    parser.add_argument("--validate-jsonl", type=str, default=None,
+                        help="Validate an exported JSONL's normalized body duplicate cap and exit.")
+    parser.add_argument("--duplicate-sample-limit", type=int, default=5,
+                        help="Number of duplicate-cap violation samples to report.")
     parser.add_argument("--db", type=str, default="data/contracts.db",
                         help="SQLite database path.")
 
     args = parser.parse_args()
     db_path = Path(args.db)
+    command_args = sys.argv[1:]
 
     setup_logging()
+
+    if args.validate_jsonl:
+        validation = validate_jsonl_body_duplicate_cap(
+            args.validate_jsonl,
+            max_body_dupes=args.max_body_dupes,
+            sample_limit=args.duplicate_sample_limit,
+        )
+        if validation["status"] != "passed":
+            logger.error(format_duplicate_cap_error(validation))
+            raise SystemExit(1)
+        logger.info(
+            "Duplicate-cap validation passed: %s rows, %s unique normalized bodies, cap=%s",
+            validation["rows_checked"],
+            validation["unique_normalized_bodies"],
+            validation["max_body_dupes"],
+        )
+        return
 
     logger.info("=" * 70)
     logger.info("Smart Contract HuggingFace Dataset -> Training Data Pipeline")
     logger.info("=" * 70)
 
     init_database(db_path)
+    manifest_dir = Path(args.manifest_dir) if args.manifest_dir else None
+    if manifest_dir:
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+    download_manifest = manifest_dir / "hf_download_manifest.json" if manifest_dir else None
+    compile_manifest = manifest_dir / "hf_compile_manifest.json" if manifest_dir else None
+    export_manifest = manifest_dir / "hf_export_manifest.json" if manifest_dir else None
 
     # Import selectors if requested
     if args.import_selectors:
@@ -1575,6 +2383,8 @@ def main():
             db_path=db_path,
             cache_dir=args.cache_dir,
             hf_revision=args.hf_revision,
+            manifest_path=download_manifest,
+            command_args=command_args,
         )
         after = count_contracts(db_path)
         logger.info(f"Database now has {after} contracts (was {before}, added {after - before})")
@@ -1595,6 +2405,9 @@ def main():
                 max_body_dupes=args.max_body_dupes,
                 min_body_length=args.min_body_length,
                 db_path=db_path,
+                manifest_path=compile_manifest,
+                command_args=command_args,
+                hf_revision=args.hf_revision,
             )
             logger.info(f"New training pairs created: {pairs}")
         else:
@@ -1615,6 +2428,8 @@ def main():
             max_body_dupes=args.max_body_dupes,
             db_path=db_path,
             hf_revision=args.hf_revision,
+            manifest_path=export_manifest,
+            command_args=command_args,
         )
         logger.info(f"Training data written to: {out}")
     else:

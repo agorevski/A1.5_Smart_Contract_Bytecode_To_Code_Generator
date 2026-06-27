@@ -75,11 +75,16 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
     --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 4096
 ```
 
-**Output:** Trained model saved to `models/`
+**Output:** Trained model saved to `models/`; run manifests are written under
+`models/run_manifests/` by default. Dataset splitting writes
+`data/split_manifest.json` with leakage checks and holdout coverage; JSONL schema
+and token-length preflight runs before training/evaluation unless
+`--skip-data-preflight` is used for legacy smoke runs.
 
 ### 4. Evaluate
 
 Evaluation runs automatically after training unless `--skip-eval` is passed. Results are saved to `results/`.
+Use `--eval-batch-size N` to batch decompilation during evaluation.
 
 ```bash
 # Train and evaluate
@@ -100,6 +105,30 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
 
 # Step 3: Check results
 ls results/
+```
+
+## Inference CLI and Web API
+
+```bash
+# Generate JSON with Solidity, TAC, timings, function errors, and model config
+uv run python scripts/decompile.py \
+  --model-path models/final_model \
+  --bytecode 0x60806040... \
+  --compiler-version 0.8.20 \
+  --optimizer-enabled true \
+  --optimizer-runs 200 \
+  --format json
+
+# TAC-only analysis does not require a model artifact
+uv run python scripts/decompile.py --format tac --bytecode 0x60806040...
+```
+
+The web API streams Server-Sent Events from `POST /api/decompile`:
+
+```bash
+curl -N http://127.0.0.1:5000/api/decompile \
+  -H 'Content-Type: application/json' \
+  -d '{"bytecode":"0x60806040...","generation":{"max_new_tokens":512}}'
 ```
 
 For the full operator guide, including current-data sufficiency checks, data regeneration, training, evaluation, and model usage, see [docs/runbook.md](docs/runbook.md).
@@ -176,6 +205,7 @@ uv run pytest --cov=src tests/
 │   └── static/                # Frontend assets (app.js, style.css)
 │
 ├── scripts/                   # Debug & utility scripts
+│   ├── decompile.py            # CLI: bytecode → TAC/Solidity inference
 │   ├── demo.py
 │   ├── check_bytecode_format.py
 │   ├── inspect_bytecode.py
@@ -235,9 +265,46 @@ uv run pytest --cov=src tests/
 | `--lr FLOAT` | `2e-4` | Learning rate |
 | `--max-seq-length N` | `2048` | Max token sequence length |
 | `--model-name NAME` | `meta-llama/Llama-3.2-3B` | Base model |
+| `--collection-workers N` | `3` | Etherscan collection worker count when supported |
+| `--max-compiler-configs N` | `2` | Compiler configs per collected contract |
+| `--allow-demo-fallback` | off | Explicitly allow `demo_dataset.jsonl` when real collection yields no pairs |
+| `--split-seed N` | `42` | Deterministic leakage-free split seed |
+| `--split-manifest PATH` | `<data-dir>/split_manifest.json` | Dataset split manifest path |
+| `--skip-split-validation` | off | Skip leakage/coverage split gate |
+| `--min-holdout-stratum-count N` | `0` | Fail if common val/test coverage strata fall below N |
+| `--resume PATH\|auto` | — | Resume from a checkpoint path or latest `checkpoint-*` under `--output-dir` |
 | `--skip-eval` | — | Skip post-training evaluation |
+| `--eval-batch-size N` | `1` | Batch size for evaluation decompilation |
 | `--dataset-only` | — | Only build dataset, skip training |
 | `--no-compiler-metadata` | — | Omit compiler/optimizer metadata from prompts |
+| `--skip-data-preflight` | off | Skip JSONL schema/token-length preflight |
+| `--preflight-tokenizer-download` | off | Allow tokenizer downloads during preflight |
+| `--max-steps N` | `-1` | Cap optimizer steps for bounded experiments |
+| `--tokenization-cache` | off | Cache tokenized train/eval datasets |
+| `--manifest-dir PATH` | `<output-dir>/run_manifests` | Directory for run manifests |
+| `--run-manifest PATH` | — | Exact manifest JSON path |
+| `--no-throughput-metrics` | off | Disable default throughput telemetry |
+| `--enable-torch-profiler` | off | Write bounded torch profiler traces |
+
+For the compiler-metadata control-vs-ablation experiment, use
+`scripts/run_compiler_metadata_ablation.py`; the full workflow is documented in
+`docs/runbook.md`.
+
+### `scripts/decompile.py`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-path PATH` | — | Trained model artifact for Solidity generation |
+| `--bytecode HEX` | — | EVM bytecode with or without `0x` |
+| `--bytecode-file PATH` | — | Read bytecode from a file instead of the command line |
+| `--format json\|solidity\|tac` | `json` | Output machine JSON, Solidity only, or TAC only |
+| `--compiler-version VERSION` | — | Optional compiler metadata for prompts |
+| `--optimizer-enabled true\|false` | — | Optional optimizer metadata |
+| `--optimizer-runs N` | — | Optional optimizer run count |
+| `--max-new-tokens N` | `1024` | Per-function generation cap |
+| `--temperature FLOAT` | `0.1` | Sampling temperature |
+| `--do-sample` | off | Enable stochastic sampling |
+| `--repetition-penalty FLOAT` | `1.15` | Repetition penalty |
 
 ## Environment Variables
 
@@ -248,6 +315,9 @@ uv run pytest --cov=src tests/
 | `WEB_API_KEY` | Shared/remote web deployments | Protects API endpoints and GPU telemetry; the browser UI has an in-memory API key field |
 | `WEB_HOST` | Optional | Web bind address, default `127.0.0.1`; use with `WEB_API_KEY` for non-loopback hosts |
 | `WEB_CORS_ORIGINS` | Optional | Comma-separated allowed API origins, default `http://127.0.0.1:5000,http://localhost:5000` |
+| `WEB_INFERENCE_TRACE_ENABLED` | Optional | Write request traces under `results/inference_traces/` (default true) |
+| `WEB_MAX_BYTECODE_HEX_LENGTH` | Optional | Max accepted bytecode hex characters (default 200000) |
+| `WEB_MAX_DECOMPILE_FUNCTIONS` | Optional | Max functions per web decompile job (default 128) |
 
 Alternatively, set these in `src/settings.yaml`.
 

@@ -9,14 +9,17 @@ and structural fidelity metrics.
 import os
 import json
 import logging
+import math
+import re
 import time
 import traceback
 from collections import defaultdict
 import hashlib
 import random
-from typing import Dict, List, Optional, Tuple, Any
+from statistics import NormalDist
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Any
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import sqlite3
 
 import numpy as np
@@ -30,7 +33,6 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-import difflib
 
 # Our modules
 from .bytecode_analyzer import BytecodeAnalyzer
@@ -150,6 +152,640 @@ def sample_evaluation_data(
     return [test_data[i] for i in indices], indices
 
 
+DEFAULT_METADATA_SEGMENT_FIELDS = (
+    "compiler_version",
+    "optimizer_enabled",
+    "optimizer_runs",
+    "language_version",
+    "contract_kind",
+)
+
+DEFAULT_BASELINE_METRIC_DIRECTIONS = {
+    "semantic_similarity_mean": "higher",
+    "edit_distance_mean": "lower",
+    "normalized_edit_distance_mean": "lower",
+    "bleu_score_mean": "higher",
+    "rouge_l_score_mean": "higher",
+    "token_accuracy_mean": "higher",
+    "structural_preservation_mean": "higher",
+    "pct_above_0.8_similarity": "higher",
+    "pct_below_0.4_edit_dist": "higher",
+    "pct_above_0.8_replication_f1": "higher",
+    "replication_precision_mean": "higher",
+    "replication_recall_mean": "higher",
+    "replication_f1_mean": "higher",
+    "replication_precision_micro": "higher",
+    "replication_recall_micro": "higher",
+    "replication_f1_micro": "higher",
+    "solidity_valid_mean": "higher",
+    "solidity_ast_valid_mean": "higher",
+}
+
+
+@dataclass(frozen=True)
+class SolidityValidityResult:
+    """Best-effort generated Solidity validity signal."""
+
+    valid: bool
+    method: str
+    scaffold_valid: bool
+    scaffold_errors: List[str] = field(default_factory=list)
+    compiler_checked: bool = False
+    compiler_version: Optional[str] = None
+    compiler_errors: List[str] = field(default_factory=list)
+    ast_checked: bool = False
+    ast_valid: Optional[bool] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "method": self.method,
+            "scaffold_valid": self.scaffold_valid,
+            "scaffold_errors": list(self.scaffold_errors),
+            "compiler_checked": self.compiler_checked,
+            "compiler_version": self.compiler_version,
+            "compiler_errors": list(self.compiler_errors),
+            "ast_checked": self.ast_checked,
+            "ast_valid": self.ast_valid,
+        }
+
+
+def normalized_levenshtein_distance(
+    original: str,
+    candidate: str,
+    *,
+    normalize_whitespace: bool = True,
+) -> float:
+    """Return true normalized Levenshtein edit distance in [0, 1]."""
+    left = original or ""
+    right = candidate or ""
+    if normalize_whitespace:
+        left = " ".join(left.split())
+        right = " ".join(right.split())
+
+    denominator = max(len(left), len(right))
+    if denominator == 0:
+        return 0.0
+    return levenshtein_distance(left, right) / denominator
+
+
+def levenshtein_distance(left: str, right: str) -> int:
+    """Compute deterministic character-level Levenshtein distance."""
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+
+    if len(left) < len(right):
+        left, right = right, left
+
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        for j, right_char in enumerate(right, start=1):
+            insertion = current[j - 1] + 1
+            deletion = previous[j] + 1
+            substitution = previous[j - 1] + (left_char != right_char)
+            current.append(min(insertion, deletion, substitution))
+        previous = current
+
+    return previous[-1]
+
+
+def validate_generated_solidity(
+    source_code: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+    *,
+    allow_compiler: bool = True,
+) -> SolidityValidityResult:
+    """Validate generated Solidity without requiring network or solc installs.
+
+    A local installed solc is used for compiler/AST validation when available.
+    The function never installs compiler versions; otherwise it falls back to a
+    deterministic syntax/scaffold check.
+    """
+    scaffold_valid, scaffold_errors = _solidity_scaffold_check(source_code)
+    if allow_compiler:
+        compiler_result = _try_local_solc_ast_validation(source_code, metadata or {})
+        if compiler_result is not None:
+            compiler_errors = compiler_result.get("compiler_errors", [])
+            ast_valid = compiler_result.get("ast_valid")
+            compiler_valid = not compiler_errors and bool(ast_valid)
+            return SolidityValidityResult(
+                valid=compiler_valid,
+                method="compiler_ast",
+                scaffold_valid=scaffold_valid,
+                scaffold_errors=scaffold_errors,
+                compiler_checked=True,
+                compiler_version=compiler_result.get("compiler_version"),
+                compiler_errors=compiler_errors,
+                ast_checked=True,
+                ast_valid=bool(ast_valid),
+            )
+
+    return SolidityValidityResult(
+        valid=scaffold_valid,
+        method="scaffold",
+        scaffold_valid=scaffold_valid,
+        scaffold_errors=scaffold_errors,
+    )
+
+
+def mean_confidence_interval(
+    values: Iterable[Any],
+    *,
+    confidence: float = 0.95,
+) -> Dict[str, Any]:
+    """Compute a deterministic normal-approximation confidence interval."""
+    numeric_values = [float(value) for value in values if isinstance(value, (int, float))]
+    numeric_values = [value for value in numeric_values if not math.isnan(value)]
+    count = len(numeric_values)
+    if count == 0:
+        return {
+            "confidence": confidence,
+            "low": None,
+            "high": None,
+            "mean": None,
+            "n": 0,
+            "method": "normal_approximation",
+        }
+
+    mean = sum(numeric_values) / count
+    if count == 1:
+        margin = 0.0
+    else:
+        variance = sum((value - mean) ** 2 for value in numeric_values) / (count - 1)
+        z_score = NormalDist().inv_cdf(0.5 + confidence / 2.0)
+        margin = z_score * math.sqrt(variance) / math.sqrt(count)
+
+    return {
+        "confidence": confidence,
+        "low": mean - margin,
+        "high": mean + margin,
+        "mean": mean,
+        "n": count,
+        "method": "normal_approximation",
+    }
+
+
+def summarize_numeric_metrics(
+    metric_rows: Iterable[Mapping[str, Any]],
+    *,
+    include_confidence_interval: bool = True,
+) -> Dict[str, Dict[str, Any]]:
+    """Summarize numeric metric fields with deterministic aggregate stats."""
+    values_by_metric: Dict[str, List[float]] = defaultdict(list)
+    for row in metric_rows:
+        for key, value in row.items():
+            if key == "metadata":
+                continue
+            if isinstance(value, bool):
+                values_by_metric[key].append(float(value))
+            elif isinstance(value, (int, float)) and not math.isnan(float(value)):
+                values_by_metric[key].append(float(value))
+
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for metric, values in sorted(values_by_metric.items()):
+        metric_summary: Dict[str, Any] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "median": float(np.median(values)),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+            "count": len(values),
+        }
+        if include_confidence_interval:
+            metric_summary["confidence_interval_95"] = mean_confidence_interval(values)
+        summaries[metric] = metric_summary
+    return summaries
+
+
+def compute_metadata_segment_metrics(
+    results: Iterable[Mapping[str, Any]],
+    *,
+    segment_fields: Sequence[str] = DEFAULT_METADATA_SEGMENT_FIELDS,
+) -> Dict[str, Any]:
+    """Compute metadata coverage and per-segment metric summaries."""
+    result_rows = list(results)
+    total = len(result_rows)
+    coverage: Dict[str, Any] = {}
+    segments: Dict[str, Any] = {}
+
+    for field_name in segment_fields:
+        counts: Dict[str, int] = defaultdict(int)
+        groups: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+        unknown_count = 0
+
+        for result in result_rows:
+            value = _metadata_segment_value(result, field_name)
+            value_key = "unknown" if value in (None, "") else str(value)
+            if value_key == "unknown":
+                unknown_count += 1
+            counts[value_key] += 1
+            groups[value_key].append(result)
+
+        coverage[field_name] = {
+            "total": total,
+            "known": total - unknown_count,
+            "unknown": unknown_count,
+            "values": dict(sorted(counts.items())),
+        }
+
+        field_segments: Dict[str, Any] = {}
+        for value_key, group in sorted(groups.items()):
+            metric_rows = [_metrics_from_result(result) for result in group]
+            segment_summary: Dict[str, Any] = {
+                "count": len(group),
+                "metrics": summarize_numeric_metrics(metric_rows),
+            }
+            replication_summary = aggregate_replication_scores(metric_rows)
+            if replication_summary:
+                segment_summary["replication_metrics"] = replication_summary
+            field_segments[value_key] = segment_summary
+        segments[field_name] = field_segments
+
+    return {
+        "total_examples": total,
+        "coverage": coverage,
+        "segments": segments,
+    }
+
+
+def compare_evaluation_to_baseline(
+    current_summary: Mapping[str, Any],
+    baseline_summary: Mapping[str, Any],
+    *,
+    metric_directions: Optional[Mapping[str, str]] = None,
+    tolerance: float = 0.0,
+) -> Dict[str, Any]:
+    """Compare current evaluation metrics with a baseline/regression run."""
+    directions = dict(DEFAULT_BASELINE_METRIC_DIRECTIONS)
+    if metric_directions:
+        directions.update(metric_directions)
+
+    current_metrics = flatten_numeric_metrics(current_summary)
+    baseline_metrics = flatten_numeric_metrics(baseline_summary)
+    comparisons: Dict[str, Any] = {}
+
+    for metric in sorted(set(current_metrics) & set(baseline_metrics)):
+        direction = _metric_direction(metric, directions)
+        if not direction:
+            continue
+
+        current_value = current_metrics[metric]
+        baseline_value = baseline_metrics[metric]
+        delta = current_value - baseline_value
+        if baseline_value:
+            relative_delta = delta / abs(baseline_value)
+        else:
+            relative_delta = None
+
+        if direction == "lower":
+            regressed = delta > tolerance
+            improved = delta < -tolerance
+        else:
+            regressed = delta < -tolerance
+            improved = delta > tolerance
+
+        status = "regressed" if regressed else "improved" if improved else "unchanged"
+        comparisons[metric] = {
+            "current": current_value,
+            "baseline": baseline_value,
+            "delta": delta,
+            "relative_delta": relative_delta,
+            "direction": direction,
+            "status": status,
+        }
+
+    return {
+        "num_metrics_compared": len(comparisons),
+        "num_regressions": sum(1 for item in comparisons.values() if item["status"] == "regressed"),
+        "num_improvements": sum(1 for item in comparisons.values() if item["status"] == "improved"),
+        "comparisons": comparisons,
+    }
+
+
+def flatten_numeric_metrics(
+    summary: Mapping[str, Any],
+    *,
+    prefix: str = "",
+) -> Dict[str, float]:
+    """Flatten nested numeric summary metrics into stable comparison keys."""
+    flattened: Dict[str, float] = {}
+    for key, value in summary.items():
+        if key in {"details", "detailed_results"}:
+            continue
+        metric_key = f"{prefix}_{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            if key == "replication_metrics":
+                flattened.update(_flatten_replication_metrics(value))
+            flattened.update(flatten_numeric_metrics(value, prefix=metric_key))
+        elif isinstance(value, bool):
+            flattened[metric_key] = float(value)
+        elif isinstance(value, (int, float)) and not math.isnan(float(value)):
+            flattened[metric_key] = float(value)
+    return flattened
+
+
+def _solidity_scaffold_check(source_code: str) -> Tuple[bool, List[str]]:
+    errors: List[str] = []
+    code = (source_code or "").strip()
+    if not code:
+        return False, ["empty_output"]
+    if "```" in code:
+        errors.append("contains_markdown_code_fence")
+
+    masked = _mask_solidity_comments_and_strings(code)
+    if not re.search(r"\b(contract|interface|library|function|fallback|receive)\b", masked):
+        errors.append("missing_contract_or_function")
+    if re.search(r"\bfunction\b", masked) and not re.search(
+        r"\bfunction(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*\([^;{}]*\)\s*[^;{}]*(?:\{|;)",
+        masked,
+        flags=re.DOTALL,
+    ):
+        errors.append("invalid_function_signature")
+
+    delimiter_error = _first_delimiter_error(masked)
+    if delimiter_error:
+        errors.append(delimiter_error)
+
+    return not errors, errors
+
+
+def _mask_solidity_comments_and_strings(source_code: str) -> str:
+    result: List[str] = []
+    i = 0
+    in_string: Optional[str] = None
+    escaped = False
+
+    while i < len(source_code):
+        ch = source_code[i]
+        nxt = source_code[i + 1] if i + 1 < len(source_code) else ""
+        if in_string:
+            result.append(" ")
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            i += 1
+            continue
+
+        if ch in {"'", '"'}:
+            in_string = ch
+            result.append(" ")
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            result.extend("  ")
+            i += 2
+            while i < len(source_code) and source_code[i] != "\n":
+                result.append(" ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            result.extend("  ")
+            i += 2
+            while i + 1 < len(source_code) and not (
+                source_code[i] == "*" and source_code[i + 1] == "/"
+            ):
+                result.append("\n" if source_code[i] == "\n" else " ")
+                i += 1
+            if i + 1 < len(source_code):
+                result.extend("  ")
+                i += 2
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def _first_delimiter_error(masked_code: str) -> Optional[str]:
+    pairs = {"}": "{", ")": "(", "]": "["}
+    openings = set(pairs.values())
+    stack: List[str] = []
+    for ch in masked_code:
+        if ch in openings:
+            stack.append(ch)
+        elif ch in pairs:
+            if not stack or stack[-1] != pairs[ch]:
+                return f"unbalanced_delimiter:{ch}"
+            stack.pop()
+    if stack:
+        return f"unclosed_delimiter:{stack[-1]}"
+    return None
+
+
+def _try_local_solc_ast_validation(
+    source_code: str,
+    metadata: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    try:
+        import solcx
+        from solcx.exceptions import SolcError
+    except Exception:
+        return None
+
+    installed_versions = [str(version) for version in solcx.get_installed_solc_versions()]
+    compiler_version = _select_installed_solc_version(source_code, metadata, installed_versions)
+    if not compiler_version:
+        return None
+
+    input_json = {
+        "language": "Solidity",
+        "sources": {"Evaluation.sol": {"content": _compiler_source_unit(source_code)}},
+        "settings": {
+            "outputSelection": {
+                "*": {
+                    "": ["ast"],
+                    "*": ["abi"],
+                }
+            }
+        },
+    }
+
+    try:
+        output = solcx.compile_standard(
+            input_json, solc_version=compiler_version, allow_paths=["."]
+        )
+    except SolcError as exc:
+        return {
+            "compiler_version": compiler_version,
+            "compiler_errors": [str(exc)],
+            "ast_valid": False,
+        }
+    except Exception as exc:
+        return {
+            "compiler_version": compiler_version,
+            "compiler_errors": [f"{exc.__class__.__name__}: {exc}"],
+            "ast_valid": False,
+        }
+
+    compiler_errors = [
+        error.get("formattedMessage", str(error))
+        for error in output.get("errors", [])
+        if error.get("severity") == "error"
+    ]
+    ast = output.get("sources", {}).get("Evaluation.sol", {}).get("ast")
+    return {
+        "compiler_version": compiler_version,
+        "compiler_errors": compiler_errors,
+        "ast_valid": isinstance(ast, Mapping) and ast.get("nodeType") == "SourceUnit",
+    }
+
+
+def _select_installed_solc_version(
+    source_code: str,
+    metadata: Mapping[str, Any],
+    installed_versions: Sequence[str],
+) -> Optional[str]:
+    normalized_installed = sorted(
+        {_normalize_solc_version(version) for version in installed_versions if version},
+        key=_version_sort_key,
+        reverse=True,
+    )
+    normalized_installed = [version for version in normalized_installed if version]
+    if not normalized_installed:
+        return None
+
+    metadata_version = _metadata_compiler_version(metadata)
+    if metadata_version in normalized_installed:
+        return metadata_version
+
+    pragmas = _parse_solidity_pragmas(source_code)
+    if pragmas:
+        try:
+            from .local_compiler import version_satisfies_all_pragmas
+
+            for version in normalized_installed:
+                if version_satisfies_all_pragmas(version, pragmas):
+                    return version
+        except Exception:
+            pass
+
+    return normalized_installed[0]
+
+
+def _metadata_compiler_version(metadata: Mapping[str, Any]) -> Optional[str]:
+    for key in ("compiler_version", "solc_version", "CompilerVersion", "compiler"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            normalized = _normalize_solc_version(str(value))
+            if normalized:
+                return normalized
+    return None
+
+
+def _normalize_solc_version(version: str) -> Optional[str]:
+    match = re.search(r"(\d+\.\d+\.\d+)", version or "")
+    return match.group(1) if match else None
+
+
+def _version_sort_key(version: Optional[str]) -> Tuple[int, int, int]:
+    if not version:
+        return (0, 0, 0)
+    parts = _normalize_solc_version(version)
+    if not parts:
+        return (0, 0, 0)
+    major, minor, patch = parts.split(".")
+    return (int(major), int(minor), int(patch))
+
+
+def _parse_solidity_pragmas(source_code: str) -> List[str]:
+    masked = _mask_solidity_comments_and_strings(source_code or "")
+    return [
+        match.group(1).strip()
+        for match in re.finditer(r"^\s*pragma\s+solidity\s+([^;]+);", masked, re.MULTILINE)
+    ]
+
+
+def _compiler_source_unit(source_code: str) -> str:
+    code = (source_code or "").strip()
+    if re.search(r"\b(contract|interface|library)\s+[A-Za-z_][A-Za-z0-9_]*", code):
+        return code
+    code = re.sub(r"^\s*//\s*SPDX-License-Identifier:[^\n]*\n?", "", code, flags=re.MULTILINE)
+    code = re.sub(r"^\s*pragma\s+solidity\s+[^;]+;\s*", "", code, flags=re.MULTILINE)
+    return f"contract EvaluationHarness {{\n{code}\n}}\n"
+
+
+def _metadata_segment_value(result: Mapping[str, Any], field_name: str) -> Any:
+    metadata = _metadata_from_result(result)
+    if field_name in metadata:
+        return metadata[field_name]
+    nested_metadata = metadata.get("metadata")
+    if isinstance(nested_metadata, Mapping) and field_name in nested_metadata:
+        return nested_metadata[field_name]
+    return None
+
+
+def _metadata_from_result(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = result.get("metadata")
+    if isinstance(metadata, Mapping):
+        return metadata
+
+    metrics = result.get("metrics")
+    if isinstance(metrics, Mapping):
+        metrics_metadata = metrics.get("metadata")
+        if isinstance(metrics_metadata, Mapping):
+            function_metadata = metrics_metadata.get("function_metadata")
+            if isinstance(function_metadata, Mapping):
+                return function_metadata
+            return metrics_metadata
+
+    return {}
+
+
+def _metrics_from_result(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    metrics = result.get("metrics")
+    if isinstance(metrics, Mapping):
+        return metrics
+    return result
+
+
+def _flatten_replication_metrics(replication_metrics: Mapping[str, Any]) -> Dict[str, float]:
+    flattened: Dict[str, float] = {}
+    mean_key_map = {
+        "precision_mean": "replication_precision_mean",
+        "recall_mean": "replication_recall_mean",
+        "f1_mean": "replication_f1_mean",
+        "pct_above_0_8_f1": "pct_above_0.8_replication_f1",
+    }
+    for source_key, target_key in mean_key_map.items():
+        value = replication_metrics.get(source_key)
+        if isinstance(value, (int, float)) and not math.isnan(float(value)):
+            flattened[target_key] = float(value)
+
+    micro = replication_metrics.get("micro")
+    if isinstance(micro, Mapping):
+        for source_key, target_key in {
+            "precision": "replication_precision_micro",
+            "recall": "replication_recall_micro",
+            "f1": "replication_f1_micro",
+        }.items():
+            value = micro.get(source_key)
+            if isinstance(value, (int, float)) and not math.isnan(float(value)):
+                flattened[target_key] = float(value)
+    return flattened
+
+
+def _metric_direction(metric: str, directions: Mapping[str, str]) -> Optional[str]:
+    if metric in directions:
+        return directions[metric]
+    lowered = metric.lower()
+    if lowered.endswith("_std") or lowered.endswith("_count") or "confidence_interval" in lowered:
+        return None
+    if any(token in lowered for token in ("distance", "loss", "error")):
+        return "lower"
+    if lowered.endswith("_mean") or lowered.startswith("pct_") or lowered.endswith("_micro"):
+        return "higher"
+    return None
+
+
 @dataclass
 class EvaluationMetrics:
     """Container for evaluation metrics as described in the paper."""
@@ -165,6 +801,9 @@ class EvaluationMetrics:
     replication_precision: float = 0.0
     replication_recall: float = 0.0
     replication_f1: float = 0.0
+    solidity_valid: bool = False
+    solidity_compiler_checked: bool = False
+    solidity_ast_valid: bool = False
     metadata: Dict[str, Any] = None
 
 
@@ -260,7 +899,7 @@ class SmartContractEvaluator:
             return 0.0
 
     def compute_normalized_edit_distance(self, original: str, decompiled: str) -> float:
-        """Compute normalized edit distance (Levenshtein distance).
+        """Compute normalized edit distance using true Levenshtein distance.
 
         Args:
             original: Original Solidity code.
@@ -271,15 +910,7 @@ class SmartContractEvaluator:
             identical strings.
         """
         try:
-            # Normalize whitespace
-            original = " ".join(original.split())
-            decompiled = " ".join(decompiled.split())
-
-            # Compute edit distance
-            distance = difflib.SequenceMatcher(None, original, decompiled).ratio()
-
-            # Return as distance (1 - similarity)
-            return 1.0 - distance
+            return normalized_levenshtein_distance(original, decompiled)
 
         except Exception as e:
             logger.error(f"Error computing edit distance: {e}")
@@ -571,6 +1202,9 @@ class SmartContractEvaluator:
                 replication_precision=0.0,
                 replication_recall=0.0,
                 replication_f1=0.0,
+                solidity_valid=False,
+                solidity_compiler_checked=False,
+                solidity_ast_valid=False,
                 metadata={
                     "original_metadata": {},
                     "decompiled_metadata": {},
@@ -603,6 +1237,7 @@ class SmartContractEvaluator:
             # Extract and compare metadata
             original_metadata = self.extract_function_metadata(original)
             decompiled_metadata = self.extract_function_metadata(decompiled)
+            solidity_validity = validate_generated_solidity(decompiled, metadata)
 
             function_signature_match = original_metadata.get(
                 "has_function_keyword"
@@ -626,12 +1261,16 @@ class SmartContractEvaluator:
                 replication_precision=replication.overall.precision,
                 replication_recall=replication.overall.recall,
                 replication_f1=replication.overall.f1,
+                solidity_valid=solidity_validity.valid,
+                solidity_compiler_checked=solidity_validity.compiler_checked,
+                solidity_ast_valid=bool(solidity_validity.ast_valid),
                 metadata={
                     "original_metadata": original_metadata,
                     "decompiled_metadata": decompiled_metadata,
                     "function_metadata": metadata,
                     "enhanced_structural_preservation": enhanced_structural_preservation,
                     "replication": replication.to_dict(),
+                    "solidity_validity": solidity_validity.to_dict(),
                     "evaluation_time": evaluation_time,
                 },
             )
@@ -652,6 +1291,9 @@ class SmartContractEvaluator:
                 replication_precision=0.0,
                 replication_recall=0.0,
                 replication_f1=0.0,
+                solidity_valid=False,
+                solidity_compiler_checked=False,
+                solidity_ast_valid=False,
                 metadata={
                     "original_metadata": {},
                     "decompiled_metadata": {},
@@ -917,6 +1559,9 @@ class SmartContractTrainingPipeline:
                             "replication_precision": 0.0,
                             "replication_recall": 0.0,
                             "replication_f1": 0.0,
+                            "solidity_valid": False,
+                            "solidity_compiler_checked": False,
+                            "solidity_ast_valid": False,
                             "metadata": {"error": str(e), "traceback": traceback.format_exc()},
                         },
                         "metadata": item.get("metadata", {}),
@@ -943,7 +1588,11 @@ class SmartContractTrainingPipeline:
         logger.info(f"Evaluation completed. Results saved to {results_path}")
         return aggregate_stats
 
-    def _compute_aggregate_statistics(self, results: List[Dict]) -> Dict[str, Any]:
+    def _compute_aggregate_statistics(
+        self,
+        results: List[Dict],
+        baseline_summary: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Compute aggregate statistics from evaluation results.
 
         Args:
@@ -976,21 +1625,22 @@ class SmartContractTrainingPipeline:
         for metric, values in metrics_data.items():
             if values:
                 stats[metric] = {
-                    "mean": np.mean(values),
-                    "std": np.std(values),
-                    "median": np.median(values),
-                    "min": np.min(values),
-                    "max": np.max(values),
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "median": float(np.median(values)),
+                    "min": float(np.min(values)),
+                    "max": float(np.max(values)),
                     "count": len(values),
+                    "confidence_interval_95": mean_confidence_interval(values),
                 }
 
                 # Add percentiles for key metrics
                 if metric in ["semantic_similarity", "normalized_edit_distance"]:
                     stats[metric]["percentiles"] = {
-                        "25th": np.percentile(values, 25),
-                        "75th": np.percentile(values, 75),
-                        "90th": np.percentile(values, 90),
-                        "95th": np.percentile(values, 95),
+                        "25th": float(np.percentile(values, 25)),
+                        "75th": float(np.percentile(values, 75)),
+                        "90th": float(np.percentile(values, 90)),
+                        "95th": float(np.percentile(values, 95)),
                     }
 
         # Add paper-specific metrics
@@ -1009,6 +1659,7 @@ class SmartContractTrainingPipeline:
 
         if "normalized_edit_distance" in metrics_data:
             edit_values = metrics_data["normalized_edit_distance"]
+            stats.setdefault("paper_metrics", {})
             stats["paper_metrics"]["functions_below_0_4_edit_distance"] = sum(
                 1 for v in edit_values if v < 0.4
             ) / len(edit_values)
@@ -1018,6 +1669,11 @@ class SmartContractTrainingPipeline:
         )
         if replication_stats:
             stats["replication_metrics"] = replication_stats
+
+        stats["metadata_segments"] = compute_metadata_segment_metrics(results)
+
+        if baseline_summary:
+            stats["baseline_comparison"] = compare_evaluation_to_baseline(stats, baseline_summary)
 
         return stats
 

@@ -45,14 +45,17 @@ def minimal_config():
 
 @pytest.fixture
 def orchestrator():
-    return PipelineOrchestrator(PipelineConfig(
-        stages=[PipelineStage.CLASSIFY, PipelineStage.DETECT_VULNERABILITIES],
-    ))
+    return PipelineOrchestrator(
+        PipelineConfig(
+            stages=[PipelineStage.CLASSIFY, PipelineStage.DETECT_VULNERABILITIES],
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
 # PipelineConfig
 # ---------------------------------------------------------------------------
+
 
 class TestPipelineConfig:
     def test_default_stages(self, default_config):
@@ -77,6 +80,7 @@ class TestPipelineConfig:
 # ---------------------------------------------------------------------------
 # PipelineResult
 # ---------------------------------------------------------------------------
+
 
 class TestPipelineResult:
     def test_empty_result(self):
@@ -110,6 +114,7 @@ class TestPipelineResult:
 # Pipeline Initialization
 # ---------------------------------------------------------------------------
 
+
 class TestPipelineInitialization:
     def test_initialize_default(self):
         orch = PipelineOrchestrator()
@@ -139,13 +144,41 @@ class TestPipelineInitialization:
 # Pipeline Execution
 # ---------------------------------------------------------------------------
 
+
 class TestPipelineExecution:
     def test_decompile_only(self):
         config = PipelineConfig(stages=[PipelineStage.DECOMPILE])
         orch = PipelineOrchestrator(config)
         result = orch.analyze(MINIMAL_BYTECODE)
         assert "decompile" in result.stages_completed
-        assert result.decompiled_source is not None
+        assert result.decompiled_source is None
+        assert result.tac is not None
+        assert result.decompilation_status == "tac_only_no_model"
+
+    def test_decompile_uses_configured_model_path(self, monkeypatch):
+        class FakeDecompiler:
+            def __init__(self, model_path):
+                self.model_path = model_path
+
+            def decompile_contract(self, bytecode):
+                return {
+                    "solidity": "contract DecompiledContract { function f() public {} }",
+                    "functions": {"f": "function f() public {}"},
+                    "tac_per_function": {"f": "f:\n  RETURN"},
+                    "analysis": {"function_errors": {}},
+                }
+
+        monkeypatch.setattr("src.model_setup.SmartContractDecompiler", FakeDecompiler)
+        config = PipelineConfig(
+            stages=[PipelineStage.DECOMPILE],
+            decompiler_model_path="models/fake",
+        )
+        result = PipelineOrchestrator(config).analyze(MINIMAL_BYTECODE)
+
+        assert result.decompiled_source.startswith("contract DecompiledContract")
+        assert result.tac == "f:\n  RETURN"
+        assert result.decompilation_status == "model_generated"
+        assert result.to_dict()["decompiled_functions"]["f"].startswith("function f")
 
     def test_classify_stage(self):
         config = PipelineConfig(stages=[PipelineStage.CLASSIFY])
@@ -162,32 +195,47 @@ class TestPipelineExecution:
         assert result.vulnerability_report is not None
 
     def test_full_pipeline(self):
-        config = PipelineConfig(stages=[
-            PipelineStage.CLASSIFY,
-            PipelineStage.DECOMPILE,
-            PipelineStage.DETECT_VULNERABILITIES,
-            PipelineStage.AUDIT_REPORT,
-        ])
+        config = PipelineConfig(
+            stages=[
+                PipelineStage.CLASSIFY,
+                PipelineStage.DECOMPILE,
+                PipelineStage.DETECT_VULNERABILITIES,
+                PipelineStage.AUDIT_REPORT,
+            ]
+        )
         orch = PipelineOrchestrator(config)
         result = orch.analyze(MINIMAL_BYTECODE, "0xABC")
         assert result.contract_address == "0xABC"
         assert len(result.stages_completed) >= 3
 
     def test_audit_report_uses_prior_decompilation_output(self, monkeypatch):
-        monkeypatch.setattr(
-            "src.bytecode_analyzer.analyze_bytecode_to_tac",
-            lambda bytecode: "precomputed TAC output",
+        class FakeDecompiler:
+            def __init__(self, model_path):
+                pass
+
+            def decompile_contract(self, bytecode):
+                return {
+                    "solidity": "contract Precomputed {}",
+                    "functions": {"f": "function f() public {}"},
+                    "tac_per_function": {"f": "precomputed TAC output"},
+                    "analysis": {"function_errors": {}},
+                }
+
+        monkeypatch.setattr("src.model_setup.SmartContractDecompiler", FakeDecompiler)
+        config = PipelineConfig(
+            stages=[
+                PipelineStage.DECOMPILE,
+                PipelineStage.AUDIT_REPORT,
+            ],
+            decompiler_model_path="models/fake",
         )
-        config = PipelineConfig(stages=[
-            PipelineStage.DECOMPILE,
-            PipelineStage.AUDIT_REPORT,
-        ])
         orch = PipelineOrchestrator(config)
 
         result = orch.analyze(MINIMAL_BYTECODE)
 
-        assert result.decompiled_source == "precomputed TAC output"
-        assert result.audit_report.decompiled_source == "precomputed TAC output"
+        assert result.decompiled_source == "contract Precomputed {}"
+        assert result.tac == "precomputed TAC output"
+        assert result.audit_report.decompiled_source == "contract Precomputed {}"
         assert result.audit_report.metadata["decompilation_source"] == "precomputed"
 
     def test_classifier_model_path_uses_model_backed_inference(self):
@@ -227,6 +275,7 @@ class TestPipelineExecution:
 # Batch Analysis
 # ---------------------------------------------------------------------------
 
+
 class TestBatchAnalysis:
     def test_batch_analysis(self):
         config = PipelineConfig(stages=[PipelineStage.DECOMPILE])
@@ -253,6 +302,7 @@ class TestBatchAnalysis:
 # ---------------------------------------------------------------------------
 # Error Handling
 # ---------------------------------------------------------------------------
+
 
 class TestErrorHandling:
     def test_stage_failure_recorded(self):

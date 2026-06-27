@@ -61,7 +61,9 @@ wc -l data/*.jsonl demo_dataset.jsonl 2>/dev/null || true
 du -h data/*.jsonl demo_dataset.jsonl 2>/dev/null || true
 ```
 
-Validate that a JSONL file contains usable training pairs:
+Validate that a JSONL file contains usable training pairs. `train.py` now runs
+this schema and token-length preflight automatically before training/eval-only;
+the snippet below is only a quick manual check:
 
 ```bash
 uv run python - <<'PY'
@@ -95,10 +97,12 @@ A valid training row looks like:
 ```
 
 Use `demo_dataset.jsonl` only for smoke tests. Three examples are not enough for meaningful fine-tuning.
+Automatic demo fallback is disabled by default; collection runs that produce zero
+real pairs fail fast unless `--allow-demo-fallback` is set.
 
 ## 3. Generate or refresh training data
 
-The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles them with compatible `solc` versions, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, and exports JSONL.
+The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles them with compatible `solc` versions, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests.
 
 ```bash
 # Quick data-generation test
@@ -109,6 +113,9 @@ uv run python download_hf_contracts.py --limit 1000 --max-compiler-versions 3
 
 # Full Hugging Face-backed generation
 uv run python download_hf_contracts.py
+
+# Keep all phase manifests together
+uv run python download_hf_contracts.py --limit 1000 --manifest-dir data/manifests
 ```
 
 Run phases independently when debugging or resuming:
@@ -117,6 +124,11 @@ Run phases independently when debugging or resuming:
 uv run python download_hf_contracts.py --download-only
 uv run python download_hf_contracts.py --compile-only
 uv run python download_hf_contracts.py --export-only
+
+# Validate an existing export without downloading or compiling
+uv run python download_hf_contracts.py \
+  --validate-jsonl data/hf_training_dataset.jsonl \
+  --max-body-dupes 2
 ```
 
 Useful flags:
@@ -136,12 +148,18 @@ Useful flags:
 | `--output PATH` | `data/hf_training_dataset.jsonl` | Export JSONL target |
 | `--export-selectors PATH` | — | Export selector registry JSON |
 | `--import-selectors PATH` | — | Import selector registry JSON before processing |
+| `--manifest-dir PATH` | next to artifacts | Write download, compile, and export manifests to one directory |
+| `--validate-jsonl PATH` | — | Recompute normalized JSONL target-body duplicates and fail if any body exceeds `--max-body-dupes` |
+| `--duplicate-sample-limit N` | 5 | Number of duplicate violation/error samples to include in validation output |
 | `--db PATH` | `data/contracts.db` | SQLite state/cache path |
 
 Expected outputs:
 
 - `data/contracts.db`: downloaded contracts, generated function pairs, and selector registry.
 - `data/hf_training_dataset.jsonl`: training-ready TAC-to-Solidity pairs.
+- Manifests: `data/hf_download_manifest.json`, `data/hf_compile_manifest.json`, and `data/hf_training_dataset.jsonl.manifest.json` (or files under `--manifest-dir`). These capture source/revision lineage, command args, git state, artifact hashes, row counts, typed status/drop counts, duplicate stats, timings, and compile failure diagnostics.
+
+If `--validate-jsonl` or export-time validation fails, inspect the reported top normalized-body duplicate samples. Lower duplicate counts by re-exporting with a stricter cap or by fixing missing/stale body hashes in `function_pairs`; the validator always recomputes from JSONL `output` fields, so it catches stale database metadata.
 
 If you want to use the older Etherscan path in `train.py`, provide `ETHERSCAN_API_KEY` and a `data/contract_addresses.txt` file, then run without `--skip-collection`. For most runs, prefer the Hugging Face generator followed by `train.py --skip-collection --dataset ...`.
 
@@ -185,11 +203,71 @@ uv run python train.py \
 ```
 
 This re-splits the source JSONL into `data/train_dataset.jsonl`,
-`data/val_dataset.jsonl`, and `data/test_dataset.jsonl`, trains the LoRA
-adapter, saves to `models/final_model/`, and runs evaluation unless
-`--skip-eval` is set. Compiler version and optimizer metadata are included in
-prompts by default when dataset rows contain them; use
-`--no-compiler-metadata` only for an ablation run.
+`data/val_dataset.jsonl`, and `data/test_dataset.jsonl`, writes
+`data/split_manifest.json`, trains the LoRA adapter, saves to
+`models/final_model/`, and runs evaluation unless `--skip-eval` is set. The
+splitter preserves leakage-connected groups (source hash, contract address,
+contract+selector/signature, exact input hash, exact output hash), validates no
+overlap across train/val/test, and reports holdout coverage by compiler version,
+optimizer, visibility, source, length bucket, and function family. Compiler
+version and optimizer metadata are included in prompts by default when dataset
+rows contain them; use `--no-compiler-metadata` only for an ablation run.
+
+Before training or eval-only, `train.py` validates JSONL schema and tokenizer
+lengths. By default it uses a cached tokenizer when available and falls back to
+whitespace counts without downloading; add `--preflight-tokenizer-download` to
+force loading the actual tokenizer if it is not cached. Use
+`--skip-data-preflight` only for legacy smoke runs.
+
+Every `train.py` run writes a structured manifest under
+`models/run_manifests/` by default (override with `--manifest-dir` or
+`--run-manifest`). The manifest records CLI args, git state, dataset hashes and
+split counts, training config, checkpoint resume choice, telemetry artifacts,
+final metrics, and evaluation result references. Throughput telemetry is enabled
+by default and writes `models/training_throughput.json` plus
+`models/training_throughput.csv`; disable it with `--no-throughput-metrics`.
+
+### Compiler metadata ablation study
+
+Use an ablation study to measure whether compiler metadata improves generated
+Solidity quality. The control run includes compiler/optimizer metadata in the
+prompt; the ablation run uses the same dataset, model, LoRA config, sequence
+length, learning rate, seed, and step budget, but removes that metadata.
+
+The reusable script below prepares one deterministic train/eval sample and then
+runs the two variants in separate Python processes so GPU memory is released
+between runs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+uv run python scripts/run_compiler_metadata_ablation.py \
+  --dataset data/hf_training_dataset.jsonl \
+  --model-name Qwen/Qwen2.5-Coder-7B-Instruct \
+  --target-train-minutes 20 \
+  --seconds-per-step-estimate 8.0 \
+  --max-seq-length 4096 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 4 \
+  --lora-rank 32 \
+  --lora-alpha 64 \
+  --eval-samples 8
+```
+
+With the default estimate, the script caps each training run at **150 optimizer
+steps**, which is roughly 20 minutes per run on the local RTX 8000/Qwen 7B fp16
+setup after observing ~8 seconds/step on 4096-token samples. The script also
+filters extreme long-tail examples by default (`--max-input-chars 12000`,
+`--max-output-chars 4000`) so a few huge functions do not dominate runtime.
+Override `--max-steps` if you want an exact step count, or adjust
+`--seconds-per-step-estimate` after a calibration run. Results are written under
+`results/ablation/compiler_metadata_<timestamp>/` with per-variant
+`summary.json` files and an aggregate `ablation_summary.json`.
+
+Interpret the study directionally unless you repeat it with multiple seeds.
+Compare `edit_similarity_mean`, `edit_distance_mean`,
+`replication_precision_mean`, `replication_recall_mean`, and
+`replication_f1_mean`. If the control consistently beats the ablation, keep
+compiler metadata in production prompts.
 
 ### Recommended <=8B code model: Qwen2.5-Coder-7B-Instruct
 
@@ -261,6 +339,17 @@ uv run python train.py \
   --resume models/checkpoints/checkpoint-1000
 ```
 
+To safely resume the latest Hugging Face `Trainer` checkpoint under
+`--output-dir`, use:
+
+```bash
+uv run python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --output-dir models \
+  --resume auto
+```
+
 ## 5. Evaluate
 
 Training evaluates automatically unless `--skip-eval` is passed. Results are written to `results/eval_<timestamp>.json`.
@@ -271,7 +360,8 @@ Evaluate an existing model:
 uv run python train.py \
   --eval-only \
   --model-path models/final_model \
-  --test-dataset data/test_dataset.jsonl
+  --test-dataset data/test_dataset.jsonl \
+  --eval-batch-size 4
 ```
 
 Every evaluation writes two artifacts:
@@ -280,6 +370,10 @@ Every evaluation writes two artifacts:
 - `latest_results.txt` — check-in friendly human-readable quality report with
   run metadata, model/config size, training/eval parameters, target checks, and
   replication precision/recall/F1.
+
+`--eval-batch-size 1` preserves the historical per-example path. Larger values
+use `SmartContractDecompiler.decompile_batch` in chunks and fall back to
+single-example retries if a batch hits CUDA OOM.
 
 For a quick report-generation smoke demo against the latest local model, limit
 the eval size:
@@ -324,6 +418,7 @@ Key metrics:
 | `replication_precision_micro` | higher is better; measures recovered facts that are correct |
 | `replication_recall_micro` | higher is better; measures ground-truth facts recovered |
 | `replication_f1_micro` | higher is better; balanced structured replication score |
+| `solidity_valid_mean` | higher is better; generated Solidity passed compiler/AST validation when local solc was available, otherwise the deterministic scaffold check |
 
 The replication metrics compare structured Solidity facts extracted from the
 ground-truth function and generated function: ABI/function facts, visibility,
@@ -331,6 +426,15 @@ mutability, modifiers, guards, events, calls, state writes, returns, and control
 flow. The evaluation JSON also includes `replication_by_category_micro` so you
 can see whether failures are concentrated in ABI recovery, state writes, guards,
 calls, or other categories.
+
+Evaluation helpers now use true normalized Levenshtein distance for
+`edit_distance_mean` instead of a `difflib.SequenceMatcher` ratio. Compiler/AST
+validity is best-effort and offline: installed local `solc` versions are used
+without attempting downloads; if no matching compiler is available, the report
+falls back to an explicit Solidity scaffold/syntax check. Reusable helpers also
+produce `metadata_segments` coverage/per-segment metrics plus deterministic
+mean confidence intervals and baseline/regression comparisons for future CLI
+wiring.
 
 ## 6. Use the trained model
 
@@ -359,6 +463,29 @@ Passing compiler metadata is recommended when you know it. Solidity language
 semantics and bytecode shape vary by compiler version and optimizer settings,
 so the training and inference prompts include `compiler_version`,
 `optimizer_enabled`, `optimizer_runs`, and `evm_version` when present.
+
+### CLI: bytecode to TAC or Solidity
+
+Use `scripts/decompile.py` for shell, CI, and batch inference. JSON output is
+machine-readable and includes generated Solidity, TAC, analysis timings,
+function errors, compiler metadata, generation controls, and model config:
+
+```bash
+uv run python scripts/decompile.py \
+  --model-path models/final_model \
+  --bytecode 0x60806040... \
+  --compiler-version 0.8.20 \
+  --optimizer-enabled true \
+  --optimizer-runs 200 \
+  --max-new-tokens 1024 \
+  --format json
+```
+
+For static-analysis-only debugging, emit TAC without loading a model:
+
+```bash
+uv run python scripts/decompile.py --format tac --bytecode 0x60806040...
+```
 
 ### Python API: bytecode to contract-level output
 
@@ -401,6 +528,51 @@ uv run python web/app.py
 ```
 
 Open `http://localhost:5000`. If no model artifact can be resolved, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
+The readiness panel calls `/api/health` before a job and shows whether the
+model is loaded, which model path/config is effective, lookup DB availability,
+request limits, and default generation controls. The browser validates bytecode
+format/size before upload and provides an explicit cancel button for long jobs.
+
+The `/api/decompile` endpoint streams SSE progress and a final result. Each
+request includes a `request_id`; when `WEB_INFERENCE_TRACE_ENABLED=true`
+(default), a JSON trace is written under `results/inference_traces/` with
+bytecode hashes, per-function lookup/model provenance, token/truncation
+diagnostics, generation settings, timings, and errors. Raw bytecode/TAC samples
+are omitted unless `WEB_INFERENCE_TRACE_INCLUDE_SAMPLES=true`.
+
+```bash
+curl -N http://127.0.0.1:5000/api/decompile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "bytecode": "0x60806040...",
+    "compiler_version": "0.8.20",
+    "optimizer_enabled": true,
+    "optimizer_runs": 200,
+    "generation": {
+      "max_new_tokens": 512,
+      "temperature": 0.1,
+      "do_sample": false,
+      "repetition_penalty": 1.15
+    }
+  }'
+```
+
+The UI also exposes the security-analysis APIs using the same bytecode/API-key
+inputs:
+
+```bash
+curl http://127.0.0.1:5000/api/vulnerability-scan \
+  -H 'Content-Type: application/json' \
+  -d '{"bytecode":"0x60806040..."}'
+
+curl http://127.0.0.1:5000/api/classify \
+  -H 'Content-Type: application/json' \
+  -d '{"bytecode":"0x60806040..."}'
+
+curl http://127.0.0.1:5000/api/audit-report \
+  -H 'Content-Type: application/json' \
+  -d '{"bytecode":"0x60806040..."}'
+```
 
 For a shared host, set an API key and restrict CORS to trusted browser
 origins. The UI includes an API key field that sends an in-memory

@@ -38,6 +38,58 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
         "replication_precision_micro": 0.8,
         "replication_recall_micro": 0.75,
         "replication_f1_micro": 0.7742,
+        "solidity_valid_mean": 1.0,
+        "solidity_compiler_checked_mean": 0.0,
+        "solidity_ast_valid_mean": 0.0,
+        "confidence_intervals": {
+            "semantic_similarity_mean": {
+                "mean": 0.9,
+                "low": 0.85,
+                "high": 0.95,
+                "n": 4,
+            }
+        },
+        "metadata_segments": {
+            "coverage": {
+                "compiler_version": {
+                    "known": 1,
+                    "unknown": 0,
+                    "values": {"0.8.20": 1},
+                }
+            },
+            "segments": {
+                "compiler_version": {
+                    "0.8.20": {
+                        "count": 1,
+                        "metrics": {
+                            "semantic_similarity": {"mean": 0.9},
+                            "normalized_edit_distance": {"mean": 0.1},
+                            "replication_f1": {"mean": 0.7742},
+                            "solidity_valid": {"mean": 1.0},
+                        },
+                    }
+                }
+            },
+        },
+        "baseline_comparison": {
+            "num_metrics_compared": 2,
+            "num_improvements": 1,
+            "num_regressions": 1,
+            "comparisons": {
+                "semantic_similarity_mean": {
+                    "current": 0.9,
+                    "baseline": 0.8,
+                    "delta": 0.1,
+                    "status": "improved",
+                },
+                "edit_distance_mean": {
+                    "current": 0.1,
+                    "baseline": 0.08,
+                    "delta": 0.02,
+                    "status": "regressed",
+                },
+            },
+        },
         "replication_by_category_micro": {
             "abi": {
                 "precision": 1.0,
@@ -67,7 +119,13 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
     assert "Examples evaluated: 1" in report
     assert "Semantic similarity mean: 0.9000" in report
     assert "Replication F1 micro: 0.7742" in report
+    assert "Solidity valid outputs: 100.00%" in report
     assert "abi | 1.0000 | 0.5000 | 0.6667 | 1 | 0 | 1" in report
+    assert "semantic_similarity_mean | 0.9000 | [0.8500, 0.9500] | 4" in report
+    assert "compiler_version | 1 | 0 | 0.8.20 (1)" in report
+    assert "compiler_version=0.8.20 | 1 | 0.9000 | 0.1000 | 0.7742 | 100.00%" in report
+    assert "Metrics compared: 2" in report
+    assert "edit_distance_mean | 0.1000 | 0.0800 | 0.0200 | regressed" in report
 
 
 def test_write_latest_results_report_creates_file(tmp_path):

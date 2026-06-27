@@ -15,7 +15,14 @@
   const compilerVersionInput = document.getElementById("compiler-version-input");
   const optimizerEnabledInput = document.getElementById("optimizer-enabled-input");
   const optimizerRunsInput = document.getElementById("optimizer-runs-input");
+  const bytecodeGuidance = document.getElementById("bytecode-guidance");
+  const maxNewTokensInput = document.getElementById("max-new-tokens-input");
+  const temperatureInput = document.getElementById("temperature-input");
+  const doSampleInput = document.getElementById("do-sample-input");
+  const repetitionPenaltyInput = document.getElementById("repetition-penalty-input");
+  const btnResetGeneration = document.getElementById("btn-reset-generation");
   const loadingEl = document.getElementById("loading");
+  const btnCancelDecompile = document.getElementById("btn-cancel-decompile");
   const errorBanner = document.getElementById("error-banner");
   const errorText = document.getElementById("error-text");
   const btnDismissError = document.getElementById("btn-dismiss-error");
@@ -26,6 +33,10 @@
   const modelWarning = document.getElementById("model-warning");
   const modelWarningText = document.getElementById("model-warning-text");
   const functionMappingContent = document.getElementById("function-mapping-content");
+  const securityContent = document.getElementById("security-content");
+  const btnVulnerabilityScan = document.getElementById("btn-vulnerability-scan");
+  const btnClassify = document.getElementById("btn-classify");
+  const btnAuditReport = document.getElementById("btn-audit-report");
 
   // Progress elements
   const progressMessage = document.getElementById("progress-message");
@@ -41,6 +52,8 @@
   const gpuPanel = document.getElementById("gpu-panel");
   const gpuCards = document.getElementById("gpu-cards");
   const gpuStatusDot = document.getElementById("gpu-status-dot");
+  const readinessContent = document.getElementById("readiness-content");
+  const readinessStatusDot = document.getElementById("readiness-status-dot");
 
   // ---- Sample bytecode (Owner contract compiled with solc 0.8.24, runtime bytecode) ----
   const SAMPLE_BYTECODE =
@@ -97,6 +110,15 @@
   var activeDecompileRequestId = 0;
   var activeDecompileController = null;
   var resultRevealTimer = null;
+  var healthInfo = null;
+  var maxBytecodeHexLength = 200000;
+  var generationDefaults = {
+    max_new_tokens: 1024,
+    temperature: 0.1,
+    do_sample: false,
+    repetition_penalty: 1.15
+  };
+  var generationControlsInitialized = false;
 
   // ---- Helpers ----
 
@@ -233,9 +255,103 @@
     renderFunctionCount();
   }
 
+  function normalizeBytecodeInput(raw) {
+    var text = (raw || "").trim();
+    var body = text.toLowerCase().startsWith("0x") ? text.slice(2) : text;
+    body = body.replace(/\s+/g, "");
+    return {
+      bytecode: "0x" + body,
+      hexBody: body
+    };
+  }
+
+  function validateBytecodeInput(raw) {
+    var normalized = normalizeBytecodeInput(raw);
+    var body = normalized.hexBody;
+    if (!body) {
+      return { valid: false, error: "Please enter EVM bytecode to decompile." };
+    }
+    if (body.length > maxBytecodeHexLength) {
+      return {
+        valid: false,
+        error:
+          "Bytecode is too large (" +
+          body.length.toLocaleString() +
+          " hex chars). Maximum is " +
+          maxBytecodeHexLength.toLocaleString() +
+          "."
+      };
+    }
+    if (body.length % 2 !== 0) {
+      return {
+        valid: false,
+        error: "Bytecode must contain an even number of hex characters."
+      };
+    }
+    if (!/^[0-9a-fA-F]+$/.test(body)) {
+      return {
+        valid: false,
+        error: "Bytecode contains non-hexadecimal characters."
+      };
+    }
+    return {
+      valid: true,
+      bytecode: normalized.bytecode,
+      hexLength: body.length,
+      byteLength: body.length / 2
+    };
+  }
+
   function updateCharCount() {
-    const len = inputEl.value.trim().length;
-    charCountEl.textContent = len.toLocaleString() + " characters";
+    var normalized = normalizeBytecodeInput(inputEl.value);
+    var hexLen = normalized.hexBody.length;
+    var bytes = Math.floor(hexLen / 2);
+    charCountEl.textContent =
+      hexLen.toLocaleString() +
+      " / " +
+      maxBytecodeHexLength.toLocaleString() +
+      " hex chars (" +
+      bytes.toLocaleString() +
+      " bytes)";
+    if (bytecodeGuidance) {
+      bytecodeGuidance.textContent =
+        "Hex bytecode may include whitespace and an optional 0x prefix. Limit: " +
+        maxBytecodeHexLength.toLocaleString() +
+        " hex chars (" +
+        Math.floor(maxBytecodeHexLength / 2).toLocaleString() +
+        " bytes).";
+    }
+  }
+
+  function applyGenerationDefaults(defaults) {
+    generationDefaults = Object.assign(generationDefaults, defaults || {});
+    if (maxNewTokensInput) maxNewTokensInput.value = generationDefaults.max_new_tokens;
+    if (temperatureInput) temperatureInput.value = generationDefaults.temperature;
+    if (doSampleInput) doSampleInput.value = generationDefaults.do_sample ? "true" : "false";
+    if (repetitionPenaltyInput) {
+      repetitionPenaltyInput.value = generationDefaults.repetition_penalty;
+    }
+  }
+
+  function collectGenerationConfig() {
+    var maxNew = parseInt(maxNewTokensInput ? maxNewTokensInput.value : generationDefaults.max_new_tokens, 10);
+    var temp = parseFloat(temperatureInput ? temperatureInput.value : generationDefaults.temperature);
+    var rep = parseFloat(repetitionPenaltyInput ? repetitionPenaltyInput.value : generationDefaults.repetition_penalty);
+    if (!Number.isFinite(maxNew) || maxNew < 1) {
+      throw new Error("Max new tokens must be at least 1.");
+    }
+    if (!Number.isFinite(temp) || temp < 0 || temp > 2) {
+      throw new Error("Temperature must be between 0 and 2.");
+    }
+    if (!Number.isFinite(rep) || rep < 0.8 || rep > 2) {
+      throw new Error("Repetition penalty must be between 0.8 and 2.");
+    }
+    return {
+      max_new_tokens: maxNew,
+      temperature: temp,
+      do_sample: doSampleInput ? doSampleInput.value === "true" : false,
+      repetition_penalty: rep
+    };
   }
 
   function escapeHtml(text) {
@@ -404,24 +520,27 @@
 
   // ---- Tab switching ----
 
+  function activateTab(targetId) {
+    document.querySelectorAll(".tab").forEach(function (t) {
+      t.classList.remove("active");
+      if (t.getAttribute("data-tab") === targetId) {
+        t.classList.add("active");
+      }
+    });
+    document.querySelectorAll(".tab-panel").forEach(function (p) {
+      p.classList.add("hidden");
+      p.classList.remove("active");
+    });
+    const panel = document.getElementById(targetId);
+    if (panel) {
+      panel.classList.remove("hidden");
+      panel.classList.add("active");
+    }
+  }
+
   document.querySelectorAll(".tab").forEach(function (tab) {
     tab.addEventListener("click", function () {
-      const targetId = this.getAttribute("data-tab");
-
-      document.querySelectorAll(".tab").forEach(function (t) {
-        t.classList.remove("active");
-      });
-      document.querySelectorAll(".tab-panel").forEach(function (p) {
-        p.classList.add("hidden");
-        p.classList.remove("active");
-      });
-
-      this.classList.add("active");
-      const panel = document.getElementById(targetId);
-      if (panel) {
-        panel.classList.remove("hidden");
-        panel.classList.add("active");
-      }
+      activateTab(this.getAttribute("data-tab"));
     });
   });
 
@@ -493,6 +612,29 @@
     if (analysis.lookup_hits !== undefined) {
       html += card("Lookup Hits", analysis.lookup_hits);
     }
+    if (analysis.source_summary) {
+      html += card("DB Functions", analysis.source_summary.exact_match || 0);
+      html += card("LLM Functions", analysis.source_summary.model_inference || 0);
+      html += card("Failed Functions", analysis.source_summary.error || 0);
+    }
+    if (analysis.effective_generation_config) {
+      var gen = analysis.effective_generation_config;
+      html += card(
+        "Generation",
+        "max_new_tokens=" +
+          gen.max_new_tokens +
+          ", temp=" +
+          gen.temperature +
+          ", sample=" +
+          gen.do_sample +
+          ", repeat=" +
+          gen.repetition_penalty,
+        true
+      );
+    }
+    if (analysis.model_path) {
+      html += card("Model Path", analysis.model_path, true);
+    }
 
     if (analysis.model_config) {
       var mc = analysis.model_config;
@@ -516,10 +658,12 @@
   //  Function Selector Mapping
   // ================================================================== //
 
-  function renderFunctionMapping(selectorMap) {
-    if (!selectorMap || Object.keys(selectorMap).length === 0) {
+  function renderFunctionMapping(selectorMap, functionResults) {
+    var hasSelectors = selectorMap && Object.keys(selectorMap).length > 0;
+    var hasResults = functionResults && functionResults.length > 0;
+    if (!hasSelectors && !hasResults) {
       functionMappingContent.innerHTML =
-        '<p class="text-muted">No function selectors detected.</p>';
+        '<p class="text-muted">No function data returned.</p>';
       return;
     }
 
@@ -527,83 +671,68 @@
     html +=
       "<thead><tr>" +
       "<th>Bytecode Function</th>" +
-      "<th>→</th>" +
       "<th>Resolved Name</th>" +
       "<th>Confidence</th>" +
       "<th>Source</th>" +
+      "<th>Status</th>" +
+      "<th>Elapsed</th>" +
+      "<th>Error</th>" +
       "</tr></thead><tbody>";
 
-    var fnames = Object.keys(selectorMap);
+    var fnames = hasResults
+      ? functionResults.map(function (r) { return r.name; })
+      : Object.keys(selectorMap);
     for (var i = 0; i < fnames.length; i++) {
       var fname = fnames[i];
-      var info = selectorMap[fname];
-      var best = info.best_match;
-      if (!best) continue;
+      var info = hasSelectors ? (selectorMap[fname] || {}) : {};
+      var best = info.best_match || {};
+      var result = hasResults ? functionResults[i] : {};
 
-      var conf = best.confidence; // 0-100
+      var conf = result.confidence != null ? result.confidence : best.confidence;
       var confClass = "conf-high";
       if (conf < 50) confClass = "conf-low";
       else if (conf < 80) confClass = "conf-med";
 
-      var sourceLabel = best.source === "builtin" ? "Known Standard" :
-                        best.source === "4byte" ? "4byte.directory" : "Unknown";
+      var selectorSource =
+        best.source === "builtin" ? "Known Standard" :
+        best.source === "4byte" ? "4byte.directory" : (best.source || "Unknown");
+      var provenance = result.source || "unknown";
+      var status = result.status || "unknown";
+      var error = result.error || "";
 
       html += "<tr>";
       html +=
         '<td class="fn-map-fname"><code>' +
         escapeHtml(fname) +
         "</code></td>";
-      html += '<td class="fn-map-arrow">→</td>';
       html +=
         '<td class="fn-map-sig"><code>' +
-        escapeHtml(best.signature) +
+        escapeHtml(result.signature || best.signature || "—") +
         "</code></td>";
-      html +=
-        '<td><span class="conf-badge ' +
-        confClass +
-        '" title="' +
-        conf.toFixed(1) +
-        '% confidence">' +
-        conf.toFixed(0) +
-        "%</span></td>";
-      html +=
-        '<td class="fn-map-source">' +
-        escapeHtml(sourceLabel) +
-        "</td>";
+      if (conf != null) {
+        html +=
+          '<td><span class="conf-badge ' +
+          confClass +
+          '" title="' +
+          Number(conf).toFixed(1) +
+          '% confidence">' +
+          Number(conf).toFixed(0) +
+          "%</span></td>";
+      } else {
+        html += "<td>—</td>";
+      }
+      html += '<td class="fn-map-source">' +
+        escapeHtml(getSourceLabel(provenance) + " / " + selectorSource) + "</td>";
+      html += "<td>" + escapeHtml(status) + "</td>";
+      html += "<td>" + escapeHtml(result.elapsed_s != null ? result.elapsed_s + "s" : "—") + "</td>";
+      html += "<td>" + escapeHtml(error || "—") + "</td>";
       html += "</tr>";
 
-      // Additional candidates (if any beyond the best)
       if (info.candidates && info.candidates.length > 1) {
-        for (var j = 0; j < info.candidates.length; j++) {
-          var cand = info.candidates[j];
-          if (cand.signature === best.signature) continue;
-          var cConf = cand.confidence;
-          var cClass = "conf-high";
-          if (cConf < 50) cClass = "conf-low";
-          else if (cConf < 80) cClass = "conf-med";
-
-          var cSource = cand.source === "builtin" ? "Known Standard" :
-                        cand.source === "4byte" ? "4byte.directory" : "Unknown";
-
-          html += '<tr class="fn-map-alt">';
-          html += "<td></td>";
-          html += '<td class="fn-map-arrow">↳</td>';
-          html +=
-            '<td class="fn-map-sig"><code>' +
-            escapeHtml(cand.signature) +
-            "</code></td>";
-          html +=
-            '<td><span class="conf-badge ' +
-            cClass +
-            '">' +
-            cConf.toFixed(0) +
-            "%</span></td>";
-          html +=
-            '<td class="fn-map-source">' +
-            escapeHtml(cSource) +
-            "</td>";
-          html += "</tr>";
-        }
+        html +=
+          '<tr class="fn-map-alt"><td></td><td colspan="6">' +
+          escapeHtml((info.candidates.length - 1) + " alternate selector candidate(s) available") +
+          "</td></tr>";
       }
     }
 
@@ -778,6 +907,66 @@
     }
   }
 
+  function renderHealth(data) {
+    healthInfo = data || null;
+    if (!data) {
+      readinessContent.innerHTML =
+        '<div class="gpu-placeholder">Unable to fetch readiness status.</div>';
+      readinessStatusDot.className = "gpu-status-dot offline";
+      readinessStatusDot.title = "Unknown";
+      return;
+    }
+
+    if (data.limits && data.limits.max_bytecode_hex_length) {
+      maxBytecodeHexLength = data.limits.max_bytecode_hex_length;
+      inputEl.maxLength = maxBytecodeHexLength + 2;
+      updateCharCount();
+    }
+    if (data.generation_defaults && !generationControlsInitialized) {
+      applyGenerationDefaults(data.generation_defaults);
+      generationControlsInitialized = true;
+    }
+
+    var ready = !!data.inference_ready;
+    readinessStatusDot.className = "gpu-status-dot " + (ready ? "online" : "offline");
+    readinessStatusDot.title = ready ? "Inference model loaded" : "Model unavailable";
+
+    var lookup = data.lookup || {};
+    var limits = data.limits || {};
+    var html = '<div class="gpu-card">';
+    html += '<div class="gpu-card-title"><span class="gpu-card-name">' +
+      escapeHtml(ready ? "Model ready" : "TAC/lookup-only mode") + "</span></div>";
+    html += "<div>Model: " + escapeHtml(data.model_path || "not loaded") + "</div>";
+    if (data.model_error) {
+      html += '<div class="gpu-warning">Load error: ' + escapeHtml(data.model_error) + "</div>";
+    }
+    html += "<div>Lookup DB: " + escapeHtml(lookup.available ? "available" : "unavailable") + "</div>";
+    html += "<div>Bytecode limit: " +
+      Number(limits.max_bytecode_hex_length || maxBytecodeHexLength).toLocaleString() +
+      " hex chars</div>";
+    html += "<div>Generation default: max_new_tokens=" +
+      escapeHtml(String((data.generation_defaults || generationDefaults).max_new_tokens)) +
+      "</div>";
+    html += "</div>";
+    readinessContent.innerHTML = html;
+
+    if (ready) {
+      btnDecompile.textContent = "⚡ Decompile";
+      btnDecompile.title = "Generate Solidity with the loaded model.";
+    } else {
+      btnDecompile.textContent = "⚡ Analyze TAC / lookup";
+      btnDecompile.title =
+        "No model is loaded. The request can still analyze bytecode, emit TAC, and use DB lookup hits.";
+    }
+  }
+
+  function pollHealth() {
+    fetch("/api/health", { headers: apiHeaders() })
+      .then(function (resp) { return resp.json(); })
+      .then(renderHealth)
+      .catch(function () { renderHealth(null); });
+  }
+
   // ---- Handle SSE progress events ----
 
   function handleProgress(data) {
@@ -792,6 +981,11 @@
     }
 
     switch (data.stage) {
+      case "readiness":
+        progressStage.textContent = data.message || "Checking readiness…";
+        if (data.health) renderHealth(data.health);
+        break;
+
       case "analysis":
         progressStage.textContent = "Stage 1: Analyzing bytecode…";
         break;
@@ -875,13 +1069,20 @@
       return;
     }
 
-    var bytecode = inputEl.value.trim();
-    if (!bytecode) {
-      showError("Please enter EVM bytecode to decompile.");
+    var validation = validateBytecodeInput(inputEl.value);
+    if (!validation.valid) {
+      showError(validation.error);
+      return;
+    }
+    var generationConfig;
+    try {
+      generationConfig = collectGenerationConfig();
+    } catch (e) {
+      showError(e.message);
       return;
     }
 
-    var requestBody = { bytecode: bytecode };
+    var requestBody = { bytecode: validation.bytecode, generation: generationConfig };
     var compilerVersion = compilerVersionInput
       ? compilerVersionInput.value.trim()
       : "";
@@ -1027,9 +1228,18 @@
     tacOutput.textContent = data.tac || "(no TAC output)";
     solidityOutput.textContent = data.solidity || "(no Solidity output)";
 
-    // Model warning
-    if (data.model_error) {
-      modelWarningText.textContent = data.model_error;
+    // Model / partial-failure warning
+    if (data.model_error || data.partial_success || data.success === false) {
+      var warning = data.model_error || "";
+      if (data.source_summary && data.source_summary.error) {
+        warning +=
+          (warning ? " " : "") +
+          data.source_summary.error +
+          " function(s) failed; see Function Mapping for details.";
+      } else if (data.success === false) {
+        warning += (warning ? " " : "") + "Decompilation did not fully succeed.";
+      }
+      modelWarningText.textContent = warning;
       show(modelWarning);
     } else {
       hide(modelWarning);
@@ -1042,8 +1252,8 @@
 
     // Function mapping
     var selMap = data.selector_map || currentSelectorMap;
-    if (selMap) {
-      renderFunctionMapping(selMap);
+    if (selMap || data.function_results) {
+      renderFunctionMapping(selMap, data.function_results || []);
     }
 
     // Final progress update
@@ -1060,9 +1270,115 @@
     }, 600);
   }
 
+  // ---- Security analysis actions ----
+
+  function renderSecurityJson(title, data) {
+    var html = '<div class="analysis-card"><div class="label">' +
+      escapeHtml(title) + '</div><div class="value small">';
+    html += "<pre>" + escapeHtml(JSON.stringify(data, null, 2)) + "</pre>";
+    html += "</div></div>";
+    securityContent.innerHTML = html;
+  }
+
+  function renderVulnerabilityResult(data) {
+    var html = "";
+    html += '<div class="analysis-card"><div class="label">Risk Score</div><div class="value">' +
+      escapeHtml(String(data.risk_score != null ? data.risk_score : "—")) + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Summary</div><div class="value small">' +
+      escapeHtml(data.summary || "No vulnerabilities reported.") + "</div></div>";
+    var vulns = data.vulnerabilities || [];
+    if (vulns.length) {
+      html += '<div class="analysis-card"><div class="label">Findings</div><div class="value small">';
+      for (var i = 0; i < vulns.length; i++) {
+        var v = vulns[i];
+        html += "<p><strong>" + escapeHtml(v.severity || "severity") + "</strong> " +
+          escapeHtml(v.type || "finding") + " (" +
+          escapeHtml(String(v.confidence != null ? v.confidence : "n/a")) +
+          " confidence)<br>" +
+          escapeHtml(v.explanation || "") +
+          "<br><em>" + escapeHtml(v.recommendation || "") + "</em></p>";
+      }
+      html += "</div></div>";
+    }
+    securityContent.innerHTML = html;
+  }
+
+  function renderClassificationResult(data) {
+    var html = "";
+    html += '<div class="analysis-card"><div class="label">Classification</div><div class="value">' +
+      (data.is_malicious ? "Malicious" : "Legitimate / inconclusive") + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Confidence</div><div class="value">' +
+      escapeHtml(String(data.confidence != null ? data.confidence : "—")) + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Explanation</div><div class="value small">' +
+      escapeHtml(data.explanation || "") + "</div></div>";
+    securityContent.innerHTML = html;
+  }
+
+  function runSecurityEndpoint(kind, endpoint) {
+    var validation = validateBytecodeInput(inputEl.value);
+    if (!validation.valid) {
+      showError(validation.error);
+      return;
+    }
+    hideError();
+    show(resultsSection);
+    activateTab("tab-security");
+    securityContent.innerHTML =
+      '<div class="gpu-placeholder">Running ' + escapeHtml(kind) + "…</div>";
+    fetch(endpoint, {
+      method: "POST",
+      headers: apiHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ bytecode: validation.bytecode })
+    })
+      .then(function (resp) {
+        return resp.json().then(function (data) {
+          if (!resp.ok) throw new Error(data.error || "Server error (" + resp.status + ")");
+          return data;
+        });
+      })
+      .then(function (data) {
+        if (kind === "vulnerability scan") renderVulnerabilityResult(data);
+        else if (kind === "classification") renderClassificationResult(data);
+        else renderSecurityJson("Audit Report", data.report || data);
+      })
+      .catch(function (err) {
+        securityContent.innerHTML =
+          '<div class="gpu-warning">' + escapeHtml(err.message) + "</div>";
+      });
+  }
+
   // ---- Event listeners ----
 
   btnDecompile.addEventListener("click", decompile);
+
+  if (btnCancelDecompile) {
+    btnCancelDecompile.addEventListener("click", function () {
+      abortActiveDecompile();
+      showError("Decompilation cancelled.");
+    });
+  }
+
+  if (btnResetGeneration) {
+    btnResetGeneration.addEventListener("click", function () {
+      applyGenerationDefaults(healthInfo ? healthInfo.generation_defaults : generationDefaults);
+    });
+  }
+
+  if (btnVulnerabilityScan) {
+    btnVulnerabilityScan.addEventListener("click", function () {
+      runSecurityEndpoint("vulnerability scan", "/api/vulnerability-scan");
+    });
+  }
+  if (btnClassify) {
+    btnClassify.addEventListener("click", function () {
+      runSecurityEndpoint("classification", "/api/classify");
+    });
+  }
+  if (btnAuditReport) {
+    btnAuditReport.addEventListener("click", function () {
+      runSecurityEndpoint("audit report", "/api/audit-report");
+    });
+  }
 
   btnSample.addEventListener("click", function () {
     abortActiveDecompile();
@@ -1105,7 +1421,10 @@
   btnDismissError.addEventListener("click", hideError);
 
   if (apiKeyInput) {
-    apiKeyInput.addEventListener("change", pollGpuStats);
+    apiKeyInput.addEventListener("change", function () {
+      pollGpuStats();
+      pollHealth();
+    });
   }
 
   inputEl.addEventListener("input", updateCharCount);
@@ -1121,6 +1440,8 @@
 
   // Initial char count
   updateCharCount();
+  applyGenerationDefaults(generationDefaults);
+  pollHealth();
 
   // Start GPU polling
   startGpuPolling();

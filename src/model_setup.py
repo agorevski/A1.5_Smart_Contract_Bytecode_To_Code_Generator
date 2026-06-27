@@ -9,9 +9,13 @@ import os
 import json
 import logging
 import copy
+import csv
+import hashlib
 import inspect
 import math
 import re
+import time
+from collections.abc import Mapping as MappingABC
 from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +47,8 @@ import numpy as np
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+TOKENIZATION_CACHE_VERSION = 1
 
 SOLIDITY_RESERVED_WORDS = {
     "address",
@@ -162,6 +168,73 @@ class ModelConfig:
         }
         filtered = {k: v for k, v in d.items() if k in known_keys}
         return cls(**filtered)
+
+
+@dataclass(frozen=True)
+class TokenizationCacheConfig:
+    """Configuration for optional on-disk tokenized-example caching."""
+
+    enabled: bool = False
+    cache_dir: Optional[str] = None
+    overwrite: bool = False
+
+    @classmethod
+    def from_value(
+        cls, value: Optional[Union["TokenizationCacheConfig", str, Path, bool]]
+    ) -> "TokenizationCacheConfig":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, (str, Path)):
+            return cls(enabled=True, cache_dir=str(value))
+        if isinstance(value, bool):
+            return cls(enabled=value)
+        raise TypeError(f"Unsupported tokenization cache config: {type(value)!r}")
+
+    def resolved_cache_dir(self, data_path: str) -> Optional[Path]:
+        if not self.enabled:
+            return None
+        if self.cache_dir:
+            return Path(self.cache_dir)
+        return Path(data_path).parent / ".tokenized_cache"
+
+
+@dataclass
+class TrainingInstrumentationConfig:
+    """Optional throughput metrics and bounded torch profiler settings."""
+
+    enable_throughput_metrics: bool = False
+    throughput_summary_path: Optional[str] = None
+    throughput_csv_path: Optional[str] = None
+    enable_torch_profiler: bool = False
+    profiler_trace_dir: Optional[str] = None
+    profiler_wait_steps: int = 1
+    profiler_warmup_steps: int = 1
+    profiler_active_steps: int = 3
+    profiler_repeat: int = 1
+    profiler_record_shapes: bool = False
+    profiler_profile_memory: bool = False
+    profiler_with_stack: bool = False
+    max_throughput_records: int = 1000
+
+    @classmethod
+    def from_value(
+        cls, value: Optional[Union["TrainingInstrumentationConfig", Dict[str, Any], bool]]
+    ) -> "TrainingInstrumentationConfig":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, MappingABC):
+            return cls(**dict(value))
+        if isinstance(value, bool):
+            return cls(enable_throughput_metrics=value)
+        raise TypeError(f"Unsupported training instrumentation config: {type(value)!r}")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.enable_throughput_metrics or self.enable_torch_profiler)
 
 
 def _metadata_text(value) -> Optional[str]:
@@ -286,10 +359,126 @@ def _tokenize_to_ids(tokenizer, text: str) -> List[int]:
         padding=False,
         return_tensors=None,
     )
-    input_ids = tokenized["input_ids"] if isinstance(tokenized, dict) else tokenized
+    if hasattr(tokenized, "input_ids"):
+        input_ids = tokenized.input_ids
+    elif isinstance(tokenized, MappingABC) or (
+        hasattr(tokenized, "__contains__") and "input_ids" in tokenized
+    ):
+        input_ids = tokenized["input_ids"]
+    else:
+        input_ids = tokenized
     if input_ids and isinstance(input_ids[0], list):
         input_ids = input_ids[0]
     return list(input_ids)
+
+
+def _sha256_file(path: Union[str, Path]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stable_json_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _tokenizer_vocab_fingerprint(tokenizer) -> Optional[str]:
+    vocab = None
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        try:
+            vocab = get_vocab()
+        except Exception:
+            vocab = None
+    if not isinstance(vocab, MappingABC):
+        vocab = getattr(tokenizer, "vocab", None)
+    if not isinstance(vocab, MappingABC):
+        return None
+
+    digest = hashlib.sha256()
+    for token, token_id in sorted(vocab.items(), key=lambda item: (str(item[0]), str(item[1]))):
+        digest.update(
+            json.dumps(
+                [str(token), token_id],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _safe_tokenizer_len(tokenizer) -> Optional[int]:
+    try:
+        return int(len(tokenizer))
+    except Exception:
+        value = getattr(tokenizer, "vocab_size", None)
+        try:
+            return int(value) if value is not None else None
+        except Exception:
+            return None
+
+
+def tokenizer_cache_identity(tokenizer) -> Dict[str, Any]:
+    """Return stable tokenizer identity fields for cache invalidation."""
+    tokenizer_name = (
+        getattr(tokenizer, "name_or_path", None)
+        or getattr(tokenizer, "_name_or_path", None)
+        or getattr(tokenizer, "model_name", None)
+    )
+    return {
+        "class": f"{tokenizer.__class__.__module__}.{tokenizer.__class__.__qualname__}",
+        "name_or_path": str(tokenizer_name) if tokenizer_name else None,
+        "vocab_size": _safe_tokenizer_len(tokenizer),
+        "vocab_sha256": _tokenizer_vocab_fingerprint(tokenizer),
+        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+        "unk_token_id": getattr(tokenizer, "unk_token_id", None),
+        "model_max_length": getattr(tokenizer, "model_max_length", None),
+    }
+
+
+def _local_rank_from_env() -> Optional[int]:
+    raw_rank = os.environ.get("LOCAL_RANK")
+    if raw_rank in (None, ""):
+        return None
+    try:
+        return int(raw_rank)
+    except ValueError:
+        logger.warning("Ignoring invalid LOCAL_RANK value: %s", raw_rank)
+        return None
+
+
+def resolve_model_device_placement(
+    use_quantization: bool,
+    has_cuda: Optional[bool] = None,
+) -> Tuple[Optional[Union[str, Dict[str, int]]], Optional[torch.device], Optional[int]]:
+    """Resolve load-time device_map and optional post-load device for training."""
+    if has_cuda is None:
+        has_cuda = torch.cuda.is_available()
+    local_rank = _local_rank_from_env()
+
+    if not has_cuda:
+        return ("auto" if use_quantization else None), None, local_rank
+
+    if use_quantization:
+        return {"": local_rank if local_rank is not None else 0}, None, local_rank
+
+    if local_rank is not None:
+        return None, torch.device("cuda", local_rank), local_rank
+
+    return "auto", None, None
 
 
 def detect_max_sequence_length(
@@ -382,6 +571,9 @@ class SmartContractDataset(Dataset):
         template_format: str = "alpaca",
         augment_names: bool = False,
         include_compiler_metadata: bool = True,
+        tokenization_cache: Optional[
+            Union[TokenizationCacheConfig, str, Path, bool]
+        ] = None,
     ):
         """Initialize the dataset with training data.
 
@@ -393,6 +585,8 @@ class SmartContractDataset(Dataset):
             augment_names: Whether to deterministically augment target variable names.
             include_compiler_metadata: Whether compiler settings in metadata are
                 included in the prompt header.
+            tokenization_cache: Optional cache config/path. Disabled by default
+                to preserve existing lazy tokenization behavior.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -401,6 +595,13 @@ class SmartContractDataset(Dataset):
         self.include_compiler_metadata = include_compiler_metadata
         self.AUGMENT_RATE = 0.3
         self.data = self._load_data(data_path)
+        self._tokenized_cache: Optional[List[Dict[str, List[Any]]]] = None
+
+        cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
+        if cache_config.enabled:
+            self._tokenized_cache = self._load_or_build_tokenization_cache(
+                data_path, cache_config
+            )
 
     def _load_data(self, data_path: str) -> List[Dict]:
         """Load dataset from JSONL file."""
@@ -412,6 +613,122 @@ class SmartContractDataset(Dataset):
                     item = json.loads(line)
                     data.append(item)
         return data
+
+    def _cache_metadata(self, data_path: str) -> Dict[str, Any]:
+        return {
+            "cache_version": TOKENIZATION_CACHE_VERSION,
+            "dataset_fingerprint": _sha256_file(data_path),
+            "tokenizer": tokenizer_cache_identity(self.tokenizer),
+            "template_format": self.template_format,
+            "include_compiler_metadata": bool(self.include_compiler_metadata),
+            "augment_names": bool(self.augment_names),
+            "max_length": int(self.max_length),
+            "num_examples": len(self.data),
+        }
+
+    def _cache_paths(
+        self, data_path: str, cache_dir: Path, metadata: Dict[str, Any]
+    ) -> Tuple[Path, Path]:
+        cache_key = _stable_json_hash(metadata)
+        safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(data_path).stem)[:80]
+        safe_stem = safe_stem or "dataset"
+        cache_path = cache_dir / f"{safe_stem}-{cache_key[:32]}.jsonl"
+        metadata_path = cache_dir / f"{safe_stem}-{cache_key[:32]}.meta.json"
+        return cache_path, metadata_path
+
+    def _load_or_build_tokenization_cache(
+        self, data_path: str, cache_config: TokenizationCacheConfig
+    ) -> List[Dict[str, List[Any]]]:
+        cache_dir = cache_config.resolved_cache_dir(data_path)
+        if cache_dir is None:
+            return [self._tokenize_item(idx) for idx in range(len(self.data))]
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        expected_metadata = self._cache_metadata(data_path)
+        cache_path, metadata_path = self._cache_paths(
+            data_path, cache_dir, expected_metadata
+        )
+
+        if not cache_config.overwrite:
+            cached = self._read_tokenization_cache(
+                cache_path, metadata_path, expected_metadata
+            )
+            if cached is not None:
+                logger.info("Loaded tokenized dataset cache from %s", cache_path)
+                return cached
+
+        tokenized_examples = [self._tokenize_item(idx) for idx in range(len(self.data))]
+        self._write_tokenization_cache(
+            cache_path, metadata_path, expected_metadata, tokenized_examples
+        )
+        logger.info("Wrote tokenized dataset cache to %s", cache_path)
+        return tokenized_examples
+
+    def _read_tokenization_cache(
+        self,
+        cache_path: Path,
+        metadata_path: Path,
+        expected_metadata: Dict[str, Any],
+    ) -> Optional[List[Dict[str, List[Any]]]]:
+        if not cache_path.exists() or not metadata_path.exists():
+            return None
+        try:
+            with open(metadata_path, "r") as f:
+                cached_metadata = json.load(f)
+            if cached_metadata != expected_metadata:
+                return None
+
+            examples = []
+            with open(cache_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    if not {"input_ids", "attention_mask", "labels"} <= set(item):
+                        return None
+                    examples.append(
+                        {
+                            "input_ids": list(item["input_ids"]),
+                            "attention_mask": list(item["attention_mask"]),
+                            "labels": list(item["labels"]),
+                        }
+                    )
+
+            if len(examples) != len(self.data):
+                return None
+            return examples
+        except Exception as e:
+            logger.warning("Could not read tokenized dataset cache %s: %s", cache_path, e)
+            return None
+
+    def _write_tokenization_cache(
+        self,
+        cache_path: Path,
+        metadata_path: Path,
+        metadata: Dict[str, Any],
+        examples: List[Dict[str, List[Any]]],
+    ) -> None:
+        rank = os.environ.get("LOCAL_RANK", "main")
+        suffix = f".{os.getpid()}.{rank}.partial"
+        cache_tmp_path = cache_path.with_name(cache_path.name + suffix)
+        metadata_tmp_path = metadata_path.with_name(metadata_path.name + suffix)
+        try:
+            with open(cache_tmp_path, "w") as f:
+                for example in examples:
+                    f.write(json.dumps(example, separators=(",", ":")) + "\n")
+            os.replace(cache_tmp_path, cache_path)
+
+            with open(metadata_tmp_path, "w") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+            os.replace(metadata_tmp_path, metadata_path)
+        finally:
+            for partial_path in (cache_tmp_path, metadata_tmp_path):
+                try:
+                    if partial_path.exists():
+                        partial_path.unlink()
+                except OSError:
+                    pass
 
     def _format_prompt(
         self, tac_input: str, solidity_output: str, metadata: Dict
@@ -492,6 +809,16 @@ class SmartContractDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        tokenized_cache = getattr(self, "_tokenized_cache", None)
+        if tokenized_cache is not None:
+            return {
+                "input_ids": list(tokenized_cache[idx]["input_ids"]),
+                "attention_mask": list(tokenized_cache[idx]["attention_mask"]),
+                "labels": list(tokenized_cache[idx]["labels"]),
+            }
+        return self._tokenize_item(idx)
+
+    def _tokenize_item(self, idx: int) -> Dict[str, List[Any]]:
         """Get a single training example with dynamic-length tokenization."""
         item = self.data[idx]
         output = item["output"]
@@ -582,6 +909,182 @@ class MemoryLoggingCallback(TrainerCallback):
             self.logger.debug("Memory logging failed: %s", e)
 
 
+class TrainingInstrumentationCallback(TrainerCallback):
+    """Opt-in throughput summary and bounded torch profiler integration."""
+
+    def __init__(
+        self,
+        config: TrainingInstrumentationConfig,
+        output_dir: Union[str, Path],
+        train_dataset_size: Optional[int] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self.config = config
+        self.output_dir = Path(output_dir)
+        self.train_dataset_size = train_dataset_size
+        self.logger = logger or logging.getLogger(__name__)
+        self._start_time: Optional[float] = None
+        self._last_step = 0
+        self._records: List[Dict[str, Any]] = []
+        self._profiler = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not self.config.enabled:
+            return
+        self._start_time = time.perf_counter()
+        if self.config.enable_torch_profiler:
+            self._start_profiler()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._profiler is not None:
+            try:
+                self._profiler.step()
+            except Exception as e:
+                self.logger.warning("Torch profiler step failed: %s", e)
+
+        if not self.config.enable_throughput_metrics or self._start_time is None:
+            return
+
+        step = int(getattr(state, "global_step", 0) or 0)
+        if step <= self._last_step:
+            step = self._last_step + 1
+        self._last_step = step
+
+        if len(self._records) >= max(0, self.config.max_throughput_records):
+            return
+
+        elapsed = max(time.perf_counter() - self._start_time, 1e-9)
+        tokens_seen = getattr(state, "num_input_tokens_seen", None)
+        record = {
+            "step": step,
+            "elapsed_seconds": elapsed,
+            "steps_per_second": step / elapsed,
+            "estimated_samples_per_second": (
+                step * self._examples_per_step(args) / elapsed
+            ),
+            "input_tokens_per_second": (
+                float(tokens_seen) / elapsed if tokens_seen is not None else None
+            ),
+        }
+        self._records.append(record)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._profiler is not None:
+            try:
+                self._profiler.stop()
+            except Exception as e:
+                self.logger.warning("Torch profiler stop failed: %s", e)
+            finally:
+                self._profiler = None
+
+        if not self.config.enable_throughput_metrics or self._start_time is None:
+            return
+
+        summary = self._build_summary(args, state)
+        summary_path = self._summary_path()
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        self.logger.info("Wrote training throughput summary to %s", summary_path)
+
+        if self.config.throughput_csv_path:
+            csv_path = Path(self.config.throughput_csv_path)
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_csv(csv_path)
+
+    def _start_profiler(self) -> None:
+        try:
+            trace_dir = Path(self.config.profiler_trace_dir) if self.config.profiler_trace_dir else (
+                self.output_dir / "profiler_trace"
+            )
+            trace_dir.mkdir(parents=True, exist_ok=True)
+
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+            schedule = torch.profiler.schedule(
+                wait=max(0, self.config.profiler_wait_steps),
+                warmup=max(0, self.config.profiler_warmup_steps),
+                active=max(1, self.config.profiler_active_steps),
+                repeat=max(1, self.config.profiler_repeat),
+            )
+            self._profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+                record_shapes=self.config.profiler_record_shapes,
+                profile_memory=self.config.profiler_profile_memory,
+                with_stack=self.config.profiler_with_stack,
+            )
+            self._profiler.start()
+            self.logger.info("Torch profiler enabled; traces will be written to %s", trace_dir)
+        except Exception as e:
+            self._profiler = None
+            self.logger.warning("Could not start torch profiler: %s", e)
+
+    def _summary_path(self) -> Path:
+        if self.config.throughput_summary_path:
+            return Path(self.config.throughput_summary_path)
+        return self.output_dir / "training_throughput.json"
+
+    def _world_size(self, args) -> int:
+        value = getattr(args, "world_size", None) or os.environ.get("WORLD_SIZE") or 1
+        try:
+            return max(1, int(value))
+        except Exception:
+            return 1
+
+    def _examples_per_step(self, args) -> int:
+        per_device_batch = getattr(args, "per_device_train_batch_size", 1) or 1
+        grad_accum = getattr(args, "gradient_accumulation_steps", 1) or 1
+        return max(1, int(per_device_batch) * int(grad_accum) * self._world_size(args))
+
+    def _build_summary(self, args, state) -> Dict[str, Any]:
+        elapsed = max(time.perf_counter() - self._start_time, 1e-9)
+        steps = int(getattr(state, "global_step", 0) or self._last_step or 0)
+        examples_per_step = self._examples_per_step(args)
+        estimated_samples = steps * examples_per_step
+        tokens_seen = getattr(state, "num_input_tokens_seen", None)
+        return {
+            "elapsed_seconds": elapsed,
+            "steps": steps,
+            "steps_per_second": steps / elapsed if steps else 0.0,
+            "estimated_samples": estimated_samples,
+            "estimated_samples_per_second": (
+                estimated_samples / elapsed if estimated_samples else 0.0
+            ),
+            "input_tokens_seen": tokens_seen,
+            "input_tokens_per_second": (
+                float(tokens_seen) / elapsed if tokens_seen is not None else None
+            ),
+            "per_device_train_batch_size": getattr(
+                args, "per_device_train_batch_size", None
+            ),
+            "gradient_accumulation_steps": getattr(
+                args, "gradient_accumulation_steps", None
+            ),
+            "world_size": self._world_size(args),
+            "train_dataset_size": self.train_dataset_size,
+            "max_steps": getattr(state, "max_steps", None),
+            "records": self._records,
+        }
+
+    def _write_csv(self, csv_path: Path) -> None:
+        fieldnames = [
+            "step",
+            "elapsed_seconds",
+            "steps_per_second",
+            "estimated_samples_per_second",
+            "input_tokens_per_second",
+        ]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in self._records:
+                writer.writerow({field: record.get(field) for field in fieldnames})
+
+
 class SmartContractModelTrainer:
     """
     Main trainer class for fine-tuning Llama 3.2 3B on smart contract decompilation.
@@ -662,8 +1165,15 @@ class SmartContractModelTrainer:
                 bnb_4bit_quant_type="nf4",
             )
 
-        # Determine which GPU this process owns (for DDP / multi-GPU)
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device_map, post_load_device, local_rank = resolve_model_device_placement(
+            self.config.use_quantization,
+            has_cuda=has_cuda,
+        )
+        if has_cuda and local_rank is not None:
+            try:
+                torch.cuda.set_device(local_rank)
+            except Exception as e:
+                logger.warning("Could not set CUDA device to LOCAL_RANK=%s: %s", local_rank, e)
 
         # Load base model
         # Use SDPA (Scaled Dot-Product Attention) for fused attention kernels
@@ -685,16 +1195,17 @@ class SmartContractModelTrainer:
             load_kwargs["attn_implementation"] = attn_impl
         if quantization_config:
             load_kwargs["quantization_config"] = quantization_config
-            # Pin the quantized model to this process's GPU
-            load_kwargs["device_map"] = {"": local_rank} if has_cuda else "auto"
-        elif has_cuda:
-            load_kwargs["device_map"] = "auto"
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
         # For CPU without quantization, don't set device_map
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
             **load_kwargs,
         )
+
+        if post_load_device is not None:
+            self.model = self.model.to(post_load_device)
 
         if self.config.use_quantization:
             self.model = prepare_model_for_kbit_training(
@@ -745,6 +1256,7 @@ class SmartContractModelTrainer:
         logging_steps: int = 10,
         save_steps: int = 500,
         eval_steps: int = 500,
+        max_steps: int = -1,
         max_grad_norm: float = 1.0,
         do_eval: bool = True,
         train_dataset_size: int = 0,
@@ -769,7 +1281,7 @@ class SmartContractModelTrainer:
 
         # Scale warmup proportionally for small datasets
         steps_per_epoch = max(1, train_dataset_size // (batch_size * gradient_accumulation_steps))
-        total_steps = steps_per_epoch * num_epochs
+        total_steps = max_steps if max_steps and max_steps > 0 else steps_per_epoch * num_epochs
         if warmup_steps > total_steps // 2:
             warmup_steps = max(0, total_steps // 5)
             logger.info(f"Auto-adjusted warmup_steps to {warmup_steps}")
@@ -822,6 +1334,8 @@ class SmartContractModelTrainer:
             "logging_nan_inf_filter": True,
             "logging_first_step": True,
         }
+        if max_steps and max_steps > 0:
+            args["max_steps"] = max_steps
         if "group_by_length" in training_arg_params:
             args["group_by_length"] = True
 
@@ -862,10 +1376,23 @@ class SmartContractModelTrainer:
         resume_from_checkpoint: Optional[str] = None,
         deepspeed_config: Optional[str] = None,
         enable_memory_monitoring: bool = False,
+        max_steps: int = -1,
+        tokenization_cache: Optional[
+            Union[TokenizationCacheConfig, str, Path, bool]
+        ] = None,
+        instrumentation_config: Optional[
+            Union[TrainingInstrumentationConfig, Dict[str, Any], bool]
+        ] = None,
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
         tokenizer, peft_model = self.setup_model(
             use_deepspeed=deepspeed_config is not None
+        )
+        tokenization_cache_config = TokenizationCacheConfig.from_value(
+            tokenization_cache
+        )
+        instrumentation = TrainingInstrumentationConfig.from_value(
+            instrumentation_config
         )
 
         logger.info("Loading training dataset...")
@@ -874,6 +1401,7 @@ class SmartContractModelTrainer:
             tokenizer,
             max_length=self.config.max_sequence_length,
             include_compiler_metadata=self.config.include_compiler_metadata,
+            tokenization_cache=tokenization_cache_config,
         )
 
         eval_dataset = None
@@ -884,6 +1412,7 @@ class SmartContractModelTrainer:
                 tokenizer,
                 max_length=self.config.max_sequence_length,
                 include_compiler_metadata=self.config.include_compiler_metadata,
+                tokenization_cache=tokenization_cache_config,
             )
             if len(eval_dataset) == 0:
                 logger.warning("Evaluation dataset is empty; disabling evaluation")
@@ -931,6 +1460,7 @@ class SmartContractModelTrainer:
             do_eval=do_eval,
             train_dataset_size=len(train_dataset),
             deepspeed_config=deepspeed_config,
+            max_steps=max_steps,
         )
 
         callbacks = []
@@ -943,6 +1473,15 @@ class SmartContractModelTrainer:
             )
         if enable_memory_monitoring:
             callbacks.append(MemoryLoggingCallback(self.logger))
+        if instrumentation.enabled:
+            callbacks.append(
+                TrainingInstrumentationCallback(
+                    instrumentation,
+                    output_dir=self.output_dir,
+                    train_dataset_size=len(train_dataset),
+                    logger=self.logger,
+                )
+            )
 
         trainer = Trainer(
             model=peft_model,
@@ -956,10 +1495,12 @@ class SmartContractModelTrainer:
         logger.info(
             f"Starting training on {len(train_dataset)} examples for {num_epochs} epochs..."
         )
+        if max_steps and max_steps > 0:
+            logger.info("Training is capped at max_steps=%d", max_steps)
         if resume_from_checkpoint:
-            trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+            train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         else:
-            trainer.train()
+            train_output = trainer.train()
 
         final_model_path = self.output_dir / "final_model"
         trainer.save_model(str(final_model_path))
@@ -969,6 +1510,10 @@ class SmartContractModelTrainer:
         config_path = final_model_path / "model_config.json"
         with open(config_path, "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
+
+        metrics_path = final_model_path / "training_metrics.json"
+        with open(metrics_path, "w") as f:
+            json.dump(train_output.metrics, f, indent=2)
 
         logger.info(f"Training completed. Model saved to {final_model_path}")
         return str(final_model_path)

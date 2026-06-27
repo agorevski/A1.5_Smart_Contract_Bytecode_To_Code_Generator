@@ -61,6 +61,7 @@ SELFDESTRUCT_BYTECODE = "0x6000ff"
 # E2E: Bytecode Analysis → Feature Extraction
 # ---------------------------------------------------------------------------
 
+
 class TestE2EBytecodeToFeatures:
     def test_bytecode_to_tac_and_features(self):
         """Full pipeline: bytecode → TAC + opcode features."""
@@ -71,9 +72,7 @@ class TestE2EBytecodeToFeatures:
 
         # Step 2: Extract opcode features from same bytecode
         extractor = OpcodeFeatureExtractor()
-        features = extractor.extract_features(
-            OWNER_CONTRACT_BYTECODE.replace("0x", "")
-        )
+        features = extractor.extract_features(OWNER_CONTRACT_BYTECODE.replace("0x", ""))
         assert features.total_opcodes > 0
         assert len(features.normalized_frequencies) > 0
 
@@ -90,14 +89,13 @@ class TestE2EBytecodeToFeatures:
 # E2E: Classification → Vulnerability Detection
 # ---------------------------------------------------------------------------
 
+
 class TestE2EClassificationToVulnerability:
     def test_classify_then_scan(self):
         """Classify contract, then scan for vulnerabilities."""
         # Step 1: Classify
         classifier = MaliciousContractClassifier()
-        cls_result = classifier.classify_from_bytecode(
-            MINIMAL_BYTECODE.replace("0x", "")
-        )
+        cls_result = classifier.classify_from_bytecode(MINIMAL_BYTECODE.replace("0x", ""))
         assert isinstance(cls_result.is_malicious, bool)
 
         # Step 2: Scan for vulnerabilities
@@ -108,14 +106,13 @@ class TestE2EClassificationToVulnerability:
     def test_selfdestruct_detection_chain(self):
         """Detect SELFDESTRUCT in both classifier and vulnerability scanner."""
         classifier = MaliciousContractClassifier()
-        cls_result = classifier.classify_from_bytecode(
-            SELFDESTRUCT_BYTECODE.replace("0x", "")
-        )
+        cls_result = classifier.classify_from_bytecode(SELFDESTRUCT_BYTECODE.replace("0x", ""))
 
         detector = VulnerabilityDetector()
         vuln_report = detector.scan_from_bytecode(SELFDESTRUCT_BYTECODE)
         sd_results = [
-            v for v in vuln_report.vulnerabilities
+            v
+            for v in vuln_report.vulnerabilities
             if v.vulnerability_type == VulnerabilityType.SELFDESTRUCT
         ]
         assert len(sd_results) == 1
@@ -124,6 +121,7 @@ class TestE2EClassificationToVulnerability:
 # ---------------------------------------------------------------------------
 # E2E: Full Audit Report
 # ---------------------------------------------------------------------------
+
 
 class TestE2EAuditReport:
     def test_full_audit_report(self):
@@ -135,9 +133,7 @@ class TestE2EAuditReport:
             malicious_classifier=classifier,
         )
 
-        report = generator.generate_report(
-            OWNER_CONTRACT_BYTECODE, "0xTestAddr"
-        )
+        report = generator.generate_report(OWNER_CONTRACT_BYTECODE, "0xTestAddr")
 
         assert isinstance(report, AuditReport)
         assert report.contract_address == "0xTestAddr"
@@ -166,15 +162,18 @@ class TestE2EAuditReport:
 # E2E: Pipeline Orchestrator
 # ---------------------------------------------------------------------------
 
+
 class TestE2EPipelineOrchestrator:
     def test_full_pipeline(self):
         """Run complete pipeline orchestrator."""
-        config = PipelineConfig(stages=[
-            PipelineStage.CLASSIFY,
-            PipelineStage.DECOMPILE,
-            PipelineStage.DETECT_VULNERABILITIES,
-            PipelineStage.AUDIT_REPORT,
-        ])
+        config = PipelineConfig(
+            stages=[
+                PipelineStage.CLASSIFY,
+                PipelineStage.DECOMPILE,
+                PipelineStage.DETECT_VULNERABILITIES,
+                PipelineStage.AUDIT_REPORT,
+            ]
+        )
         orch = PipelineOrchestrator(config)
         result = orch.analyze(OWNER_CONTRACT_BYTECODE, "0xTest")
 
@@ -192,15 +191,19 @@ class TestE2EPipelineOrchestrator:
         config = PipelineConfig(stages=[PipelineStage.DECOMPILE])
         orch = PipelineOrchestrator(config)
         result = orch.analyze(MINIMAL_BYTECODE)
-        assert result.decompiled_source is not None
+        assert result.tac is not None
+        assert result.decompiled_source is None
+        assert result.decompilation_status == "tac_only_no_model"
         assert "decompile" in result.stages_completed
 
     def test_pipeline_batch(self):
         """Batch analysis through orchestrator."""
-        config = PipelineConfig(stages=[
-            PipelineStage.CLASSIFY,
-            PipelineStage.DETECT_VULNERABILITIES,
-        ])
+        config = PipelineConfig(
+            stages=[
+                PipelineStage.CLASSIFY,
+                PipelineStage.DETECT_VULNERABILITIES,
+            ]
+        )
         orch = PipelineOrchestrator(config)
         results = orch.analyze_batch(
             [MINIMAL_BYTECODE, SELFDESTRUCT_BYTECODE],
@@ -214,6 +217,7 @@ class TestE2EPipelineOrchestrator:
 # ---------------------------------------------------------------------------
 # E2E: Cross-Module Consistency
 # ---------------------------------------------------------------------------
+
 
 class TestE2ECrossModuleConsistency:
     def test_bytecode_analyzer_and_features_agree(self):
@@ -245,21 +249,18 @@ class TestE2ECrossModuleConsistency:
 
     def test_pipeline_result_matches_individual_scans(self):
         """Pipeline results should be consistent with individual module runs."""
-        config = PipelineConfig(stages=[
-            PipelineStage.CLASSIFY,
-            PipelineStage.DETECT_VULNERABILITIES,
-        ])
+        config = PipelineConfig(
+            stages=[
+                PipelineStage.CLASSIFY,
+                PipelineStage.DETECT_VULNERABILITIES,
+            ]
+        )
         orch = PipelineOrchestrator(config)
         pipeline_result = orch.analyze(MINIMAL_BYTECODE)
 
         # Individual classification
         classifier = MaliciousContractClassifier()
-        individual_cls = classifier.classify_from_bytecode(
-            MINIMAL_BYTECODE.replace("0x", "")
-        )
+        individual_cls = classifier.classify_from_bytecode(MINIMAL_BYTECODE.replace("0x", ""))
 
         if pipeline_result.classification_result is not None:
-            assert (
-                pipeline_result.classification_result.is_malicious
-                == individual_cls.is_malicious
-            )
+            assert pipeline_result.classification_result.is_malicious == individual_cls.is_malicious

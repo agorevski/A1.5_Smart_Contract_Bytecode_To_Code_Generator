@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 class PipelineStage(Enum):
     """Available pipeline stages."""
+
     DECOMPILE = "decompile"
     CLASSIFY = "classify"
     DETECT_VULNERABILITIES = "detect_vulnerabilities"
@@ -31,12 +32,15 @@ class PipelineStage(Enum):
 @dataclass
 class PipelineConfig:
     """Configuration for the analysis pipeline."""
-    stages: List[PipelineStage] = field(default_factory=lambda: [
-        PipelineStage.CLASSIFY,
-        PipelineStage.DECOMPILE,
-        PipelineStage.DETECT_VULNERABILITIES,
-        PipelineStage.AUDIT_REPORT,
-    ])
+
+    stages: List[PipelineStage] = field(
+        default_factory=lambda: [
+            PipelineStage.CLASSIFY,
+            PipelineStage.DECOMPILE,
+            PipelineStage.DETECT_VULNERABILITIES,
+            PipelineStage.AUDIT_REPORT,
+        ]
+    )
     decompiler_model_path: Optional[str] = None
     vulnerability_model_path: Optional[str] = None
     classifier_model_path: Optional[str] = None
@@ -47,6 +51,7 @@ class PipelineConfig:
 @dataclass
 class PipelineResult:
     """Complete result from the pipeline."""
+
     contract_address: str = ""
     bytecode: str = ""
     stages_completed: List[str] = field(default_factory=list)
@@ -54,6 +59,11 @@ class PipelineResult:
 
     # Stage outputs
     decompiled_source: Optional[str] = None
+    tac: Optional[str] = None
+    tac_per_function: Dict[str, str] = field(default_factory=dict)
+    decompiled_functions: Dict[str, str] = field(default_factory=dict)
+    function_errors: Dict[str, str] = field(default_factory=dict)
+    decompilation_status: Optional[str] = None
     classification_result: Optional[Any] = None
     vulnerability_report: Optional[Any] = None
     audit_report: Optional[Any] = None
@@ -74,6 +84,16 @@ class PipelineResult:
         }
         if self.decompiled_source:
             result["decompiled_source_preview"] = self.decompiled_source[:500]
+        if self.tac:
+            result["tac_preview"] = self.tac[:500]
+        if self.tac_per_function:
+            result["tac_per_function"] = self.tac_per_function
+        if self.decompiled_functions:
+            result["decompiled_functions"] = self.decompiled_functions
+        if self.function_errors:
+            result["function_errors"] = self.function_errors
+        if self.decompilation_status:
+            result["decompilation_status"] = self.decompilation_status
         if self.classification_result:
             result["classification"] = {
                 "is_malicious": self.classification_result.is_malicious,
@@ -113,19 +133,27 @@ class PipelineOrchestrator:
 
         if PipelineStage.CLASSIFY in stages:
             from .malicious_classifier import MaliciousContractClassifier
+
             self._classifier = MaliciousContractClassifier(
                 model_path=self.config.classifier_model_path
             )
 
         if PipelineStage.DETECT_VULNERABILITIES in stages:
             from .vulnerability_detector import VulnerabilityDetector
+
             self._vulnerability_detector = VulnerabilityDetector(
                 use_llm=self.config.use_llm_for_vulnerability,
                 model_path=self.config.vulnerability_model_path,
             )
 
+        if PipelineStage.DECOMPILE in stages and self.config.decompiler_model_path:
+            from .model_setup import SmartContractDecompiler
+
+            self._decompiler = SmartContractDecompiler(self.config.decompiler_model_path)
+
         if PipelineStage.AUDIT_REPORT in stages:
             from .audit_report import AuditReportGenerator
+
             self._report_generator = AuditReportGenerator(
                 decompiler=self._decompiler,
                 vulnerability_detector=self._vulnerability_detector,
@@ -203,12 +231,42 @@ class PipelineOrchestrator:
     def _run_decompilation(self, bytecode: str, result: PipelineResult) -> None:
         """Run bytecode decompilation."""
         if result.metadata.get("decompilation_skipped"):
+            result.decompilation_status = "skipped_malicious"
             return
 
-        from .bytecode_analyzer import analyze_bytecode_to_tac
-        tac = analyze_bytecode_to_tac(bytecode)
-        result.decompiled_source = tac
-        result.metadata["tac_length"] = len(tac)
+        from .bytecode_analyzer import BytecodeAnalyzer
+
+        if self._decompiler is None:
+            analyzer = BytecodeAnalyzer(bytecode)
+            func_tac = analyzer.generate_per_function_tac()
+            if func_tac:
+                tac = "\n\n".join(func_tac.values())
+            else:
+                tac = analyzer.generate_tac_representation()
+            result.tac = tac
+            result.tac_per_function = func_tac
+            result.decompiled_source = None
+            result.decompilation_status = "tac_only_no_model"
+            result.metadata["decompilation_status"] = result.decompilation_status
+            result.metadata["decompilation_warning"] = (
+                "No decompiler_model_path configured; generated TAC only."
+            )
+            result.metadata["tac_length"] = len(tac)
+            return
+
+        decompile_result = self._decompiler.decompile_contract(bytecode)
+        result.decompiled_source = decompile_result.get("solidity")
+        result.decompiled_functions = decompile_result.get("functions", {})
+        result.tac_per_function = decompile_result.get("tac_per_function", {})
+        result.tac = "\n\n".join(result.tac_per_function.values())
+        analysis = decompile_result.get("analysis", {})
+        result.function_errors = analysis.get("function_errors", {})
+        result.decompilation_status = (
+            "partial_error" if result.function_errors else "model_generated"
+        )
+        result.metadata["decompilation_status"] = result.decompilation_status
+        result.metadata["decompilation_analysis"] = analysis
+        result.metadata["tac_length"] = len(result.tac or "")
 
     def _run_vulnerability_detection(
         self, bytecode: str, contract_address: str, result: PipelineResult
@@ -245,7 +303,4 @@ class PipelineOrchestrator:
         """Analyze multiple contracts."""
         if addresses is None:
             addresses = [""] * len(bytecodes)
-        return [
-            self.analyze(bc, addr)
-            for bc, addr in zip(bytecodes, addresses)
-        ]
+        return [self.analyze(bc, addr) for bc, addr in zip(bytecodes, addresses)]
