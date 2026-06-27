@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import inspect
+import re
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,66 @@ import numpy as np
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+SOLIDITY_RESERVED_WORDS = {
+    "address",
+    "bool",
+    "bytes",
+    "calldata",
+    "contract",
+    "emit",
+    "event",
+    "external",
+    "false",
+    "function",
+    "if",
+    "indexed",
+    "internal",
+    "mapping",
+    "memory",
+    "msg",
+    "payable",
+    "private",
+    "public",
+    "pure",
+    "require",
+    "return",
+    "returns",
+    "sender",
+    "storage",
+    "string",
+    "struct",
+    "true",
+    "uint",
+    "uint256",
+    "view",
+}
+
+
+def augment_variable_names(solidity_code: str, seed: Optional[int] = None) -> str:
+    """Replace declared local variable names with deterministic generic names."""
+    if not solidity_code or not solidity_code.strip():
+        return solidity_code
+
+    declaration_re = re.compile(
+        r"\b(?:u?int(?:\d+)?|address|bool|string|bytes(?:\d+)?)"
+        r"\s+(?:memory|storage|calldata\s+)?([A-Za-z_][A-Za-z0-9_]*)\b"
+    )
+    replacements: Dict[str, str] = {}
+    for match in declaration_re.finditer(solidity_code):
+        name = match.group(1)
+        if name in SOLIDITY_RESERVED_WORDS or name in replacements:
+            continue
+        replacements[name] = f"var_{len(replacements) + 1}"
+
+    if not replacements:
+        return solidity_code
+
+    def replace_identifier(match: re.Match) -> str:
+        token = match.group(0)
+        return replacements.get(token, token)
+
+    return re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", replace_identifier, solidity_code)
 
 
 @dataclass
@@ -112,6 +173,7 @@ class SmartContractDataset(Dataset):
         tokenizer: AutoTokenizer,
         max_length: int = 2048,
         template_format: str = "alpaca",
+        augment_names: bool = False,
     ):
         """Initialize the dataset with training data.
 
@@ -120,10 +182,13 @@ class SmartContractDataset(Dataset):
             tokenizer: Pre-initialized tokenizer for encoding text.
             max_length: Maximum sequence length for tokenization.
             template_format: Prompt template format ('alpaca' or 'simple').
+            augment_names: Whether to deterministically augment target variable names.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.template_format = template_format
+        self.augment_names = augment_names
+        self.AUGMENT_RATE = 0.3
         self.data = self._load_data(data_path)
 
     def _load_data(self, data_path: str) -> List[Dict]:
@@ -141,6 +206,15 @@ class SmartContractDataset(Dataset):
         self, tac_input: str, solidity_output: str, metadata: Dict
     ) -> str:
         """Format the training example using the template described in the paper."""
+        prefix, target, suffix = self._format_prompt_parts(
+            tac_input, solidity_output, metadata
+        )
+        return f"{prefix}{target}{suffix}"
+
+    def _format_prompt_parts(
+        self, tac_input: str, solidity_output: str, metadata: Dict
+    ) -> Tuple[str, str, str]:
+        """Format an example and expose the response span for label masking."""
         if self.template_format == "alpaca":
             instruction = "Convert the following Three-Address Code (TAC) representation to readable Solidity code."
 
@@ -159,28 +233,31 @@ class SmartContractDataset(Dataset):
                 if metadata_parts:
                     metadata_str = f"{', '.join(metadata_parts)}\n\n"
 
-            prompt = f"""### Instruction:
+            prefix = f"""### Instruction:
 {instruction}
 
 ### Input:
 {metadata_str}{tac_input.strip()}
 
 ### Response:
-{solidity_output.strip()}"""
+"""
+            target = solidity_output.strip()
+            suffix = ""
 
         elif self.template_format == "simple":
-            prompt = f"""[TAC]
+            prefix = f"""[TAC]
 {tac_input.strip()}
 [/TAC]
 
 [SOLIDITY]
-{solidity_output.strip()}
-[/SOLIDITY]"""
+"""
+            target = solidity_output.strip()
+            suffix = "\n[/SOLIDITY]"
 
         else:
             raise ValueError(f"Unknown template format: {self.template_format}")
 
-        return prompt
+        return prefix, target, suffix
 
     def __len__(self) -> int:
         return len(self.data)
@@ -188,10 +265,14 @@ class SmartContractDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a single training example with dynamic-length tokenization."""
         item = self.data[idx]
+        output = item["output"]
+        if self.augment_names and (idx % 10) < int(self.AUGMENT_RATE * 10):
+            output = augment_variable_names(output, seed=idx)
 
-        prompt = self._format_prompt(
-            item["input"], item["output"], item.get("metadata", {})
+        prefix, target, suffix = self._format_prompt_parts(
+            item["input"], output, item.get("metadata", {})
         )
+        prompt = f"{prefix}{target}{suffix}"
 
         # Tokenize without padding — the data collator handles padding per batch
         tokenized = self.tokenizer(
@@ -202,8 +283,17 @@ class SmartContractDataset(Dataset):
             return_tensors=None,  # Return lists, not tensors
         )
 
-        # For causal LM, labels == input_ids
-        tokenized["labels"] = tokenized["input_ids"].copy()
+        prefix_tokenized = self.tokenizer(
+            prefix,
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors=None,
+        )
+        labels = tokenized["input_ids"].copy()
+        response_start = min(len(prefix_tokenized["input_ids"]), len(labels))
+        labels[:response_start] = [-100] * response_start
+        tokenized["labels"] = labels
 
         return tokenized
 
@@ -540,6 +630,7 @@ class SmartContractModelTrainer:
         batch_size: int = 4,
         learning_rate: float = 2e-4,
         num_epochs: int = 3,
+        gradient_accumulation_steps: int = 4,
         resume_from_checkpoint: Optional[str] = None,
         deepspeed_config: Optional[str] = None,
         enable_memory_monitoring: bool = False,
@@ -603,6 +694,7 @@ class SmartContractModelTrainer:
             batch_size=batch_size,
             learning_rate=learning_rate,
             num_epochs=num_epochs,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             do_eval=do_eval,
             train_dataset_size=len(train_dataset),
             deepspeed_config=deepspeed_config,

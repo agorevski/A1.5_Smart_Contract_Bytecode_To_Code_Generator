@@ -621,19 +621,34 @@ class SmartContractTrainingPipeline:
             for line in f:
                 data.append(json.loads(line.strip()))
         
-        # First split: separate test set
-        train_val_data, test_data = train_test_split(
-            data, 
-            test_size=1 - self.config.train_test_split,
-            random_state=42
+        test_ratio = 1.0 - self.config.train_test_split - self.config.validation_split
+        if self.config.train_test_split <= 0 or self.config.validation_split < 0 or test_ratio < 0:
+            raise ValueError("train_test_split and validation_split must leave a non-negative test split")
+
+        test_count = max(1, round(len(data) * test_ratio)) if test_ratio > 0 else 0
+        test_count = min(test_count, max(0, len(data) - 2))
+        if test_count:
+            train_val_data, test_data = train_test_split(
+                data,
+                test_size=test_count,
+                random_state=42,
+            )
+        else:
+            train_val_data, test_data = data, []
+
+        val_count = (
+            max(1, round(len(data) * self.config.validation_split))
+            if self.config.validation_split > 0 else 0
         )
-        
-        # Second split: separate validation set from training
-        train_data, val_data = train_test_split(
-            train_val_data,
-            test_size=self.config.validation_split,
-            random_state=42
-        )
+        val_count = min(val_count, max(0, len(train_val_data) - 1))
+        if val_count:
+            train_data, val_data = train_test_split(
+                train_val_data,
+                test_size=val_count,
+                random_state=42,
+            )
+        else:
+            train_data, val_data = train_val_data, []
         
         # Save splits
         data_dir = Path(self.config.data_dir)
@@ -669,7 +684,8 @@ class SmartContractTrainingPipeline:
             eval_dataset_path=val_path,
             batch_size=self.config.batch_size,
             learning_rate=self.config.learning_rate,
-            num_epochs=self.config.num_epochs
+            num_epochs=self.config.num_epochs,
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
         )
         
         logger.info(f"Model training completed. Model saved to {model_path}")

@@ -171,7 +171,15 @@ class AuditReportGenerator:
         # Step 3: Decompilation
         if include_decompilation and self.decompiler is not None:
             try:
-                decompiled = self.decompiler.decompile(bytecode)
+                if hasattr(self.decompiler, "decompile_contract"):
+                    decompile_result = self.decompiler.decompile_contract(bytecode)
+                    decompiled = (
+                        decompile_result.get("solidity", "")
+                        if isinstance(decompile_result, dict)
+                        else str(decompile_result)
+                    )
+                else:
+                    decompiled = self.decompiler.decompile(bytecode)
                 report.decompiled_source = decompiled
                 report.metadata["decompilation_success"] = True
 

@@ -157,19 +157,21 @@ def _version_matches_pragma(version: str, pragma: str) -> bool:
     if not parts:
         return False
 
-    # Split pragma into individual constraints
-    # Handle compound constraints like '>=0.7.0 <0.9.0'
-    constraints = re.findall(r"([><=^~!]*\s*\d+\.\d+\.\d+)", pragma)
-    if not constraints:
-        # Try simple version match
-        constraints = [pragma.strip()]
+    # Solidity pragmas can combine AND constraints within a clause and OR
+    # disjunctions across clauses, e.g. ">=0.5.0 <0.7.0 || ^0.8.0".
+    for clause in re.split(r"\s*\|\|\s*", pragma):
+        clause = clause.strip()
+        if not clause:
+            continue
 
-    for constraint in constraints:
-        constraint = constraint.strip()
-        if not _single_constraint_matches(parts, constraint):
-            return False
+        constraints = re.findall(r"([><=^~!]*\s*\d+\.\d+\.\d+)", clause)
+        if not constraints:
+            constraints = [clause]
 
-    return True
+        if all(_single_constraint_matches(parts, c.strip()) for c in constraints):
+            return True
+
+    return False
 
 
 def _single_constraint_matches(

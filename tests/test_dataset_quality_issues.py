@@ -1089,33 +1089,9 @@ class TestIssue10_NoFallbackPairs:
             assert not hasattr(builder, '_create_fallback_pair_called')
 
 # ---------------------------------------------------------------------------
-# Issue 11: Variable name augmentation (placeholder)
+# Issue 11: Variable name augmentation
 # ---------------------------------------------------------------------------
 
-def _model_setup_supports_name_augmentation():
-    """Return True when the model_setup-owned augmentation API is present."""
-    try:
-        import inspect
-        from src import model_setup
-
-        dataset_init = getattr(
-            getattr(model_setup, "SmartContractDataset", None),
-            "__init__",
-            None,
-        )
-        return (
-            callable(getattr(model_setup, "augment_variable_names", None))
-            and dataset_init is not None
-            and "augment_names" in inspect.signature(dataset_init).parameters
-        )
-    except Exception:
-        return False
-
-
-@pytest.mark.skipif(
-    not _model_setup_supports_name_augmentation(),
-    reason="model_setup name augmentation API is owned outside dataset-bytecode surface",
-)
 class TestIssue11_VariableNameAugmentation:
     """Variable name augmentation replaces user-defined names with generic ones."""
 

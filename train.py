@@ -189,6 +189,11 @@ def split_dataset(
     from sklearn.model_selection import train_test_split
 
     logger = logging.getLogger(__name__)
+    test_ratio = 1.0 - train_ratio - val_ratio
+    if train_ratio <= 0 or val_ratio < 0 or test_ratio < 0:
+        raise ValueError("train_ratio and val_ratio must leave a non-negative test split")
+    if train_ratio + val_ratio + test_ratio > 1.0 + 1e-9:
+        raise ValueError("train_ratio, val_ratio, and test_ratio must sum to 1.0")
 
     # Load data
     data = []
@@ -207,21 +212,29 @@ def split_dataset(
         val_data = data
         test_data = data
     else:
-        test_ratio = 1.0 - train_ratio
-        train_val, test_data = train_test_split(
-            data, test_size=max(test_ratio, 1 / len(data)), random_state=42
-        )
+        test_count = max(1, round(len(data) * test_ratio)) if test_ratio > 0 else 0
+        test_count = min(test_count, max(0, len(data) - 2))
+        if test_count:
+            train_val, test_data = train_test_split(
+                data, test_size=test_count, random_state=42
+            )
+        else:
+            train_val, test_data = data, []
 
         if len(train_val) < 2:
             train_data = train_val
             val_data = train_val
         else:
-            relative_val = val_ratio / (train_ratio + val_ratio)
-            train_data, val_data = train_test_split(
-                train_val,
-                test_size=max(relative_val, 1 / len(train_val)),
-                random_state=42,
-            )
+            val_count = max(1, round(len(data) * val_ratio)) if val_ratio > 0 else 0
+            val_count = min(val_count, len(train_val) - 1)
+            if val_count:
+                train_data, val_data = train_test_split(
+                    train_val,
+                    test_size=val_count,
+                    random_state=42,
+                )
+            else:
+                train_data, val_data = train_val, []
 
     out = Path(output_dir)
     out.mkdir(exist_ok=True)
@@ -255,6 +268,7 @@ def train_model(
     use_quantization: bool = True,
     deepspeed_config: str = None,
     enable_memory_monitoring: bool = False,
+    gradient_accumulation_steps: int = 4,
 ) -> str:
     """Fine-tune the model and return path to saved model."""
     # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
@@ -298,6 +312,7 @@ def train_model(
         resume_from_checkpoint=resume_from,
         deepspeed_config=deepspeed_config,
         enable_memory_monitoring=enable_memory_monitoring,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
 
     logger.info(f"Training complete. Model saved to {model_path}")
@@ -493,6 +508,12 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps",
+    )
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument(
         "--max-seq-length", type=int, default=2048, help="Max sequence length"
@@ -686,6 +707,7 @@ def main():
         use_quantization=use_quant,
         deepspeed_config=args.deepspeed,
         enable_memory_monitoring=args.enable_memory_monitoring,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     # ── Step 3: Evaluation ───────────────────────────────────────
