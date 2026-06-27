@@ -152,6 +152,15 @@ block_entry:
     assert "### Response:" in prompt
 
 
+def test_decompiler_inference_context_keeps_prompt_budget_above_training_sweep_length():
+    decompiler = SmartContractDecompiler.__new__(SmartContractDecompiler)
+    decompiler.tokenizer = FakeTokenizer()
+    decompiler.config = ModelConfig(max_sequence_length=256)
+
+    assert decompiler._context_window() >= 2048
+    assert decompiler._prompt_token_budget(max_new_tokens=1024) >= 1024
+
+
 def test_sanitize_tac_removes_oracle_annotations_but_keeps_bytecode_tac():
     tac = """// Compiler: solc 0.8.20
 // param[0] at 0x04: address to

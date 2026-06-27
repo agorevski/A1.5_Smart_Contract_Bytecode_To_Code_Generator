@@ -34,6 +34,7 @@
   const modelWarning = document.getElementById("model-warning");
   const modelWarningText = document.getElementById("model-warning-text");
   const functionMappingContent = document.getElementById("function-mapping-content");
+  const reconstructionContent = document.getElementById("reconstruction-content");
   const traceDiagnostics = document.getElementById("trace-diagnostics");
   const securityContent = document.getElementById("security-content");
   const btnVulnerabilityScan = document.getElementById("btn-vulnerability-scan");
@@ -69,6 +70,7 @@
   var completedFunctionCount = 0;
   var activeDecompileRequestId = 0;
   var activeDecompileController = null;
+  var activeServerJobId = null;
   var resultRevealTimer = null;
   var healthInfo = null;
   var lastDecompileResult = null;
@@ -163,17 +165,33 @@
   function finishDecompileRequest(requestId) {
     if (!isCurrentDecompileRequest(requestId)) return;
     activeDecompileController = null;
+    activeServerJobId = null;
     setLoading(false);
   }
 
   function abortActiveDecompile() {
     clearResultRevealTimer();
+    var jobId = activeServerJobId;
     if (activeDecompileController) {
       activeDecompileController.abort();
       activeDecompileController = null;
       activeDecompileRequestId += 1;
     }
+    if (jobId) {
+      fetch("/api/decompile/" + encodeURIComponent(jobId) + "/cancel", {
+        method: "POST",
+        headers: apiHeaders()
+      }).catch(function () {});
+    }
+    activeServerJobId = null;
     setLoading(false);
+  }
+
+  function newClientJobId() {
+    if (window.crypto && window.crypto.randomUUID) {
+      return window.crypto.randomUUID();
+    }
+    return "web-" + Date.now() + "-" + Math.random().toString(16).slice(2);
   }
 
   function updateProgress(pct, message) {
@@ -461,6 +479,42 @@
     progressLog.scrollTop = progressLog.scrollHeight;
   }
 
+  function addBatchLogEntry(batchIndex, status, elapsedSeconds, size) {
+    show(progressLog);
+    var id = "batch-" + batchIndex;
+    var existing = document.getElementById(id);
+    var text = "Batch " + batchIndex + " (" + size + " function" +
+      (size === 1 ? "" : "s") + ")";
+    var elapsed = elapsedSeconds != null ? Number(elapsedSeconds) * 1000 : undefined;
+    if (existing) {
+      existing.className = status;
+      var icon = existing.querySelector(".log-icon");
+      if (icon) icon.textContent = status === "completed" ? "✓" : "⟳";
+      var timeEl = existing.querySelector(".log-time");
+      if (timeEl && elapsed !== undefined) timeEl.textContent = formatElapsed(Math.round(elapsed));
+      return;
+    }
+    var li = document.createElement("li");
+    li.id = id;
+    li.className = status;
+    var iconSpan = document.createElement("span");
+    iconSpan.className = "log-icon";
+    iconSpan.textContent = status === "completed" ? "✓" : "⟳";
+    var nameSpan = document.createElement("span");
+    nameSpan.className = "log-name";
+    nameSpan.textContent = text;
+    li.appendChild(iconSpan);
+    li.appendChild(nameSpan);
+    if (elapsed !== undefined) {
+      var timeSpan = document.createElement("span");
+      timeSpan.className = "log-time";
+      timeSpan.textContent = formatElapsed(Math.round(elapsed));
+      li.appendChild(timeSpan);
+    }
+    progressLogList.appendChild(li);
+    progressLog.scrollTop = progressLog.scrollHeight;
+  }
+
   // ---- Source/confidence formatting helpers ----
 
   function getSourceClass(source) {
@@ -641,6 +695,18 @@
       html += card("ABI Functions", analysis.source_summary.abi_functions_used || 0);
       html += card("Validation Failed", analysis.source_summary.validation_failed || 0);
     }
+    if (analysis.reconstruction_strategy) {
+      html += card("Reconstruction", analysis.reconstruction_strategy, true);
+    }
+    if (analysis.semantic_chunk_count !== undefined) {
+      html += card("Semantic Chunks", analysis.semantic_chunk_count);
+    }
+    if (analysis.detected_interfaces && analysis.detected_interfaces.length) {
+      html += card("Interface Hints", analysis.detected_interfaces.join(", "), true);
+    }
+    if (analysis.proxy_like !== undefined) {
+      html += card("Proxy-like", analysis.proxy_like ? "yes" : "no");
+    }
     if (analysis.validation) {
       html += card(
         "Solidity Validation",
@@ -650,6 +716,18 @@
       );
       if (analysis.validation.scaffold_errors && analysis.validation.scaffold_errors.length) {
         html += card("Validation Errors", analysis.validation.scaffold_errors.join(", "), true);
+      }
+    }
+    if (analysis.quality) {
+      var q = analysis.quality;
+      html += card("Reconstruction Quality", qualitySummary(q), true);
+      html += card("Compiler Checked", q.compiler_checked ? "yes" : "no");
+      html += card("Deployable", q.deployable ? "yes" : "no");
+      if (q.selector_coverage != null) {
+        html += card("Selector Coverage", Math.round(Number(q.selector_coverage) * 100) + "%");
+      }
+      if (q.recommended_actions && q.recommended_actions.length) {
+        html += card("Recommended Actions", q.recommended_actions.join(" "), true);
       }
     }
     if (analysis.effective_generation_config) {
@@ -705,6 +783,28 @@
     return parts.join(", ") || "—";
   }
 
+  function qualitySummary(quality) {
+    if (!quality) return "—";
+    var parts = [];
+    if (quality.severity) parts.push(quality.severity);
+    if (quality.deployable === false) parts.push("non-deployable");
+    else if (quality.deployable === true) parts.push("deployable");
+    if (quality.compiler_checked === false) parts.push("unchecked");
+    if (quality.scaffold_only) parts.push("scaffold-only");
+    if (quality.score != null) parts.push("score " + Number(quality.score).toFixed(2));
+    return parts.join(", ") || "—";
+  }
+
+  function provenanceSummary(provenance) {
+    if (!provenance) return "—";
+    var parts = [];
+    if (provenance.build_id) parts.push("build " + provenance.build_id);
+    if (provenance.tac_hash) parts.push("tac " + String(provenance.tac_hash).slice(0, 10));
+    if (provenance.source_row_count != null) parts.push(provenance.source_row_count + " rows");
+    if (provenance.compiler_version) parts.push("solc " + provenance.compiler_version);
+    return parts.join(", ") || "lookup";
+  }
+
   function renderTraceDiagnostics(data) {
     if (!traceDiagnostics) return;
     var functionResults = data.function_results || [];
@@ -736,7 +836,78 @@
         escapeHtml((data.validation.valid ? "valid" : "invalid") +
           " via " + (data.validation.method || "unknown")) + "</div>";
     }
+    if (data.quality) {
+      html += '<div class="diagnostic-card"><div class="label">Quality</div>' +
+        escapeHtml(qualitySummary(data.quality)) + "</div>";
+    }
+    if (data.reconstruction) {
+      html += '<div class="diagnostic-card"><div class="label">Reconstruction</div>' +
+        escapeHtml((data.reconstruction.chunk_count || 0) + " semantic chunk(s), " +
+          (data.reconstruction.assembly && data.reconstruction.assembly.mode ||
+            "deterministic assembly")) + "</div>";
+    }
     traceDiagnostics.innerHTML = html;
+  }
+
+  function renderReconstruction(reconstruction) {
+    if (!reconstructionContent) return;
+    if (!reconstruction) {
+      reconstructionContent.innerHTML =
+        '<p class="text-muted">No reconstruction plan returned.</p>';
+      return;
+    }
+
+    var facts = reconstruction.contract_facts || {};
+    var proxy = facts.proxy || {};
+    var interfaces = facts.detected_interfaces || [];
+    var chunks = reconstruction.semantic_chunks || [];
+    var html = '<div class="reconstruction-summary">';
+    html += '<div class="analysis-card"><div class="label">Strategy</div><div class="value small">' +
+      escapeHtml(reconstruction.strategy || "semantic_function_chunks") + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Assembly</div><div class="value small">' +
+      escapeHtml((reconstruction.assembly && reconstruction.assembly.mode) ||
+        "deterministic_reconciliation") + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Chunks</div><div class="value">' +
+      escapeHtml(String(reconstruction.chunk_count || chunks.length || 0)) + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Selectors</div><div class="value small">' +
+      escapeHtml((facts.selectors || []).join(", ") || "none") + "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Interface Hints</div><div class="value small">' +
+      escapeHtml(interfaces.map(function (item) { return item.name; }).join(", ") || "none") +
+      "</div></div>";
+    html += '<div class="analysis-card"><div class="label">Proxy-like</div><div class="value small">' +
+      escapeHtml(proxy.is_proxy_like ? "yes" : "no") + "</div></div>";
+    html += "</div>";
+
+    if (chunks.length) {
+      html += '<table class="fn-map-table reconstruction-table"><thead><tr>' +
+        "<th>#</th><th>Chunk</th><th>Kind</th><th>Selector</th>" +
+        "<th>Blocks</th><th>Storage</th><th>Calls/Logs</th><th>Signature</th>" +
+        "</tr></thead><tbody>";
+      for (var i = 0; i < chunks.length; i++) {
+        var chunk = chunks[i];
+        var resolution = chunk.selector_resolution || {};
+        var storage = "r" + ((chunk.storage_reads || []).length || 0) +
+          " / w" + ((chunk.storage_writes || []).length || 0);
+        var effects = "calls " + (chunk.external_calls || 0) +
+          ", logs " + (chunk.logs || 0) +
+          ", reverts " + (chunk.reverts || 0);
+        html += "<tr>";
+        html += "<td>" + escapeHtml(String(chunk.index || i + 1)) + "</td>";
+        html += '<td class="fn-map-fname"><code>' + escapeHtml(chunk.name || "chunk") +
+          "</code></td>";
+        html += "<td>" + escapeHtml(chunk.kind || "semantic_region") + "</td>";
+        html += "<td><code>" + escapeHtml(chunk.selector || "—") + "</code></td>";
+        html += "<td>" + escapeHtml(String(chunk.basic_block_count || 0)) + "</td>";
+        html += "<td>" + escapeHtml(storage) + "</td>";
+        html += "<td>" + escapeHtml(effects) + "</td>";
+        html += '<td class="fn-map-sig"><code>' +
+          escapeHtml(resolution.signature || "—") + "</code></td>";
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+    }
+
+    reconstructionContent.innerHTML = html;
   }
 
   function renderFunctionMapping(selectorMap, functionResults) {
@@ -755,6 +926,8 @@
       "<th>Resolved Name</th>" +
       "<th>Confidence</th>" +
       "<th>Source</th>" +
+      "<th>Lookup Provenance</th>" +
+      "<th>Quality</th>" +
       "<th>Status</th>" +
       "<th>Elapsed</th>" +
       "<th>Diagnostics</th>" +
@@ -783,6 +956,8 @@
       var status = result.status || "unknown";
       var error = result.error || "";
       var diag = result.diagnostics || {};
+      var quality = result.quality || null;
+      var provenanceInfo = result.lookup_provenance || null;
       var abi = result.abi || (info.abi || null);
       var validation = result.validation || null;
 
@@ -809,6 +984,12 @@
       }
       html += '<td class="fn-map-source">' +
         escapeHtml(getSourceLabel(provenance) + " / " + selectorSource) + "</td>";
+      html += '<td class="fn-map-diagnostics">' +
+        '<span title="' + escapeHtml(JSON.stringify(provenanceInfo || {}, null, 2)) + '">' +
+        escapeHtml(provenanceSummary(provenanceInfo)) + "</span></td>";
+      html += '<td class="fn-map-diagnostics">' +
+        '<span title="' + escapeHtml(JSON.stringify(quality || {}, null, 2)) + '">' +
+        escapeHtml(qualitySummary(quality)) + "</span></td>";
       html += "<td>" + escapeHtml(status) +
         (validation && !validation.valid ? ' <span class="diag-badge truncated">invalid</span>' : "") +
         (abi ? ' <span class="diag-badge abi">ABI</span>' : "") + "</td>";
@@ -824,7 +1005,7 @@
 
       if (info.candidates && info.candidates.length > 1) {
         html +=
-          '<tr class="fn-map-alt"><td></td><td colspan="7">' +
+          '<tr class="fn-map-alt"><td></td><td colspan="9">' +
           escapeHtml((info.candidates.length - 1) + " alternate selector candidate(s) available") +
           "</td></tr>";
       }
@@ -1031,7 +1212,9 @@
     var html = '<div class="gpu-card">';
     html += '<div class="gpu-card-title"><span class="gpu-card-name">' +
       escapeHtml(ready ? "Model ready" : "TAC/lookup-only mode") + "</span></div>";
-    html += "<div>Model: " + escapeHtml(data.model_path || "not loaded") + "</div>";
+    html += "<div>Model: " + escapeHtml(
+      data.model_path || (data.model_loaded ? "loaded" : "not loaded")
+    ) + "</div>";
     if (data.model_error) {
       html += '<div class="gpu-warning">Load error: ' + escapeHtml(data.model_error) + "</div>";
     }
@@ -1074,6 +1257,7 @@
   function handleProgress(data) {
     var pct = data.percent || 0;
     var msg = data.message || "";
+    if (data.request_id) activeServerJobId = data.request_id;
 
     updateProgress(pct, msg);
 
@@ -1101,10 +1285,16 @@
           " function(s) found";
         show(progressFunctions);
         renderFunctionCount();
+        if (data.reconstruction) renderReconstruction(data.reconstruction);
         break;
 
       case "lookup":
         progressStage.textContent = "Checking TAC hash database…";
+        break;
+
+      case "chunking":
+        progressStage.textContent = "Stage 1: Building semantic chunks…";
+        if (data.reconstruction) renderReconstruction(data.reconstruction);
         break;
 
       case "function_resolved":
@@ -1147,8 +1337,27 @@
         functionStartTime = Date.now();
         break;
 
+      case "batch_start":
+        progressStage.textContent =
+          "Stage 2: Batch " + (data.batch_index || "?") + "/" +
+          (data.total_batches || "?") + " running (" +
+          (data.batch_size || 0) + " function(s))";
+        show(progressFunctions);
+        addBatchLogEntry(data.batch_index || 0, "in-progress", null, data.batch_size || 0);
+        break;
+
+      case "batch_done":
+        progressStage.textContent =
+          "Stage 2: Batch " + (data.batch_index || "?") + "/" +
+          (data.total_batches || "?") + " complete in " +
+          (data.elapsed_s != null ? Number(data.elapsed_s).toFixed(3) + "s" : "server time");
+        addBatchLogEntry(data.batch_index || 0, "completed", data.elapsed_s, data.batch_size || 0);
+        break;
+
       case "function_done":
-        var elapsed = functionStartTime ? Date.now() - functionStartTime : 0;
+        var elapsed = data.elapsed_s != null
+          ? Math.round(Number(data.elapsed_s) * 1000)
+          : (functionStartTime ? Date.now() - functionStartTime : 0);
         var status = data.source === "error" ? "error" : "completed";
         addLogEntry(
           data.current_function, status, elapsed,
@@ -1159,7 +1368,7 @@
         break;
 
       case "assembling":
-        progressStage.textContent = "Assembling final contract…";
+        progressStage.textContent = "Stage 3: Reconstructing full contract…";
         break;
     }
   }
@@ -1186,7 +1395,12 @@
       return;
     }
 
-    var requestBody = { bytecode: validation.bytecode, generation: generationConfig };
+    activeServerJobId = newClientJobId();
+    var requestBody = {
+      bytecode: validation.bytecode,
+      generation: generationConfig,
+      client_job_id: activeServerJobId
+    };
     if (userMetadata.abi) requestBody.abi = userMetadata.abi;
     if (userMetadata.metadata) requestBody.metadata = userMetadata.metadata;
 
@@ -1354,6 +1568,7 @@
       renderAnalysis(data.analysis);
     }
     renderTraceDiagnostics(data);
+    renderReconstruction(data.reconstruction);
 
     // Function mapping
     var selMap = data.selector_map || currentSelectorMap;

@@ -17,6 +17,7 @@ Usage at inference time:
 """
 
 import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -110,6 +111,7 @@ class TACLookup:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.row_factory = sqlite3.Row
 
+        self._ensure_optional_schema()
         count = self._conn.execute("SELECT COUNT(*) FROM tac_to_body").fetchone()[0]
         body_count = self._conn.execute("SELECT COUNT(*) FROM solidity_bodies").fetchone()[0]
         logger.info(
@@ -121,6 +123,36 @@ class TACLookup:
     def available(self) -> bool:
         """Whether the lookup database is loaded and ready."""
         return self._conn is not None
+
+    def _ensure_optional_schema(self) -> None:
+        """Create optional provenance tables for older lookup databases."""
+        if not self._conn:
+            return
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS lookup_manifest (
+                key        TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self._conn.commit()
+
+    def manifest(self) -> Dict:
+        """Return lookup build provenance recorded in the database."""
+        if not self._conn:
+            return {}
+        try:
+            row = self._conn.execute(
+                "SELECT value_json FROM lookup_manifest WHERE key = 'build_manifest'"
+            ).fetchone()
+        except sqlite3.Error:
+            return {}
+        if not row:
+            return {}
+        try:
+            return json.loads(row["value_json"])
+        except (TypeError, json.JSONDecodeError):
+            return {}
 
     def query(self, tac_text: str) -> Optional[Dict]:
         """Look up a TAC string and return the matching Solidity body.
@@ -140,10 +172,11 @@ class TACLookup:
         tac_hash = hash_normalized_tac(tac_text)
 
         row = self._conn.execute("""
-            SELECT sb.solidity_code, sb.function_name, sb.selector,
+            SELECT sb.solidity_code, sb.body_hash, sb.function_name, sb.selector,
                    sb.function_signature, sb.visibility,
                    sb.is_payable, sb.is_view,
-                   tb.compiler_version, tb.occurrences
+                   tb.compiler_version, tb.optimizer_enabled,
+                   tb.optimizer_runs, tb.occurrences
             FROM tac_to_body tb
             JOIN solidity_bodies sb ON tb.body_id = sb.body_id
             WHERE tb.tac_hash = ?
@@ -151,6 +184,27 @@ class TACLookup:
 
         if not row:
             return None
+
+        manifest = self.manifest()
+        provenance = {
+            "source": "tac_lookup",
+            "db_path": str(self.db_path),
+            "tac_hash": tac_hash,
+            "body_hash": row["body_hash"],
+            "compiler_version": row["compiler_version"],
+            "optimizer_enabled": bool(row["optimizer_enabled"]),
+            "optimizer_runs": row["optimizer_runs"],
+            "occurrences": row["occurrences"],
+        }
+        if manifest:
+            provenance["build_id"] = manifest.get("build_id")
+            provenance["dataset_revision"] = manifest.get("dataset_revision")
+            provenance["source_db"] = manifest.get("source_db")
+            provenance["source_table"] = manifest.get("source_table")
+            provenance["source_row_count"] = manifest.get("source_row_count")
+            provenance["decontamination_exclusions"] = manifest.get(
+                "decontamination_exclusions", []
+            )
 
         return {
             "solidity": row["solidity_code"],
@@ -163,6 +217,7 @@ class TACLookup:
             "compiler_version": row["compiler_version"],
             "occurrences": row["occurrences"],
             "source": "exact_match",
+            "provenance": provenance,
         }
 
     def query_batch(self, tac_texts: List[str]) -> Dict[int, Dict]:
@@ -193,7 +248,8 @@ class TACLookup:
         ).fetchone()[0] or 0
         avg_tac_per_body = round(tac_count / max(body_count, 1), 1)
 
-        return {
+        manifest = self.manifest()
+        result = {
             "available": True,
             "tac_hashes": tac_count,
             "unique_bodies": body_count,
@@ -201,6 +257,11 @@ class TACLookup:
             "avg_tac_per_body": avg_tac_per_body,
             "db_path": str(self.db_path),
         }
+        if manifest:
+            result["build_id"] = manifest.get("build_id")
+            result["dataset_revision"] = manifest.get("dataset_revision")
+            result["manifest"] = manifest
+        return result
 
     def close(self):
         """Close the database connection."""
@@ -276,6 +337,14 @@ class TACLookupBuilder:
                     pairs_found      INTEGER DEFAULT 0,
                     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (address, solc_version, optimizer_enabled)
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lookup_manifest (
+                    key        TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -491,13 +560,41 @@ class TACLookupBuilder:
                 "SELECT SUM(occurrences) FROM tac_to_body"
             ).fetchone()[0] or 0
 
-        return {
+            manifest_row = conn.execute(
+                "SELECT value_json FROM lookup_manifest WHERE key = 'build_manifest'"
+            ).fetchone()
+
+        result = {
             "tac_hashes": tac_count,
             "unique_bodies": body_count,
             "total_occurrences": total_occ,
             "avg_tac_per_body": round(tac_count / max(body_count, 1), 1),
             "db_path": str(self.db_path),
         }
+        if manifest_row:
+            try:
+                manifest = json.loads(manifest_row[0])
+                result["build_id"] = manifest.get("build_id")
+                result["dataset_revision"] = manifest.get("dataset_revision")
+                result["manifest"] = manifest
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return result
+
+    def record_manifest(self, manifest: Dict) -> None:
+        """Persist lookup build provenance in the database."""
+        with _db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO lookup_manifest(key, value_json, updated_at)
+                VALUES ('build_manifest', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (json.dumps(manifest, sort_keys=True, default=str),),
+            )
+            conn.commit()
 
     # ── job tracking for re-runnability ───────────────────────────────────
 

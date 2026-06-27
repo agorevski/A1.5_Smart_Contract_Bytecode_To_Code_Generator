@@ -156,7 +156,7 @@ def extract_solidity_facts(solidity_code: str) -> FactMap:
     }
 
     _add_signature_facts(facts, signature)
-    _add_event_facts(facts, body)
+    _add_event_facts(facts, masked_code)
     _add_call_facts(facts, body, signature.get("function_name"))
     _add_guard_facts(facts, body, aliases)
     _add_state_write_facts(facts, body, non_state_names, aliases)
@@ -293,6 +293,7 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
     if hallucination_counts or groundedness_scores:
         summary["hallucination_buckets"] = dict(sorted(hallucination_counts.items()))
         summary["hallucination_total"] = hallucination_total
+        summary["candidate_fact_total"] = candidate_fact_total
         summary["hallucination_rate"] = (
             hallucination_total / candidate_fact_total if candidate_fact_total else 0.0
         )
@@ -309,14 +310,38 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
 def _normalized_grounding_facts(grounding_facts: Mapping[str, Iterable[str]]) -> FactMap:
     normalized: FactMap = {}
     for category, values in grounding_facts.items():
+        category_key = str(category).lower()
         if isinstance(values, str):
-            normalized[str(category)] = {values}
+            normalized[category_key] = {_normalize_grounding_value(category_key, values)}
             continue
         try:
-            normalized[str(category)] = {str(value) for value in values}
+            normalized[category_key] = {
+                _normalize_grounding_value(category_key, value) for value in values
+            }
         except TypeError:
-            normalized[str(category)] = {str(values)}
+            normalized[category_key] = {_normalize_grounding_value(category_key, values)}
     return normalized
+
+
+def _normalize_grounding_value(category: str, value: Any) -> str:
+    text = str(value).strip()
+    category_prefix = f"{category}:"
+    if text.lower().startswith(category_prefix.lower()):
+        text = text[len(category_prefix) :]
+
+    if category in {"call", "member_call", "event", "modifier"}:
+        return _normalize_identifier(text)
+    if category in {"abi", "visibility", "mutability", "control_flow"}:
+        return _normalize_expression(text)
+    if category == "guard":
+        lowered = text.lower()
+        for prefix in ("require:", "assert:", "revert:"):
+            if lowered.startswith(prefix):
+                return prefix + _normalize_expression(text[len(prefix) :])
+        return _normalize_expression(text)
+    if category in {"state_write", "return"}:
+        return _normalize_expression(text)
+    return text
 
 
 def _classify_hallucination_buckets(
@@ -562,6 +587,8 @@ def _add_call_facts(facts: FactMap, body: str, function_name: Optional[str]):
         _add_fact(facts, "member_call", _normalize_identifier(method))
 
     for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+        if _is_event_emit_invocation(body, match.start()):
+            continue
         call_name = match.group(1)
         normalized = _normalize_identifier(call_name)
         if normalized in _CALL_EXCLUSIONS:
@@ -571,6 +598,11 @@ def _add_call_facts(facts: FactMap, body: str, function_name: Optional[str]):
         if function_name and normalized == _normalize_identifier(function_name):
             continue
         _add_fact(facts, "call", normalized)
+
+
+def _is_event_emit_invocation(body: str, call_start: int) -> bool:
+    prefix = body[max(0, call_start - 32) : call_start]
+    return re.search(r"\bemit\s+$", prefix) is not None
 
 
 def _add_guard_facts(facts: FactMap, body: str, aliases: Mapping[str, str]):

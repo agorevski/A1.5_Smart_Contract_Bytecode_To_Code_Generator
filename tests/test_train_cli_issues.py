@@ -478,11 +478,14 @@ def test_evaluate_model_uses_decompile_batch_chunks(tmp_path, monkeypatch):
         results_dir=str(tmp_path / "results"),
         latest_results_path=str(tmp_path / "latest.txt"),
         eval_batch_size=2,
+        eval_max_new_tokens=77,
     )
 
     assert [call[0] for call in FakeDecompiler.batch_calls] == [["tac0", "tac1"], ["tac2"]]
+    assert [call[2] for call in FakeDecompiler.batch_calls] == [77, 77]
     assert FakeDecompiler.single_calls == []
     assert summary["eval_batch_size"] == 2
+    assert summary["eval_max_new_tokens"] == 77
     assert summary["num_evaluated"] == 3
     assert Path(summary["results_path"]).exists()
 
@@ -763,9 +766,18 @@ def test_resolve_resume_checkpoint_auto_selects_latest_numeric_checkpoint(tmp_pa
     (output_dir / "checkpoint-12").mkdir()
     (output_dir / "checkpoints" / "checkpoint-20").mkdir(parents=True)
     (output_dir / "not-a-checkpoint").mkdir()
-    (output_dir / "checkpoint-3" / "trainer_state.json").write_text("{}")
-    (output_dir / "checkpoint-12" / "trainer_state.json").write_text("{}")
-    (output_dir / "checkpoints" / "checkpoint-20" / "trainer_state.json").write_text("{}")
+    custom = output_dir / "checkpoint-custom"
+    custom.mkdir()
+    for checkpoint in [
+        output_dir / "checkpoint-3",
+        output_dir / "checkpoint-12",
+        output_dir / "checkpoints" / "checkpoint-20",
+        custom,
+    ]:
+        (checkpoint / "trainer_state.json").write_text("{}")
+        (checkpoint / "optimizer.pt").write_bytes(b"optimizer")
+        (checkpoint / "scheduler.pt").write_bytes(b"scheduler")
+        (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
 
     assert train.resolve_resume_checkpoint("auto", str(output_dir)) == str(
         output_dir / "checkpoints" / "checkpoint-20"
@@ -774,10 +786,79 @@ def test_resolve_resume_checkpoint_auto_selects_latest_numeric_checkpoint(tmp_pa
         str(output_dir),
         str(output_dir / "checkpoints"),
     ]
-    assert (
-        train.resolve_resume_checkpoint("checkpoint-custom", str(output_dir)) == "checkpoint-custom"
-    )
+    assert train.resolve_resume_checkpoint(str(custom), str(output_dir)) == str(custom)
     assert train.resolve_resume_checkpoint("auto", str(tmp_path / "empty")) is None
+
+
+def test_resolve_resume_checkpoint_required_rejects_partial_checkpoints(tmp_path):
+    output_dir = tmp_path / "models"
+    partial = output_dir / "checkpoint-5"
+    partial.mkdir(parents=True)
+    (partial / "trainer_state.json").write_text("{}")
+
+    with pytest.raises(FileNotFoundError, match="missing_required_file"):
+        train.resolve_resume_checkpoint("required", str(output_dir))
+    assert train.resolve_resume_checkpoint.last_result["invalid_checkpoints"][0]["status"] == "invalid"
+
+    with pytest.raises(ValueError, match="invalid candidates"):
+        train.resolve_resume_checkpoint("auto", str(output_dir))
+
+    with pytest.raises(ValueError, match="Invalid resume checkpoint"):
+        train.resolve_resume_checkpoint(str(partial), str(output_dir))
+
+
+def _write_deepspeed_checkpoint(path: Path, step: int) -> None:
+    path.mkdir(parents=True)
+    (path / "trainer_state.json").write_text("{}")
+    (path / "latest").write_text(f"global_step{step}")
+    tag_dir = path / f"global_step{step}"
+    tag_dir.mkdir()
+    (tag_dir / "mp_rank_00_model_states.pt").write_bytes(b"model")
+    (tag_dir / "zero_pp_rank_0_mp_rank_00_optim_states.pt").write_bytes(b"optim")
+
+
+def test_resolve_resume_checkpoint_accepts_deepspeed_layout_when_enabled(tmp_path):
+    output_dir = tmp_path / "models"
+    checkpoint = output_dir / "checkpoint-8"
+    _write_deepspeed_checkpoint(checkpoint, 8)
+
+    assert (
+        train.resolve_resume_checkpoint("required", str(output_dir), deepspeed=True)
+        == str(checkpoint)
+    )
+    validation = train.resolve_resume_checkpoint.last_result["invalid_checkpoints"]
+    assert validation == []
+
+    assert (
+        train.resolve_resume_checkpoint(str(checkpoint), str(output_dir), deepspeed=True)
+        == str(checkpoint)
+    )
+    explicit = train.resolve_resume_checkpoint.last_result["explicit_checkpoint_validation"]
+    assert explicit["uses_deepspeed_layout"] is True
+    assert explicit["missing_required_files"] == []
+
+
+def test_resolve_resume_checkpoint_detects_deepspeed_layout_without_flag(tmp_path):
+    output_dir = tmp_path / "models"
+    checkpoint = output_dir / "checkpoint-14"
+    _write_deepspeed_checkpoint(checkpoint, 14)
+
+    assert train.resolve_resume_checkpoint("auto", str(output_dir)) == str(checkpoint)
+    report = train._checkpoint_validation_report(checkpoint)
+    assert report["uses_deepspeed_layout"] is True
+    assert report["deepspeed_layout"]["model_state_shards"] == [
+        "global_step14/mp_rank_00_model_states.pt"
+    ]
+
+
+def test_resolve_resume_checkpoint_deepspeed_flag_still_rejects_partial_checkpoints(tmp_path):
+    output_dir = tmp_path / "models"
+    partial = output_dir / "checkpoint-6"
+    partial.mkdir(parents=True)
+    (partial / "trainer_state.json").write_text("{}")
+
+    with pytest.raises(FileNotFoundError, match="missing_required_file:optimizer.pt"):
+        train.resolve_resume_checkpoint("required", str(output_dir), deepspeed=True)
 
 
 def test_training_config_file_keys_flatten_to_cli_destinations():
@@ -875,8 +956,11 @@ def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(tmp_pa
     older_checkpoint = output_dir / "checkpoint-7"
     checkpoint.mkdir(parents=True)
     older_checkpoint.mkdir()
-    (checkpoint / "trainer_state.json").write_text("{}")
-    (older_checkpoint / "trainer_state.json").write_text("{}")
+    for candidate in (checkpoint, older_checkpoint):
+        (candidate / "trainer_state.json").write_text("{}")
+        (candidate / "optimizer.pt").write_bytes(b"optimizer")
+        (candidate / "scheduler.pt").write_bytes(b"scheduler")
+        (candidate / "adapter_model.safetensors").write_bytes(b"adapter")
     manifest_path = tmp_path / "run.manifest.json"
     captured_train_kwargs = {}
 
@@ -922,6 +1006,10 @@ def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(tmp_pa
             "--no-quantization",
             "--train-eval-strategy",
             "no",
+            "--seed",
+            "123",
+            "--report-to",
+            "tensorboard",
             "--dataloader-num-workers",
             "0",
             "--run-manifest",
@@ -940,11 +1028,16 @@ def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(tmp_pa
     assert captured_train_kwargs["precision"] == "fp16"
     assert captured_train_kwargs["use_quantization"] is False
     assert captured_train_kwargs["train_eval_strategy"] == "no"
+    assert captured_train_kwargs["seed"] == 123
+    assert captured_train_kwargs["report_to"] == "tensorboard"
     assert captured_train_kwargs["dataloader_num_workers"] == 0
     assert manifest["status"] == "completed"
     assert manifest["training"]["config"]["resume"] == "auto"
     assert manifest["training"]["config"]["resume_from_checkpoint"] == str(checkpoint)
     assert manifest["training"]["config"]["precision"] == "fp16"
+    assert manifest["training"]["config"]["seed"] == 123
+    assert manifest["training"]["config"]["report_to"] == "tensorboard"
+    assert manifest["runtime"]["global_seed"] == 123
     assert manifest["training"]["config"]["resume_resolution"]["searched_roots"] == [
         str(output_dir),
         str(output_dir / "checkpoints"),
@@ -1082,6 +1175,89 @@ def test_eval_only_autodetected_test_dataset_requires_split_manifest(tmp_path):
     )
     assert info["status"] == "unverified_allowed"
     assert "split_manifest_missing" in info["problems"]
+
+
+def test_skip_collection_does_not_autodetect_cached_split_artifacts(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    train_split = data_dir / "train_dataset.jsonl"
+    _write_jsonl(train_split, [{"input": "tac", "output": "sol", "metadata": {}}])
+    manifest_path = tmp_path / "run.manifest.json"
+    monkeypatch.setattr(train, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--skip-collection",
+            "--data-dir",
+            str(data_dir),
+            "--run-manifest",
+            str(manifest_path),
+            "--no-auto-torchrun",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="No dataset found"):
+        train.main()
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["status"] == "failed"
+
+
+def test_split_artifact_source_requires_explicit_override_and_is_manifested(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    train_split = data_dir / "train_dataset.jsonl"
+    _write_jsonl(train_split, [{"input": "tac", "output": "sol", "metadata": {}}])
+    monkeypatch.setattr(train, "setup_logging", lambda *args, **kwargs: None)
+    blocked_manifest = tmp_path / "blocked.manifest.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--skip-collection",
+            "--dataset",
+            str(train_split),
+            "--data-dir",
+            str(data_dir),
+            "--dataset-only",
+            "--skip-data-preflight",
+            "--run-manifest",
+            str(blocked_manifest),
+            "--no-auto-torchrun",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="cached split artifact"):
+        train.main()
+
+    allowed_manifest = tmp_path / "allowed.manifest.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--skip-collection",
+            "--dataset",
+            str(train_split),
+            "--allow-split-artifact-source",
+            "--data-dir",
+            str(data_dir),
+            "--dataset-only",
+            "--skip-data-preflight",
+            "--run-manifest",
+            str(allowed_manifest),
+            "--no-auto-torchrun",
+        ],
+    )
+
+    train.main()
+
+    manifest = json.loads(allowed_manifest.read_text())
+    split_manifest = json.loads((data_dir / "split_manifest.json").read_text())
+    assert manifest["status"] == "completed"
+    assert manifest["datasets"]["source"]["dataset_artifact_type"] == "derived_split_artifact"
+    assert split_manifest["source_dataset"]["dataset_artifact_type"] == "derived_split_artifact"
 
 
 def test_main_finalizes_manifest_for_early_eval_only_failure(tmp_path, monkeypatch):

@@ -281,6 +281,8 @@ def test_training_arguments_expose_precision_eval_cadence_and_dataloader(tmp_pat
         dataloader_persistent_workers=True,
         dataloader_prefetch_factor=4,
         precision="fp16",
+        seed=123,
+        report_to="tensorboard",
     )
 
     assert args.kwargs["fp16"] is True
@@ -292,6 +294,9 @@ def test_training_arguments_expose_precision_eval_cadence_and_dataloader(tmp_pat
     assert args.kwargs["dataloader_pin_memory"] is False
     assert args.kwargs["dataloader_persistent_workers"] is True
     assert args.kwargs["dataloader_prefetch_factor"] == 4
+    assert args.kwargs["seed"] == 123
+    assert args.kwargs["data_seed"] == 123
+    assert args.kwargs["report_to"] == "tensorboard"
 
 
 def test_training_arguments_disable_eval_and_safe_cpu_dataloader_defaults(tmp_path, monkeypatch):
@@ -327,19 +332,25 @@ def test_default_training_recipe_uses_qwen_lora_and_preserves_global_batch():
     assert config.use_lora is True
     assert config.use_quantization is False
     assert train.DEFAULT_NUM_GPUS == 4
+    assert train.DEFAULT_BATCH_SIZE == 4
+    assert train.DEFAULT_GLOBAL_BATCH_SIZE == 16
+    assert train.DEFAULT_MAX_SEQ_LENGTH == 2048
+    assert config.max_sequence_length == 2048
+    assert config.precision == "fp16"
+    assert config.gradient_checkpointing is False
     assert (
         train.resolve_gradient_accumulation_steps(
-            per_device_batch_size=4,
+            per_device_batch_size=train.DEFAULT_BATCH_SIZE,
             world_size=1,
-            global_batch_size=16,
+            global_batch_size=train.DEFAULT_GLOBAL_BATCH_SIZE,
         )
         == 4
     )
     assert (
         train.resolve_gradient_accumulation_steps(
-            per_device_batch_size=4,
+            per_device_batch_size=train.DEFAULT_BATCH_SIZE,
             world_size=4,
-            global_batch_size=16,
+            global_batch_size=train.DEFAULT_GLOBAL_BATCH_SIZE,
         )
         == 1
     )
@@ -373,6 +384,8 @@ def test_train_model_passes_lora_config_and_auto_gradient_accumulation(tmp_path,
         lora_dropout=0.05,
         lora_target_modules=["q_proj", "v_proj"],
         use_quantization=False,
+        seed=99,
+        report_to="wandb",
     )
 
     config = captured["config"]
@@ -384,7 +397,10 @@ def test_train_model_passes_lora_config_and_auto_gradient_accumulation(tmp_path,
     assert config.lora_dropout == 0.05
     assert config.target_modules == ["q_proj", "v_proj"]
     assert config.use_quantization is False
+    assert config.report_to == "wandb"
     assert captured["train_kwargs"]["gradient_accumulation_steps"] == 8
+    assert captured["train_kwargs"]["seed"] == 99
+    assert captured["train_kwargs"]["report_to"] == "wandb"
 
 
 def test_inference_tac_budget_scales_with_configured_context_length():
@@ -408,6 +424,7 @@ def test_inference_tac_budget_scales_with_configured_context_length():
 def test_decompiler_prompt_diagnostics_capture_over_budget_tac():
     decompiler = SmartContractDecompiler.__new__(SmartContractDecompiler)
     decompiler.tokenizer = WhitespaceTokenizer()
+    decompiler.MIN_INFERENCE_CONTEXT_WINDOW = 32
     decompiler.config = ModelConfig(max_sequence_length=32)
 
     long_tac = "\n".join(f"OP_{i}" for i in range(80))
@@ -443,6 +460,20 @@ def test_seeded_evaluation_sampling_is_reproducible():
     )
 
 
+def test_bytecode_semantics_requires_grounding_and_scaffold_is_not_deployable():
+    from src.training_pipeline import evaluate_bytecode_semantics, validate_generated_solidity
+
+    code = "function foo() public { return; }"
+    validity = validate_generated_solidity(code, allow_compiler=False)
+    semantics = evaluate_bytecode_semantics(code, code, {}, solidity_validity=validity)
+
+    assert validity.scaffold_valid is True
+    assert validity.compiler_checked is False
+    assert validity.deployable is False
+    assert semantics.checked is False
+    assert semantics.deployable is False
+
+
 def test_tokenizer_based_max_seq_detection_changes_with_tokenizer(tmp_path):
     row = {
         "input": " ".join(["longtoken"] * 220),
@@ -461,10 +492,16 @@ def test_tokenizer_based_max_seq_detection_changes_with_tokenizer(tmp_path):
 
 def test_train_common_wrapper_uses_tokenizer_detection():
     wrapper = Path("train_common.sh").read_text()
+    torchrun_wrapper = Path("run_train_torchrun.sh").read_text()
+    deepspeed_wrapper = Path("run_train_deepspeed.sh").read_text()
 
     assert "AutoTokenizer.from_pretrained" in wrapper
     assert "detect_max_sequence_length" in wrapper
     assert "/ 3.5" not in wrapper
+    assert "REPORT_TO" in wrapper
+    assert "SKIP_EVAL" in wrapper
+    assert "--skip-eval" not in torchrun_wrapper.split("uv run torchrun", 1)[1]
+    assert "--skip-eval" not in deepspeed_wrapper.split("uv run --extra deepspeed deepspeed", 1)[1]
 
 
 def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):

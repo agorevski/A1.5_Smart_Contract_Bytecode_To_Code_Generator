@@ -26,7 +26,7 @@ Schema version 1 rows include `metadata.schema_version: 1`. Required fields are
 non-empty string `input` and `output`; `metadata` is optional only for explicit
 legacy compatibility and must be an object when present. Decontamination-critical
 metadata values are validated by the shared schema helpers in
-`src.dataset_pipeline`:
+`src.dataset_export_primitives` (re-exported by `src.dataset_pipeline`):
 
 - `contract_address`: 20-byte `0x`-prefixed hex address
 - `selector` / `function_selector`: 4-byte `0x`-prefixed hex selector
@@ -146,18 +146,21 @@ Each manifest includes:
 
 Download manifests include Parquet streaming throughput and bounded
 `parquet_batch_size` so large HuggingFace files are ingested without full
-DataFrame materialization. Export manifests include
-`validation.body_duplicate_cap`, `validation.token_length_filter`, and
-`training_row_schema_version`. Rows exceeding the configured export
-`--max-seq-length` are omitted from the main JSONL and written to
-`<output>.rejects.jsonl` with source row, contract/function metadata, token
-lengths, and reject reasons.
+DataFrame materialization. Export manifests include `validation.body_duplicate_cap`,
+`validation.final_row_duplicates`, `validation.tac_quality_filter`,
+`validation.auxiliary_contract_filter`, `validation.token_length_filter`, and
+`training_row_schema_version`. Rows with duplicate final `input`+`output`,
+TAC error markers such as `stack_underflow`, auxiliary compiled-contract
+artifacts, or examples exceeding the configured export `--max-seq-length` are
+omitted from the main JSONL and written to `<output>.rejects.jsonl` with source
+row, contract/function metadata, token lengths, and reject reasons.
 
 The Etherscan `DatasetBuilder` path writes
 `smart_contract_dataset.jsonl.manifest.json` next to its export. That manifest
 includes the input address-list hash/count when available, typed
 `generation_diagnostics`, `dataset_filter_drops`, output artifact hashes, row
-counts, and the training row schema version.
+counts, git/environment metadata, export reject counts, and the training row
+schema version.
 
 Partial decompilation placeholders (`metadata.partial == true`,
 `Partial decompilation`, `TODO: Full logic not reconstructed`, or

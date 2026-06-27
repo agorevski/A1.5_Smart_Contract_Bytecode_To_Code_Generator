@@ -16,6 +16,8 @@ def protected_api_state(monkeypatch):
     original_testing = web_app.app.config.get("TESTING", False)
     monkeypatch.setattr(web_app, "WEB_API_KEY", None)
     web_app._reset_warmup_state(False)
+    with web_app.ACTIVE_DECOMPILE_JOBS_LOCK:
+        web_app.ACTIVE_DECOMPILE_JOBS.clear()
     monkeypatch.setattr(
         web_app,
         "_get_gpu_stats",
@@ -23,6 +25,8 @@ def protected_api_state(monkeypatch):
     )
     web_app.app.config["TESTING"] = True
     yield
+    with web_app.ACTIVE_DECOMPILE_JOBS_LOCK:
+        web_app.ACTIVE_DECOMPILE_JOBS.clear()
     web_app._reset_warmup_state(False)
     web_app.app.config["TESTING"] = original_testing
 
@@ -93,22 +97,29 @@ def test_ui_provides_in_memory_api_key_field_and_auth_headers(client):
     assert 'headers.Authorization = "Bearer " + apiKey' in app_js
 
 
-def test_health_surfaces_readiness_config_and_limits(client, monkeypatch):
+def test_health_splits_liveness_readiness_and_redacts_public_details(client, monkeypatch):
     monkeypatch.setattr(web_app, "decompiler", None)
     monkeypatch.setattr(web_app, "active_model_path", "models/missing")
     monkeypatch.setattr(web_app, "model_load_error", "not found")
     monkeypatch.setattr(web_app, "tac_lookup", None)
 
+    live = client.get("/livez").get_json()
     data = client.get("/api/health").get_json()
+    ready = client.get("/readyz", environ_overrides={"REMOTE_ADDR": "127.0.0.1"}).get_json()
 
+    assert live["status"] == "ok"
+    assert live["liveness"] == "ok"
     assert data["status"] == "ok"
     assert data["ready"] is False
-    assert data["model_path"] == "models/missing"
-    assert data["model_error"] == "not found"
+    assert "model_path" not in data
+    assert "model_error" not in data
+    assert "model_config" not in data
     assert data["warmup"]["status"] == "disabled"
     assert data["limits"]["max_bytecode_hex_length"] == web_app.MAX_BYTECODE_HEX_LENGTH
-    assert data["limits"]["timeout_enforcement"] == "daemon_thread"
+    assert data["limits"]["timeout_enforcement"] in {"killable_worker_process", "daemon_thread"}
     assert data["generation_defaults"]["max_new_tokens"] >= 1
+    assert ready["model_path"] == "models/missing"
+    assert ready["model_error"] == "not found"
 
 
 def test_ui_exposes_readiness_generation_cancel_and_security_controls(client):
@@ -126,10 +137,18 @@ def test_ui_exposes_readiness_generation_cancel_and_security_controls(client):
     assert 'id="metadata-input"' in html
     assert 'class="btn btn-small btn-download"' in html
     assert 'id="trace-diagnostics"' in html
+    assert 'data-tab="tab-reconstruction"' in html
+    assert 'id="reconstruction-content"' in html
     assert 'fetch("/api/health", { headers: apiHeaders() })' in app_js
+    assert '"/api/decompile/" + encodeURIComponent(jobId) + "/cancel"' in app_js
     assert 'runSecurityEndpoint("vulnerability scan", "/api/vulnerability-scan")' in app_js
     assert "handleDownloadArtifact" in app_js
     assert "renderTraceDiagnostics" in app_js
+    assert "renderReconstruction" in app_js
+    assert 'case "batch_done"' in app_js
+    assert "data.elapsed_s != null" in app_js
+    assert "qualitySummary" in app_js
+    assert "provenanceSummary" in app_js
 
 
 def _parse_sse_events(text):
@@ -225,6 +244,18 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
     monkeypatch.setattr(web_app, "tac_lookup", None)
     monkeypatch.setattr(web_app, "INFERENCE_TRACE_ENABLED", True)
     monkeypatch.setattr(web_app, "INFERENCE_TRACE_DIR", str(trace_dir))
+    monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", False)
+    monkeypatch.setattr(
+        web_app,
+        "_validate_solidity_output",
+        lambda source, metadata=None: {
+            "valid": True,
+            "method": "scaffold",
+            "compiler_checked": False,
+            "scaffold_valid": True,
+            "scaffold_errors": [],
+        },
+    )
 
     response = client.post(
         "/api/decompile",
@@ -269,12 +300,22 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
     assert result["function_results"][0]["selector_source"] == "abi"
     assert result["function_results"][0]["abi"]["name"] == "transfer"
     assert result["function_results"][0]["diagnostics"]["tac_truncated"] is True
+    assert result["reconstruction"]["strategy"] == "semantic_function_chunks"
+    assert result["reconstruction"]["chunk_count"] == 1
+    assert result["analysis"]["reconstruction_strategy"] == "semantic_function_chunks"
+    assert result["analysis"]["semantic_chunk_count"] == 1
+    assert "contract Token" in result["solidity"]
+    assert "Function selector: 0xa9059cbb" in result["solidity"]
     assert result["validation"]["valid"] is True
+    assert result["quality"]["compiler_checked"] is False
+    assert result["quality"]["deployable"] is False
+    assert result["function_results"][0]["quality"]["tac_truncated"] is True
     assert result["contract_metadata"]["abi"]["event_count"] == 1
     trace_path = ROOT / result["trace_path"]
     assert trace_path.exists()
     trace = json.loads(trace_path.read_text())
     assert trace["request_id"] == result["request_id"]
+    assert trace["reconstruction"]["strategy"] == "semantic_function_chunks"
     assert trace["functions"]["func_a9059cbb"]["diagnostics"]["generated_tokens"] > 0
     assert trace["analysis"]["validation"]["valid"] is True
 
@@ -292,6 +333,126 @@ def test_decompile_rejects_invalid_generation_controls(client):
     assert "max_new_tokens" in response.get_json()["error"]
 
 
+def test_decompile_rejects_strict_schema_type_and_bytecode_errors(client):
+    float_tokens = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000", "generation": {"max_new_tokens": 12.5}},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    numeric_bool = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000", "generation": {"do_sample": 1}},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    unknown = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000", "generation": {"unknown": True}},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    odd = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x123"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    bad_hex = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x60zz"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert float_tokens.status_code == 400
+    assert float_tokens.get_json()["field"] == "generation.max_new_tokens"
+    assert numeric_bool.status_code == 400
+    assert numeric_bool.get_json()["field"] == "generation.do_sample"
+    assert unknown.status_code == 400
+    assert unknown.get_json()["code"] == "unknown_field"
+    assert odd.status_code == 400
+    assert odd.get_json()["code"] == "odd_length"
+    assert bad_hex.status_code == 400
+    assert bad_hex.get_json()["code"] == "invalid_hex"
+
+
+def test_decompile_lookup_hit_surfaces_provenance_and_can_be_disabled(client, monkeypatch):
+    class FakeAnalyzer:
+        def __init__(self, bytecode):
+            self.instructions = [object()]
+            self.basic_blocks = {}
+            self.functions = {
+                "func_00000000": SimpleNamespace(name="func_00000000", selector="0x00000000")
+            }
+
+        def generate_per_function_tac(self):
+            return {"func_00000000": "func_00000000:\n  RETURN 0"}
+
+    class FakeLookup:
+        available = True
+
+        def stats(self):
+            return {"available": True, "build_id": "build-1", "tac_hashes": 1}
+
+        def query(self, tac_text):
+            return {
+                "solidity": "function cached() public {}",
+                "selector": "0x00000000",
+                "occurrences": 3,
+                "source": "exact_match",
+                "provenance": {
+                    "source": "tac_lookup",
+                    "build_id": "build-1",
+                    "tac_hash": "abc123",
+                    "source_row_count": 42,
+                },
+            }
+
+    class FakeResolver:
+        def resolve_function_names(self, fnames):
+            return {
+                fname: SimpleNamespace(
+                    to_dict=lambda: {"best_match": None, "candidates": [], "selector": "0x00000000"}
+                )
+                for fname in fnames
+            }
+
+    monkeypatch.setattr(web_app, "BytecodeAnalyzer", FakeAnalyzer)
+    monkeypatch.setattr(web_app, "get_resolver", lambda use_remote=False: FakeResolver())
+    monkeypatch.setattr(web_app, "tac_lookup", FakeLookup())
+    monkeypatch.setattr(web_app, "decompiler", None)
+    monkeypatch.setattr(
+        web_app,
+        "_validate_solidity_output",
+        lambda source, metadata=None: {
+            "valid": True,
+            "method": "scaffold",
+            "compiler_checked": False,
+            "scaffold_valid": True,
+            "scaffold_errors": [],
+        },
+    )
+
+    response = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    result = [data for event, data in _parse_sse_events(response.get_data(as_text=True)) if event == "result"][-1]
+
+    assert result["source_summary"]["exact_match"] == 1
+    assert result["function_results"][0]["lookup_provenance"]["build_id"] == "build-1"
+    assert result["analysis"]["lookup_provenance"]["func_00000000"]["tac_hash"] == "abc123"
+    assert result["quality"]["lookup_hits"] == 1
+
+    disabled = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000", "lookup": {"benchmark_mode": True}},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    disabled_result = [
+        data for event, data in _parse_sse_events(disabled.get_data(as_text=True)) if event == "result"
+    ][-1]
+    assert disabled_result["source_summary"]["exact_match"] == 0
+    assert disabled_result["lookup_config"]["benchmark_mode"] is True
+
+
 def test_decompile_rejects_invalid_abi_json(client):
     response = client.post(
         "/api/decompile",
@@ -301,6 +462,63 @@ def test_decompile_rejects_invalid_abi_json(client):
 
     assert response.status_code == 400
     assert "abi" in response.get_json()["error"]
+
+
+def test_cancel_endpoint_marks_job_and_terminates_active_worker(client):
+    class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+            self.killed = False
+
+        def is_alive(self):
+            return not self.terminated and not self.killed
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        def join(self, timeout=None):
+            return None
+
+    job = web_app._register_decompile_job("cancel-test")
+    proc = FakeProcess()
+    web_app._set_job_process(job, proc)
+
+    response = client.post(
+        "/api/decompile/cancel-test/cancel",
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "cancelled"
+    assert proc.terminated is True
+    assert web_app._job_snapshot("cancel-test")["cancelled"] is True
+
+
+def test_cancel_endpoint_rejects_finished_jobs(client):
+    job = web_app._register_decompile_job("finished-test")
+    web_app._mark_job_finished(job, "success", "results/trace.json")
+
+    response = client.post(
+        "/api/decompile/finished-test/cancel",
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert web_app._job_snapshot("finished-test") is None
+    assert response.status_code == 404
+    assert job["status"] == "success"
+    assert job["cancelled"] is False
+
+
+def test_killable_timeout_drains_large_successful_result(monkeypatch):
+    payload = "x" * (128 * 1024)
+    monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", True)
+
+    result = web_app._run_killable_with_timeout(lambda: payload, 1.0, "large result")
+
+    assert result == payload
 
 
 def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
@@ -340,15 +558,18 @@ def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
     monkeypatch.setattr(web_app, "decompiler", SlowDecompiler())
     monkeypatch.setattr(web_app, "DECOMPILE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(web_app, "tac_lookup", None)
+    monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", True)
 
     response = client.post(
         "/api/decompile",
-        json={"bytecode": "0x6000"},
+        json={"bytecode": "0x6000", "client_job_id": "timeout-test"},
         environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
     )
     events = _parse_sse_events(response.get_data(as_text=True))
 
     assert any(event == "error" and "timed out" in data["error"] for event, data in events)
+    assert any(event == "error" and data.get("status") == "timeout" for event, data in events)
+    assert web_app._job_snapshot("timeout-test") is None
     assert web_app.DECOMPILE_SEMAPHORE.acquire(blocking=False)
     web_app.DECOMPILE_SEMAPHORE.release()
 

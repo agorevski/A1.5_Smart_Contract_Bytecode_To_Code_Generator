@@ -243,6 +243,207 @@ def test_export_training_data_quarantines_overlength_rows(tmp_path):
     assert manifest["artifacts"]["rejects_jsonl"]["row_count"] == 2
 
 
+def test_shared_primitives_produce_same_final_rows_across_export_paths(tmp_path):
+    import download_hf_contracts
+    from src import dataset_pipeline
+    from src.dataset_export_primitives import final_row_hash
+    from src.dataset_pipeline import DatasetBuilder, FunctionPair
+
+    assert download_hf_contracts.hash_normalized_pair is dataset_pipeline.hash_normalized_pair
+    assert download_hf_contracts.sanitize_tac_prompt_input is dataset_pipeline.sanitize_tac_prompt_input
+
+    tac = (
+        "function transfer(address to):\n"
+        "  // Selector: 0xa9059cbb\n"
+        "  // Compiler: solc 0.8.20\n"
+        "  block:\n"
+        "    temp = 1\n"
+    )
+    body = "function transfer(address to) public { uint256 x = 1; emit Done(to, x); }"
+
+    hf_db = tmp_path / "hf.db"
+    hf_output = tmp_path / "hf.jsonl"
+    download_hf_contracts.init_database(hf_db)
+    assert download_hf_contracts._store_pairs_batch(
+        hf_db,
+        [_make_pair(download_hf_contracts, 1, body) | {"tac_representation": tac}],
+    ) == 1
+    download_hf_contracts.export_training_data(
+        str(hf_output),
+        max_body_dupes=5,
+        db_path=hf_db,
+        manifest_path=tmp_path / "hf.manifest.json",
+    )
+
+    builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
+    builder._store_function_pair(
+        FunctionPair(
+            function_name="transfer",
+            tac_representation=tac,
+            solidity_code=body,
+            function_signature="function transfer(address)",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
+            contract_address="0x0000000000000000000000000000000000000001",
+            metadata={"selector": "0xa9059cbb"},
+        )
+    )
+    builder_output = Path(builder.export_dataset("jsonl"))
+
+    hf_row = json.loads(hf_output.read_text().splitlines()[0])
+    builder_row = json.loads(builder_output.read_text().splitlines()[0])
+    assert hf_row["input"] == builder_row["input"]
+    assert hf_row["output"] == builder_row["output"]
+    assert final_row_hash(hf_row["input"], hf_row["output"]) == final_row_hash(
+        builder_row["input"], builder_row["output"]
+    )
+
+
+def test_export_training_data_deduplicates_after_final_sanitization(tmp_path):
+    import download_hf_contracts
+
+    db_path = tmp_path / "contracts.db"
+    output_path = tmp_path / "dataset.jsonl"
+    manifest_path = tmp_path / "dataset.manifest.json"
+    download_hf_contracts.init_database(db_path)
+
+    body = "function transfer(address to) public { uint256 x = 1; emit Done(to, x); }"
+    tac_a = (
+        "function transfer(address to):\n"
+        "  // Selector: 0xa9059cbb\n"
+        "  block:\n"
+        "    temp = 1"
+    )
+    tac_b = (
+        "function selector_a9059cbb:\n"
+        "  // Selector: 0xa9059cbb\n"
+        "  block:\n"
+        "    temp = 1"
+    )
+    with sqlite3.connect(db_path) as conn:
+        for idx, tac in enumerate([tac_a, tac_b], start=1):
+            conn.execute(
+                """
+                INSERT INTO function_pairs (
+                    contract_address, function_name, tac_representation, solidity_code,
+                    function_signature, visibility, is_payable, is_view, metadata, hash,
+                    body_hash, tac_hash, pair_norm_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"0x{idx:040x}",
+                    "transfer",
+                    tac,
+                    body,
+                    "function transfer(address)",
+                    "public",
+                    False,
+                    False,
+                    json.dumps({"selector": "0xa9059cbb"}),
+                    download_hf_contracts._md5(f"{tac}{body}{idx}"),
+                    download_hf_contracts.hash_normalized_body(body),
+                    download_hf_contracts.hash_normalized_tac(tac),
+                    download_hf_contracts._md5(f"distinct-{idx}"),
+                ),
+            )
+
+    download_hf_contracts.export_training_data(
+        str(output_path),
+        max_body_dupes=5,
+        db_path=db_path,
+        manifest_path=manifest_path,
+    )
+
+    rows = output_path.read_text().splitlines()
+    rejects = [json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()]
+    manifest = json.loads(manifest_path.read_text())
+    assert len(rows) == 1
+    assert len(rejects) == 1
+    assert rejects[0]["reasons"] == ["final_row_duplicate"]
+    assert manifest["drop_counts"]["final_row_duplicate_rows"] == 1
+    assert manifest["validation"]["final_row_duplicates"]["export_reject_count"] == 1
+
+
+def test_export_training_data_quarantines_tac_errors_and_auxiliary_contracts(tmp_path):
+    import download_hf_contracts
+
+    db_path = tmp_path / "contracts.db"
+    output_path = tmp_path / "dataset.jsonl"
+    manifest_path = tmp_path / "dataset.manifest.json"
+    download_hf_contracts.init_database(db_path)
+    address = "0x00000000000000000000000000000000000000aa"
+
+    rows = [
+        (
+            "good",
+            "function selector_11111111:\n  // Selector: 0x11111111\n  block:\n    temp = 1",
+            "function good() public { uint256 x = 1; emit Done(x); }",
+            "Target",
+        ),
+        (
+            "badTac",
+            "function selector_22222222:\n  // Selector: 0x22222222\n  block:\n    goto stack_underflow",
+            "function badTac() public { uint256 x = 2; emit Done(x); }",
+            "Target",
+        ),
+        (
+            "helper",
+            "function selector_33333333:\n  // Selector: 0x33333333\n  block:\n    temp = 3",
+            "function helper() public { uint256 x = 3; emit Done(x); }",
+            "SafeMathIntLib",
+        ),
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO contracts (address, source_code, bytecode, contract_name) VALUES (?, ?, ?, ?)",
+            (address, "contract Target {}", "0x00", "Target"),
+        )
+        for idx, (name, tac, body, compiled_contract) in enumerate(rows, start=1):
+            conn.execute(
+                """
+                INSERT INTO function_pairs (
+                    contract_address, function_name, tac_representation, solidity_code,
+                    function_signature, visibility, is_payable, is_view, metadata, hash,
+                    body_hash, tac_hash, pair_norm_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    address,
+                    name,
+                    tac,
+                    body,
+                    f"function {name}()",
+                    "public",
+                    False,
+                    False,
+                    json.dumps({"compiled_contract": compiled_contract}),
+                    download_hf_contracts._md5(f"{tac}{body}{idx}"),
+                    download_hf_contracts.hash_normalized_body(body),
+                    download_hf_contracts.hash_normalized_tac(tac),
+                    download_hf_contracts.hash_normalized_pair(tac, body),
+                ),
+            )
+
+    download_hf_contracts.export_training_data(
+        str(output_path),
+        max_body_dupes=5,
+        db_path=db_path,
+        manifest_path=manifest_path,
+    )
+
+    exported = [json.loads(line) for line in output_path.read_text().splitlines()]
+    rejects = [json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()]
+    manifest = json.loads(manifest_path.read_text())
+    assert [row["metadata"]["function_name"] for row in exported] == ["good"]
+    assert {reason for row in rejects for reason in row["reasons"]} >= {
+        "tac_stack_underflow",
+        "auxiliary_compiled_contract",
+    }
+    assert manifest["drop_counts"]["tac_error_rows"] == 1
+    assert manifest["drop_counts"]["auxiliary_compiled_contract_rows"] == 1
+
+
 def test_dataset_builder_manifest_filter_drops_and_partial_quarantine(tmp_path):
     from src.dataset_pipeline import DatasetBuilder, FunctionPair
 

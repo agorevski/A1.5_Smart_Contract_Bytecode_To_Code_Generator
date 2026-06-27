@@ -154,19 +154,18 @@ class TestPipelineExecution:
         assert result.decompiled_source is None
         assert result.tac is not None
         assert result.decompilation_status == "tac_only_no_model"
+        assert result.reconstruction["strategy"] == "semantic_function_chunks"
+        assert result.quality["semantic_chunk_count"] == len(result.tac_per_function)
+        assert result.metadata["lookup"]["enabled"] is False
+        assert result.trace["status"] == "tac_only"
 
     def test_decompile_uses_configured_model_path(self, monkeypatch):
         class FakeDecompiler:
             def __init__(self, model_path):
                 self.model_path = model_path
 
-            def decompile_contract(self, bytecode):
-                return {
-                    "solidity": "contract DecompiledContract { function f() public {} }",
-                    "functions": {"f": "function f() public {}"},
-                    "tac_per_function": {"f": "f:\n  RETURN"},
-                    "analysis": {"function_errors": {}},
-                }
+            def decompile_tac_to_solidity(self, tac, metadata=None, **kwargs):
+                return "function f() public {}"
 
         monkeypatch.setattr("src.model_setup.SmartContractDecompiler", FakeDecompiler)
         config = PipelineConfig(
@@ -175,10 +174,13 @@ class TestPipelineExecution:
         )
         result = PipelineOrchestrator(config).analyze(MINIMAL_BYTECODE)
 
-        assert result.decompiled_source.startswith("contract DecompiledContract")
-        assert result.tac == "f:\n  RETURN"
-        assert result.decompilation_status == "model_generated"
-        assert result.to_dict()["decompiled_functions"]["f"].startswith("function f")
+        assert "contract DecompiledContract {" in result.decompiled_source
+        assert "function f() public {}" in result.decompiled_source
+        assert result.tac_per_function
+        assert result.decompilation_status in {"model_generated", "validation_failed"}
+        assert result.function_results[0]["source"] == "model_inference"
+        assert result.reconstruction["strategy"] == "semantic_function_chunks"
+        assert "validation" in result.to_dict()
 
     def test_classify_stage(self):
         config = PipelineConfig(stages=[PipelineStage.CLASSIFY])
@@ -213,13 +215,8 @@ class TestPipelineExecution:
             def __init__(self, model_path):
                 pass
 
-            def decompile_contract(self, bytecode):
-                return {
-                    "solidity": "contract Precomputed {}",
-                    "functions": {"f": "function f() public {}"},
-                    "tac_per_function": {"f": "precomputed TAC output"},
-                    "analysis": {"function_errors": {}},
-                }
+            def decompile_tac_to_solidity(self, tac, metadata=None, **kwargs):
+                return "function precomputed() public {}"
 
         monkeypatch.setattr("src.model_setup.SmartContractDecompiler", FakeDecompiler)
         config = PipelineConfig(
@@ -233,9 +230,9 @@ class TestPipelineExecution:
 
         result = orch.analyze(MINIMAL_BYTECODE)
 
-        assert result.decompiled_source == "contract Precomputed {}"
-        assert result.tac == "precomputed TAC output"
-        assert result.audit_report.decompiled_source == "contract Precomputed {}"
+        assert result.decompiled_source.startswith("// SPDX-License-Identifier: UNKNOWN")
+        assert "function precomputed() public {}" in result.decompiled_source
+        assert result.audit_report.decompiled_source == result.decompiled_source
         assert result.audit_report.metadata["decompilation_source"] == "precomputed"
 
     def test_classifier_model_path_uses_model_backed_inference(self):

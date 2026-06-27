@@ -52,11 +52,32 @@ from tqdm import tqdm
 from web3 import Web3
 
 from src.bytecode_analyzer import BytecodeAnalyzer
-from src.dataset_pipeline import (
+from src.dataset_pipeline import SolidityParser
+from src.dataset_export_primitives import (
     TRAINING_ROW_SCHEMA_VERSION,
-    SolidityParser,
+    _collapse_whitespace,
+    _md5,
+    _safe_tac_function_name,
+    _selector_safe_name,
+    auxiliary_contract_reject_reasons,
+    build_training_record,
+    contract_names_match,
+    ensure_tac_integrated,
+    export_length_report as _export_length_report,
+    extract_tac_for_function,
+    final_row_hash,
+    hash_normalized_body,
+    hash_normalized_pair,
+    hash_normalized_tac,
+    hash_source_code,
+    match_functions_by_selector,
+    normalize_solidity_body,
+    normalize_tac,
     normalize_training_metadata,
+    parse_metadata_object,
     sanitize_tac_prompt_input,
+    tac_quality_reject_reasons,
+    validate_jsonl_final_row_duplicates,
 )
 from src.abi_enrichment import (
     canonicalize_abi_type,
@@ -159,92 +180,6 @@ MIN_MEANINGFUL_TOKENS = 15
 
 PROXY_PATTERN = re.compile(r"\bdelegatecall\b")
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-
-
-def _strip_comments(text: str) -> str:
-    """Remove single-line and multi-line comments."""
-    text = re.sub(r"//[^\n]*", "", text)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    return text
-
-
-def _collapse_whitespace(text: str) -> str:
-    """Collapse runs of whitespace to a single space and strip."""
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def normalize_solidity_body(body: str) -> str:
-    """Normalize a Solidity function body for dedup hashing."""
-    return _collapse_whitespace(_strip_comments(body)).lower()
-
-
-def normalize_tac(tac: str) -> str:
-    """Normalize TAC for dedup hashing.
-
-    Strips comments (including any legacy compiler/source annotations),
-    collapses whitespace, and lowercases so identical bytecode compiled by
-    different solc versions produces the same hash.
-    """
-    text = re.sub(r"//[^\n]*", "", tac)
-    return _collapse_whitespace(text).lower()
-
-
-def _selector_safe_name(selector: Optional[str]) -> Optional[str]:
-    """Return a selector-based TAC function name, or ``None`` without a selector."""
-    if not selector:
-        return None
-    selector_text = str(selector).strip().lower()
-    if selector_text.startswith("0x"):
-        selector_text = selector_text[2:]
-    selector_text = re.sub(r"[^0-9a-f]", "", selector_text)
-    if len(selector_text) != 8:
-        return None
-    return f"selector_{selector_text}"
-
-
-def _safe_tac_function_name(bytecode_function) -> str:
-    """Name TAC headers from bytecode-visible facts, preferring selectors."""
-    selector_name = _selector_safe_name(getattr(bytecode_function, "selector", None))
-    if selector_name:
-        return selector_name
-
-    raw_name = str(getattr(bytecode_function, "name", "") or "").strip()
-    if raw_name in {"fallback", "fallback_function", "receive"}:
-        return re.sub(r"[^A-Za-z0-9_]", "_", raw_name).strip("_") or "bytecode_function"
-
-    if raw_name.startswith("internal_"):
-        return re.sub(r"[^A-Za-z0-9_]", "_", raw_name).strip("_") or "bytecode_function"
-
-    entry_block = str(getattr(bytecode_function, "entry_block", "") or "").strip()
-    if entry_block:
-        safe_entry = re.sub(r"[^A-Za-z0-9_]", "_", entry_block).strip("_")
-        if safe_entry:
-            return f"bytecode_{safe_entry}"
-
-    return "bytecode_function"
-
-
-def _md5(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
-
-
-def hash_normalized_body(body: str) -> str:
-    return _md5(normalize_solidity_body(body))
-
-
-def hash_normalized_tac(tac: str) -> str:
-    return _md5(normalize_tac(tac))
-
-
-def hash_normalized_pair(tac: str, body: str) -> str:
-    """Hash normalized (TAC + body) -- the ultimate semantic dedup key."""
-    return _md5(normalize_tac(tac) + "|" + normalize_solidity_body(body))
-
-
-def hash_source_code(source: str) -> str:
-    """Hash source code for contract-level dedup (normalize whitespace)."""
-    normalized = _collapse_whitespace(source)
-    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def _now_utc_iso() -> str:
@@ -1186,45 +1121,6 @@ def _max_rss_mb() -> float:
     return round(value / 1024, 2)
 
 
-def _token_count_estimate(text: Any) -> int:
-    text = str(text or "")
-    whitespace_tokens = len(text.split())
-    bpeish_tokens = (len(text) + 3) // 4
-    return max(whitespace_tokens, bpeish_tokens)
-
-
-def _export_prompt_parts(record: Dict[str, Any]) -> Tuple[str, str, str]:
-    try:
-        import train
-
-        return train._preflight_prompt_parts(
-            record,
-            include_bytecode_metadata=True,
-            template_format="alpaca",
-        )
-    except Exception:
-        return record.get("input", ""), record.get("output", ""), ""
-
-
-def _export_length_report(record: Dict[str, Any], max_seq_length: int) -> Dict[str, Any]:
-    prefix, target, suffix = _export_prompt_parts(record)
-    context_tokens = _token_count_estimate(prefix)
-    target_tokens = _token_count_estimate(f"{target}{suffix}")
-    total_tokens = context_tokens + target_tokens
-    reasons: List[str] = []
-    if target_tokens >= max_seq_length:
-        reasons.append("target_overlength")
-    if total_tokens > max_seq_length:
-        reasons.append("context_overlength")
-    return {
-        "context_tokens": context_tokens,
-        "target_tokens": target_tokens,
-        "total_tokens": total_tokens,
-        "max_seq_length": max_seq_length,
-        "reasons": reasons,
-    }
-
-
 def download_contracts(
     limit: int = 0,
     db_path: Path = DB_PATH,
@@ -1501,6 +1397,7 @@ def _prepare_contract(
     orig_version: str,
     orig_runs: int,
     max_compiler_versions: int,
+    target_contract_name: str = "",
 ) -> Optional[Dict]:
     """Parse a contract and return a compile job spec (runs in worker)."""
     logging.disable(logging.CRITICAL)
@@ -1540,6 +1437,7 @@ def _prepare_contract(
             "compatible_versions": compatible,
             "solidity_functions": _add_selectors(solidity_functions),
             "runs": orig_runs or 200,
+            "target_contract_name": target_contract_name or "",
         }
     except Exception:
         return None
@@ -1553,6 +1451,7 @@ def _compile_one_job(
     opt_enabled: bool,
     runs: int,
     min_body_length: int,
+    target_contract_name: str = "",
 ) -> Dict[str, Any]:
     """Compile one (contract, version, optimizer) combo and return outcome.
 
@@ -1588,9 +1487,23 @@ def _compile_one_job(
 
         pairs: List[Dict] = []
         analysis_errors: List[str] = []
+        drop_counts: Counter = Counter()
+        compiled_contract_counts: Counter = Counter()
+        target_name = str(target_contract_name or "").strip()
         for cname, compiled in comp.contracts.items():
+            if target_name:
+                if contract_names_match(target_name, cname):
+                    compiled_contract_counts["target_contracts_analyzed"] += 1
+                else:
+                    compiled_contract_counts["auxiliary_contracts_skipped"] += 1
+                    drop_counts["auxiliary_compiled_contract"] += 1
+                    continue
+            else:
+                compiled_contract_counts["contracts_analyzed_without_target_metadata"] += 1
+
             bytecode_hex = "0x" + compiled.runtime_bytecode
             if len(bytecode_hex) < 10:
+                drop_counts["empty_runtime_bytecode"] += 1
                 continue
 
             try:
@@ -1614,17 +1527,44 @@ def _compile_one_job(
 
                 pair = _build_pair(m, address, solc_version, opt_enabled, runs, cname)
                 if pair:
+                    tac_reasons = tac_quality_reject_reasons(pair["tac_representation"])
+                    if tac_reasons:
+                        for reason in tac_reasons:
+                            drop_counts[reason] += 1
+                        continue
                     pairs.append(pair)
 
         if pairs:
-            return {"pairs": pairs, "status": "processed", "error": ""}
+            return {
+                "pairs": pairs,
+                "status": "processed",
+                "error": "",
+                "drop_counts": dict(drop_counts),
+                "compiled_contract_counts": dict(compiled_contract_counts),
+            }
         if analysis_errors:
             return {
                 "pairs": [],
                 "status": "analysis_failed",
                 "error": "; ".join(analysis_errors[:3]),
+                "drop_counts": dict(drop_counts),
+                "compiled_contract_counts": dict(compiled_contract_counts),
             }
-        return {"pairs": [], "status": "no_pairs", "error": "no matched functions"}
+        if target_name and compiled_contract_counts.get("auxiliary_contracts_skipped") and not compiled_contract_counts.get("target_contracts_analyzed"):
+            return {
+                "pairs": [],
+                "status": "no_target_contract",
+                "error": f"target contract {target_name!r} not found in compiled artifacts",
+                "drop_counts": dict(drop_counts),
+                "compiled_contract_counts": dict(compiled_contract_counts),
+            }
+        return {
+            "pairs": [],
+            "status": "no_pairs",
+            "error": "no matched functions",
+            "drop_counts": dict(drop_counts),
+            "compiled_contract_counts": dict(compiled_contract_counts),
+        }
     except Exception as e:
         return {"pairs": [], "status": "compile_failed", "error": str(e)}
 
@@ -1651,7 +1591,7 @@ def compile_and_generate(
     with _db_connection(db_path) as conn:
         rows = conn.execute(
             "SELECT address, source_code, compiler_version, "
-            "optimization_enabled, optimization_runs "
+            "optimization_enabled, optimization_runs, contract_name "
             "FROM contracts WHERE processed = FALSE"
         ).fetchall()
 
@@ -1703,9 +1643,9 @@ def compile_and_generate(
                 batch_rows = rows[batch_start : batch_start + SUBMIT_BATCH]
                 futures = {
                     executor.submit(
-                        _prepare_contract, addr, src, ver, runs, max_compiler_versions
+                        _prepare_contract, addr, src, ver, runs, max_compiler_versions, contract_name
                     ): addr
-                    for addr, src, ver, _opt, runs in batch_rows
+                    for addr, src, ver, _opt, runs, contract_name in batch_rows
                 }
                 for fut in as_completed(futures):
                     addr = futures[fut]
@@ -1752,6 +1692,7 @@ def compile_and_generate(
             opt,
             prep["runs"],
             min_body_length,
+            prep.get("target_contract_name", ""),
         )
         for addr, prep in sorted(prepared.items())
         for ver in prep["compatible_versions"]
@@ -1809,6 +1750,8 @@ def compile_and_generate(
     pair_buffer: List[Dict] = []
     diagnostics_buffer: List[Dict[str, Any]] = []
     job_status_counts: Dict[str, int] = {}
+    quality_drop_counts: Counter = Counter()
+    compiled_contract_counts: Counter = Counter()
     contract_outcomes: Dict[str, Dict[str, Any]] = {
         addr: {"pairs": 0, "failures": []} for addr in prepared
     }
@@ -1849,6 +1792,8 @@ def compile_and_generate(
                     pairs = result.get("pairs", []) or []
                     status = result.get("status", "no_pairs")
                     job_status_counts[status] = job_status_counts.get(status, 0) + 1
+                    quality_drop_counts.update(result.get("drop_counts", {}) or {})
+                    compiled_contract_counts.update(result.get("compiled_contract_counts", {}) or {})
                     if pairs:
                         pair_buffer.extend(pairs)
                         total_pairs += len(pairs)
@@ -1943,16 +1888,19 @@ def compile_and_generate(
             "pairs_inserted": total_inserted,
             "db_pair_duplicates": total_db_deduped,
             "selectors_harvested": len(all_selectors),
+            "compiled_contract_counts": dict(compiled_contract_counts),
         },
         status_counts={
             "compile_jobs": job_status_counts,
             "contract_outcomes": outcome_counts,
+            "compiled_contracts": dict(compiled_contract_counts),
         },
         drop_counts={
             "prepare_no_jobs": len(no_work_addresses),
             "no_pair_jobs": job_status_counts.get("no_pairs", 0),
             "compile_or_analysis_errors": errors_count,
             "db_pair_duplicates": total_db_deduped,
+            **dict(quality_drop_counts),
         },
         command_args=command_args,
         hf_revision=hf_revision,
@@ -2093,39 +2041,12 @@ def _match_functions(
     Source/ABI/compiler arguments are accepted for backwards compatibility but
     are intentionally ignored when constructing TAC prompt text.
     """
-    _ensure_tac_integrated(analyzer)
-    sol_by_sel = {f["selector"]: f for f in solidity_functions if f.get("selector")}
-    bc_by_sel = {f.selector: f for f in bytecode_functions.values() if f.selector}
-
-    matches = []
-    for selector, sol_func in sol_by_sel.items():
-        if selector in bc_by_sel:
-            tac = _extract_tac(bc_by_sel[selector], analyzer)
-            matches.append(
-                {
-                    "solidity_function": sol_func,
-                    "bytecode_function": bc_by_sel[selector],
-                    "tac": tac,
-                    "selector": selector,
-                }
-            )
-    return matches
+    return match_functions_by_selector(solidity_functions, bytecode_functions, analyzer)
 
 
 def _ensure_tac_integrated(analyzer) -> None:
     """Populate analyzer basic blocks with TAC instructions once."""
-    blocks = getattr(analyzer, "basic_blocks", {}) or {}
-    if not blocks:
-        return
-    if any(getattr(block, "instructions", None) for block in blocks.values()):
-        return
-    if not any(
-        (getattr(block, "metadata", {}) or {}).get("raw_instructions") for block in blocks.values()
-    ):
-        return
-    converter = getattr(analyzer, "_convert_and_integrate_tac", None)
-    if callable(converter):
-        converter()
+    ensure_tac_integrated(analyzer)
 
 
 def _extract_tac(
@@ -2136,30 +2057,7 @@ def _extract_tac(
     Compiler/optimizer arguments are accepted for compatibility, but they are
     not emitted because production inference only has bytecode.
     """
-    lines: List[str] = []
-    try:
-        _ensure_tac_integrated(analyzer)
-        lines.append(f"function {_safe_tac_function_name(bytecode_function)}:")
-        if bytecode_function.selector:
-            lines.append(f"  // Selector: {bytecode_function.selector}")
-        lines.append(f"  // Entry block: {bytecode_function.entry_block}")
-
-        blocks = bytecode_function.basic_blocks or []
-        if not blocks and bytecode_function.entry_block in analyzer.basic_blocks:
-            blocks = _collect_blocks(bytecode_function.entry_block, analyzer.basic_blocks)
-
-        for block in blocks:
-            lines.append(f"  {block.id}:")
-            if block.predecessors:
-                lines.append(f"    // Predecessors: {', '.join(block.predecessors)}")
-            if block.successors:
-                lines.append(f"    // Successors: {', '.join(block.successors)}")
-            for instr in block.instructions:
-                lines.append(f"    {analyzer._format_tac_instruction(instr)}")
-            lines.append("")
-    except Exception as e:
-        lines.append(f"  // Error extracting TAC: {e}")
-    return "\n".join(lines)
+    return extract_tac_for_function(bytecode_function, analyzer)
 
 
 def _collect_blocks(entry_block_id: str, all_blocks: Dict) -> list:
@@ -2196,6 +2094,8 @@ def _build_pair(
     tac = sanitize_tac_prompt_input(match["tac"])
 
     if len(sol_func["body"].strip()) < 10 or not tac or len(tac.strip()) < 10:
+        return None
+    if tac_quality_reject_reasons(tac):
         return None
 
     return {
@@ -2424,9 +2324,10 @@ def export_training_data(
     with _db_connection(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT function_name, tac_representation, solidity_code,
-                   function_signature, visibility, is_payable, is_view,
-                   contract_address, metadata, body_hash
+            SELECT fp.function_name, fp.tac_representation, fp.solidity_code,
+                   fp.function_signature, fp.visibility, fp.is_payable, fp.is_view,
+                   fp.contract_address, fp.metadata, fp.body_hash,
+                   fp.pair_norm_hash, fp.tac_hash, contracts.contract_name
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (
@@ -2453,13 +2354,15 @@ def export_training_data(
                 )
                 WHERE pair_rn = 1
             )
-            WHERE body_rn <= ?
-            ORDER BY COALESCE(body_hash, ''),
-                     COALESCE(pair_norm_hash, ''),
-                     COALESCE(tac_hash, ''),
-                     COALESCE(contract_address, ''),
-                     COALESCE(function_signature, ''),
-                     COALESCE(function_name, '')
+            AS fp
+            LEFT JOIN contracts ON contracts.address = fp.contract_address
+            WHERE fp.body_rn <= ?
+            ORDER BY COALESCE(fp.body_hash, ''),
+                     COALESCE(fp.pair_norm_hash, ''),
+                     COALESCE(fp.tac_hash, ''),
+                     COALESCE(fp.contract_address, ''),
+                     COALESCE(fp.function_signature, ''),
+                     COALESCE(fp.function_name, '')
         """,
             (max_body_dupes,),
         ).fetchall()
@@ -2472,7 +2375,16 @@ def export_training_data(
 
     count = 0
     rejected_count = 0
+    overlength_row_rejects = 0
+    final_duplicate_rejects = 0
+    quality_row_rejects = 0
     overlength_counts: Counter = Counter()
+    reject_reason_counts: Counter = Counter()
+    tac_quality_counts: Counter = Counter()
+    auxiliary_counts: Counter = Counter()
+    compiled_contract_export_counts: Counter = Counter()
+    seen_final_hashes: Dict[str, Dict[str, Any]] = {}
+    final_duplicate_samples: List[Dict[str, Any]] = []
     solc_versions: Set[str] = set()
     reject_samples: List[Dict[str, Any]] = []
     with (
@@ -2490,8 +2402,12 @@ def export_training_data(
             addr,
             meta_str,
             body_hash,
+            pair_norm_hash,
+            tac_hash,
+            target_contract_name,
         ) in enumerate(rows, start=1):
             prompt_input = sanitize_tac_prompt_input(tac)
+            parsed_meta = parse_metadata_object(meta_str)
             metadata = {
                 "function_name": func_name,
                 "function_signature": sig,
@@ -2500,30 +2416,61 @@ def export_training_data(
                 "is_view": bool(is_view),
                 "body_hash": body_hash,
             }
+            if pair_norm_hash:
+                metadata["pair_norm_hash"] = pair_norm_hash
+            if tac_hash:
+                metadata["tac_hash"] = tac_hash
+            if target_contract_name:
+                metadata["target_contract_name"] = target_contract_name
             if isinstance(addr, str) and ETH_ADDRESS_RE.match(addr):
                 metadata["contract_address"] = addr
             else:
                 metadata["contract_id"] = addr
-            if meta_str:
-                try:
-                    parsed_meta = json.loads(meta_str)
-                    if isinstance(parsed_meta, dict):
-                        metadata.update(parsed_meta)
-                        compiler_version = parsed_meta.get("compiler_version")
-                        if compiler_version:
-                            solc_versions.add(compiler_version)
-                except json.JSONDecodeError:
-                    pass
-            record = {
-                "input": prompt_input,
-                "output": solidity,
-                "metadata": normalize_training_metadata(metadata),
-            }
+            if parsed_meta:
+                metadata.update(parsed_meta)
+                compiler_version = parsed_meta.get("compiler_version")
+                if compiler_version:
+                    solc_versions.add(compiler_version)
+            record = build_training_record(prompt_input, solidity, metadata)
 
+            compiled_contract = record["metadata"].get("compiled_contract")
+            if target_contract_name and compiled_contract:
+                if contract_names_match(target_contract_name, compiled_contract):
+                    compiled_contract_export_counts["target_compiled_contract_rows"] += 1
+                else:
+                    compiled_contract_export_counts["auxiliary_compiled_contract_rows"] += 1
+            elif compiled_contract:
+                compiled_contract_export_counts["compiled_contract_rows_without_target"] += 1
+            else:
+                compiled_contract_export_counts["rows_without_compiled_contract_metadata"] += 1
+
+            quality_reasons = tac_quality_reject_reasons(prompt_input)
+            aux_reasons = auxiliary_contract_reject_reasons(
+                target_contract_name,
+                compiled_contract,
+            )
             length_report = _export_length_report(record, max_seq_length)
-            if filter_overlength and length_report["reasons"]:
+            length_reasons = length_report["reasons"] if filter_overlength else []
+            row_hash = final_row_hash(record["input"], record["output"])
+            duplicate_reasons: List[str] = []
+            if row_hash in seen_final_hashes:
+                duplicate_reasons = ["final_row_duplicate"]
+
+            reject_reasons = quality_reasons + aux_reasons + length_reasons + duplicate_reasons
+            if reject_reasons:
                 rejected_count += 1
-                for reason in length_report["reasons"]:
+                reject_reason_counts.update(reject_reasons)
+                if quality_reasons or aux_reasons:
+                    quality_row_rejects += 1
+                if length_reasons:
+                    overlength_row_rejects += 1
+                if duplicate_reasons:
+                    final_duplicate_rejects += 1
+                for reason in quality_reasons:
+                    tac_quality_counts[reason] += 1
+                for reason in aux_reasons:
+                    auxiliary_counts[reason] += 1
+                for reason in length_reasons:
                     overlength_counts[reason] += 1
                 reject_record = {
                     "source_row_number": source_index,
@@ -2531,21 +2478,34 @@ def export_training_data(
                     "function_name": func_name,
                     "function_signature": sig,
                     "body_hash": body_hash,
-                    "reasons": length_report["reasons"],
+                    "compiled_contract": compiled_contract,
+                    "target_contract_name": target_contract_name,
+                    "final_row_hash": row_hash,
+                    "reasons": reject_reasons,
                     "lengths": {
                         key: value for key, value in length_report.items() if key != "reasons"
                     },
                 }
+                if duplicate_reasons:
+                    reject_record["duplicate_of"] = seen_final_hashes[row_hash]
+                    if len(final_duplicate_samples) < 10:
+                        final_duplicate_samples.append(reject_record)
                 reject_f.write(json.dumps(reject_record, sort_keys=True) + "\n")
                 if len(reject_samples) < 10:
                     reject_samples.append(reject_record)
                 continue
 
             f.write(json.dumps(record, sort_keys=True) + "\n")
+            seen_final_hashes[row_hash] = {
+                "source_row_number": source_index,
+                "function_name": func_name,
+                "function_signature": sig,
+                "contract_address": addr,
+            }
             count += 1
 
     logger.info(
-        "Exported %s training pairs to %s (%s overlength rows quarantined at %s)",
+        "Exported %s training pairs to %s (%s rows quarantined at %s)",
         count,
         output_path,
         rejected_count,
@@ -2569,8 +2529,12 @@ def export_training_data(
         if validate_body_dupes
         else {"status": "skipped", "max_body_dupes": max_body_dupes}
     )
+    final_duplicate_validation = validate_jsonl_final_row_duplicates(output_path)
     manifest_status = (
-        "completed" if validation_stats["status"] in ("passed", "skipped") else "failed"
+        "completed"
+        if validation_stats["status"] in ("passed", "skipped")
+        and final_duplicate_validation["status"] == "passed"
+        else "failed"
     )
     manifest = _base_manifest(
         "hf_export",
@@ -2592,6 +2556,9 @@ def export_training_data(
                 "validate_body_dupes": validate_body_dupes,
                 "max_seq_length": max_seq_length,
                 "filter_overlength": filter_overlength,
+                "final_row_duplicate_policy": "quarantine",
+                "tac_quality_policy": "quarantine",
+                "auxiliary_contract_policy": "quarantine",
             },
             "artifacts": {
                 "jsonl": _artifact_summary(output_path, row_count=count),
@@ -2601,27 +2568,57 @@ def export_training_data(
             "row_counts": {
                 **_db_table_counts(db_path),
                 "rows_exported": count,
-                "rows_rejected_overlength": rejected_count,
+                "rows_rejected": rejected_count,
+                "rows_rejected_overlength": overlength_row_rejects,
+                "rows_rejected_quality": quality_row_rejects,
+                "rows_rejected_final_duplicates": final_duplicate_rejects,
             },
             "status_counts": {
                 "contracts": _contract_status_counts(db_path),
-                "validation": {validation_stats["status"]: 1},
+                "compiled_contracts": dict(sorted(compiled_contract_export_counts.items())),
+                "validation": {
+                    f"body_duplicate_cap_{validation_stats['status']}": 1,
+                    f"final_row_duplicates_{final_duplicate_validation['status']}": 1,
+                },
             },
             "drop_counts": {
                 "pair_duplicate_rows": selection_stats["pair_duplicate_rows_dropped"],
                 "body_cap_rows": selection_stats["body_cap_rows_dropped"],
-                "overlength_rows": rejected_count,
+                "rejected_rows": rejected_count,
+                "overlength_rows": overlength_row_rejects,
+                "tac_error_rows": sum(tac_quality_counts.values()),
+                "auxiliary_compiled_contract_rows": auxiliary_counts.get(
+                    "auxiliary_compiled_contract", 0
+                ),
+                "final_row_duplicate_rows": final_duplicate_rejects,
+                **dict(sorted(reject_reason_counts.items())),
                 **{f"overlength_{reason}": count for reason, count in overlength_counts.items()},
             },
             "duplicate_stats": duplicate_stats,
             "export_selection": selection_stats,
             "validation": {
                 "body_duplicate_cap": validation_stats,
+                "final_row_duplicates": {
+                    **final_duplicate_validation,
+                    "export_reject_count": final_duplicate_rejects,
+                    "reject_samples": final_duplicate_samples,
+                },
+                "tac_quality_filter": {
+                    "status": "filtered" if tac_quality_counts else "passed",
+                    "reason_counts": dict(sorted(tac_quality_counts.items())),
+                },
+                "auxiliary_contract_filter": {
+                    "status": "filtered" if auxiliary_counts else "passed",
+                    "reason_counts": dict(sorted(auxiliary_counts.items())),
+                    "compiled_contract_counts": dict(
+                        sorted(compiled_contract_export_counts.items())
+                    ),
+                },
                 "token_length_filter": {
-                    "status": "filtered" if rejected_count else "passed",
+                    "status": "filtered" if overlength_row_rejects else "passed",
                     "max_seq_length": max_seq_length,
                     "filter_overlength": filter_overlength,
-                    "reject_count": rejected_count,
+                    "reject_count": overlength_row_rejects,
                     "reason_counts": dict(sorted(overlength_counts.items())),
                     "reject_samples": reject_samples,
                 },
@@ -2633,6 +2630,11 @@ def export_training_data(
     _write_manifest(manifest_path or Path(f"{output_path}.manifest.json"), manifest)
     if validation_stats["status"] not in ("passed", "skipped"):
         raise ValueError(format_duplicate_cap_error(validation_stats))
+    if final_duplicate_validation["status"] != "passed":
+        raise ValueError(
+            f"{output_path}: final-row duplicate validation "
+            f"{final_duplicate_validation['status']}"
+        )
     return output_path
 
 
@@ -2742,7 +2744,7 @@ def main():
         "--validate-jsonl",
         type=str,
         default=None,
-        help="Validate an exported JSONL's normalized body duplicate cap and exit.",
+        help="Validate exported JSONL body caps and final input/output duplicates, then exit.",
     )
     parser.add_argument(
         "--duplicate-sample-limit",
@@ -2768,13 +2770,34 @@ def main():
             max_body_dupes=args.max_body_dupes,
             sample_limit=args.duplicate_sample_limit,
         )
+        final_validation = validate_jsonl_final_row_duplicates(
+            args.validate_jsonl,
+            sample_limit=args.duplicate_sample_limit,
+        )
         if validation["status"] != "passed":
             logger.error(format_duplicate_cap_error(validation))
             raise SystemExit(1)
+        if final_validation["status"] != "passed":
+            logger.error(
+                "%s: final input/output duplicate validation %s (%s duplicate rows)",
+                args.validate_jsonl,
+                final_validation["status"],
+                final_validation["duplicate_final_rows"],
+            )
+            for item in final_validation.get("duplicates", []):
+                logger.error(
+                    "  final_row_hash=%s count=%s samples=%s",
+                    item["final_row_hash"],
+                    item["count"],
+                    item.get("samples", []),
+                )
+            raise SystemExit(1)
         logger.info(
-            "Duplicate-cap validation passed: %s rows, %s unique normalized bodies, cap=%s",
+            "Export validation passed: %s rows, %s unique normalized bodies, "
+            "%s unique final rows, body cap=%s",
             validation["rows_checked"],
             validation["unique_normalized_bodies"],
+            final_validation["unique_final_rows"],
             validation["max_body_dupes"],
         )
         return

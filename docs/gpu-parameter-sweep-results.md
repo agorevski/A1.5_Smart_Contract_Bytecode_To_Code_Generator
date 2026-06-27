@@ -2,7 +2,9 @@
 
 ## Recommendation
 
-Use the opt-in throughput recipe now configured in the repo:
+Use the opt-in throughput recipe now configured in the repo. The wrapper runs
+evaluation by default; add `SKIP_EVAL=true` only when repeating a throughput
+sweep where post-train quality reports are intentionally out of scope:
 
 ```bash
 THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh
@@ -18,8 +20,8 @@ uv run torchrun --nproc_per_node=4 train.py \
   --global-batch-size 36 \
   --max-seq-length 256 \
   --precision fp16 \
-  --no-gradient-checkpointing \
-  --skip-eval
+  --report-to tensorboard \
+  --no-gradient-checkpointing
 ```
 
 Recommended defaults:
@@ -50,8 +52,8 @@ uv run torchrun --standalone --nproc_per_node=4 train.py \
   --precision fp16 \
   --quantization \
   --gradient-checkpointing \
-  --train-eval-strategy no \
-  --skip-eval
+  --report-to tensorboard \
+  --train-eval-strategy no
 ```
 
 Recommended 8192-token settings:

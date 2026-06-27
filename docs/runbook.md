@@ -226,10 +226,11 @@ TAC `input`, the training prompt builder strips those lines before tokenization;
 new exports also sanitize TAC prompt inputs.
 
 Before training or eval-only, `train.py` validates JSONL schema and tokenizer
-lengths. By default it uses a cached tokenizer when available and falls back to
-whitespace counts without downloading; add `--preflight-tokenizer-download` to
-force loading the actual tokenizer if it is not cached. Use
-`--skip-data-preflight` only for legacy smoke runs.
+lengths. By default it fails closed if the requested tokenizer cannot be loaded
+from the local cache; add `--preflight-tokenizer-download` to allow downloading
+the actual tokenizer or `--allow-whitespace-preflight-fallback` for an explicit
+approximate-count override. Use `--skip-data-preflight` only for legacy smoke
+runs.
 
 Every `train.py` run writes a structured manifest under
 `models/run_manifests/` by default (override with `--manifest-dir` or
@@ -328,13 +329,16 @@ LR=2e-4 \
 ./run_train_torchrun.sh
 ```
 
-`train_common.sh` auto-detects `MAX_SEQ_LEN` from the dataset and computes `BATCH_SIZE` unless you override them:
+`train_common.sh` auto-detects `MAX_SEQ_LEN` from tokenizer counts, computes
+`BATCH_SIZE`, runs post-training evaluation, and reports to TensorBoard by
+default. Set `SKIP_EVAL=true` only for smoke/sweep runs, and set
+`REPORT_TO=wandb` or `REPORT_TO=none` to change Trainer telemetry. To force the
+4x RTX 8000 throughput sweep recipe, set `THROUGHPUT_SWEEP_DEFAULTS=true`:
 
 ```bash
-NGPUS=2 MAX_SEQ_LEN=4096 BATCH_SIZE=2 ./run_train_torchrun.sh
+THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh
+MAX_SEQ_LEN=512 BATCH_SIZE=4 GLOBAL_BATCH_SIZE=16 ./run_train_torchrun.sh
 ```
-
-The wrapper currently passes `--skip-eval`; run evaluation afterward with the eval-only command below.
 
 ### DeepSpeed
 
@@ -367,6 +371,10 @@ uv run python train.py \
   --resume auto
 ```
 
+Use `--resume required` when a preempted job must resume and should fail rather
+than silently starting fresh. Checkpoints must include `trainer_state.json`,
+`optimizer.pt`, `scheduler.pt`, and model/adapter weights.
+
 ## 5. Evaluate
 
 Training evaluates automatically unless `--skip-eval` is passed. Results are written to `results/eval_<timestamp>.json`.
@@ -378,7 +386,8 @@ uv run python train.py \
   --eval-only \
   --model-path models/final_model \
   --test-dataset data/test_dataset.jsonl \
-  --eval-batch-size 4
+  --eval-batch-size 4 \
+  --eval-max-new-tokens 256
 ```
 
 Every evaluation writes two artifacts:
@@ -403,14 +412,7 @@ uv run python train.py \
   --eval-limit 3
 ```
 
-If you trained with `run_train_torchrun.sh`, evaluate afterward because the wrapper skips evaluation:
-
-```bash
-uv run torchrun --nproc_per_node=4 train.py \
-  --eval-only \
-  --model-path models/final_model \
-  --test-dataset data/test_dataset.jsonl
-```
+If you trained with `SKIP_EVAL=true`, run the eval-only command manually.
 
 Inspect result summaries:
 
@@ -435,7 +437,9 @@ Key metrics:
 | `replication_precision_micro` | higher is better; measures recovered facts that are correct |
 | `replication_recall_micro` | higher is better; measures ground-truth facts recovered |
 | `replication_f1_micro` | higher is better; balanced structured replication score |
-| `solidity_valid_mean` | higher is better; generated Solidity passed compiler/AST validation when local solc was available, otherwise the deterministic scaffold check |
+| `solidity_valid_mean` | higher is better; generated Solidity passed compiler/AST validation when local solc was available |
+| `bytecode_semantic_checked_mean` | should be 100%; rows need opcode/runtime/compiler evidence to count as bytecode-grounded |
+| `bytecode_deployable_mean` | should be 100%; scaffold-only syntax checks are not considered deployable |
 
 The replication metrics compare structured Solidity facts extracted from the
 ground-truth function and generated function: ABI/function facts, visibility,
@@ -447,11 +451,11 @@ calls, or other categories.
 Evaluation helpers now use true normalized Levenshtein distance for
 `edit_distance_mean` instead of a `difflib.SequenceMatcher` ratio. Compiler/AST
 validity is best-effort and offline: installed local `solc` versions are used
-without attempting downloads; if no matching compiler is available, the report
-falls back to an explicit Solidity scaffold/syntax check. Reusable helpers also
-produce `metadata_segments` coverage/per-segment metrics plus deterministic
-mean confidence intervals and baseline/regression comparisons for future CLI
-wiring.
+without attempting downloads. Scaffold-only syntax checks are reported
+separately and do not satisfy deployability/bytecode-grounded quality gates.
+Reusable helpers also produce `metadata_segments` coverage/per-segment metrics,
+prompt/truncation diagnostics, deterministic confidence intervals, and
+baseline/regression comparisons (`--baseline-results`).
 
 ## 6. Use the trained model
 
@@ -546,12 +550,14 @@ uv run python web/app.py
 ```
 
 Open `http://localhost:5000`. If no model artifact can be resolved, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
-The readiness panel calls `/api/health` before a job and shows whether the
-model is loaded, which model path/config is effective, lookup DB availability,
-warmup status, request limits, hard-timeout mode, and default generation
-controls. The browser validates bytecode/ABI/metadata format before upload,
-provides an explicit cancel button for long jobs, and exposes `.sol`, `.tac`,
-and structured JSON downloads after results arrive.
+The readiness panel calls redacted `/api/health` before a job and shows model
+availability, lookup DB availability, warmup status, request limits,
+killable-timeout mode, and default generation controls without exposing local
+model paths or full config. Use `/livez` for minimal public liveness and
+protected `/readyz` for internal model path/error/config diagnostics. The
+browser validates bytecode/ABI/metadata format before upload, sends a
+server-side cancellation request for long jobs, and exposes `.sol`, `.tac`, and
+structured JSON downloads after results arrive.
 
 The `/api/decompile` endpoint streams SSE progress and a final result. Each
 request includes a `request_id`; when `WEB_INFERENCE_TRACE_ENABLED=true`
@@ -583,7 +589,8 @@ curl -N http://127.0.0.1:5000/api/decompile \
       "temperature": 0.1,
       "do_sample": false,
       "repetition_penalty": 1.15
-    }
+    },
+    "lookup": {"benchmark_mode": false}
   }'
 ```
 
@@ -592,8 +599,12 @@ curl -N http://127.0.0.1:5000/api/decompile \
 `abi` array. ABI-derived function signatures override selector provenance as
 `source="abi"` and are included in per-function metadata, traces, and JSON
 exports. The final result includes `validation`, `function_validation`,
-`trace_path`, `function_results[*].diagnostics`, `contract_metadata`,
-`source_summary`, and `effective_generation_config`.
+`quality`, `trace_path`, `function_results[*].diagnostics`,
+`function_results[*].quality`, lookup provenance for TAC cache hits,
+`contract_metadata`, `source_summary`, and `effective_generation_config`.
+Set `lookup.benchmark_mode=true` (or `lookup.enabled=false`) to disable exact
+TAC lookup for model-quality benchmarks; lookup/model/error counts are reported
+separately in `source_summary`.
 
 Supported web inference configuration is environment/CLI driven; web requests do
 not read `src/settings.yaml`.
@@ -609,13 +620,15 @@ not read `src/settings.yaml`.
 | `WEB_MAX_BYTECODE_HEX_LENGTH` | `200000` | Request bytecode hex limit |
 | `WEB_MAX_CONCURRENT_DECOMPILES` | `1` | Bounded semaphore capacity |
 | `WEB_MAX_DECOMPILE_FUNCTIONS` | `128` | Function work cap |
-| `WEB_DECOMPILE_TIMEOUT_SECONDS` | `900` | Hard daemon-thread timeout around analyzer/model calls; `0` disables |
+| `WEB_DECOMPILE_TIMEOUT_SECONDS` | `900` | Request deadline for analyzer/model calls; `0` disables |
+| `WEB_KILLABLE_INFERENCE_WORKERS` | `true` | Run model calls in terminable worker processes for hard timeout/cancel cleanup |
 | `WEB_MAX_NEW_TOKENS` | `4096` | Maximum request generation cap |
 | `WEB_DEFAULT_MAX_NEW_TOKENS` | `1024` | UI/API default generation cap |
 | `WEB_DEFAULT_TEMPERATURE` | `0.1` | UI/API default |
 | `WEB_DEFAULT_DO_SAMPLE` | `false` | UI/API default |
 | `WEB_DEFAULT_REPETITION_PENALTY` | `1.15` | UI/API default |
 | `WEB_ENABLE_REMOTE_SELECTOR_LOOKUP` / `--remote-selector-lookup` | `false` | Enables 4byte.directory lookups |
+| `WEB_TAC_LOOKUP_ENABLED` | `true` | Enables TAC exact-match lookup unless request lookup config disables it |
 | `WEB_INFERENCE_TRACE_ENABLED` | `true` | Writes trace JSON |
 | `WEB_INFERENCE_TRACE_INCLUDE_SAMPLES` | `false` | Include raw samples in traces |
 | `WEB_INFERENCE_TRACE_DIR` | `results/inference_traces/` | Trace output directory |
@@ -625,9 +638,31 @@ not read `src/settings.yaml`.
 | `WEB_MODEL_WARMUP_ENABLED` / `--warmup` / `--no-warmup` | `false` | Optional startup warmup |
 | `WEB_MODEL_WARMUP_TIMEOUT_SECONDS` | `30` | Warmup deadline |
 | `WEB_MODEL_WARMUP_MAX_NEW_TOKENS` | `8` | Warmup generation cap |
+| `WEB_LOAD_MODEL_ON_STARTUP` | `false` | Use with WSGI factory to load the model during worker startup |
 
-`/api/health` reports these as `limits`, `generation_defaults`, `tracing`,
-`warmup`, `model_path`, `model_loaded`, `inference_ready`, and `lookup`.
+`/api/health` reports public `limits`, `generation_defaults`, `tracing`,
+`warmup`, `model_loaded`, `inference_ready`, and redacted `lookup` state.
+`/readyz` returns protected diagnostics including `model_path`, `model_error`,
+`model_config`, and active running jobs.
+
+For production, run the WSGI application factory under a container/WSGI server
+instead of Flask's development server, for example:
+
+```bash
+WEB_LOAD_MODEL_ON_STARTUP=true \
+WEB_MODEL_PATH=models/final_model \
+gunicorn 'web.app:create_app()' --bind 0.0.0.0:5000 --workers 1 --timeout 0
+```
+
+The TAC lookup builder writes provenance into the database and a JSON manifest:
+
+```bash
+uv run python scripts/build_lookup_db.py \
+  --source-db data/contracts.db \
+  --lookup-db data/tac_lookup.db \
+  --manifest-path data/tac_lookup.db.manifest.json \
+  --decontamination-exclusion validation_split
+```
 
 The UI also exposes the security-analysis APIs using the same bytecode/API-key
 inputs:
@@ -700,4 +735,4 @@ PY
 | CUDA out of memory | Batch/sequence/model too large | Lower `--batch-size`, lower `--max-seq-length`, use `--small`, or choose a smaller model |
 | Multi-GPU quantization issues | Bare single-process `uv run python train.py` with quantized model across GPUs | Use `run_train_torchrun.sh` or restrict `CUDA_VISIBLE_DEVICES=0` |
 | Web app shows TAC only | `models/final_model/` is absent | Train a model or symlink/copy the trained artifact to `models/final_model/` |
-| Evaluation cannot find test data | Split files are absent | Re-run training once with `--skip-collection --dataset ... --skip-eval`, or pass `--test-dataset` explicitly |
+| Evaluation cannot find test data | Split files are absent or cached test lineage is unverified | Re-run dataset splitting with `--skip-collection --dataset ... --dataset-only`, pass `--test-dataset` explicitly, or use `--allow-unverified-test-dataset` only for audits |

@@ -13,6 +13,7 @@ import traceback
 import ipaddress
 import threading
 import queue
+import multiprocessing
 import hmac
 import hashlib
 import re
@@ -28,6 +29,12 @@ from flask import Flask, render_template, request, jsonify, Response, stream_wit
 from flask_cors import CORS
 
 from src.bytecode_analyzer import BytecodeAnalyzer
+from src.contract_reconstruction import (
+    assemble_reconstructed_contract,
+    build_contract_quality,
+    build_function_quality,
+    build_reconstruction_plan,
+)
 from src.model_setup import SmartContractDecompiler
 from src.selector_resolver import get_resolver
 from src.tac_lookup import TACLookup
@@ -124,12 +131,15 @@ def _parse_cors_origins() -> list[str] | str:
 
 CORS_ORIGINS = _parse_cors_origins()
 ENABLE_REMOTE_SELECTOR_LOOKUP = _parse_bool_env("WEB_ENABLE_REMOTE_SELECTOR_LOOKUP", False)
+TAC_LOOKUP_ENABLED = _parse_bool_env("WEB_TAC_LOOKUP_ENABLED", True)
 MAX_DECOMPILE_FUNCTIONS = _parse_int_env("WEB_MAX_DECOMPILE_FUNCTIONS", 128, 1)
 DECOMPILE_TIMEOUT_SECONDS = _parse_float_env("WEB_DECOMPILE_TIMEOUT_SECONDS", 900.0, 0.0)
 MAX_NEW_TOKENS_LIMIT = _parse_int_env("WEB_MAX_NEW_TOKENS", 4096, 1)
 MAX_ABI_JSON_CHARS = _parse_int_env("WEB_MAX_ABI_JSON_CHARS", 200000, 1)
 MAX_CONTRACT_METADATA_JSON_CHARS = _parse_int_env("WEB_MAX_CONTRACT_METADATA_JSON_CHARS", 200000, 1)
 MAX_ABI_ENTRIES = _parse_int_env("WEB_MAX_ABI_ENTRIES", 512, 1)
+KILLABLE_INFERENCE_WORKERS = _parse_bool_env("WEB_KILLABLE_INFERENCE_WORKERS", True)
+READYZ_PUBLIC = _parse_bool_env("WEB_READYZ_PUBLIC", False)
 DEFAULT_GENERATION_CONFIG = {
     "max_new_tokens": _parse_int_env("WEB_DEFAULT_MAX_NEW_TOKENS", 1024, 1),
     "temperature": _parse_float_env("WEB_DEFAULT_TEMPERATURE", 0.1, 0.0),
@@ -182,18 +192,111 @@ model_warmup_state: dict = {
     "max_new_tokens": MODEL_WARMUP_MAX_NEW_TOKENS,
     "timeout_seconds": MODEL_WARMUP_TIMEOUT_SECONDS,
 }
+ACTIVE_DECOMPILE_JOBS: dict[str, dict] = {}
+ACTIVE_DECOMPILE_JOBS_LOCK = threading.Lock()
 
 
 class DecompileRequestError(Exception):
     """Raised for request-scoped decompilation failures after SSE starts."""
 
 
-def _run_with_timeout(operation, timeout_seconds: float | None, description: str):
+class DecompileTimeoutError(DecompileRequestError):
+    """Raised when server-side deadline enforcement terminates a job."""
+
+
+class DecompileCancelledError(DecompileRequestError):
+    """Raised when a client cancels a server-side decompilation job."""
+
+
+def _register_decompile_job(request_id: str) -> dict:
+    job = {
+        "request_id": request_id,
+        "cancelled": False,
+        "status": "running",
+        "started_at": _utc_now_iso(),
+        "active_process": None,
+        "last_stage": None,
+        "finished_at": None,
+        "trace_path": None,
+    }
+    with ACTIVE_DECOMPILE_JOBS_LOCK:
+        ACTIVE_DECOMPILE_JOBS[request_id] = job
+    return job
+
+
+def _job_snapshot(request_id: str) -> dict | None:
+    with ACTIVE_DECOMPILE_JOBS_LOCK:
+        job = ACTIVE_DECOMPILE_JOBS.get(request_id)
+        return dict(job) if job else None
+
+
+def _set_job_process(job: dict | None, process) -> None:
+    if not job:
+        return
+    with ACTIVE_DECOMPILE_JOBS_LOCK:
+        current = ACTIVE_DECOMPILE_JOBS.get(job["request_id"])
+        if current is not None:
+            current["active_process"] = process
+            current["last_stage"] = job.get("last_stage")
+            job["active_process"] = process
+
+
+def _terminate_process(process) -> None:
+    if process is None or not getattr(process, "is_alive", lambda: False)():
+        return
+    process.terminate()
+    process.join(timeout=2)
+    if process.is_alive():  # pragma: no cover - defensive hard kill
+        process.kill()
+        process.join(timeout=2)
+
+
+def _mark_job_finished(job: dict | None, status: str, trace_path: str | None = None) -> None:
+    if not job:
+        return
+    finished_at = _utc_now_iso()
+    with ACTIVE_DECOMPILE_JOBS_LOCK:
+        current = ACTIVE_DECOMPILE_JOBS.get(job["request_id"])
+        if current is not None:
+            current["status"] = status
+            current["finished_at"] = finished_at
+            current["trace_path"] = trace_path
+            current["active_process"] = None
+            ACTIVE_DECOMPILE_JOBS.pop(job["request_id"], None)
+        job["status"] = status
+        job["finished_at"] = finished_at
+        job["trace_path"] = trace_path
+        job["active_process"] = None
+
+
+def _cancel_decompile_job(request_id: str, reason: str = "cancel_requested") -> bool:
+    with ACTIVE_DECOMPILE_JOBS_LOCK:
+        job = ACTIVE_DECOMPILE_JOBS.get(request_id)
+        if not job or job.get("status") != "running":
+            return False
+        job["cancelled"] = True
+        job["status"] = "cancelled"
+        job["cancel_reason"] = reason
+        process = job.get("active_process")
+    _terminate_process(process)
+    return True
+
+
+def _check_job_cancelled(job: dict | None, description: str = "decompile") -> None:
+    if not job:
+        return
+    snapshot = _job_snapshot(job["request_id"])
+    if snapshot and snapshot.get("cancelled"):
+        raise DecompileCancelledError(f"Decompile cancelled during {description}.")
+
+
+def _run_with_timeout(operation, timeout_seconds: float | None, description: str, job: dict | None = None):
     """Run blocking work with a request-level hard timeout."""
+    _check_job_cancelled(job, description)
     if timeout_seconds is None:
         return operation()
     if timeout_seconds <= 0:
-        raise DecompileRequestError(
+        raise DecompileTimeoutError(
             f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds before {description}."
         )
 
@@ -209,7 +312,7 @@ def _run_with_timeout(operation, timeout_seconds: float | None, description: str
     worker.start()
     worker.join(timeout_seconds)
     if worker.is_alive():
-        raise DecompileRequestError(
+        raise DecompileTimeoutError(
             f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds during {description}."
         )
 
@@ -219,10 +322,97 @@ def _run_with_timeout(operation, timeout_seconds: float | None, description: str
     raise payload
 
 
+def _process_worker_target(result_queue, operation) -> None:
+    try:
+        result_queue.put((True, operation()))
+    except BaseException as exc:  # pragma: no cover - defensive handoff
+        result_queue.put((False, exc))
+
+
+def _run_killable_with_timeout(
+    operation,
+    timeout_seconds: float | None,
+    description: str,
+    job: dict | None = None,
+):
+    """Run model work in a killable child process with timeout/cancel polling."""
+    _check_job_cancelled(job, description)
+    if not KILLABLE_INFERENCE_WORKERS:
+        return _run_with_timeout(operation, timeout_seconds, description, job=job)
+
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise DecompileTimeoutError(
+            f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds before {description}."
+        )
+
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:  # pragma: no cover - non-Unix fallback
+        return _run_with_timeout(operation, timeout_seconds, description, job=job)
+
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(target=_process_worker_target, args=(result_queue, operation))
+    process.start()
+    _set_job_process(job, process)
+    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    try:
+        while True:
+            _check_job_cancelled(job, description)
+            wait_timeout = 0.05
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_process(process)
+                    raise DecompileTimeoutError(
+                        f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds during {description}."
+                    )
+                wait_timeout = min(wait_timeout, remaining)
+            try:
+                ok, payload = result_queue.get(timeout=wait_timeout)
+                process.join(timeout=0.2)
+                _terminate_process(process)
+                if ok:
+                    return payload
+                raise payload
+            except queue.Empty:
+                if not process.is_alive():
+                    break
+
+        _check_job_cancelled(job, description)
+        try:
+            ok, payload = result_queue.get(timeout=1)
+        except queue.Empty:
+            raise DecompileRequestError(f"Worker process ended without a result during {description}.")
+        process.join(timeout=0)
+        if ok:
+            return payload
+        raise payload
+    except DecompileCancelledError:
+        _terminate_process(process)
+        raise
+    finally:
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+        _set_job_process(job, None)
+
+
 def _error_response(message: str, status_code: int, **extra):
     payload = {"error": message}
     payload.update({k: v for k, v in extra.items() if v is not None})
     return jsonify(payload), status_code
+
+
+def _field_error(message: str, field: str, code: str, status_code: int = 400, **extra):
+    return _error_response(
+        message,
+        status_code,
+        field=field,
+        code=code,
+        errors=[{"field": field, "code": code, "message": message}],
+        **extra,
+    )
 
 
 def _is_loopback_request() -> bool:
@@ -257,19 +447,27 @@ def _require_protected_api_access():
 def _normalize_bytecode_from_request(data: dict | None, request_id: str | None = None):
     """Return normalized 0x-prefixed bytecode or a Flask error response."""
     if not data or "bytecode" not in data:
-        return None, _error_response(
-            "Missing 'bytecode' field in request body.", 400, request_id=request_id
+        return None, _field_error(
+            "Missing 'bytecode' field in request body.",
+            "bytecode",
+            "missing",
+            request_id=request_id,
         )
 
     raw_bytecode = data["bytecode"]
     if not isinstance(raw_bytecode, str):
-        return None, _error_response(
-            "'bytecode' must be a hexadecimal string.", 400, request_id=request_id
+        return None, _field_error(
+            "'bytecode' must be a hexadecimal string.",
+            "bytecode",
+            "invalid_type",
+            request_id=request_id,
         )
 
     bytecode = raw_bytecode.strip()
     if not bytecode:
-        return None, _error_response("Bytecode is empty.", 400, request_id=request_id)
+        return None, _field_error(
+            "Bytecode is empty.", "bytecode", "empty", request_id=request_id
+        )
 
     if bytecode.lower().startswith("0x"):
         hex_body = bytecode[2:]
@@ -280,41 +478,170 @@ def _normalize_bytecode_from_request(data: dict | None, request_id: str | None =
     bytecode = "0x" + hex_body
 
     if len(hex_body) > MAX_BYTECODE_HEX_LENGTH:
-        return None, _error_response(
+        return None, _field_error(
             (
                 f"Bytecode too large. Maximum {MAX_BYTECODE_HEX_LENGTH} hex "
                 f"characters ({MAX_BYTECODE_HEX_LENGTH // 2} bytes) allowed."
             ),
+            "bytecode",
+            "too_large",
             413,
             request_id=request_id,
         )
 
-    if (
-        not hex_body
-        or len(hex_body) % 2 != 0
-        or any(c not in "0123456789abcdefABCDEF" for c in hex_body)
-    ):
-        return None, _error_response("Invalid hexadecimal bytecode.", 400, request_id=request_id)
+    if not hex_body:
+        return None, _field_error(
+            "Bytecode is empty.", "bytecode", "empty", request_id=request_id
+        )
+    if len(hex_body) % 2 != 0:
+        return None, _field_error(
+            "Bytecode must contain an even number of hex characters.",
+            "bytecode",
+            "odd_length",
+            request_id=request_id,
+        )
+    if any(c not in "0123456789abcdefABCDEF" for c in hex_body):
+        return None, _field_error(
+            "Bytecode contains non-hexadecimal characters.",
+            "bytecode",
+            "invalid_hex",
+            request_id=request_id,
+        )
 
     return bytecode, None
 
 
-def _parse_optional_bool(value):
+DECOMPILE_REQUEST_FIELDS = {
+    "bytecode",
+    "generation",
+    "lookup",
+    "abi",
+    "metadata",
+    "client_job_id",
+}
+GENERATION_FIELDS = {"max_new_tokens", "temperature", "do_sample", "repetition_penalty"}
+LOOKUP_FIELDS = {"enabled", "benchmark_mode"}
+
+
+def _request_id_from_request(data: dict | None) -> str:
+    if isinstance(data, dict):
+        candidate = data.get("client_job_id")
+        if isinstance(candidate, str):
+            safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", candidate.strip())[:80]
+            if safe:
+                return safe
+    return uuid.uuid4().hex
+
+
+def _validate_decompile_request_schema(data: dict | None, request_id: str):
+    if not isinstance(data, dict):
+        return _field_error(
+            "Request body must be a JSON object.",
+            "$",
+            "invalid_json_object",
+            request_id=request_id,
+        )
+    unknown = sorted(set(data) - DECOMPILE_REQUEST_FIELDS - GENERATION_FIELDS)
+    if unknown:
+        field = unknown[0]
+        return _field_error(
+            f"Unknown request field '{field}'.",
+            field,
+            "unknown_field",
+            request_id=request_id,
+            allowed_fields=sorted(DECOMPILE_REQUEST_FIELDS),
+        )
+    generation = data.get("generation")
+    if generation is not None:
+        if not isinstance(generation, dict):
+            return _field_error(
+                "'generation' must be an object.",
+                "generation",
+                "invalid_type",
+                request_id=request_id,
+            )
+        generation_unknown = sorted(set(generation) - GENERATION_FIELDS)
+        if generation_unknown:
+            field = f"generation.{generation_unknown[0]}"
+            return _field_error(
+                f"Unknown generation field '{generation_unknown[0]}'.",
+                field,
+                "unknown_field",
+                request_id=request_id,
+                allowed_fields=sorted(GENERATION_FIELDS),
+            )
+    lookup = data.get("lookup")
+    if lookup is not None:
+        if not isinstance(lookup, dict):
+            return _field_error(
+                "'lookup' must be an object.",
+                "lookup",
+                "invalid_type",
+                request_id=request_id,
+            )
+        lookup_unknown = sorted(set(lookup) - LOOKUP_FIELDS)
+        if lookup_unknown:
+            field = f"lookup.{lookup_unknown[0]}"
+            return _field_error(
+                f"Unknown lookup field '{lookup_unknown[0]}'.",
+                field,
+                "unknown_field",
+                request_id=request_id,
+                allowed_fields=sorted(LOOKUP_FIELDS),
+            )
+    return None
+
+
+def _parse_optional_bool(value, field: str, request_id: str, allow_numeric: bool = False):
     """Parse optional bool-like request values."""
     if value is None:
-        return None
+        return None, None
     if isinstance(value, bool):
-        return value
+        return value, None
     if isinstance(value, (int, float)):
-        return bool(value)
+        if allow_numeric:
+            return bool(value), None
+        return None, _field_error(
+            f"'{field}' must be a boolean; numeric booleans are not accepted for JSON requests.",
+            field,
+            "invalid_type",
+            request_id=request_id,
+        )
     text = str(value).strip().lower()
     if not text:
-        return None
+        return None, None
     if text in {"true", "1", "yes", "y", "enabled", "on"}:
-        return True
+        return True, None
     if text in {"false", "0", "no", "n", "disabled", "off"}:
-        return False
-    return None
+        return False, None
+    return None, _field_error(
+        f"'{field}' must be a boolean.",
+        field,
+        "invalid_type",
+        request_id=request_id,
+    )
+
+
+def _strict_int(value, field: str, request_id: str):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, _field_error(
+            f"'{field}' must be an integer.",
+            field,
+            "invalid_type",
+            request_id=request_id,
+        )
+    return value, None
+
+
+def _strict_number(value, field: str, request_id: str):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, _field_error(
+            f"'{field}' must be a number.",
+            field,
+            "invalid_type",
+            request_id=request_id,
+        )
+    return float(value), None
 
 
 def _generation_config_from_request(data: dict | None, request_id: str):
@@ -327,8 +654,11 @@ def _generation_config_from_request(data: dict | None, request_id: str):
     generation = data.get("generation")
     if generation is not None:
         if not isinstance(generation, dict):
-            return None, _error_response(
-                "'generation' must be an object.", 400, request_id=request_id
+            return None, _field_error(
+                "'generation' must be an object.",
+                "generation",
+                "invalid_type",
+                request_id=request_id,
             )
         supplied.update(generation)
 
@@ -339,66 +669,101 @@ def _generation_config_from_request(data: dict | None, request_id: str):
             supplied[key] = data[key]
 
     if "max_new_tokens" in supplied:
-        try:
-            value = int(supplied["max_new_tokens"])
-        except (TypeError, ValueError):
-            return None, _error_response(
-                "'generation.max_new_tokens' must be an integer.",
-                400,
-                request_id=request_id,
-            )
+        value, err = _strict_int(supplied["max_new_tokens"], "generation.max_new_tokens", request_id)
+        if err:
+            return None, err
         if value < 1 or value > MAX_NEW_TOKENS_LIMIT:
             return None, _error_response(
                 ("'generation.max_new_tokens' must be between 1 and " f"{MAX_NEW_TOKENS_LIMIT}."),
-                400,
+                400, field="generation.max_new_tokens", code="out_of_range",
                 request_id=request_id,
             )
         config["max_new_tokens"] = value
 
     if "temperature" in supplied:
-        try:
-            value = float(supplied["temperature"])
-        except (TypeError, ValueError):
-            return None, _error_response(
-                "'generation.temperature' must be a number.",
-                400,
-                request_id=request_id,
-            )
+        value, err = _strict_number(supplied["temperature"], "generation.temperature", request_id)
+        if err:
+            return None, err
         if value < 0.0 or value > 2.0:
             return None, _error_response(
                 "'generation.temperature' must be between 0.0 and 2.0.",
                 400,
+                field="generation.temperature",
+                code="out_of_range",
                 request_id=request_id,
             )
         config["temperature"] = value
 
     if "do_sample" in supplied:
-        value = _parse_optional_bool(supplied["do_sample"])
+        value, err = _parse_optional_bool(
+            supplied["do_sample"], "generation.do_sample", request_id
+        )
+        if err:
+            return None, err
         if value is None:
-            return None, _error_response(
+            return None, _field_error(
                 "'generation.do_sample' must be a boolean.",
-                400,
+                "generation.do_sample",
+                "invalid_type",
                 request_id=request_id,
             )
         config["do_sample"] = value
 
     if "repetition_penalty" in supplied:
-        try:
-            value = float(supplied["repetition_penalty"])
-        except (TypeError, ValueError):
-            return None, _error_response(
-                "'generation.repetition_penalty' must be a number.",
-                400,
-                request_id=request_id,
-            )
+        value, err = _strict_number(
+            supplied["repetition_penalty"], "generation.repetition_penalty", request_id
+        )
+        if err:
+            return None, err
         if value < 0.8 or value > 2.0:
             return None, _error_response(
                 "'generation.repetition_penalty' must be between 0.8 and 2.0.",
                 400,
+                field="generation.repetition_penalty",
+                code="out_of_range",
                 request_id=request_id,
             )
         config["repetition_penalty"] = value
 
+    return config, None
+
+
+def _lookup_config_from_request(data: dict | None, request_id: str):
+    config = {
+        "enabled": TAC_LOOKUP_ENABLED,
+        "benchmark_mode": False,
+    }
+    if not isinstance(data, dict) or data.get("lookup") is None:
+        return config, None
+    lookup = data.get("lookup")
+    if not isinstance(lookup, dict):
+        return None, _field_error(
+            "'lookup' must be an object.",
+            "lookup",
+            "invalid_type",
+            request_id=request_id,
+        )
+    if "enabled" in lookup:
+        value, err = _parse_optional_bool(lookup.get("enabled"), "lookup.enabled", request_id)
+        if err:
+            return None, err
+        if value is None:
+            return None, _field_error(
+                "'lookup.enabled' must be a boolean.",
+                "lookup.enabled",
+                "invalid_type",
+                request_id=request_id,
+            )
+        config["enabled"] = value
+    if "benchmark_mode" in lookup:
+        value, err = _parse_optional_bool(
+            lookup.get("benchmark_mode"), "lookup.benchmark_mode", request_id
+        )
+        if err:
+            return None, err
+        config["benchmark_mode"] = bool(value)
+        if value:
+            config["enabled"] = False
     return config, None
 
 
@@ -713,7 +1078,7 @@ def _json_safe(value):
         return str(value)
 
 
-def _lookup_stats() -> dict:
+def _lookup_stats(include_sensitive: bool = True) -> dict:
     available = bool(tac_lookup is not None and tac_lookup.available)
     stats = {}
     if available:
@@ -723,35 +1088,56 @@ def _lookup_stats() -> dict:
             raise
         except Exception as e:
             stats = {"error": str(e)}
-    return {
+    payload = {
         "available": available,
-        "db_path": TAC_LOOKUP_DB,
         "stats": stats,
     }
+    if include_sensitive:
+        payload["db_path"] = TAC_LOOKUP_DB
+    elif isinstance(stats, dict):
+        payload["stats"] = {
+            key: value
+            for key, value in stats.items()
+            if key not in {"db_path", "manifest", "manifest_path", "source_db", "build_inputs"}
+        }
+    return payload
 
 
-def _health_payload() -> dict:
-    warmup_status = dict(model_warmup_state)
-    ready = decompiler is not None and warmup_status.get("status") not in {"running", "failed"}
+def _liveness_payload() -> dict:
     return {
         "status": "ok",
         "liveness": "ok",
+        "service": "smart-contract-bytecode-decompiler",
+        "time": _utc_now_iso(),
+    }
+
+
+def _readiness_payload(include_sensitive: bool = False) -> dict:
+    warmup_status = dict(model_warmup_state)
+    ready = decompiler is not None and warmup_status.get("status") not in {"running", "failed"}
+    public_warmup = {
+        "enabled": bool(warmup_status.get("enabled")),
+        "status": warmup_status.get("status"),
+        "duration_s": warmup_status.get("duration_s"),
+    }
+    payload = {
+        "status": "ok",
         "ready": ready,
         "inference_ready": ready,
         "model_loaded": decompiler is not None,
         "mock_mode": mock_mode,
-        "model_path": active_model_path,
-        "model_error": model_load_error,
-        "model_config": model_config_dict,
-        "warmup": warmup_status,
-        "lookup": _lookup_stats(),
+        "warmup": warmup_status if include_sensitive else public_warmup,
+        "lookup": _lookup_stats(include_sensitive=include_sensitive),
+        "lookup_enabled": TAC_LOOKUP_ENABLED,
         "limits": {
             "max_bytecode_hex_length": MAX_BYTECODE_HEX_LENGTH,
             "max_bytecode_bytes": MAX_BYTECODE_HEX_LENGTH // 2,
             "max_concurrent_decompiles": MAX_CONCURRENT_DECOMPILES,
             "max_functions": MAX_DECOMPILE_FUNCTIONS,
             "timeout_seconds": DECOMPILE_TIMEOUT_SECONDS,
-            "timeout_enforcement": "daemon_thread",
+            "timeout_enforcement": (
+                "killable_worker_process" if KILLABLE_INFERENCE_WORKERS else "daemon_thread"
+            ),
             "max_new_tokens": MAX_NEW_TOKENS_LIMIT,
             "max_abi_json_chars": MAX_ABI_JSON_CHARS,
             "max_contract_metadata_json_chars": MAX_CONTRACT_METADATA_JSON_CHARS,
@@ -763,13 +1149,43 @@ def _health_payload() -> dict:
             "enabled": INFERENCE_TRACE_ENABLED,
             "include_samples": INFERENCE_TRACE_INCLUDE_SAMPLES,
         },
+        "reconstruction": {
+            "strategy": "semantic_function_chunks",
+            "assembly_mode": "deterministic_reconciliation",
+        },
     }
+    if include_sensitive:
+        payload.update(
+            {
+                "model_path": active_model_path,
+                "model_error": model_load_error,
+                "model_config": model_config_dict,
+                "active_jobs": [
+                    {
+                        key: value
+                        for key, value in job.items()
+                        if key not in {"active_process"}
+                    }
+                    for job in ACTIVE_DECOMPILE_JOBS.values()
+                    if job.get("status") == "running"
+                ],
+            }
+        )
+    return payload
+
+
+def _health_payload() -> dict:
+    """Backward-compatible public health payload without sensitive diagnostics."""
+    payload = _liveness_payload()
+    payload.update(_readiness_payload(include_sensitive=False))
+    return payload
 
 
 def _new_inference_trace(
     request_id: str,
     bytecode: str,
     generation_config: dict,
+    lookup_config: dict | None = None,
     contract_metadata: dict | None = None,
 ) -> dict:
     hex_body = bytecode[2:] if bytecode.startswith("0x") else bytecode
@@ -783,6 +1199,7 @@ def _new_inference_trace(
             "byte_length": len(hex_body) // 2,
         },
         "generation_config": generation_config,
+        "lookup_config": lookup_config or {"enabled": TAC_LOOKUP_ENABLED},
         "model": {
             "loaded": decompiler is not None,
             "mock_mode": mock_mode,
@@ -794,6 +1211,7 @@ def _new_inference_trace(
         "contract_metadata": contract_metadata or {},
         "analysis": {},
         "selector_map": {},
+        "reconstruction": {},
         "functions": {},
         "events": [],
     }
@@ -983,6 +1401,7 @@ def _build_function_results(
     analyzer: BytecodeAnalyzer | None = None,
     contract_metadata: dict | None = None,
     validation_by_function: dict | None = None,
+    lookup_provenance: dict | None = None,
 ) -> list[dict]:
     results = []
     for fname in func_names:
@@ -1001,7 +1420,16 @@ def _build_function_results(
             "diagnostics": prompt_diagnostics.get(fname),
             "validation": validation,
         }
+        if lookup_provenance and lookup_provenance.get(fname):
+            item["lookup_provenance"] = lookup_provenance[fname]
         item.update(_selector_summary(selector_map, fname))
+        item["quality"] = build_function_quality(
+            validation=validation,
+            diagnostics=prompt_diagnostics.get(fname),
+            source=source,
+            error=error,
+            selector_confidence=item.get("confidence"),
+        )
         abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
         if abi_fact:
             item["abi"] = abi_fact
@@ -1233,6 +1661,32 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
         _warm_model()
 
 
+def create_app(
+    load_model_on_startup: bool | None = None,
+    use_mock: bool | None = None,
+    model_path: str | None = None,
+):
+    """WSGI/container entrypoint factory.
+
+    By default this factory loads the model when WEB_LOAD_MODEL_ON_STARTUP is
+    true. Tests can import ``app`` directly without triggering model loading.
+    """
+    should_load = (
+        _parse_bool_env("WEB_LOAD_MODEL_ON_STARTUP", False)
+        if load_model_on_startup is None
+        else load_model_on_startup
+    )
+    if should_load:
+        load_model(
+            use_mock=_parse_bool_env("WEB_MOCK_MODEL", False) if use_mock is None else use_mock,
+            model_path=model_path,
+        )
+    return app
+
+
+application = app
+
+
 # ---------------------------------------------------------------------------
 # GPU Stats Helper
 # ---------------------------------------------------------------------------
@@ -1441,14 +1895,20 @@ def api_decompile():
     if access_error:
         return access_error
 
-    request_id = uuid.uuid4().hex
     data = request.get_json(silent=True)
+    request_id = _request_id_from_request(data)
+    schema_error = _validate_decompile_request_schema(data, request_id)
+    if schema_error:
+        return schema_error
     bytecode, validation_error = _normalize_bytecode_from_request(data, request_id=request_id)
     if validation_error:
         return validation_error
     generation_config, generation_error = _generation_config_from_request(data, request_id)
     if generation_error:
         return generation_error
+    lookup_config, lookup_error = _lookup_config_from_request(data, request_id)
+    if lookup_error:
+        return lookup_error
     contract_metadata, metadata_error = _contract_metadata_from_request(data, request_id)
     if metadata_error:
         return metadata_error
@@ -1465,8 +1925,16 @@ def api_decompile():
         )
 
     request_started_at = time.time()
-    trace = _new_inference_trace(request_id, bytecode, generation_config, contract_metadata)
+    job = _register_decompile_job(request_id)
+    trace = _new_inference_trace(
+        request_id,
+        bytecode,
+        generation_config,
+        lookup_config,
+        contract_metadata,
+    )
     trace_written_path: str | None = None
+    trace_finalized = False
 
     def _sse(event: str, data: dict) -> str:
         """Format a single SSE message."""
@@ -1475,11 +1943,12 @@ def api_decompile():
         return f"event: {event}\ndata: {_json.dumps(payload, default=str)}\n\n"
 
     def _check_timeout() -> None:
+        _check_job_cancelled(job, "request")
         if (
             DECOMPILE_TIMEOUT_SECONDS
             and time.time() - request_started_at > DECOMPILE_TIMEOUT_SECONDS
         ):
-            raise DecompileRequestError(
+            raise DecompileTimeoutError(
                 f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds."
             )
 
@@ -1489,12 +1958,18 @@ def api_decompile():
         return max(0.0, DECOMPILE_TIMEOUT_SECONDS - (time.time() - request_started_at))
 
     def _blocking_call(operation, description: str):
+        job["last_stage"] = description
         _check_timeout()
-        return _run_with_timeout(operation, _timeout_remaining(), description)
+        return _run_with_timeout(operation, _timeout_remaining(), description, job=job)
+
+    def _killable_model_call(operation, description: str):
+        job["last_stage"] = description
+        _check_timeout()
+        return _run_killable_with_timeout(operation, _timeout_remaining(), description, job=job)
 
     def _finish_trace(status: str, error: str | None = None) -> str | None:
-        nonlocal trace_written_path
-        if trace_written_path:
+        nonlocal trace_written_path, trace_finalized
+        if trace_finalized:
             return trace_written_path
         trace["finished_at"] = _utc_now_iso()
         trace["duration_s"] = round(time.time() - request_started_at, 3)
@@ -1502,6 +1977,9 @@ def api_decompile():
         if error:
             trace["error"] = error
         trace_written_path = _write_inference_trace(trace)
+        trace_finalized = True
+        if trace_written_path:
+            job["trace_path"] = _relative_project_path(trace_written_path)
         return trace_written_path
 
     def generate():
@@ -1575,6 +2053,42 @@ def api_decompile():
             yield _sse(
                 "progress",
                 {
+                    "stage": "chunking",
+                    "message": "Building semantic chunks and contract-level reconstruction facts…",
+                    "percent": 13,
+                },
+            )
+            reconstruction_plan = _blocking_call(
+                lambda: build_reconstruction_plan(
+                    bytecode,
+                    analyzer,
+                    func_tac_map,
+                    selector_map=selector_map,
+                    contract_metadata=contract_metadata,
+                ),
+                "semantic reconstruction planning",
+            )
+            trace["reconstruction"] = reconstruction_plan
+            trace["analysis"].update(
+                {
+                    "reconstruction_strategy": reconstruction_plan.get("strategy"),
+                    "semantic_chunk_count": reconstruction_plan.get("chunk_count"),
+                    "detected_interfaces": [
+                        item.get("name")
+                        for item in reconstruction_plan.get("contract_facts", {}).get(
+                            "detected_interfaces", []
+                        )
+                        if isinstance(item, dict) and item.get("name")
+                    ],
+                    "proxy_like": reconstruction_plan.get("contract_facts", {})
+                    .get("proxy", {})
+                    .get("is_proxy_like", False),
+                }
+            )
+
+            yield _sse(
+                "progress",
+                {
                     "stage": "analysis_done",
                     "message": (
                         f"Analysis complete — {num_instructions} instructions, "
@@ -1586,6 +2100,7 @@ def api_decompile():
                     "num_functions": num_functions,
                     "function_names": func_names,
                     "selector_map": selector_map,
+                    "reconstruction": reconstruction_plan,
                     "tac_generation_time_s": round(tac_time, 3),
                 },
             )
@@ -1596,10 +2111,11 @@ def api_decompile():
             function_sources = {}  # fname → "exact_match" | "model_inference"
             function_latencies = {}
             prompt_diagnostics = {}
+            lookup_provenance = {}
             lookup_hits = 0
             unresolved_fnames = []  # functions that need LLM inference
 
-            if tac_lookup is not None and tac_lookup.available:
+            if lookup_config.get("enabled") and tac_lookup is not None and tac_lookup.available:
                 yield _sse(
                     "progress",
                     {
@@ -1625,14 +2141,31 @@ def api_decompile():
                         function_solidity[fname] = result["solidity"]
                         function_sources[fname] = "exact_match"
                         function_latencies[fname] = 0.0
+                        lookup_provenance[fname] = result.get("provenance") or {}
+                        func_metadata = _safe_function_metadata(
+                            bytecode,
+                            analyzer,
+                            fname,
+                            tac_text,
+                            contract_metadata,
+                        )
+                        prompt_diagnostics[fname] = _prompt_diagnostics(
+                            None,
+                            tac_text,
+                            func_metadata,
+                            generation_config,
+                            result["solidity"],
+                        )
                         lookup_hits += 1
                         trace["functions"][fname]["lookup"].update(
                             {
                                 "selector": result.get("selector"),
                                 "occurrences": result.get("occurrences"),
                                 "source": "exact_match",
+                                "provenance": lookup_provenance[fname],
                             }
                         )
+                        trace["functions"][fname]["diagnostics"] = prompt_diagnostics[fname]
                         logger.info(
                             "[%s] TAC lookup hit for %s (selector=%s, occurrences=%d)",
                             request_id,
@@ -1649,6 +2182,7 @@ def api_decompile():
                                 "current_function": fname,
                                 "source": "exact_match",
                                 "confidence": 100,
+                                "lookup_provenance": lookup_provenance[fname],
                             },
                         )
                     else:
@@ -1679,7 +2213,7 @@ def api_decompile():
                     },
                 )
             else:
-                # No lookup DB — all functions need inference
+                # No lookup DB or benchmark mode disabled lookup — all functions need inference
                 unresolved_fnames = list(func_names)
                 for fname in func_names:
                     tac_text = func_tac_map[fname]
@@ -1687,7 +2221,12 @@ def api_decompile():
                         {
                             "tac_sha256": _sha256_text(tac_text),
                             "tac_chars": len(tac_text),
-                            "lookup": {"hit": False, "available": False},
+                            "lookup": {
+                                "hit": False,
+                                "available": tac_lookup is not None and tac_lookup.available,
+                                "enabled": bool(lookup_config.get("enabled")),
+                                "benchmark_mode": bool(lookup_config.get("benchmark_mode")),
+                            },
                         }
                     )
 
@@ -1737,9 +2276,16 @@ def api_decompile():
                         prompt_diagnostics,
                         analyzer,
                         contract_metadata,
+                        lookup_provenance=lookup_provenance,
                     )
                     source_summary = _source_summary(
                         function_sources, function_errors, function_results
+                    )
+                    quality = build_contract_quality(
+                        {},
+                        function_results,
+                        source_summary,
+                        reconstruction_plan,
                     )
                     analysis = {
                         "num_instructions": num_instructions,
@@ -1749,14 +2295,21 @@ def api_decompile():
                         "solidity_generation_time_s": 0.0,
                         "lookup_hits": lookup_hits,
                         "lookup_available": tac_lookup is not None and tac_lookup.available,
+                        "lookup_enabled": bool(lookup_config.get("enabled")),
+                        "lookup_benchmark_mode": bool(lookup_config.get("benchmark_mode")),
                         "function_sources": function_sources,
                         "function_errors": function_errors,
                         "function_latencies_s": function_latencies,
+                        "lookup_provenance": lookup_provenance,
                         "function_results": function_results,
                         "source_summary": source_summary,
                         "model_config": model_config_dict,
                         "model_path": active_model_path,
                         "effective_generation_config": generation_config,
+                        "reconstruction_strategy": reconstruction_plan.get("strategy"),
+                        "semantic_chunk_count": reconstruction_plan.get("chunk_count"),
+                        "reconstruction": reconstruction_plan,
+                        "quality": quality,
                     }
                     trace["analysis"].update(analysis)
                     trace["functions"].update(
@@ -1783,7 +2336,10 @@ def api_decompile():
                             "function_results": function_results,
                             "source_summary": source_summary,
                             "analysis": analysis,
+                            "reconstruction": reconstruction_plan,
+                            "quality": quality,
                             "effective_generation_config": generation_config,
+                            "lookup_config": lookup_config,
                             "model_path": active_model_path,
                             "contract_metadata": contract_metadata,
                             "trace_path": _relative_project_path(trace_path),
@@ -1827,6 +2383,7 @@ def api_decompile():
                 )
 
                 if use_batch:
+                    total_batches = (total_unresolved + BATCH_SIZE - 1) // BATCH_SIZE
                     yield _sse(
                         "progress",
                         {
@@ -1839,6 +2396,8 @@ def api_decompile():
                             "current_function": unresolved_fnames[0],
                             "current_index": 1,
                             "total_functions": total_unresolved,
+                            "batch_size": BATCH_SIZE,
+                            "total_batches": total_batches,
                         },
                     )
 
@@ -1847,14 +2406,15 @@ def api_decompile():
                         batch_fnames = unresolved_fnames[batch_start:batch_end]
                         batch_tac = tac_list[batch_start:batch_end]
                         batch_meta = meta_list[batch_start:batch_end]
+                        batch_index = batch_start // BATCH_SIZE + 1
 
                         pct = 20 + int((batch_start / max(total_unresolved, 1)) * 70)
                         yield _sse(
                             "progress",
                             {
-                                "stage": "decompiling",
+                                "stage": "batch_start",
                                 "message": (
-                                    f"Batch {batch_start // BATCH_SIZE + 1}: "
+                                    f"Batch {batch_index}/{total_batches}: "
                                     f"functions {batch_start + 1}–{batch_end} "
                                     f"of {total_unresolved}"
                                 ),
@@ -1862,12 +2422,24 @@ def api_decompile():
                                 "current_function": batch_fnames[0],
                                 "current_index": batch_start + 1,
                                 "total_functions": total_unresolved,
+                                "batch_index": batch_index,
+                                "total_batches": total_batches,
+                                "batch_size": len(batch_fnames),
+                                "batch_functions": batch_fnames,
                             },
                         )
+                        _trace_event(
+                            trace,
+                            "batch_start",
+                            batch_index=batch_index,
+                            batch_size=len(batch_fnames),
+                            functions=batch_fnames,
+                        )
 
+                        batch_t0 = time.time()
+                        batch_latency = None
                         try:
-                            batch_t0 = time.time()
-                            results = _blocking_call(
+                            results = _killable_model_call(
                                 lambda: decompiler.decompile_batch(
                                     batch_tac,
                                     metadatas=batch_meta,
@@ -1899,12 +2471,14 @@ def api_decompile():
                                         "diagnostics": prompt_diagnostics[fname],
                                     }
                                 )
+                        except DecompileRequestError:
+                            raise
                         except Exception as e:
                             logger.error("[%s] Batch decompilation failed: %s", request_id, e)
                             for j, fname in enumerate(batch_fnames):
                                 try:
                                     single_t0 = time.time()
-                                    sol = _blocking_call(
+                                    sol = _killable_model_call(
                                         lambda j=j: decompiler.decompile_tac_to_solidity(
                                             batch_tac[j],
                                             metadata=batch_meta[j],
@@ -1956,6 +2530,8 @@ def api_decompile():
                                         }
                                     )
 
+                        if batch_latency is None:
+                            batch_latency = time.time() - batch_t0
                         pct_done = 20 + int((batch_end / max(total_unresolved, 1)) * 70)
                         for fname in batch_fnames:
                             yield _sse(
@@ -1970,8 +2546,33 @@ def api_decompile():
                                     "source": function_sources.get(fname, "model_inference"),
                                     "error": function_errors.get(fname),
                                     "elapsed_s": function_latencies.get(fname),
+                                    "batch_index": batch_index,
+                                    "batch_latency_s": round(batch_latency, 3),
                                 },
                             )
+                        yield _sse(
+                            "progress",
+                            {
+                                "stage": "batch_done",
+                                "message": (
+                                    f"Batch {batch_index}/{total_batches} complete in "
+                                    f"{batch_latency:.3f}s"
+                                ),
+                                "percent": pct_done,
+                                "batch_index": batch_index,
+                                "total_batches": total_batches,
+                                "batch_size": len(batch_fnames),
+                                "batch_functions": batch_fnames,
+                                "elapsed_s": round(batch_latency, 3),
+                            },
+                        )
+                        _trace_event(
+                            trace,
+                            "batch_done",
+                            batch_index=batch_index,
+                            elapsed_s=round(batch_latency, 3),
+                            functions=batch_fnames,
+                        )
                         _check_timeout()
                 else:
                     for idx, fname in enumerate(unresolved_fnames):
@@ -1994,7 +2595,7 @@ def api_decompile():
 
                         try:
                             single_t0 = time.time()
-                            sol = _blocking_call(
+                            sol = _killable_model_call(
                                 lambda idx=idx: decompiler.decompile_tac_to_solidity(
                                     tac_list[idx],
                                     metadata=meta_list[idx],
@@ -2079,22 +2680,13 @@ def api_decompile():
                 if fname in function_solidity
             }
 
-            if decompiler is not None:
-                assembled = decompiler._assemble_contract(ordered_function_solidity, analyzer)
-            else:
-                # No model — assemble manually from lookup results
-                parts = []
-                for fname in func_names:
-                    sol = ordered_function_solidity.get(fname, "")
-                    if sol:
-                        parts.append(f"// --- {fname} ---\n{sol}")
-                assembled = (
-                    "// SPDX-License-Identifier: UNLICENSED\n"
-                    "pragma solidity ^0.8.0;\n\n"
-                    "contract DecompiledContract {\n"
-                    + "\n\n".join(f"    {line}" for p in parts for line in p.split("\n"))
-                    + "\n}\n"
-                )
+            assembled = assemble_reconstructed_contract(
+                ordered_function_solidity,
+                analyzer,
+                reconstruction_plan=reconstruction_plan,
+                selector_map=selector_map,
+                contract_metadata=contract_metadata,
+            )
 
             combined_tac = "\n\n".join(func_tac_map.values())
             function_validation = {
@@ -2128,8 +2720,15 @@ def api_decompile():
                 analyzer,
                 contract_metadata,
                 function_validation,
+                lookup_provenance=lookup_provenance,
             )
             source_summary = _source_summary(function_sources, function_errors, function_results)
+            quality = build_contract_quality(
+                validation,
+                function_results,
+                source_summary,
+                reconstruction_plan,
+            )
             failure_count = len(function_errors)
             validation_failed = not bool(validation.get("valid"))
             success = (
@@ -2149,9 +2748,12 @@ def api_decompile():
                 "solidity_generation_time_s": round(gen_time, 3),
                 "lookup_hits": lookup_hits,
                 "lookup_available": tac_lookup is not None and tac_lookup.available,
+                "lookup_enabled": bool(lookup_config.get("enabled")),
+                "lookup_benchmark_mode": bool(lookup_config.get("benchmark_mode")),
                 "function_sources": function_sources,
                 "function_errors": function_errors,
                 "function_latencies_s": function_latencies,
+                "lookup_provenance": lookup_provenance,
                 "function_results": function_results,
                 "source_summary": source_summary,
                 "failure_count": failure_count,
@@ -2161,6 +2763,10 @@ def api_decompile():
                 "model_path": active_model_path,
                 "effective_generation_config": generation_config,
                 "contract_metadata": contract_metadata,
+                "reconstruction_strategy": reconstruction_plan.get("strategy"),
+                "semantic_chunk_count": reconstruction_plan.get("chunk_count"),
+                "reconstruction": reconstruction_plan,
+                "quality": quality,
             }
             trace["analysis"].update(analysis)
             for item in function_results:
@@ -2192,7 +2798,10 @@ def api_decompile():
                     "function_results": function_results,
                     "source_summary": source_summary,
                     "analysis": analysis,
+                    "reconstruction": reconstruction_plan,
+                    "quality": quality,
                     "effective_generation_config": generation_config,
+                    "lookup_config": lookup_config,
                     "model_path": active_model_path,
                     "contract_metadata": contract_metadata,
                     "validation": validation,
@@ -2206,6 +2815,30 @@ def api_decompile():
                 },
             )
 
+        except DecompileCancelledError as e:
+            logger.info("[%s] Decompilation cancelled: %s", request_id, e)
+            _trace_event(trace, "cancelled", reason=str(e))
+            trace_path = _finish_trace("cancelled", str(e))
+            yield _sse(
+                "error",
+                {
+                    "error": f"Decompilation cancelled: {e}",
+                    "status": "cancelled",
+                    "trace_path": _relative_project_path(trace_path),
+                },
+            )
+        except DecompileTimeoutError as e:
+            logger.warning("[%s] Decompilation timed out: %s", request_id, e)
+            _trace_event(trace, "timeout", reason=str(e))
+            trace_path = _finish_trace("timeout", str(e))
+            yield _sse(
+                "error",
+                {
+                    "error": f"Decompilation failed: {e}",
+                    "status": "timeout",
+                    "trace_path": _relative_project_path(trace_path),
+                },
+            )
         except Exception as e:
             logger.error("[%s] Decompilation failed: %s", request_id, e)
             logger.error(traceback.format_exc())
@@ -2218,8 +2851,15 @@ def api_decompile():
                 },
             )
         finally:
-            if trace_written_path is None:
-                _finish_trace("failed", "Request ended before a final result was emitted")
+            if not trace_finalized:
+                snapshot = _job_snapshot(request_id) or {}
+                if snapshot.get("cancelled"):
+                    _finish_trace("cancelled", snapshot.get("cancel_reason") or "Request cancelled")
+                else:
+                    _cancel_decompile_job(request_id, reason="client_disconnect_or_stream_closed")
+                    _finish_trace("cancelled", "Request ended before a final result was emitted")
+            final_status = trace.get("status") or "failed"
+            _mark_job_finished(job, final_status, trace.get("trace_path"))
             DECOMPILE_SEMAPHORE.release()
             logger.info("[%s] Decompile request complete", request_id)
 
@@ -2235,8 +2875,45 @@ def api_decompile():
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
-    """Health check endpoint."""
+    """Public health/readiness endpoint with sensitive details redacted."""
     return jsonify(_health_payload())
+
+
+@app.route("/livez", methods=["GET"])
+def livez():
+    """Minimal unauthenticated liveness probe."""
+    return jsonify(_liveness_payload())
+
+
+@app.route("/readyz", methods=["GET"])
+def readyz():
+    """Readiness probe. Detailed diagnostics are protected unless explicitly public."""
+    include_sensitive = False
+    if not READYZ_PUBLIC:
+        access_error = _require_protected_api_access()
+        if access_error:
+            return access_error
+        include_sensitive = True
+    return jsonify(_readiness_payload(include_sensitive=include_sensitive))
+
+
+@app.route("/api/decompile/<request_id>/cancel", methods=["POST"])
+def api_cancel_decompile(request_id: str):
+    """Cancel a running server-side decompilation job."""
+    access_error = _require_protected_api_access()
+    if access_error:
+        return access_error
+    cancelled = _cancel_decompile_job(request_id, reason="client_cancel_endpoint")
+    if not cancelled:
+        return _field_error(
+            "No running decompile job found for request_id.",
+            "request_id",
+            "not_found",
+            404,
+            request_id=request_id,
+        )
+    logger.info("[%s] Decompile cancellation requested", request_id)
+    return jsonify({"success": True, "request_id": request_id, "status": "cancelled"})
 
 
 # ---------------------------------------------------------------------------

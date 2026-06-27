@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import math
 import re
+import subprocess
 import time
 from collections.abc import Mapping as MappingABC
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -116,7 +117,7 @@ class ModelConfig:
     """Configuration for the base model and optional LoRA adapter setup."""
 
     model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
-    max_sequence_length: int = 2048  # Practical training length; paper max is 20000
+    max_sequence_length: int = 2048  # Practical training/inference default.
     use_lora: bool = True
     lora_rank: int = 16  # As specified in paper
     lora_alpha: int = 32
@@ -124,19 +125,23 @@ class ModelConfig:
     target_modules: Optional[Union[List[str], str]] = None
     use_quantization: bool = False
     load_in_4bit: bool = True
-    precision: str = "auto"
+    precision: str = "fp16"
     dataloader_num_workers: Optional[int] = None
     dataloader_pin_memory: Optional[bool] = None
     dataloader_persistent_workers: Optional[bool] = None
     dataloader_prefetch_factor: Optional[int] = None
+    gradient_checkpointing: bool = False
     include_bytecode_metadata: bool = True
     include_compiler_metadata: bool = False  # Deprecated; ignored for prompt safety.
+    report_to: Union[str, List[str]] = "none"
 
     def __post_init__(self):
         self.include_compiler_metadata = False
         self.precision = str(self.precision or "auto").lower()
         if self.precision not in {"auto", "bf16", "fp16", "fp32"}:
             raise ValueError("precision must be one of: auto, bf16, fp16, fp32")
+        if isinstance(self.report_to, str):
+            self.report_to = self.report_to.strip().lower() or "none"
         if self.target_modules is None:
             # Target query, key, value, and projection layers as mentioned in paper
             self.target_modules = [
@@ -166,7 +171,9 @@ class ModelConfig:
             "dataloader_pin_memory": self.dataloader_pin_memory,
             "dataloader_persistent_workers": self.dataloader_persistent_workers,
             "dataloader_prefetch_factor": self.dataloader_prefetch_factor,
+            "gradient_checkpointing": self.gradient_checkpointing,
             "include_bytecode_metadata": self.include_bytecode_metadata,
+            "report_to": self.report_to,
         }
 
     @classmethod
@@ -187,8 +194,10 @@ class ModelConfig:
             "dataloader_pin_memory",
             "dataloader_persistent_workers",
             "dataloader_prefetch_factor",
+            "gradient_checkpointing",
             "include_bytecode_metadata",
             "include_compiler_metadata",
+            "report_to",
         }
         filtered = {k: v for k, v in d.items() if k in known_keys}
         return cls(**filtered)
@@ -907,19 +916,67 @@ class SmartContractDataset(Dataset):
         cache_dir.mkdir(parents=True, exist_ok=True)
         expected_metadata = self._cache_metadata(data_path)
         cache_path, metadata_path = self._cache_paths(data_path, cache_dir, expected_metadata)
+        rank = os.environ.get("LOCAL_RANK", "main")
 
         if not cache_config.overwrite:
             cached = self._read_tokenization_cache(cache_path, metadata_path, expected_metadata)
             if cached is not None:
-                logger.info("Loaded tokenized dataset cache from %s", cache_path)
+                logger.info("Loaded tokenized dataset cache from %s (rank=%s)", cache_path, rank)
                 return cached
 
-        tokenized_examples = [self._tokenize_item(idx) for idx in range(len(self.data))]
-        self._write_tokenization_cache(
-            cache_path, metadata_path, expected_metadata, tokenized_examples
-        )
-        logger.info("Wrote tokenized dataset cache to %s", cache_path)
-        return tokenized_examples
+        lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+        with self._tokenization_cache_lock(lock_path):
+            if not cache_config.overwrite:
+                cached = self._read_tokenization_cache(cache_path, metadata_path, expected_metadata)
+                if cached is not None:
+                    logger.info(
+                        "Loaded tokenized dataset cache after writer finished: %s (rank=%s)",
+                        cache_path,
+                        rank,
+                    )
+                    return cached
+
+            logger.info("Building tokenized dataset cache writer=%s path=%s", rank, cache_path)
+            tokenized_examples = [self._tokenize_item(idx) for idx in range(len(self.data))]
+            self._write_tokenization_cache(
+                cache_path, metadata_path, expected_metadata, tokenized_examples
+            )
+            logger.info("Wrote tokenized dataset cache to %s (writer=%s)", cache_path, rank)
+            return tokenized_examples
+
+    def _tokenization_cache_lock(self, lock_path: Path, timeout_s: float = 3600.0):
+        class _Lock:
+            def __init__(self, path: Path, timeout: float):
+                self.path = path
+                self.timeout = timeout
+                self.fd: Optional[int] = None
+
+            def __enter__(self):
+                start = time.monotonic()
+                while True:
+                    try:
+                        self.fd = os.open(
+                            self.path,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o644,
+                        )
+                        os.write(self.fd, f"pid={os.getpid()}\n".encode())
+                        return self
+                    except FileExistsError:
+                        if time.monotonic() - start > self.timeout:
+                            raise TimeoutError(f"Timed out waiting for tokenization cache lock {self.path}")
+                        time.sleep(0.25)
+
+            def __exit__(self, exc_type, exc, tb):
+                if self.fd is not None:
+                    os.close(self.fd)
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                return False
+
+        return _Lock(lock_path, timeout_s)
 
     def _read_tokenization_cache(
         self,
@@ -1217,6 +1274,12 @@ class TrainingInstrumentationCallback(TrainerCallback):
             "input_tokens_per_second": (
                 float(tokens_seen) / elapsed if tokens_seen is not None else None
             ),
+            "effective_tokens_per_second": (
+                float(tokens_seen) / elapsed if tokens_seen is not None else None
+            ),
+            "padding_ratio": None,
+            "dataloader_wait_seconds": None,
+            "gpu": self._gpu_telemetry(),
         }
         self._records.append(record)
 
@@ -1312,6 +1375,12 @@ class TrainingInstrumentationCallback(TrainerCallback):
             "input_tokens_per_second": (
                 float(tokens_seen) / elapsed if tokens_seen is not None else None
             ),
+            "effective_tokens_per_second": (
+                float(tokens_seen) / elapsed if tokens_seen is not None else None
+            ),
+            "padding_ratio": None,
+            "dataloader_wait_seconds": None,
+            "gpu": self._gpu_telemetry(),
             "per_device_train_batch_size": getattr(args, "per_device_train_batch_size", None),
             "gradient_accumulation_steps": getattr(args, "gradient_accumulation_steps", None),
             "world_size": self._world_size(args),
@@ -1320,6 +1389,52 @@ class TrainingInstrumentationCallback(TrainerCallback):
             "records": self._records,
         }
 
+    def _gpu_telemetry(self) -> Dict[str, Any]:
+        telemetry: Dict[str, Any] = {
+            "rank": os.environ.get("LOCAL_RANK"),
+            "cuda_available": bool(torch.cuda.is_available()),
+        }
+        if not torch.cuda.is_available():
+            return telemetry
+        try:
+            device = torch.cuda.current_device()
+            telemetry.update(
+                {
+                    "device_index": int(device),
+                    "device_name": torch.cuda.get_device_name(device),
+                    "memory_allocated_bytes": int(torch.cuda.memory_allocated(device)),
+                    "memory_reserved_bytes": int(torch.cuda.memory_reserved(device)),
+                    "memory_max_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                }
+            )
+            try:
+                props = torch.cuda.get_device_properties(device)
+                telemetry["memory_total_bytes"] = int(props.total_memory)
+            except Exception:
+                pass
+            smi = subprocess.run(
+                [
+                    "nvidia-smi",
+                    f"--id={device}",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            if smi.returncode == 0 and smi.stdout.strip():
+                values = [part.strip() for part in smi.stdout.splitlines()[0].split(",")]
+                if len(values) >= 3:
+                    telemetry["utilization_gpu_pct"] = float(values[0])
+                    telemetry["memory_used_mib"] = float(values[1])
+                    telemetry["memory_total_mib"] = float(values[2])
+        except Exception as exc:
+            telemetry["error"] = str(exc)
+        return telemetry
+
     def _write_csv(self, csv_path: Path) -> None:
         fieldnames = [
             "step",
@@ -1327,6 +1442,9 @@ class TrainingInstrumentationCallback(TrainerCallback):
             "steps_per_second",
             "estimated_samples_per_second",
             "input_tokens_per_second",
+            "effective_tokens_per_second",
+            "padding_ratio",
+            "dataloader_wait_seconds",
         ]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1473,7 +1591,7 @@ class SmartContractModelTrainer:
         if self.config.use_quantization:
             self.model = prepare_model_for_kbit_training(
                 self.model,
-                use_gradient_checkpointing=True,
+                use_gradient_checkpointing=self.config.gradient_checkpointing,
                 gradient_checkpointing_kwargs={"use_reentrant": False},
             )
 
@@ -1551,6 +1669,9 @@ class SmartContractModelTrainer:
         dataloader_pin_memory: Optional[bool] = None,
         dataloader_persistent_workers: Optional[bool] = None,
         dataloader_prefetch_factor: Optional[int] = None,
+        gradient_checkpointing: bool = False,
+        seed: int = 42,
+        report_to: Union[str, List[str]] = "none",
     ) -> TrainingArguments:
         """Create training arguments based on the paper's optimization strategy.
 
@@ -1644,17 +1765,19 @@ class SmartContractModelTrainer:
             "dataloader_persistent_workers": dataloader_persistent_workers,
             "remove_unused_columns": False,
             "push_to_hub": False,
-            "report_to": "none",
-            "seed": 42,
+            "report_to": report_to,
+            "seed": int(seed),
+            "data_seed": int(seed),
             "bf16": use_bf16,
             "fp16": use_fp16,
-            "gradient_checkpointing": True,
-            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "gradient_checkpointing": bool(gradient_checkpointing),
             "dataloader_drop_last": False,
             "save_total_limit": 2,
             "logging_nan_inf_filter": True,
             "logging_first_step": True,
         }
+        if gradient_checkpointing:
+            args["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
         if max_steps and max_steps > 0:
             args["max_steps"] = max_steps
         if "group_by_length" in training_arg_params:
@@ -1723,6 +1846,9 @@ class SmartContractModelTrainer:
         dataloader_pin_memory: Optional[bool] = None,
         dataloader_persistent_workers: Optional[bool] = None,
         dataloader_prefetch_factor: Optional[int] = None,
+        gradient_checkpointing: Optional[bool] = None,
+        seed: int = 42,
+        report_to: Optional[Union[str, List[str]]] = None,
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
         tokenizer, peft_model = self.setup_model(use_deepspeed=deepspeed_config is not None)
@@ -1833,6 +1959,13 @@ class SmartContractModelTrainer:
                 if dataloader_prefetch_factor is not None
                 else self.config.dataloader_prefetch_factor
             ),
+            gradient_checkpointing=(
+                gradient_checkpointing
+                if gradient_checkpointing is not None
+                else self.config.gradient_checkpointing
+            ),
+            seed=seed,
+            report_to=report_to if report_to is not None else self.config.report_to,
         )
 
         callbacks = []
@@ -1886,6 +2019,22 @@ class SmartContractModelTrainer:
         metrics_path = final_model_path / "training_metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(train_output.metrics, f, indent=2)
+
+        log_history = list(getattr(trainer.state, "log_history", []) or [])
+        log_history_path = final_model_path / "training_log_history.json"
+        with open(log_history_path, "w") as f:
+            json.dump(log_history, f, indent=2)
+        if log_history:
+            csv_path = final_model_path / "training_log_history.csv"
+            fieldnames = sorted(
+                {str(key) for entry in log_history if isinstance(entry, dict) for key in entry}
+            )
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for entry in log_history:
+                    if isinstance(entry, dict):
+                        writer.writerow({field: entry.get(field) for field in fieldnames})
 
         logger.info(f"Training completed. Model saved to {final_model_path}")
         return str(final_model_path)
@@ -2051,6 +2200,7 @@ class SmartContractDecompiler:
     """High-level interface for using the trained model for decompilation."""
 
     TAC_TRUNCATION_MARKER = "  // ... truncated (TAC too large for context window)"
+    MIN_INFERENCE_CONTEXT_WINDOW = 2048
 
     def __init__(self, model_path: str):
         self.trainer = SmartContractModelTrainer(ModelConfig())
@@ -2148,7 +2298,8 @@ class SmartContractDecompiler:
         return truncated
 
     def _context_window(self) -> int:
-        return max(1, int(getattr(self.config, "max_sequence_length", 2048) or 2048))
+        configured = int(getattr(self.config, "max_sequence_length", 2048) or 2048)
+        return max(self.MIN_INFERENCE_CONTEXT_WINDOW, configured)
 
     def _prompt_token_budget(self, max_new_tokens: int) -> int:
         generation_budget = max(0, int(max_new_tokens or 0))

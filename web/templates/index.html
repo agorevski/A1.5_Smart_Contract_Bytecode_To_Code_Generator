@@ -170,6 +170,7 @@
       <div class="tabs">
         <button class="tab active" data-tab="tab-solidity">Generated Solidity</button>
         <button class="tab" data-tab="tab-functions">🔗 Function Mapping</button>
+        <button class="tab" data-tab="tab-reconstruction">🧩 Reconstruction</button>
         <button class="tab" data-tab="tab-tac">TAC Output</button>
         <button class="tab" data-tab="tab-analysis">Analysis Info</button>
         <button class="tab" data-tab="tab-security">Security Analysis</button>
@@ -198,11 +199,25 @@
           </div>
           <p class="tab-description">
             Each function selector (4-byte hash) is resolved to its likely human-readable name.
-            Confidence indicates how certain the mapping is.
+            Confidence is selector-mapping confidence; reconstruction quality is shown separately.
           </p>
           <div id="trace-diagnostics" class="diagnostics-panel"></div>
           <div id="function-mapping-content" class="function-mapping-table-wrap">
             <p class="text-muted">No function data yet. Run a decompilation first.</p>
+          </div>
+        </div>
+
+        <div id="tab-reconstruction" class="tab-panel hidden">
+          <div class="panel-header">
+            <h3>Semantic Chunking & Reconstruction Plan</h3>
+          </div>
+          <p class="tab-description">
+            The portal accepts full runtime bytecode, splits it by bytecode-derived
+            semantic boundaries, decompiles each function chunk, then assembles a
+            reconciled contract scaffold.
+          </p>
+          <div id="reconstruction-content" class="reconstruction-content">
+            <p class="text-muted">No reconstruction plan yet. Run a decompilation first.</p>
           </div>
         </div>
 

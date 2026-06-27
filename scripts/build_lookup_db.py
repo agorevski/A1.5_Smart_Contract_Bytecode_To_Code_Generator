@@ -19,12 +19,16 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -74,6 +78,41 @@ def setup_logging():
         logging.getLogger(name).setLevel(logging.CRITICAL)
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _git_revision() -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _write_lookup_manifest(builder: TACLookupBuilder, manifest_path: str, manifest: Dict) -> None:
+    builder.record_manifest(manifest)
+    out_path = Path(manifest_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    logger.info("Lookup manifest written to %s", out_path)
 
 # ---------------------------------------------------------------------------
 # Get ALL installable solc versions
@@ -350,6 +389,8 @@ def build_lookup_db(
     max_versions: int = 0,
     workers: int = 0,
     force: bool = False,
+    manifest_path: Optional[str] = None,
+    decontamination_exclusions: Optional[List[str]] = None,
 ):
     """Build the exhaustive TAC lookup database.
 
@@ -370,6 +411,8 @@ def build_lookup_db(
     logger.info(f"  Lookup DB:       {lookup_db}")
     logger.info(f"  Max versions:    {'unlimited' if max_versions == 0 else max_versions}")
     logger.info(f"  Workers:         {workers}")
+    if manifest_path is None:
+        manifest_path = f"{lookup_db}.manifest.json"
 
     # Get all installable solc versions
     all_versions = get_all_solc_versions()
@@ -410,6 +453,46 @@ def build_lookup_db(
 
     total_contracts = len(rows)
     logger.info(f"  Contracts:       {total_contracts}")
+    build_id = hashlib.sha256(
+        f"{source_db}|{lookup_db}|{_utc_now_iso()}|{total_contracts}".encode("utf-8")
+    ).hexdigest()[:16]
+
+    def _emit_manifest(
+        stats: Dict,
+        prepared_count: int,
+        total_jobs_count: int,
+        skipped_jobs_count: int,
+        pairs_seen: int,
+        new_bodies: int,
+        new_tacs: int,
+        errors_count: int,
+    ) -> None:
+        manifest = {
+            "schema_version": 1,
+            "build_id": build_id,
+            "generated_at": _utc_now_iso(),
+            "dataset_revision": _git_revision(),
+            "source_db": str(Path(source_db)),
+            "source_db_sha256": _sha256_file(source_db),
+            "source_table": table,
+            "source_row_count": total_contracts,
+            "lookup_db": str(Path(lookup_db)),
+            "lookup_db_sha256": _sha256_file(lookup_db),
+            "max_versions": max_versions,
+            "workers": workers,
+            "force": force,
+            "solc_versions_available": len(all_versions),
+            "prepared_contract_count": prepared_count,
+            "compile_jobs_total": total_jobs_count,
+            "compile_jobs_skipped": skipped_jobs_count,
+            "pairs_seen": pairs_seen,
+            "new_unique_bodies": new_bodies,
+            "new_tac_hashes": new_tacs,
+            "errors": errors_count,
+            "decontamination_exclusions": decontamination_exclusions or [],
+            "stats": stats,
+        }
+        _write_lookup_manifest(builder, manifest_path, manifest)
 
     # Phase 1: Prepare contracts (parse source, find compatible versions)
     logger.info("\n--- Phase 1: Preparing contracts ---")
@@ -475,6 +558,16 @@ def build_lookup_db(
 
     if total_jobs == 0:
         logger.warning("No compile jobs to run!")
+        _emit_manifest(
+            builder.stats(),
+            len(prepared),
+            total_jobs,
+            skipped_jobs,
+            0,
+            0,
+            0,
+            0,
+        )
         return
 
     # Phase 3: Compile in parallel and store results
@@ -556,6 +649,16 @@ def build_lookup_db(
     logger.info(f"  Errors:                {errors}")
     logger.info(f"  Lookup DB:             {lookup_db}")
     logger.info("=" * 70)
+    _emit_manifest(
+        stats,
+        len(prepared),
+        total_jobs,
+        skipped_jobs,
+        total_pairs_seen,
+        total_new_bodies,
+        total_new_tacs,
+        errors,
+    )
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -577,6 +680,10 @@ def main():
                     help="Parallel workers (0 = auto-detect)")
     ap.add_argument("--force", action="store_true",
                     help="Re-run every compile job, including successful jobs")
+    ap.add_argument("--manifest-path", default=None,
+                    help="Write lookup build manifest JSON (default: <lookup-db>.manifest.json)")
+    ap.add_argument("--decontamination-exclusion", action="append", default=[],
+                    help="Record a dataset/split/hash excluded from lookup provenance")
     ap.add_argument("--stats", action="store_true",
                     help="Print stats of existing lookup DB and exit")
 
@@ -601,6 +708,8 @@ def main():
         max_versions=args.max_versions,
         workers=args.workers,
         force=args.force,
+        manifest_path=args.manifest_path,
+        decontamination_exclusions=args.decontamination_exclusion,
     )
 
 if __name__ == "__main__":

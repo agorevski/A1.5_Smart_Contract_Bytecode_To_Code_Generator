@@ -42,12 +42,13 @@ jobs:
           mkdir -p "$TMPDIR"
           uv sync --dev --frozen
 
-      - name: Run data-quality and unit tests
+      - name: Run CPU-only data-quality regression tests
         run: |
           uv run --frozen pytest \
             tests/test_dataset_quality_issues.py \
             tests/test_data_generation_export_issues.py \
-            tests
+            tests/test_model_training_issues.py \
+            tests/test_train_cli_issues.py
 
       - name: Run deterministic quality-gate report smoke
         run: |

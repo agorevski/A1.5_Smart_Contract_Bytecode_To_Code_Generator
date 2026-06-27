@@ -547,13 +547,8 @@ def evaluate_bytecode_semantics(
         has_bytecode_evidence
         or solidity_validity.compiler_checked
         or solidity_validity.bytecode_checked
-        or reference_facts
     )
-    deployable = (
-        bool(solidity_validity.deployable)
-        if solidity_validity.deployable is not None
-        else bool(solidity_validity.valid)
-    )
+    deployable = bool(solidity_validity.deployable)
 
     return BytecodeSemanticResult(
         checked=checked,
@@ -873,7 +868,7 @@ def validate_generated_solidity(
         method="scaffold",
         scaffold_valid=scaffold_valid,
         scaffold_errors=scaffold_errors,
-        deployable=scaffold_valid,
+        deployable=False,
     )
 
 
@@ -1614,7 +1609,7 @@ class TrainingConfig:
 
     # Dataset processing
     min_function_length: int = 50
-    max_sequence_length: int = 20000
+    max_sequence_length: int = 2048
     train_test_split: float = 0.85
     validation_split: float = 0.1
     split_seed: int = 42

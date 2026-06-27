@@ -63,7 +63,16 @@ class PipelineResult:
     tac_per_function: Dict[str, str] = field(default_factory=dict)
     decompiled_functions: Dict[str, str] = field(default_factory=dict)
     function_errors: Dict[str, str] = field(default_factory=dict)
+    function_results: List[Dict[str, Any]] = field(default_factory=list)
+    source_summary: Dict[str, Any] = field(default_factory=dict)
     decompilation_status: Optional[str] = None
+    validation: Dict[str, Any] = field(default_factory=dict)
+    function_validation: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    selector_map: Dict[str, Any] = field(default_factory=dict)
+    reconstruction: Dict[str, Any] = field(default_factory=dict)
+    quality: Dict[str, Any] = field(default_factory=dict)
+    trace: Dict[str, Any] = field(default_factory=dict)
+    trace_path: Optional[str] = None
     classification_result: Optional[Any] = None
     vulnerability_report: Optional[Any] = None
     audit_report: Optional[Any] = None
@@ -92,8 +101,26 @@ class PipelineResult:
             result["decompiled_functions"] = self.decompiled_functions
         if self.function_errors:
             result["function_errors"] = self.function_errors
+        if self.function_results:
+            result["function_results"] = self.function_results
+        if self.source_summary:
+            result["source_summary"] = self.source_summary
         if self.decompilation_status:
             result["decompilation_status"] = self.decompilation_status
+        if self.validation:
+            result["validation"] = self.validation
+        if self.function_validation:
+            result["function_validation"] = self.function_validation
+        if self.selector_map:
+            result["selector_map"] = self.selector_map
+        if self.reconstruction:
+            result["reconstruction"] = self.reconstruction
+        if self.quality:
+            result["quality"] = self.quality
+        if self.trace:
+            result["trace"] = self.trace
+        if self.trace_path:
+            result["trace_path"] = self.trace_path
         if self.classification_result:
             result["classification"] = {
                 "is_malicious": self.classification_result.is_malicious,
@@ -234,39 +261,77 @@ class PipelineOrchestrator:
             result.decompilation_status = "skipped_malicious"
             return
 
-        from .bytecode_analyzer import BytecodeAnalyzer
+        from .inference import run_bytecode_inference
 
         if self._decompiler is None:
-            analyzer = BytecodeAnalyzer(bytecode)
-            func_tac = analyzer.generate_per_function_tac()
-            if func_tac:
-                tac = "\n\n".join(func_tac.values())
-            else:
-                tac = analyzer.generate_tac_representation()
-            result.tac = tac
-            result.tac_per_function = func_tac
-            result.decompiled_source = None
-            result.decompilation_status = "tac_only_no_model"
-            result.metadata["decompilation_status"] = result.decompilation_status
+            decompile_result = run_bytecode_inference(
+                bytecode,
+                model_path=self.config.decompiler_model_path,
+                tac_only=True,
+                request_id=(
+                    f"pipeline:{result.contract_address}"
+                    if result.contract_address
+                    else "pipeline"
+                ),
+            )
+            self._apply_decompilation_result(decompile_result, result)
             result.metadata["decompilation_warning"] = (
                 "No decompiler_model_path configured; generated TAC only."
             )
-            result.metadata["tac_length"] = len(tac)
             return
 
-        decompile_result = self._decompiler.decompile_contract(bytecode)
-        result.decompiled_source = decompile_result.get("solidity")
+        decompile_result = run_bytecode_inference(
+            bytecode,
+            decompiler=self._decompiler,
+            model_path=self.config.decompiler_model_path,
+            request_id=(
+                f"pipeline:{result.contract_address}"
+                if result.contract_address
+                else "pipeline"
+            ),
+        )
+        self._apply_decompilation_result(decompile_result, result)
+
+    def _apply_decompilation_result(
+        self, decompile_result: Dict[str, Any], result: PipelineResult
+    ) -> None:
+        """Copy the shared inference schema into the pipeline result."""
+        result.decompiled_source = decompile_result.get("solidity") or None
         result.decompiled_functions = decompile_result.get("functions", {})
         result.tac_per_function = decompile_result.get("tac_per_function", {})
-        result.tac = "\n\n".join(result.tac_per_function.values())
+        result.tac = decompile_result.get("tac") or "\n\n".join(result.tac_per_function.values())
         analysis = decompile_result.get("analysis", {})
-        result.function_errors = analysis.get("function_errors", {})
-        result.decompilation_status = (
-            "partial_error" if result.function_errors else "model_generated"
+        result.function_errors = analysis.get(
+            "function_errors", decompile_result.get("function_errors", {})
         )
+        result.function_results = decompile_result.get("function_results", [])
+        result.source_summary = decompile_result.get("source_summary", {})
+        result.decompilation_status = decompile_result.get(
+            "decompilation_status",
+            "partial_error" if result.function_errors else "model_generated",
+        )
+        result.validation = decompile_result.get("validation", {})
+        result.function_validation = decompile_result.get("function_validation", {})
+        result.selector_map = decompile_result.get("selector_map", {})
+        result.reconstruction = decompile_result.get("reconstruction", {})
+        result.quality = decompile_result.get("quality", {})
+        result.trace = decompile_result.get("trace", {})
+        result.trace_path = decompile_result.get("trace_path")
         result.metadata["decompilation_status"] = result.decompilation_status
         result.metadata["decompilation_analysis"] = analysis
         result.metadata["tac_length"] = len(result.tac or "")
+        result.metadata["function_results"] = result.function_results
+        result.metadata["source_summary"] = result.source_summary
+        result.metadata["validation"] = result.validation
+        result.metadata["function_validation"] = result.function_validation
+        result.metadata["selector_map"] = result.selector_map
+        result.metadata["reconstruction"] = result.reconstruction
+        result.metadata["quality"] = result.quality
+        result.metadata["lookup"] = decompile_result.get("lookup", {})
+        result.metadata["lookup_config"] = decompile_result.get("lookup_config", {})
+        result.metadata["trace"] = result.trace
+        if result.trace_path:
+            result.metadata["trace_path"] = result.trace_path
 
     def _run_vulnerability_detection(
         self, bytecode: str, contract_address: str, result: PipelineResult

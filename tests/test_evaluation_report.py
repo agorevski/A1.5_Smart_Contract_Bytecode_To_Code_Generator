@@ -98,12 +98,14 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
                     "current": 0.9,
                     "baseline": 0.8,
                     "delta": 0.1,
+                    "relative_delta": 0.125,
                     "status": "improved",
                 },
                 "edit_distance_mean": {
                     "current": 0.1,
                     "baseline": 0.08,
                     "delta": 0.02,
+                    "relative_delta": 0.25,
                     "status": "regressed",
                 },
             },
@@ -148,7 +150,52 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
     assert "compiler_version | 1 | 0 | 0.8.20 (1)" in report
     assert "compiler_version=0.8.20 | 1 | 0.9000 | 0.1000 | 0.7742 | 100.00%" in report
     assert "Metrics compared: 2" in report
-    assert "edit_distance_mean | 0.1000 | 0.0800 | 0.0200 | regressed" in report
+    assert "edit_distance_mean | 0.1000 | 0.0800 | 0.0200 | 0.2500 | regressed" in report
+
+
+def test_format_latest_results_report_derives_hallucination_rates_from_details(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    dataset = tmp_path / "test_dataset.jsonl"
+    dataset.write_text('{"input": "a", "output": "b"}\n')
+    results = tmp_path / "eval_results.json"
+    results.write_text(
+        json.dumps(
+            {
+                "details": [
+                    {
+                        "metrics": {
+                            "metadata": {
+                                "replication": {
+                                    "candidate_fact_count": 10,
+                                    "groundedness_score": 0.7,
+                                    "hallucination_buckets": {
+                                        "unsupported_calls": ["call:_afterapprove"],
+                                        "invented_guards": [
+                                            "guard:require:msg.sender==owner",
+                                            "guard:revert:unauthorized",
+                                        ],
+                                    },
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        )
+    )
+
+    report = format_latest_results_report(
+        summary={"num_evaluated": 1},
+        model_path=str(model_dir),
+        test_dataset_path=str(dataset),
+        results_json_path=str(results),
+    )
+
+    assert "Total hallucinated facts: 3" in report
+    assert "Groundedness score mean: 0.7000" in report
+    assert "unsupported_calls | 1 | 10.00%" in report
+    assert "invented_guards | 2 | 20.00%" in report
 
 
 def test_format_latest_results_report_renders_worst_samples_and_benchmark_suites(tmp_path):

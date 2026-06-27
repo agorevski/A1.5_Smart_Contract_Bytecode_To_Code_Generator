@@ -34,6 +34,10 @@ wandb/
 # Data (large files — regenerate with download_hf_contracts.py)
 data/*.db*
 data/*.jsonl
+data/*.log
+data/split_manifest.json
+data/manifests/
+data/preflight_cache/
 scripts/data/*.db*
 
 # Keep demo dataset for reference

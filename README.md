@@ -72,7 +72,7 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
 
 # Full training with custom parameters
 uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
-    --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 4096
+    --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 2048
 
 # Force single-GPU or memory-saving quantized LoRA when needed
 uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
@@ -83,12 +83,14 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
 `models/run_manifests/` by default. Dataset splitting writes
 `data/split_manifest.json` with leakage checks and holdout coverage; JSONL schema
 and token-length preflight runs before training/evaluation unless
-`--skip-data-preflight` is used for legacy smoke runs.
+`--skip-data-preflight` is used for legacy smoke runs. Preflight fails closed
+when the actual tokenizer cannot load unless `--allow-whitespace-preflight-fallback`
+is supplied explicitly.
 
 ### 4. Evaluate
 
 Evaluation runs automatically after training unless `--skip-eval` is passed. Results are saved to `results/`.
-Use `--eval-batch-size N` to batch decompilation during evaluation.
+Use `--eval-batch-size N` and `--eval-max-new-tokens N` to control batched decompilation.
 
 ```bash
 # Train and evaluate
@@ -263,11 +265,16 @@ uv run pytest --cov=src tests/
 
 ### `train.py`
 
+For the 4-GPU RTX 8000 throughput recipe from
+`docs/gpu-parameter-sweep-results.md`, use
+`THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh`.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config PATH` | — | YAML/JSON training config; CLI flags override file values |
 | `--skip-collection` | — | Use existing dataset (skip Etherscan) |
-| `--dataset PATH` | auto | Path to JSONL dataset |
+| `--dataset PATH` | auto | Path to a full-source JSONL dataset; cached split artifacts require `--allow-split-artifact-source` |
+| `--allow-split-artifact-source` | off | Explicitly allow re-splitting `train/val/test_dataset.jsonl` artifacts |
 | `--small` | — | Quick test: 1 epoch, batch=2 |
 | `--tiny` | — | Use `facebook/opt-125m` for fast testing |
 | `--epochs N` | `3` | Training epochs |
@@ -276,7 +283,10 @@ uv run pytest --cov=src tests/
 | `--gradient-accumulation-steps N` | auto | Override automatic gradient accumulation |
 | `--lr FLOAT` | `2e-4` | Learning rate |
 | `--max-seq-length N` | `2048` | Max token sequence length |
+| `--eval-max-new-tokens N` | `256` | Max generated Solidity tokens per eval example |
 | `--model-name NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Base model |
+| `--precision MODE` | `fp16` | Trainer/DeepSpeed precision mode (`auto`, `bf16`, `fp16`, or `fp32`) |
+| `--report-to BACKEND` | `none` | Trainer reporting backend (`none`, `tensorboard`, `wandb`, or `all`); wrappers default to TensorBoard |
 | `--num-gpus N` | `4` | GPU count for automatic `torchrun` launch |
 | `--no-auto-torchrun` | off | Do not auto-relaunch with `torchrun` |
 | `--lora` / `--no-lora` | on | Enable or disable LoRA adapter training |
@@ -284,6 +294,7 @@ uv run pytest --cov=src tests/
 | `--lora-alpha N` | `32` | LoRA alpha |
 | `--lora-dropout FLOAT` | `0.1` | LoRA dropout |
 | `--quantization` / `--no-quantization` | off | Enable or disable 4-bit NF4 loading |
+| `--gradient-checkpointing` / `--no-gradient-checkpointing` | off | Activation checkpointing; disabled by default for the 4x RTX 8000 throughput recipe |
 | `--collection-workers N` | `3` | Etherscan collection worker count when supported |
 | `--max-compiler-configs N` | `2` | Compiler configs per collected contract |
 | `--allow-demo-fallback` | off | Explicitly allow `demo_dataset.jsonl` when real collection yields no pairs |
@@ -291,7 +302,7 @@ uv run pytest --cov=src tests/
 | `--split-manifest PATH` | `<data-dir>/split_manifest.json` | Dataset split manifest path |
 | `--skip-split-validation` | off | Skip leakage/coverage split gate |
 | `--min-holdout-stratum-count N` | `0` | Fail if common val/test coverage strata fall below N |
-| `--resume PATH\|auto` | — | Resume from a checkpoint path or latest `checkpoint-*` under `--output-dir` |
+| `--resume PATH\|auto\|required` | — | Resume from a valid checkpoint path, latest valid `checkpoint-*`, or fail if required and none exists |
 | `--skip-eval` | — | Skip post-training evaluation |
 | `--eval-batch-size N` | `1` | Batch size for evaluation decompilation |
 | `--dataset-only` | — | Only build dataset, skip training |
@@ -299,12 +310,17 @@ uv run pytest --cov=src tests/
 | `--no-bytecode-metadata` | off | Disable the compact bytecode/TAC-derived metadata line; TAC sanitization still runs |
 | `--skip-data-preflight` | off | Skip JSONL schema/token-length preflight |
 | `--preflight-tokenizer-download` | off | Allow tokenizer downloads during preflight |
+| `--allow-whitespace-preflight-fallback` | off | Explicitly allow approximate whitespace token counts if the tokenizer cannot load |
 | `--max-steps N` | `-1` | Cap optimizer steps for bounded experiments |
-| `--tokenization-cache` | off | Cache tokenized train/eval datasets |
+| `--tokenization-cache` | on | Cache tokenized train/eval datasets with serialized writers |
 | `--manifest-dir PATH` | `<output-dir>/run_manifests` | Directory for run manifests |
 | `--run-manifest PATH` | — | Exact manifest JSON path |
 | `--no-throughput-metrics` | off | Disable default throughput telemetry |
 | `--enable-torch-profiler` | off | Write bounded torch profiler traces |
+
+Training wrappers run post-training evaluation by default and write `latest_results.txt`; set
+`SKIP_EVAL=true` only for smoke/sweep runs. They pass `REPORT_TO=tensorboard` by default and
+persist Trainer log history plus throughput telemetry under `--output-dir`.
 
 `scripts/run_compiler_metadata_ablation.py` is historical/deprecated for
 production prompt design. Current prompt code ignores compiler metadata, so the

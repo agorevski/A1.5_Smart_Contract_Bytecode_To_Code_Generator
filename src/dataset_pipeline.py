@@ -18,6 +18,9 @@ import logging
 import traceback
 import time
 import threading
+import platform
+import subprocess
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,158 +47,37 @@ from .local_compiler import (
 )
 from .abi_enrichment import canonicalize_abi_type, normalize_hex
 import yaml
+from .dataset_export_primitives import (
+    TRAINING_ROW_SCHEMA_VERSION,
+    _collapse_whitespace,
+    _md5,
+    _safe_tac_function_name,
+    _selector_safe_name,
+    auxiliary_contract_reject_reasons,
+    build_training_record,
+    contract_names_match,
+    ensure_tac_integrated,
+    export_length_report,
+    extract_tac_for_function,
+    final_row_hash,
+    hash_normalized_body,
+    hash_normalized_pair,
+    hash_normalized_tac,
+    hash_source_code,
+    is_partial_training_pair,
+    match_functions_by_selector,
+    normalize_solidity_body,
+    normalize_tac,
+    normalize_training_metadata,
+    parse_metadata_object,
+    record_final_row_hash,
+    sanitize_tac_prompt_input,
+    tac_quality_reject_reasons,
+    validate_training_metadata_schema,
+    validate_training_record_schema,
+)
 
 logger = logging.getLogger(__name__)
-TRAINING_ROW_SCHEMA_VERSION = 1
-
-
-def _collapse_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _strip_comments(text: str) -> str:
-    text = re.sub(r"//[^\n]*", "", text)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    return text
-
-
-def normalize_solidity_body(body: str) -> str:
-    return _collapse_whitespace(_strip_comments(body)).lower()
-
-
-def normalize_tac(tac: str) -> str:
-    text = re.sub(r"//[^\n]*", "", tac)
-    return _collapse_whitespace(text).lower()
-
-
-_FUNCTION_HEADER_RE = re.compile(r"^(\s*)function\s+.+:\s*$")
-_SELECTOR_COMMENT_RE = re.compile(
-    r"//\s*(?:function\s+)?selector:\s*(0x[0-9a-fA-F]{8})",
-    re.IGNORECASE,
-)
-_SOURCE_ONLY_COMMENT_RE = re.compile(
-    r"^\s*//\s*(?:Compiler:|Returns:|param\[\d+\]\s+at\s+0x[0-9a-fA-F]+:|event:)",
-    re.IGNORECASE,
-)
-_STORAGE_LAYOUT_HEADER_RE = re.compile(r"^\s*//\s*Storage layout:\s*$", re.IGNORECASE)
-_STORAGE_LAYOUT_ROW_RE = re.compile(r"^\s*//\s*slot\s+\d+:", re.IGNORECASE)
-_SOURCE_STORAGE_ANNOTATION_RE = re.compile(r"\s+//\s*likely:\s+.*$", re.IGNORECASE)
-
-
-def _selector_safe_name(selector: Optional[str]) -> Optional[str]:
-    """Return a selector-based TAC function name, or ``None`` without a selector."""
-    if not selector:
-        return None
-    selector_text = str(selector).strip().lower()
-    if selector_text.startswith("0x"):
-        selector_text = selector_text[2:]
-    selector_text = re.sub(r"[^0-9a-f]", "", selector_text)
-    if len(selector_text) != 8:
-        return None
-    return f"selector_{selector_text}"
-
-
-def _safe_tac_function_name(bytecode_function) -> str:
-    """Name TAC headers from bytecode-visible facts, preferring selectors."""
-    selector_name = _selector_safe_name(getattr(bytecode_function, "selector", None))
-    if selector_name:
-        return selector_name
-
-    raw_name = str(getattr(bytecode_function, "name", "") or "").strip()
-    if raw_name in {"fallback", "fallback_function", "receive"}:
-        return re.sub(r"[^A-Za-z0-9_]", "_", raw_name).strip("_") or "bytecode_function"
-
-    if raw_name.startswith("internal_"):
-        return re.sub(r"[^A-Za-z0-9_]", "_", raw_name).strip("_") or "bytecode_function"
-
-    entry_block = str(getattr(bytecode_function, "entry_block", "") or "").strip()
-    if entry_block:
-        safe_entry = re.sub(r"[^A-Za-z0-9_]", "_", entry_block).strip("_")
-        if safe_entry:
-            return f"bytecode_{safe_entry}"
-
-    return "bytecode_function"
-
-
-def _selector_near_header(lines: List[str], header_index: int) -> Optional[str]:
-    """Find the selector comment associated with a TAC function header."""
-    for following in lines[header_index + 1 :]:
-        if _FUNCTION_HEADER_RE.match(following):
-            break
-        match = _SELECTOR_COMMENT_RE.search(following)
-        if match:
-            return match.group(1)
-        if following and not following.strip().startswith("//") and not following.startswith(" "):
-            break
-    return None
-
-
-def sanitize_tac_prompt_input(tac: str) -> str:
-    """Remove source/compiler-only annotations from TAC prompt text.
-
-    Metadata can still carry compiler, ABI, source signature, and source storage
-    facts for offline analysis. The TAC input itself must stay limited to facts
-    available from runtime bytecode at inference time.
-    """
-    if tac is None:
-        return ""
-    if not isinstance(tac, str):
-        tac = str(tac)
-    if not tac:
-        return tac
-
-    lines = tac.splitlines()
-
-    sanitized: List[str] = []
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if _SOURCE_ONLY_COMMENT_RE.match(stripped):
-            continue
-        if _STORAGE_LAYOUT_HEADER_RE.match(stripped) or _STORAGE_LAYOUT_ROW_RE.match(stripped):
-            continue
-
-        header_match = _FUNCTION_HEADER_RE.match(line)
-        if header_match:
-            selector = _selector_near_header(lines, idx)
-            selector_name = _selector_safe_name(selector)
-            if selector_name:
-                sanitized.append(f"{header_match.group(1)}function {selector_name}:")
-            elif "(" in line or ")" in line:
-                sanitized.append(f"{header_match.group(1)}function bytecode_function:")
-            else:
-                sanitized.append(line)
-            continue
-
-        sanitized.append(_SOURCE_STORAGE_ANNOTATION_RE.sub("", line))
-
-    return "\n".join(sanitized)
-
-
-def _md5(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()
-
-
-def hash_source_code(source: str) -> str:
-    return hashlib.sha256(_collapse_whitespace(source).encode()).hexdigest()
-
-
-def hash_normalized_body(body: str) -> str:
-    return _md5(normalize_solidity_body(body))
-
-
-def hash_normalized_tac(tac: str) -> str:
-    return _md5(normalize_tac(tac))
-
-
-def hash_normalized_pair(tac: str, body: str) -> str:
-    return _md5(normalize_tac(tac) + "|" + normalize_solidity_body(body))
-
-
-_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-_SELECTOR_RE = re.compile(r"^0x[0-9a-fA-F]{8}$")
-_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}([0-9a-fA-F]{32})?$")
-_COMPILER_VERSION_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:[+-].*)?$")
-
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -252,6 +134,46 @@ def _file_artifact(path: Path, *, jsonl: bool = False) -> Dict[str, Any]:
     return artifact
 
 
+def _run_git(args: List[str]) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _get_git_state() -> Dict[str, Any]:
+    commit = _run_git(["rev-parse", "HEAD"])
+    if not commit:
+        return {"available": False}
+    status_short = _run_git(["status", "--short"]) or ""
+    return {
+        "available": True,
+        "repository_root": _run_git(["rev-parse", "--show-toplevel"]),
+        "commit": commit,
+        "branch": _run_git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "dirty": bool(status_short),
+        "status_short": status_short.splitlines()[:100],
+    }
+
+
+def _environment_summary() -> Dict[str, Any]:
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "executable": Path(sys.executable).name,
+    }
+
+
 def _hash_address_list(addresses: List[str]) -> str:
     normalized = "\n".join(str(addr).strip().lower() for addr in addresses if str(addr).strip())
     return hashlib.sha256((normalized + "\n").encode()).hexdigest()
@@ -261,204 +183,6 @@ def _bounded_error(error: Any, limit: int = 500) -> str:
     text = str(error or "").strip()
     return text[:limit]
 
-
-def parse_metadata_object(metadata: Any) -> Dict[str, Any]:
-    if isinstance(metadata, dict):
-        return dict(metadata)
-    if isinstance(metadata, str) and metadata.strip():
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def normalize_training_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return metadata with the current row-schema marker attached."""
-    normalized = dict(metadata or {})
-    normalized.setdefault("schema_version", TRAINING_ROW_SCHEMA_VERSION)
-    return normalized
-
-
-def validate_training_metadata_schema(
-    metadata: Any,
-    *,
-    allow_legacy: bool = False,
-) -> Dict[str, Any]:
-    """Validate decontamination-critical metadata fields when present.
-
-    ``allow_legacy`` accepts rows that omit ``schema_version`` while still
-    validating any critical fields they do provide.
-    """
-    errors: List[Dict[str, str]] = []
-    if not isinstance(metadata, dict):
-        return {
-            "status": "failed",
-            "schema_version": TRAINING_ROW_SCHEMA_VERSION,
-            "errors": [
-                {
-                    "field": "metadata",
-                    "code": "metadata_type_error",
-                    "message": "metadata must be an object",
-                }
-            ],
-        }
-
-    version = metadata.get("schema_version")
-    if version is None:
-        if not allow_legacy:
-            errors.append(
-                {
-                    "field": "metadata.schema_version",
-                    "code": "schema_version_missing",
-                    "message": "metadata.schema_version is required for schema v1 rows",
-                }
-            )
-    elif version != TRAINING_ROW_SCHEMA_VERSION:
-        errors.append(
-            {
-                "field": "metadata.schema_version",
-                "code": "schema_version_unsupported",
-                "message": f"unsupported metadata schema version {version!r}",
-            }
-        )
-
-    address = metadata.get("contract_address")
-    if address not in (None, "") and not (isinstance(address, str) and _ADDRESS_RE.match(address)):
-        errors.append(
-            {
-                "field": "metadata.contract_address",
-                "code": "contract_address_format",
-                "message": "contract_address must be a 20-byte 0x-prefixed hex string",
-            }
-        )
-
-    selector = metadata.get("selector", metadata.get("function_selector"))
-    if selector not in (None, "") and not (
-        isinstance(selector, str) and _SELECTOR_RE.match(selector)
-    ):
-        errors.append(
-            {
-                "field": "metadata.selector",
-                "code": "selector_format",
-                "message": "selector must be a 4-byte 0x-prefixed hex string",
-            }
-        )
-
-    for key in ("source_hash", "source_code_hash", "body_hash", "input_hash", "output_hash"):
-        value = metadata.get(key)
-        if value not in (None, "") and not (isinstance(value, str) and _HASH_RE.match(value)):
-            errors.append(
-                {
-                    "field": f"metadata.{key}",
-                    "code": "hash_format",
-                    "message": f"{key} must be a 32- or 64-byte lowercase/uppercase hex digest",
-                }
-            )
-
-    for key in ("optimizer_enabled", "is_payable", "is_view"):
-        value = metadata.get(key)
-        if value not in (None, "") and not isinstance(value, bool):
-            errors.append(
-                {
-                    "field": f"metadata.{key}",
-                    "code": "boolean_type_error",
-                    "message": f"{key} must be a boolean when present",
-                }
-            )
-
-    compiler_version = metadata.get("compiler_version")
-    if compiler_version not in (None, "") and not (
-        isinstance(compiler_version, str) and _COMPILER_VERSION_RE.match(compiler_version)
-    ):
-        errors.append(
-            {
-                "field": "metadata.compiler_version",
-                "code": "compiler_version_format",
-                "message": "compiler_version must look like a Solidity semver string",
-            }
-        )
-
-    optimizer_runs = metadata.get("optimizer_runs")
-    if optimizer_runs not in (None, "") and not (
-        isinstance(optimizer_runs, int)
-        and not isinstance(optimizer_runs, bool)
-        and optimizer_runs >= 0
-    ):
-        errors.append(
-            {
-                "field": "metadata.optimizer_runs",
-                "code": "optimizer_runs_type_error",
-                "message": "optimizer_runs must be a non-negative integer when present",
-            }
-        )
-
-    return {
-        "status": "failed" if errors else "passed",
-        "schema_version": TRAINING_ROW_SCHEMA_VERSION,
-        "errors": errors,
-    }
-
-
-def validate_training_record_schema(
-    record: Any,
-    *,
-    allow_legacy: bool = False,
-) -> Dict[str, Any]:
-    """Validate the top-level training JSONL row and versioned metadata schema."""
-    errors: List[Dict[str, str]] = []
-    if not isinstance(record, dict):
-        return {
-            "status": "failed",
-            "schema_version": TRAINING_ROW_SCHEMA_VERSION,
-            "errors": [
-                {
-                    "field": "$",
-                    "code": "row_type_error",
-                    "message": "row must be an object",
-                }
-            ],
-        }
-
-    for field_name in ("input", "output"):
-        value = record.get(field_name)
-        if not isinstance(value, str) or not value.strip():
-            errors.append(
-                {
-                    "field": field_name,
-                    "code": f"{field_name}_required_string",
-                    "message": f"{field_name} must be a non-empty string",
-                }
-            )
-
-    metadata = record.get("metadata", {})
-    metadata_result = validate_training_metadata_schema(metadata, allow_legacy=allow_legacy)
-    errors.extend(metadata_result["errors"])
-    return {
-        "status": "failed" if errors else "passed",
-        "schema_version": TRAINING_ROW_SCHEMA_VERSION,
-        "errors": errors,
-    }
-
-
-def is_partial_training_pair(
-    metadata: Any = None,
-    solidity_code: str = "",
-    function_name: str = "",
-) -> bool:
-    """Return true for partial/placeholder decompilation examples."""
-    parsed_metadata = parse_metadata_object(metadata)
-    if parsed_metadata.get("partial") is True:
-        return True
-    target = str(solidity_code or "")
-    if "Partial decompilation" in target:
-        return True
-    if "TODO: Full logic not reconstructed" in target:
-        return True
-    if re.search(r"\bfunction\s+unknown_[0-9A-Za-z_]*\s*\(", target):
-        return True
-    return str(function_name or "").startswith("unknown_")
 
 
 def _extract_function_signature_parts(signature: str) -> Optional[Tuple[str, str]]:
@@ -1935,6 +1659,8 @@ class DatasetBuilder:
             tac = self._extract_tac_for_function(func, analyzer)
             if not tac or len(tac.strip()) < 20:
                 continue
+            if tac_quality_reject_reasons(tac):
+                continue
 
             # Gather structural hints from the TAC / blocks
             blocks = self._collect_function_blocks(
@@ -2107,28 +1833,14 @@ class DatasetBuilder:
         Returns:
             List of matched function dicts.
         """
-        matches: List[Dict] = []
-        self._ensure_analyzer_tac_integrated(analyzer)
-
-        solidity_by_selector = {f["selector"]: f for f in solidity_functions if f.get("selector")}
-        bytecode_by_selector = {f.selector: f for f in bytecode_functions.values() if f.selector}
-
-        for selector, sol_func in solidity_by_selector.items():
-            if selector in bytecode_by_selector:
-                bytecode_func = bytecode_by_selector[selector]
-                tac = self._extract_tac_for_function(bytecode_func, analyzer)
-                matches.append(
-                    {
-                        "solidity_function": sol_func,
-                        "bytecode_function": bytecode_func,
-                        "tac": tac,
-                        "selector": selector,
-                    }
-                )
+        matches = match_functions_by_selector(solidity_functions, bytecode_functions, analyzer)
+        matched_selectors = {m["selector"] for m in matches}
+        for sol_func in solidity_functions:
+            selector = sol_func.get("selector")
+            if selector in matched_selectors:
                 logger.debug(f"Matched function {sol_func['name']} with selector {selector}")
-            else:
+            elif selector:
                 logger.debug(f"No bytecode match for {sol_func['name']} (selector: {selector})")
-
         return matches
 
     # ------------------------------------------------------------------ #
@@ -2138,19 +1850,7 @@ class DatasetBuilder:
     @staticmethod
     def _ensure_analyzer_tac_integrated(analyzer: BytecodeAnalyzer) -> None:
         """Populate block.instructions once after control-flow analysis."""
-        blocks = getattr(analyzer, "basic_blocks", {}) or {}
-        if not blocks:
-            return
-        if any(getattr(block, "instructions", None) for block in blocks.values()):
-            return
-        if not any(
-            (getattr(block, "metadata", {}) or {}).get("raw_instructions")
-            for block in blocks.values()
-        ):
-            return
-        converter = getattr(analyzer, "_convert_and_integrate_tac", None)
-        if callable(converter):
-            converter()
+        ensure_tac_integrated(analyzer)
 
     def _extract_tac_for_function(self, bytecode_function, analyzer: BytecodeAnalyzer) -> str:
         """Extract bytecode-only TAC representation for a specific function.
@@ -2163,46 +1863,7 @@ class DatasetBuilder:
             Formatted TAC string for the function. Headers use selector-safe
             bytecode names and exclude source/compiler-only annotations.
         """
-        tac_lines: List[str] = []
-
-        try:
-            self._ensure_analyzer_tac_integrated(analyzer)
-            func_name = _safe_tac_function_name(bytecode_function)
-            tac_lines.append(f"function {func_name}:")
-
-            if bytecode_function.selector:
-                tac_lines.append(f"  // Selector: {bytecode_function.selector}")
-
-            tac_lines.append(f"  // Entry block: {bytecode_function.entry_block}")
-
-            function_blocks = (
-                bytecode_function.basic_blocks if bytecode_function.basic_blocks else []
-            )
-
-            if not function_blocks and bytecode_function.entry_block in analyzer.basic_blocks:
-                function_blocks = self._collect_function_blocks(
-                    bytecode_function.entry_block, analyzer.basic_blocks
-                )
-
-            for block in function_blocks:
-                tac_lines.append(f"  {block.id}:")
-
-                if block.predecessors:
-                    tac_lines.append(f"    // Predecessors: {', '.join(block.predecessors)}")
-                if block.successors:
-                    tac_lines.append(f"    // Successors: {', '.join(block.successors)}")
-
-                for instr in block.instructions:
-                    formatted = analyzer._format_tac_instruction(instr)
-                    tac_lines.append(f"    {formatted}")
-
-                tac_lines.append("")
-
-        except Exception as e:
-            logger.error(f"Failed to extract TAC for function: {e}")
-            tac_lines.append(f"  // Error extracting TAC: {e}")
-
-        return "\n".join(tac_lines)
+        return extract_tac_for_function(bytecode_function, analyzer, logger=logger)
 
     def _collect_function_blocks(
         self,
@@ -2294,6 +1955,8 @@ class DatasetBuilder:
             return None
 
         if not tac or len(tac.strip()) < 10:
+            return None
+        if tac_quality_reject_reasons(tac):
             return None
 
         return FunctionPair(
@@ -2453,6 +2116,25 @@ class DatasetBuilder:
                 """,
             )
 
+        cursor.execute("SELECT id, tac_representation FROM function_pairs")
+        tac_error_ids: List[int] = []
+        tac_reason_counts: Counter = Counter()
+        for row_id, tac_text in cursor.fetchall():
+            reasons = tac_quality_reject_reasons(tac_text)
+            if reasons:
+                tac_error_ids.append(row_id)
+                tac_reason_counts.update(reasons)
+        if tac_error_ids:
+            for start in range(0, len(tac_error_ids), 500):
+                chunk = tac_error_ids[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor.execute(
+                    f"DELETE FROM function_pairs WHERE id IN ({placeholders})",
+                    tuple(chunk),
+                )
+            drop_counts["tac_error_marker"] += len(tac_error_ids)
+            drop_counts.update(tac_reason_counts)
+
         # Step 1: Remove extremely short functions
         delete_rule(
             "min_solidity_length",
@@ -2527,6 +2209,9 @@ class DatasetBuilder:
         output_format: str = "jsonl",
         *,
         include_partial: bool = False,
+        max_seq_length: int = 2048,
+        filter_overlength: bool = True,
+        rejects_path: Optional[str] = None,
         write_manifest: bool = True,
     ) -> str:
         """Export the dataset in the specified format.
@@ -2538,6 +2223,9 @@ class DatasetBuilder:
             output_format: Export format (``'jsonl'``, ``'csv'``, or ``'parquet'``).
             include_partial: Also write partial placeholders to a separate
                 ``smart_contract_dataset.partial.jsonl`` file.
+            max_seq_length: Training context budget for export-time quarantine.
+            filter_overlength: Quarantine rows exceeding ``max_seq_length``.
+            rejects_path: Optional JSONL path for rejected main-dataset rows.
             write_manifest: Write an export manifest next to the main artifact.
 
         Returns:
@@ -2589,6 +2277,11 @@ class DatasetBuilder:
         filename = f"smart_contract_dataset.{output_format}"
         filepath = self.output_dir / filename
         partial_filepath = self.output_dir / "smart_contract_dataset.partial.jsonl"
+        reject_filepath = (
+            Path(rejects_path)
+            if rejects_path
+            else self.output_dir / f"smart_contract_dataset.{output_format}.rejects.jsonl"
+        )
 
         partial_mask = []
         for _, row in df.iterrows():
@@ -2630,10 +2323,70 @@ class DatasetBuilder:
                 "metadata": metadata,
             }
 
+        main_records: List[Dict[str, Any]] = []
+        keep_indices: List[Any] = []
+        export_rejects: List[Dict[str, Any]] = []
+        reject_reason_counts: Counter = Counter()
+        overlength_counts: Counter = Counter()
+        tac_quality_counts: Counter = Counter()
+        seen_final_hashes: Dict[str, Dict[str, Any]] = {}
+        final_duplicate_rejects = 0
+        overlength_row_rejects = 0
+
+        for source_number, (idx, row) in enumerate(main_df.iterrows(), start=1):
+            record = row_to_record(row)
+            reasons = tac_quality_reject_reasons(record["input"])
+            length_report = export_length_report(record, max_seq_length)
+            length_reasons = length_report["reasons"] if filter_overlength else []
+            reasons.extend(length_reasons)
+            row_hash = record_final_row_hash(record)
+            if row_hash in seen_final_hashes:
+                reasons.append("final_row_duplicate")
+
+            if reasons:
+                reject_reason_counts.update(reasons)
+                tac_quality_counts.update(
+                    reason for reason in reasons if reason.startswith("tac_")
+                )
+                overlength_counts.update(length_reasons)
+                if length_reasons:
+                    overlength_row_rejects += 1
+                if "final_row_duplicate" in reasons:
+                    final_duplicate_rejects += 1
+                reject_record = {
+                    "source_row_number": source_number,
+                    "contract_address": record["metadata"].get("contract_address"),
+                    "function_name": record["metadata"].get("function_name"),
+                    "function_signature": record["metadata"].get("function_signature"),
+                    "final_row_hash": row_hash,
+                    "reasons": reasons,
+                    "lengths": {
+                        key: value for key, value in length_report.items() if key != "reasons"
+                    },
+                }
+                if row_hash in seen_final_hashes:
+                    reject_record["duplicate_of"] = seen_final_hashes[row_hash]
+                export_rejects.append(reject_record)
+                continue
+
+            seen_final_hashes[row_hash] = {
+                "source_row_number": source_number,
+                "function_name": record["metadata"].get("function_name"),
+                "function_signature": record["metadata"].get("function_signature"),
+                "contract_address": record["metadata"].get("contract_address"),
+            }
+            main_records.append(record)
+            keep_indices.append(idx)
+
+        main_export_df = main_df.loc[keep_indices].copy() if keep_indices else main_df.iloc[0:0].copy()
+        reject_filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(reject_filepath, "w", encoding="utf-8") as reject_f:
+            for reject in export_rejects:
+                reject_f.write(json.dumps(reject, sort_keys=True) + "\n")
+
         if output_format == "jsonl":
             with open(filepath, "w", encoding="utf-8") as f:
-                for _, row in main_df.iterrows():
-                    record = row_to_record(row)
+                for record in main_records:
                     f.write(json.dumps(record, sort_keys=True) + "\n")
 
             if include_partial:
@@ -2644,10 +2397,10 @@ class DatasetBuilder:
                         f.write(json.dumps(record, sort_keys=True) + "\n")
 
         elif output_format == "csv":
-            main_df.to_csv(filepath, index=False)
+            main_export_df.to_csv(filepath, index=False)
 
         elif output_format == "parquet":
-            main_df.to_parquet(filepath, index=False)
+            main_export_df.to_parquet(filepath, index=False)
         else:
             raise ValueError(f"Unsupported output_format: {output_format}")
 
@@ -2657,6 +2410,11 @@ class DatasetBuilder:
             drop_counts = {
                 **filter_drops,
                 "partial_placeholder_export_excluded": partial_drop_count,
+                "rejected_rows": int(len(export_rejects)),
+                "overlength_rows": overlength_row_rejects,
+                "tac_error_rows": sum(tac_quality_counts.values()),
+                "final_row_duplicate_rows": final_duplicate_rejects,
+                **dict(sorted(reject_reason_counts.items())),
             }
             manifest = {
                 "manifest_kind": "etherscan_dataset_export",
@@ -2665,22 +2423,50 @@ class DatasetBuilder:
                 "run_id": self.run_id,
                 "generated_at": _utc_now_iso(),
                 "database": str(self.db_path),
+                "git": _get_git_state(),
+                "environment": _environment_summary(),
                 "inputs": self._collection_input_summary,
                 "parameters": {
                     "output_format": output_format,
                     "include_partial": include_partial,
+                    "max_seq_length": max_seq_length,
+                    "filter_overlength": filter_overlength,
+                    "final_row_duplicate_policy": "quarantine",
+                    "tac_quality_policy": "quarantine",
                 },
                 "artifacts": {
                     "dataset": _file_artifact(filepath, jsonl=output_format == "jsonl"),
+                    "rejects_dataset": _file_artifact(reject_filepath, jsonl=True),
                     "database": _file_artifact(self.db_path),
                 },
                 "row_counts": {
                     **db_counts,
                     "rows_after_pair_dedup": int(len(df)),
-                    "rows_exported": int(len(main_df)),
+                    "rows_exported": int(len(main_records)),
+                    "rows_rejected": int(len(export_rejects)),
+                    "rows_rejected_overlength": overlength_row_rejects,
+                    "rows_rejected_final_duplicates": final_duplicate_rejects,
                     "partial_rows_quarantined": partial_drop_count,
                 },
                 "drop_counts": drop_counts,
+                "validation": {
+                    "final_row_duplicates": {
+                        "status": "filtered" if final_duplicate_rejects else "passed",
+                        "reject_count": final_duplicate_rejects,
+                    },
+                    "tac_quality_filter": {
+                        "status": "filtered" if tac_quality_counts else "passed",
+                        "reason_counts": dict(sorted(tac_quality_counts.items())),
+                    },
+                    "token_length_filter": {
+                        "status": "filtered" if overlength_row_rejects else "passed",
+                        "max_seq_length": max_seq_length,
+                        "filter_overlength": filter_overlength,
+                        "reject_count": overlength_row_rejects,
+                        "reason_counts": dict(sorted(overlength_counts.items())),
+                    },
+                    "reject_reason_counts": dict(sorted(reject_reason_counts.items())),
+                },
                 "failure_diagnostics": self._diagnostic_summary(),
                 "filter_drops": filter_drops,
                 "collection": self._last_collection_summary,

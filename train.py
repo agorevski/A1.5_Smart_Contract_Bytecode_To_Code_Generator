@@ -51,6 +51,7 @@ import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import hashlib
+import importlib.metadata as importlib_metadata
 import inspect
 import json
 import logging
@@ -68,13 +69,24 @@ import yaml
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_NUM_GPUS = 4
+DEFAULT_BATCH_SIZE = 4
 DEFAULT_GLOBAL_BATCH_SIZE = 16
+DEFAULT_MAX_SEQ_LENGTH = 2048
+DEFAULT_EVAL_MAX_NEW_TOKENS = 256
+DEFAULT_GLOBAL_SEED = 42
 DEFAULT_USE_QUANTIZATION = False
-DEFAULT_PRECISION = "auto"
+DEFAULT_PRECISION = "fp16"
+DEFAULT_GRADIENT_CHECKPOINTING = False
 DEFAULT_LORA_RANK = 16
 DEFAULT_LORA_ALPHA = 32
 DEFAULT_LORA_DROPOUT = 0.1
 DEFAULT_EVAL_SEED = 42
+SPLIT_ARTIFACT_FILENAMES = {
+    "train_dataset.jsonl",
+    "val_dataset.jsonl",
+    "validation_dataset.jsonl",
+    "test_dataset.jsonl",
+}
 SPLIT_CACHE_SCHEMA_VERSION = 2
 PREFLIGHT_CACHE_SCHEMA_VERSION = 2
 DEFAULT_MIN_SPLIT_TARGET_RATIO = 0.5
@@ -84,10 +96,13 @@ DEFAULT_QUALITY_THRESHOLDS = {
     "pct_above_0.8_similarity": {"op": ">=", "value": 0.78, "required": True},
     "pct_below_0.4_edit_dist": {"op": ">=", "value": 0.82, "required": True},
     "failure_rate": {"op": "<=", "value": 0.0, "required": True},
-    "replication_f1_mean": {"op": ">=", "value": 0.0, "required": False},
-    "solidity_valid_mean": {"op": ">=", "value": 0.0, "required": False},
-    "solidity_compiler_checked_mean": {"op": ">=", "value": 0.0, "required": False},
-    "solidity_ast_valid_mean": {"op": ">=", "value": 0.0, "required": False},
+    "replication_f1_mean": {"op": ">=", "value": 0.75, "required": True},
+    "solidity_valid_mean": {"op": ">=", "value": 1.0, "required": True},
+    "solidity_compiler_checked_mean": {"op": ">=", "value": 1.0, "required": True},
+    "solidity_ast_valid_mean": {"op": ">=", "value": 1.0, "required": True},
+    "bytecode_semantic_score_mean": {"op": ">=", "value": 0.5, "required": True},
+    "bytecode_semantic_checked_mean": {"op": ">=", "value": 1.0, "required": True},
+    "bytecode_deployable_mean": {"op": ">=", "value": 1.0, "required": True},
 }
 
 
@@ -1313,7 +1328,7 @@ def split_dataset(
         "manifest_kind": "dataset_split",
         "schema_version": SPLIT_CACHE_SCHEMA_VERSION,
         "created_at": _utc_now_iso(),
-        "source_dataset": _file_artifact(source_path, jsonl=True),
+        "source_dataset": _dataset_file_artifact(source_path, role="source"),
         "input_sha256": source_sha256,
         "parameters": parameters,
         "row_counts": {
@@ -1327,9 +1342,9 @@ def split_dataset(
             **_split_group_counts(split_rows),
         },
         "outputs": {
-            "train": _file_artifact(paths["train"], jsonl=True),
-            "val": _file_artifact(paths["val"], jsonl=True),
-            "test": _file_artifact(paths["test"], jsonl=True),
+            "train": _dataset_file_artifact(paths["train"], role="train_split"),
+            "val": _dataset_file_artifact(paths["val"], role="validation_split"),
+            "test": _dataset_file_artifact(paths["test"], role="test_split"),
         },
         "leakage_validation": leakage_validation,
         "coverage": coverage,
@@ -1464,7 +1479,7 @@ def validate_jsonl_schema_and_lengths(
     dataset_path: str | Path,
     tokenizer: Any | None = None,
     *,
-    max_seq_length: int = 2048,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     include_bytecode_metadata: bool = True,
     include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
@@ -1880,6 +1895,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _dataset_artifact_type(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    name = Path(path).name
+    if name in SPLIT_ARTIFACT_FILENAMES:
+        return "derived_split_artifact"
+    if name in {"demo_dataset.jsonl", "dataset_from_demo.jsonl"}:
+        return "demo_dataset"
+    return "full_source_dataset"
+
+
+def _dataset_file_artifact(path: str | Path | None, *, role: str | None = None) -> dict:
+    artifact = _file_artifact(path, jsonl=True)
+    artifact["dataset_artifact_type"] = _dataset_artifact_type(path)
+    if role:
+        artifact["dataset_role"] = role
+    return artifact
+
+
 def _file_artifact(path: str | Path | None, jsonl: bool = False) -> dict:
     if not path:
         return {"path": None, "exists": False}
@@ -1941,6 +1975,66 @@ def _git_state() -> dict:
     }
 
 
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _runtime_metadata(seed: int | None) -> dict:
+    metadata: dict[str, Any] = {
+        "global_seed": seed,
+        "packages": {
+            name: _package_version(name)
+            for name in ("torch", "transformers", "datasets", "peft", "accelerate", "deepspeed")
+        },
+        "cuda": {"available": False, "device_count": 0, "devices": []},
+    }
+    try:
+        import torch
+
+        cuda = metadata["cuda"]
+        cuda["available"] = bool(torch.cuda.is_available())
+        cuda["torch_cuda_version"] = getattr(torch.version, "cuda", None)
+        cuda["cudnn_version"] = torch.backends.cudnn.version()
+        if torch.cuda.is_available():
+            cuda["device_count"] = int(torch.cuda.device_count())
+            cuda["current_device"] = int(torch.cuda.current_device())
+            cuda["devices"] = [
+                {
+                    "index": idx,
+                    "name": torch.cuda.get_device_name(idx),
+                    "capability": list(torch.cuda.get_device_capability(idx)),
+                    "total_memory_bytes": torch.cuda.get_device_properties(idx).total_memory,
+                }
+                for idx in range(torch.cuda.device_count())
+            ]
+    except Exception as exc:
+        metadata["cuda"]["error"] = str(exc)
+    return metadata
+
+
+def _seed_everything(seed: int | None) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
 def _default_run_manifest_path(args: argparse.Namespace, run_id: str) -> Path:
     if args.run_manifest:
         return Path(args.run_manifest)
@@ -1973,6 +2067,7 @@ def _initial_run_manifest(args: argparse.Namespace, run_id: str, started_at: str
             "local_rank": os.getenv("LOCAL_RANK"),
             "world_size": os.getenv("WORLD_SIZE"),
         },
+        "runtime": _runtime_metadata(getattr(args, "seed", None)),
         "git": _git_state(),
         "datasets": {},
         "training": {},
@@ -1992,12 +2087,12 @@ def _record_dataset_artifacts(
     split_manifest_path: str | Path | None = None,
 ) -> None:
     datasets = manifest.setdefault("datasets", {})
-    datasets["source"] = _file_artifact(dataset_path, jsonl=True)
+    datasets["source"] = _dataset_file_artifact(dataset_path, role="source")
     if train_path or val_path or test_path:
         split_artifacts = {
-            "train": _file_artifact(train_path, jsonl=True),
-            "validation": _file_artifact(val_path, jsonl=True),
-            "test": _file_artifact(test_path, jsonl=True),
+            "train": _dataset_file_artifact(train_path, role="train_split"),
+            "validation": _dataset_file_artifact(val_path, role="validation_split"),
+            "test": _dataset_file_artifact(test_path, role="test_split"),
         }
         datasets["splits"] = split_artifacts
         datasets["split_counts"] = {
@@ -2040,10 +2135,14 @@ def _collect_training_artifacts(output_dir: str, model_path: str | None) -> dict
     model = Path(model_path) if model_path else None
     metrics_path = model / "training_metrics.json" if model else None
     model_config_path = model / "model_config.json" if model else None
+    log_history_json_path = model / "training_log_history.json" if model else None
+    log_history_csv_path = model / "training_log_history.csv" if model else None
     artifacts = {
         "model": _file_artifact(model),
         "model_config": _file_artifact(model_config_path),
         "training_metrics": _file_artifact(metrics_path),
+        "training_log_history_json": _file_artifact(log_history_json_path),
+        "training_log_history_csv": _file_artifact(log_history_csv_path),
     }
 
     metrics = None
@@ -2109,50 +2208,173 @@ def _checkpoint_step(path: Path) -> int:
     return int(match.group(1)) if match else -1
 
 
-def _looks_like_checkpoint(path: Path) -> bool:
-    markers = [
-        "trainer_state.json",
-        "optimizer.pt",
-        "scheduler.pt",
+def _deepspeed_checkpoint_layout(path: Path) -> dict:
+    checkpoint_path = Path(path)
+    marker_files = ["latest", "zero_to_fp32.py"]
+    existing_markers = [
+        marker for marker in marker_files if (checkpoint_path / marker).exists()
+    ]
+    if not checkpoint_path.exists() or not checkpoint_path.is_dir():
+        return {
+            "present": bool(existing_markers),
+            "valid": False,
+            "marker_files": marker_files,
+            "existing_markers": existing_markers,
+            "tag_directories": [],
+            "model_state_shards": [],
+            "optimizer_state_shards": [],
+        }
+
+    tag_directories = []
+    model_state_shards = []
+    optimizer_state_shards = []
+    for item in checkpoint_path.rglob("*"):
+        if item.is_dir() and item.name.startswith("global_step"):
+            tag_directories.append(str(item.relative_to(checkpoint_path)))
+        elif item.is_file():
+            relative = str(item.relative_to(checkpoint_path))
+            if item.name.endswith("_model_states.pt"):
+                model_state_shards.append(relative)
+            elif item.name.endswith("optim_states.pt"):
+                optimizer_state_shards.append(relative)
+
+    return {
+        "present": bool(
+            existing_markers
+            or tag_directories
+            or model_state_shards
+            or optimizer_state_shards
+        ),
+        "valid": bool(model_state_shards and optimizer_state_shards),
+        "marker_files": marker_files,
+        "existing_markers": sorted(existing_markers),
+        "tag_directories": sorted(tag_directories),
+        "model_state_shards": sorted(model_state_shards),
+        "optimizer_state_shards": sorted(optimizer_state_shards),
+    }
+
+
+def _checkpoint_validation_report(path: str | Path, *, deepspeed: bool = False) -> dict:
+    checkpoint_path = Path(path)
+    model_markers = [
         "adapter_model.safetensors",
         "adapter_model.bin",
         "pytorch_model.bin",
         "model.safetensors",
     ]
-    return any((path / marker).exists() for marker in markers)
+    normal_required_files = ["trainer_state.json", "optimizer.pt", "scheduler.pt"]
+    deepspeed_layout = _deepspeed_checkpoint_layout(checkpoint_path)
+    allow_deepspeed_layout = bool(deepspeed or deepspeed_layout["present"])
+    uses_deepspeed_layout = bool(allow_deepspeed_layout and deepspeed_layout["valid"])
+    required_files = ["trainer_state.json"] if uses_deepspeed_layout else normal_required_files
+    missing_required = [name for name in required_files if not (checkpoint_path / name).exists()]
+    has_model_weights = any((checkpoint_path / marker).exists() for marker in model_markers)
+    if uses_deepspeed_layout:
+        has_model_weights = bool(has_model_weights or deepspeed_layout["model_state_shards"])
+    problems = []
+    if not checkpoint_path.exists():
+        problems.append("checkpoint_missing")
+    elif not checkpoint_path.is_dir():
+        problems.append("checkpoint_not_directory")
+    problems.extend(f"missing_required_file:{name}" for name in missing_required)
+    if (
+        allow_deepspeed_layout
+        and deepspeed_layout["present"]
+        and not deepspeed_layout["valid"]
+        and any(
+            not (checkpoint_path / name).exists()
+            for name in ("optimizer.pt", "scheduler.pt")
+        )
+    ):
+        problems.append("incomplete_deepspeed_checkpoint_layout")
+    if not has_model_weights:
+        problems.append("missing_model_weights")
+    return {
+        "path": str(checkpoint_path),
+        "status": "valid" if not problems else "invalid",
+        "required_files": required_files,
+        "normal_required_files": normal_required_files,
+        "model_markers": model_markers,
+        "missing_required_files": missing_required,
+        "has_model_weights": has_model_weights,
+        "deepspeed_requested": bool(deepspeed),
+        "allows_deepspeed_layout": allow_deepspeed_layout,
+        "uses_deepspeed_layout": uses_deepspeed_layout,
+        "deepspeed_layout": deepspeed_layout,
+        "problems": problems,
+    }
 
 
-def resolve_resume_checkpoint(resume: str | None, output_dir: str) -> str | None:
+def _looks_like_checkpoint(path: Path, *, deepspeed: bool = False) -> bool:
+    return _checkpoint_validation_report(path, deepspeed=deepspeed)["status"] == "valid"
+
+
+def resolve_resume_checkpoint(
+    resume: str | None,
+    output_dir: str,
+    *,
+    deepspeed: bool = False,
+) -> str | None:
     """Resolve a checkpoint path, supporting --resume auto."""
     resolve_resume_checkpoint.last_result = {
         "resume": resume,
         "output_dir": output_dir,
+        "deepspeed": bool(deepspeed),
         "searched_roots": [],
         "selected_checkpoint": None,
+        "invalid_checkpoints": [],
     }
     if not resume:
         return None
-    if resume.lower() != "auto":
+    resume_mode = resume.lower()
+    if resume_mode not in {"auto", "required"}:
+        validation = _checkpoint_validation_report(resume, deepspeed=deepspeed)
+        resolve_resume_checkpoint.last_result["explicit_checkpoint_validation"] = validation
+        if validation["status"] != "valid":
+            raise ValueError(
+                "Invalid resume checkpoint "
+                f"{resume}: {', '.join(validation['problems'])}"
+            )
         resolve_resume_checkpoint.last_result["selected_checkpoint"] = resume
         return resume
 
     root = Path(output_dir)
     searched_roots = [root, root / "checkpoints"]
     resolve_resume_checkpoint.last_result["searched_roots"] = [str(path) for path in searched_roots]
-    candidates = [
+    all_candidates = [
         path
         for search_root in searched_roots
         for path in search_root.glob("checkpoint-*")
-        if search_root.exists()
-        and path.is_dir()
-        and _checkpoint_step(path) >= 0
-        and _looks_like_checkpoint(path)
+        if search_root.exists() and path.is_dir() and _checkpoint_step(path) >= 0
     ]
+    candidates = []
+    invalid = []
+    for path in all_candidates:
+        validation = _checkpoint_validation_report(path, deepspeed=deepspeed)
+        if validation["status"] == "valid":
+            candidates.append(path)
+        else:
+            invalid.append(validation)
+    resolve_resume_checkpoint.last_result["invalid_checkpoints"] = invalid
     if not candidates:
+        message = (
+            "No valid checkpoints found under searched roots: "
+            + ", ".join(str(path) for path in searched_roots)
+        )
+        if invalid:
+            message += (
+                "; invalid candidates: "
+                + "; ".join(
+                    f"{item['path']} ({', '.join(item['problems'])})" for item in invalid[:5]
+                )
+            )
+        if resume_mode == "required":
+            raise FileNotFoundError(message)
+        if invalid:
+            raise ValueError(message)
         logging.getLogger(__name__).info(
-            "--resume auto requested but no checkpoints found under any searched roots: %s; "
-            "starting fresh.",
-            ", ".join(str(path) for path in searched_roots),
+            "--resume auto requested but %s; starting fresh.",
+            message,
         )
         return None
 
@@ -2402,22 +2624,37 @@ def _quality_threshold_config_from_args(args: argparse.Namespace) -> dict:
         "replication_f1_mean": {
             "op": ">=",
             "value": args.min_replication_f1,
-            "required": args.min_replication_f1 is not None,
+            "required": True,
         },
         "solidity_valid_mean": {
             "op": ">=",
             "value": args.min_solidity_valid,
-            "required": args.min_solidity_valid is not None,
+            "required": True,
         },
         "solidity_compiler_checked_mean": {
             "op": ">=",
             "value": args.min_solidity_compiler_checked,
-            "required": args.min_solidity_compiler_checked is not None,
+            "required": True,
         },
         "solidity_ast_valid_mean": {
             "op": ">=",
             "value": args.min_solidity_ast_valid,
-            "required": args.min_solidity_ast_valid is not None,
+            "required": True,
+        },
+        "bytecode_semantic_score_mean": {
+            "op": ">=",
+            "value": args.min_bytecode_semantic_score,
+            "required": True,
+        },
+        "bytecode_semantic_checked_mean": {
+            "op": ">=",
+            "value": args.min_bytecode_semantic_checked,
+            "required": True,
+        },
+        "bytecode_deployable_mean": {
+            "op": ">=",
+            "value": args.min_bytecode_deployable,
+            "required": True,
         },
     }
     return {
@@ -2588,6 +2825,9 @@ def train_model(
     dataloader_pin_memory: bool | None = None,
     dataloader_persistent_workers: bool | None = None,
     dataloader_prefetch_factor: int | None = None,
+    gradient_checkpointing: bool = DEFAULT_GRADIENT_CHECKPOINTING,
+    seed: int = DEFAULT_GLOBAL_SEED,
+    report_to: str = "none",
 ) -> str:
     """Fine-tune the model and return path to saved model."""
     # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
@@ -2632,7 +2872,9 @@ def train_model(
         dataloader_pin_memory=dataloader_pin_memory,
         dataloader_persistent_workers=dataloader_persistent_workers,
         dataloader_prefetch_factor=dataloader_prefetch_factor,
+        gradient_checkpointing=gradient_checkpointing,
         include_bytecode_metadata=include_bytecode_metadata,
+        report_to=report_to,
     )
 
     trainer = SmartContractModelTrainer(config, output_dir=output_dir)
@@ -2675,6 +2917,9 @@ def train_model(
         dataloader_pin_memory=dataloader_pin_memory,
         dataloader_persistent_workers=dataloader_persistent_workers,
         dataloader_prefetch_factor=dataloader_prefetch_factor,
+        gradient_checkpointing=gradient_checkpointing,
+        seed=seed,
+        report_to=report_to,
     )
 
     logger.info(f"Training complete. Model saved to {model_path}")
@@ -2690,6 +2935,7 @@ def evaluate_model(
     eval_batch_size: int = 1,
     eval_seed: int = DEFAULT_EVAL_SEED,
     eval_first_n: bool = False,
+    eval_max_new_tokens: int = DEFAULT_EVAL_MAX_NEW_TOKENS,
     baseline_results_path: str | None = None,
     baseline_tolerance: float = 0.0,
     quality_gate_config: dict | None = None,
@@ -2722,6 +2968,8 @@ def evaluate_model(
         eval_batch_size = 1
     if eval_batch_size < 1:
         raise ValueError("--eval-batch-size must be at least 1")
+    if eval_max_new_tokens < 1:
+        raise ValueError("--eval-max-new-tokens must be at least 1")
 
     # ── Distributed setup ────────────────────────────────────────
     distributed = "LOCAL_RANK" in os.environ
@@ -2809,7 +3057,7 @@ def evaluate_model(
             torch.cuda.synchronize()
 
     generation_config = {
-        "max_new_tokens": 256,
+        "max_new_tokens": int(eval_max_new_tokens),
         "eval_batch_size": eval_batch_size,
     }
 
@@ -2869,12 +3117,118 @@ def evaluate_model(
             "replication_precision": 0.0,
             "replication_recall": 0.0,
             "replication_f1": 0.0,
+            "solidity_valid": False,
+            "solidity_compiler_checked": False,
+            "solidity_ast_valid": False,
+            "bytecode_semantic_score": 0.0,
+            "bytecode_semantic_checked": False,
+            "bytecode_deployable": False,
+            "bytecode_runtime_checked": False,
+            "bytecode_runtime_match": False,
             "metadata": metadata,
         }
+
+    def _complete_quality_metrics(metrics: dict, *, success: bool) -> dict:
+        completed = dict(metrics or {})
+        completed.setdefault("semantic_similarity", 0.0)
+        completed.setdefault(
+            "normalized_edit_distance",
+            1.0 if not success else 0.0,
+        )
+        for metric in (
+            "bleu_score",
+            "rouge_l_score",
+            "token_accuracy",
+            "structural_preservation",
+            "replication_precision",
+            "replication_recall",
+            "replication_f1",
+            "bytecode_semantic_score",
+        ):
+            completed.setdefault(metric, 0.0)
+        for metric in (
+            "function_signature_match",
+            "visibility_match",
+            "solidity_valid",
+            "solidity_compiler_checked",
+            "solidity_ast_valid",
+            "bytecode_semantic_checked",
+            "bytecode_deployable",
+            "bytecode_runtime_checked",
+            "bytecode_runtime_match",
+        ):
+            completed.setdefault(metric, False)
+        completed.setdefault("metadata", {})
+        return completed
 
     def _bounded_text(value: Any, limit: int = 1000) -> str:
         text = str(value or "")
         return text if len(text) <= limit else f"{text[:limit]}...<truncated>"
+
+    def _quality_issue_summary(records: list[dict]) -> dict:
+        categories: Counter[str] = Counter()
+        examples: dict[str, list[dict]] = defaultdict(list)
+        remediation = {
+            "generation_failure": "Inspect model/runtime errors and retry failed rows after fixing inference failures.",
+            "syntax_or_scaffold": "Check prompt truncation and Solidity syntax generation before compiler validation.",
+            "compiler_or_deployability": "Run local solc validation and compare generated bytecode/deployment errors.",
+            "bytecode_grounding": "Add opcode/runtime evidence and inspect hallucinated or missing bytecode facts.",
+            "prompt_truncation": "Increase --max-seq-length or reduce metadata/TAC prompt budget pressure.",
+            "runtime_mismatch": "Compare normalized runtime bytecode and differential-call evidence.",
+        }
+        for record in records:
+            record_categories: set[str] = set()
+            metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), Mapping) else {}
+            metadata = metrics.get("metadata", {}) if isinstance(metrics.get("metadata"), Mapping) else {}
+            diagnostics = record.get("prompt_diagnostics")
+            if not record.get("success", True):
+                record_categories.add("generation_failure")
+            if metrics.get("solidity_valid") is False:
+                record_categories.add("syntax_or_scaffold")
+            if (
+                metrics.get("solidity_compiler_checked") is False
+                or metrics.get("bytecode_deployable") is False
+            ):
+                record_categories.add("compiler_or_deployability")
+            if metrics.get("bytecode_semantic_checked") is False:
+                record_categories.add("bytecode_grounding")
+            if metrics.get("bytecode_runtime_checked") and metrics.get("bytecode_runtime_match") is False:
+                record_categories.add("runtime_mismatch")
+            if isinstance(diagnostics, Mapping) and diagnostics.get("tac_truncated") is True:
+                record_categories.add("prompt_truncation")
+            bytecode_semantics = metadata.get("bytecode_semantics")
+            mismatch_buckets = (
+                bytecode_semantics.get("mismatch_buckets")
+                if isinstance(bytecode_semantics, Mapping)
+                else None
+            )
+            if isinstance(mismatch_buckets, Mapping):
+                for bucket, values in mismatch_buckets.items():
+                    count = len(values) if isinstance(values, list) else 1
+                    categories[f"bytecode:{bucket}"] += count
+                    record_categories.add(f"bytecode:{bucket}")
+
+            for category in record_categories:
+                if not category.startswith("bytecode:"):
+                    categories[category] += 1
+                if len(examples[category]) >= 3:
+                    continue
+                examples[category].append(
+                    {
+                        "dataset_index": record.get("dataset_index"),
+                        "input_hash": record.get("input_hash"),
+                        "output_hash": record.get("output_hash"),
+                        "error": record.get("error"),
+                    }
+                )
+
+        return {
+            "category_counts": dict(sorted(categories.items())),
+            "example_failures": {key: value for key, value in sorted(examples.items()) if value},
+            "remediation_hints": {
+                key: remediation[key] for key in remediation if categories.get(key, 0) > 0
+            },
+        }
 
     def _detail_record(
         item: dict,
@@ -2904,7 +3258,7 @@ def evaluate_model(
             "metadata": source_metadata,
             "original": item.get("output", ""),
             "decompiled": decompiled,
-            "metrics": metrics,
+            "metrics": _complete_quality_metrics(metrics, success=success),
         }
         diagnostics = _prompt_diagnostics(item, decompiled if decompiled else None)
         if diagnostics:
@@ -2950,11 +3304,12 @@ def evaluate_model(
     ) -> None:
         metric_start = time.time()
         metrics = evaluator.evaluate_function(item["output"], decompiled, item.get("metadata", {}))
+        metrics_dict = _complete_quality_metrics(asdict(metrics), success=True)
         results.append(
             _detail_record(
                 item,
                 decompiled,
-                asdict(metrics),
+                metrics_dict,
                 item_number,
                 success=True,
                 elapsed_s=elapsed_s if elapsed_s is not None else time.time() - metric_start,
@@ -3101,6 +3456,8 @@ def evaluate_model(
                 "eval_sampling_strategy": sampling_strategy,
                 "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
+                "eval_max_new_tokens": int(eval_max_new_tokens),
+                "generation_config": generation_config,
                 "model_path": model_path,
                 "test_dataset": test_path,
                 "semantic_similarity_mean": float(np.mean(sem_sims)),
@@ -3149,6 +3506,8 @@ def evaluate_model(
                 "eval_sampling_strategy": sampling_strategy,
                 "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
+                "eval_max_new_tokens": int(eval_max_new_tokens),
+                "generation_config": generation_config,
                 "model_path": model_path,
                 "test_dataset": test_path,
                 "error": "No successful evaluations",
@@ -3159,6 +3518,9 @@ def evaluate_model(
             summary["baseline_results_path"] = baseline_results_path
             summary["baseline_tolerance"] = baseline_tolerance
         _merge_aggregate_statistics(summary, results, baseline_summary)
+        issue_summary = _quality_issue_summary(results)
+        if issue_summary.get("category_counts"):
+            summary["quality_issue_summary"] = issue_summary
         if baseline_summary:
             summary["baseline_comparison"] = compare_evaluation_to_baseline(
                 summary,
@@ -3230,6 +3592,14 @@ def main():
         help="Path to existing JSONL dataset (use with --skip-collection)",
     )
     parser.add_argument(
+        "--allow-split-artifact-source",
+        action="store_true",
+        help=(
+            "Explicitly allow train/val/test split artifacts to be used as a "
+            "new source dataset for re-splitting"
+        ),
+    )
+    parser.add_argument(
         "--dataset-only",
         action="store_true",
         help="Only build dataset, skip training",
@@ -3262,6 +3632,12 @@ def main():
         type=int,
         default=42,
         help="Seed for deterministic leakage-free grouped split generation",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_GLOBAL_SEED,
+        help="Global seed for Python, NumPy, Torch, Trainer, and run manifests",
     )
     parser.add_argument(
         "--split-manifest",
@@ -3328,7 +3704,12 @@ def main():
         help="Target effective global batch size used when gradient accumulation is auto",
     )
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--max-seq-length", type=int, default=2048, help="Max sequence length")
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=DEFAULT_MAX_SEQ_LENGTH,
+        help="Max sequence length",
+    )
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -3405,7 +3786,10 @@ def main():
         "--resume",
         type=str,
         default=None,
-        help="Resume from a checkpoint path, or use 'auto' for the latest checkpoint under --output-dir",
+        help=(
+            "Resume from a checkpoint path, 'auto' for the latest valid checkpoint, "
+            "or 'required' to fail if no valid checkpoint exists under --output-dir"
+        ),
     )
     parser.add_argument(
         "--deepspeed",
@@ -3457,6 +3841,21 @@ def main():
         help="DataLoader prefetch factor when workers > 0",
     )
     parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_GRADIENT_CHECKPOINTING,
+        help=(
+            "Enable activation checkpointing during training. Disable on high-VRAM GPUs "
+            "to trade memory for faster steps."
+        ),
+    )
+    parser.add_argument(
+        "--report-to",
+        choices=["none", "tensorboard", "wandb", "all"],
+        default="none",
+        help="Trainer experiment reporting backend",
+    )
+    parser.add_argument(
         "--eval-only",
         action="store_true",
         help="Only run evaluation (skip collection and training)",
@@ -3501,6 +3900,12 @@ def main():
         type=int,
         default=1,
         help="Number of examples to decompile per evaluation batch",
+    )
+    parser.add_argument(
+        "--eval-max-new-tokens",
+        type=int,
+        default=DEFAULT_EVAL_MAX_NEW_TOKENS,
+        help="Maximum new Solidity tokens generated per evaluation example",
     )
     parser.add_argument(
         "--baseline-results",
@@ -3548,26 +3953,44 @@ def main():
     parser.add_argument(
         "--min-replication-f1",
         type=float,
-        default=None,
-        help="Optional quality gate minimum replication_f1_mean",
+        default=DEFAULT_QUALITY_THRESHOLDS["replication_f1_mean"]["value"],
+        help="Quality gate minimum replication_f1_mean",
     )
     parser.add_argument(
         "--min-solidity-valid",
         type=float,
-        default=None,
-        help="Optional quality gate minimum solidity_valid_mean",
+        default=DEFAULT_QUALITY_THRESHOLDS["solidity_valid_mean"]["value"],
+        help="Quality gate minimum solidity_valid_mean",
     )
     parser.add_argument(
         "--min-solidity-compiler-checked",
         type=float,
-        default=None,
+        default=DEFAULT_QUALITY_THRESHOLDS["solidity_compiler_checked_mean"]["value"],
         help="Optional quality gate minimum solidity_compiler_checked_mean",
     )
     parser.add_argument(
         "--min-solidity-ast-valid",
         type=float,
-        default=None,
-        help="Optional quality gate minimum solidity_ast_valid_mean",
+        default=DEFAULT_QUALITY_THRESHOLDS["solidity_ast_valid_mean"]["value"],
+        help="Quality gate minimum solidity_ast_valid_mean",
+    )
+    parser.add_argument(
+        "--min-bytecode-semantic-score",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["bytecode_semantic_score_mean"]["value"],
+        help="Quality gate minimum bytecode_semantic_score_mean",
+    )
+    parser.add_argument(
+        "--min-bytecode-semantic-checked",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["bytecode_semantic_checked_mean"]["value"],
+        help="Quality gate minimum bytecode_semantic_checked_mean",
+    )
+    parser.add_argument(
+        "--min-bytecode-deployable",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["bytecode_deployable_mean"]["value"],
+        help="Quality gate minimum bytecode_deployable_mean",
     )
     parser.add_argument(
         "--max-baseline-regressions",
@@ -3718,13 +4141,15 @@ def main():
     if args.epochs is None:
         args.epochs = 3
     if args.batch_size is None:
-        args.batch_size = 4
+        args.batch_size = DEFAULT_BATCH_SIZE
     if args.num_gpus < 1:
         raise SystemExit("--num-gpus must be at least 1")
     if args.batch_size < 1:
         raise SystemExit("--batch-size must be at least 1")
     if args.global_batch_size is not None and args.global_batch_size < 1:
         raise SystemExit("--global-batch-size must be at least 1")
+    if args.seed is not None and args.seed < 0:
+        raise SystemExit("--seed must be non-negative")
     if args.gradient_accumulation_steps is not None and args.gradient_accumulation_steps < 1:
         raise SystemExit("--gradient-accumulation-steps must be at least 1")
     if args.lora_rank < 1:
@@ -3749,6 +4174,8 @@ def main():
         raise SystemExit("--dataloader-prefetch-factor must be at least 1")
     if args.eval_limit is not None and args.eval_limit < 0:
         raise SystemExit("--eval-limit must be non-negative")
+    if args.eval_max_new_tokens < 1:
+        raise SystemExit("--eval-max-new-tokens must be at least 1")
     if args.baseline_tolerance < 0:
         raise SystemExit("--baseline-tolerance must be non-negative")
     if args.max_baseline_regressions is not None and args.max_baseline_regressions < 0:
@@ -3773,6 +4200,7 @@ def main():
             "--no-compiler-metadata is deprecated and ignored; compiler metadata "
             "is never included in prompts."
         )
+    _seed_everything(args.seed)
     run_id = _make_run_id()
     started_perf = time.perf_counter()
     started_at = _utc_now_iso()
@@ -3887,6 +4315,7 @@ def main():
                 eval_batch_size=args.eval_batch_size,
                 eval_seed=args.eval_seed,
                 eval_first_n=args.eval_first_n,
+                eval_max_new_tokens=args.eval_max_new_tokens,
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
@@ -3898,6 +4327,7 @@ def main():
                     "eval_seed": args.eval_seed,
                     "eval_first_n": args.eval_first_n,
                     "eval_batch_size": args.eval_batch_size,
+                    "eval_max_new_tokens": args.eval_max_new_tokens,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
                     "baseline_tolerance": args.baseline_tolerance,
@@ -3928,10 +4358,10 @@ def main():
         if args.skip_collection:
             dataset_path = args.dataset
             if not dataset_path:
-                # Look for existing datasets
+                # Look for full source datasets only. Cached split artifacts are
+                # derived outputs and require --dataset plus an explicit override.
                 for candidate in [
                     Path(args.data_dir) / "hf_training_dataset.jsonl",
-                    Path(args.data_dir) / "train_dataset.jsonl",
                     Path("demo_dataset.jsonl"),
                 ]:
                     if candidate.name == "demo_dataset.jsonl" and not args.allow_demo_fallback:
@@ -3942,6 +4372,14 @@ def main():
 
             if not dataset_path or not Path(dataset_path).exists():
                 raise SystemExit("No dataset found. Provide --dataset or remove --skip-collection.")
+            if (
+                Path(dataset_path).name in SPLIT_ARTIFACT_FILENAMES
+                and not args.allow_split_artifact_source
+            ):
+                raise SystemExit(
+                    "Refusing to use cached split artifact as a source dataset: "
+                    f"{dataset_path}. Pass --allow-split-artifact-source to re-split it explicitly."
+                )
             if Path(dataset_path).name in {"demo_dataset.jsonl", "dataset_from_demo.jsonl"}:
                 if not args.allow_demo_fallback:
                     raise SystemExit(
@@ -4048,7 +4486,11 @@ def main():
         # ── Step 2: Training ─────────────────────────────────────────
         # Disable quantization for tiny smoke runs.
         use_quant = bool(args.use_quantization and not args.tiny)
-        resume_from = resolve_resume_checkpoint(args.resume, args.output_dir)
+        resume_from = resolve_resume_checkpoint(
+            args.resume,
+            args.output_dir,
+            deepspeed=bool(args.deepspeed),
+        )
         tokenization_cache_config = None
         if (
             args.tokenization_cache
@@ -4087,6 +4529,8 @@ def main():
                 "lora_target_modules": args.lora_target_modules,
                 "num_gpus": args.num_gpus,
                 "global_batch_size": args.global_batch_size,
+                "seed": args.seed,
+                "report_to": args.report_to,
                 "resume": args.resume,
                 "resume_from_checkpoint": resume_from,
                 "resume_resolution": getattr(resolve_resume_checkpoint, "last_result", None),
@@ -4105,6 +4549,7 @@ def main():
                     "persistent_workers": args.dataloader_persistent_workers,
                     "prefetch_factor": args.dataloader_prefetch_factor,
                 },
+                "gradient_checkpointing": args.gradient_checkpointing,
                 "effective_train_eval_strategy": effective_runtime_settings["train_eval_strategy"],
                 "effective_dataloader": effective_runtime_settings["dataloader"],
             },
@@ -4148,6 +4593,9 @@ def main():
             dataloader_pin_memory=args.dataloader_pin_memory,
             dataloader_persistent_workers=args.dataloader_persistent_workers,
             dataloader_prefetch_factor=args.dataloader_prefetch_factor,
+            gradient_checkpointing=args.gradient_checkpointing,
+            seed=args.seed,
+            report_to=args.report_to,
         )
         training_artifacts = _collect_training_artifacts(args.output_dir, model_path)
         manifest["training"].update(
@@ -4185,6 +4633,7 @@ def main():
                 eval_batch_size=args.eval_batch_size,
                 eval_seed=args.eval_seed,
                 eval_first_n=args.eval_first_n,
+                eval_max_new_tokens=args.eval_max_new_tokens,
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
@@ -4196,6 +4645,7 @@ def main():
                     "eval_seed": args.eval_seed,
                     "eval_first_n": args.eval_first_n,
                     "eval_batch_size": args.eval_batch_size,
+                    "eval_max_new_tokens": args.eval_max_new_tokens,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
                     "baseline_tolerance": args.baseline_tolerance,

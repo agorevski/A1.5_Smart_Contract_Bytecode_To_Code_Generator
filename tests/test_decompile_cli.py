@@ -162,5 +162,10 @@ def test_cli_json_includes_solidity_validation(monkeypatch, capsys):
     assert code == 0
     assert data["validation"]["valid"] is True
     assert data["function_validation"]["func_00000000"]["valid"] is True
+    assert data["reconstruction"]["strategy"] == "semantic_function_chunks"
+    assert data["quality"]["semantic_chunk_count"] == 1
+    assert data["function_results"][0]["source"] == "model_inference"
+    assert data["lookup"]["enabled"] is False
+    assert data["trace"]["status"] in {"success", "partial"}
 
     shutil.rmtree(model_dir, ignore_errors=True)

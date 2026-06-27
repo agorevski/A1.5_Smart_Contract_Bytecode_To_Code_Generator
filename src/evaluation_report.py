@@ -214,6 +214,7 @@ def format_latest_results_report(
             )
 
     _append_hallucination_bucket_report(lines, summary)
+    _append_quality_issue_summary(lines, summary.get("quality_issue_summary"))
     _append_prompt_diagnostics_report(lines, summary.get("prompt_diagnostics"))
 
     confidence_intervals = _summary_confidence_intervals(summary)
@@ -279,10 +280,17 @@ def _summary_with_derived_metrics(
             if values:
                 enriched[mean_key] = sum(values) / len(values)
 
-    if "replication_hallucination_buckets" not in enriched:
-        buckets = _detail_hallucination_buckets(details)
-        if buckets:
-            enriched["replication_hallucination_buckets"] = buckets
+    hallucination_summary = _detail_hallucination_summary(details)
+    if hallucination_summary:
+        for source_key, target_key in {
+            "hallucination_buckets": "replication_hallucination_buckets",
+            "hallucination_rate_by_bucket": "replication_hallucination_rate_by_bucket",
+            "hallucination_total": "replication_hallucination_total",
+            "candidate_fact_total": "replication_candidate_fact_total",
+            "groundedness_score_mean": "replication_groundedness_score_mean",
+        }.items():
+            if target_key not in enriched and source_key in hallucination_summary:
+                enriched[target_key] = hallucination_summary[source_key]
 
     if "metadata_segments" not in enriched:
         try:
@@ -341,22 +349,42 @@ def _detail_metric_values(details: Sequence[Mapping[str, Any]], metric: str) -> 
     return values
 
 
-def _detail_hallucination_buckets(details: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+def _detail_hallucination_summary(details: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     buckets: Dict[str, int] = {}
+    candidate_fact_total = 0
+    groundedness_scores: list[float] = []
     for detail in details:
-        metrics = detail.get("metrics")
-        if not isinstance(metrics, Mapping):
+        replication = _sample_replication_payload(detail)
+        if replication is None:
             continue
-        metadata = metrics.get("metadata")
-        if not isinstance(metadata, Mapping):
-            continue
-        replication = metadata.get("replication")
-        if not isinstance(replication, Mapping):
-            continue
+        candidate_fact_count = replication.get("candidate_fact_count")
+        if isinstance(candidate_fact_count, (int, float)):
+            candidate_fact_total += int(candidate_fact_count)
+        groundedness = replication.get("groundedness_score")
+        if isinstance(groundedness, (int, float)) and not math.isnan(float(groundedness)):
+            groundedness_scores.append(float(groundedness))
         for bucket, values in replication.get("hallucination_buckets", {}).items():
             if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
                 buckets[str(bucket)] = buckets.get(str(bucket), 0) + len(values)
-    return dict(sorted(buckets.items()))
+            elif isinstance(values, (int, float)):
+                buckets[str(bucket)] = buckets.get(str(bucket), 0) + int(values)
+
+    if not buckets and not groundedness_scores:
+        return {}
+
+    total = sum(buckets.values())
+    summary: Dict[str, Any] = {
+        "hallucination_buckets": dict(sorted(buckets.items())),
+        "hallucination_total": total,
+        "candidate_fact_total": candidate_fact_total,
+        "hallucination_rate_by_bucket": {
+            bucket: count / candidate_fact_total if candidate_fact_total else 0.0
+            for bucket, count in sorted(buckets.items())
+        },
+    }
+    if groundedness_scores:
+        summary["groundedness_score_mean"] = sum(groundedness_scores) / len(groundedness_scores)
+    return summary
 
 
 def _collect_model_info(model_path: str) -> Dict[str, Any]:
@@ -583,21 +611,88 @@ def _format_ci(interval: Mapping[str, Any]) -> str:
 
 def _append_hallucination_bucket_report(lines: list[str], summary: Mapping[str, Any]) -> None:
     buckets = summary.get("replication_hallucination_buckets")
+    rates = summary.get("replication_hallucination_rate_by_bucket")
+    total = summary.get("replication_hallucination_total")
+    groundedness = summary.get("replication_groundedness_score_mean")
+    replication_metrics = summary.get("replication_metrics")
     if not isinstance(buckets, Mapping):
-        replication_metrics = summary.get("replication_metrics")
         if isinstance(replication_metrics, Mapping):
             buckets = replication_metrics.get("hallucination_buckets")
+            rates = replication_metrics.get("hallucination_rate_by_bucket")
+            total = replication_metrics.get("hallucination_total")
+            groundedness = replication_metrics.get("groundedness_score_mean")
+    elif isinstance(replication_metrics, Mapping):
+        if not isinstance(rates, Mapping):
+            rates = replication_metrics.get("hallucination_rate_by_bucket")
+        if not isinstance(total, (int, float)):
+            total = replication_metrics.get("hallucination_total")
+        if not isinstance(groundedness, (int, float)):
+            groundedness = replication_metrics.get("groundedness_score_mean")
     if not isinstance(buckets, Mapping) or not buckets:
         return
 
-    total = sum(int(value) for value in buckets.values() if isinstance(value, int))
+    bucket_counts = {
+        str(bucket): _hallucination_bucket_count(count) for bucket, count in buckets.items()
+    }
+    computed_total = sum(bucket_counts.values())
+    if not isinstance(total, (int, float)):
+        total = computed_total
     lines.extend(["", "Grounded Hallucination Buckets", "------------------------------"])
+    lines.append(f"Total hallucinated facts: {int(total)}")
+    if isinstance(groundedness, (int, float)):
+        lines.append(f"Groundedness score mean: {_format_number(groundedness)}")
     lines.append("bucket | count | rate")
     lines.append("--- | ---: | ---:")
-    for bucket, count in sorted(buckets.items()):
-        numeric_count = int(count) if isinstance(count, int) else 0
-        rate = numeric_count / total if total else 0.0
+    rate_map = rates if isinstance(rates, Mapping) else {}
+    for bucket, numeric_count in sorted(bucket_counts.items()):
+        rate = rate_map.get(bucket)
+        if not isinstance(rate, (int, float)):
+            rate = numeric_count / computed_total if computed_total else 0.0
         lines.append(f"{bucket} | {numeric_count} | {rate * 100:.2f}%")
+
+
+def _hallucination_bucket_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return len(value)
+    return 0
+
+
+def _append_quality_issue_summary(lines: list[str], summary: Any) -> None:
+    if not isinstance(summary, Mapping) or not summary:
+        return
+    counts = summary.get("category_counts")
+    if not isinstance(counts, Mapping) or not counts:
+        return
+    lines.extend(["", "Quality Issue Taxonomy", "----------------------"])
+    lines.append("category | count")
+    lines.append("--- | ---:")
+    for category, count in sorted(counts.items()):
+        lines.append(f"{category} | {count}")
+
+    hints = summary.get("remediation_hints")
+    if isinstance(hints, Mapping) and hints:
+        lines.extend(["", "Remediation hints:"])
+        for category, hint in sorted(hints.items()):
+            lines.append(f"- {category}: {hint}")
+
+    examples = summary.get("example_failures")
+    if isinstance(examples, Mapping) and examples:
+        lines.extend(["", "Example failures:"])
+        for category, rows in sorted(examples.items()):
+            if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                continue
+            formatted = []
+            for row in list(rows)[:3]:
+                if isinstance(row, Mapping):
+                    formatted.append(
+                        f"idx={row.get('dataset_index')} input={row.get('input_hash', 'n/a')}"
+                    )
+            if formatted:
+                lines.append(f"- {category}: " + "; ".join(formatted))
 
 
 def _append_prompt_diagnostics_report(lines: list[str], diagnostics: Any) -> None:
@@ -921,6 +1016,11 @@ def _sample_replication_payload(sample: Mapping[str, Any]) -> Optional[Mapping[s
     replication = sample.get("replication")
     if isinstance(replication, Mapping):
         return replication
+    metadata = sample.get("metadata")
+    if isinstance(metadata, Mapping):
+        replication = metadata.get("replication")
+        if isinstance(replication, Mapping):
+            return replication
     metrics = sample.get("metrics")
     if not isinstance(metrics, Mapping):
         return None
@@ -984,8 +1084,8 @@ def _append_baseline_comparison(lines: list[str], comparison: Mapping[str, Any])
         return
 
     lines.append("")
-    lines.append("metric | current | baseline | delta | status")
-    lines.append("--- | ---: | ---: | ---: | ---")
+    lines.append("metric | current | baseline | delta | relative delta | status")
+    lines.append("--- | ---: | ---: | ---: | ---: | ---")
     for metric, item in sorted(comparisons.items()):
         if not isinstance(item, Mapping):
             continue
@@ -996,6 +1096,7 @@ def _append_baseline_comparison(lines: list[str], comparison: Mapping[str, Any])
                     _format_number(item.get("current")),
                     _format_number(item.get("baseline")),
                     _format_number(item.get("delta")),
+                    _format_number(item.get("relative_delta")),
                     str(item.get("status", "unknown")),
                 ]
             )

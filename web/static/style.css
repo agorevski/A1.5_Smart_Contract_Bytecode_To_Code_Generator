@@ -973,6 +973,17 @@ pre {
   gap: 0.8rem;
 }
 
+.reconstruction-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.8rem;
+  margin-bottom: 0.9rem;
+}
+
+.reconstruction-table {
+  margin-top: 0.6rem;
+}
+
 .analysis-card {
   background: var(--bg-primary);
   border: 1px solid var(--border);

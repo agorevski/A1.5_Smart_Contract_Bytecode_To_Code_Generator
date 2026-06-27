@@ -17,6 +17,14 @@ from typing import Any, Callable, Dict, Optional, TypeVar
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.contract_reconstruction import (
+    assemble_reconstructed_contract,
+    build_contract_quality,
+    build_function_quality,
+    build_reconstruction_plan,
+)
+from src.inference import InferenceWorkLimitError, run_bytecode_inference
+
 MAX_BYTECODE_HEX_LENGTH = int(os.environ.get("WEB_MAX_BYTECODE_HEX_LENGTH", "200000"))
 MODELS_DIR = PROJECT_ROOT / "models"
 DEFAULT_MODEL_PATH = MODELS_DIR / "final_model"
@@ -250,6 +258,78 @@ def _build_function_metadata(analyzer, fname: str, base_metadata: Dict[str, Any]
     return metadata
 
 
+def _simple_prompt_diagnostics(tac_text: str, generated_text: str | None = None) -> Dict[str, Any]:
+    diag: Dict[str, Any] = {
+        "tac_chars": len(tac_text or ""),
+        "tac_tokens_before": len((tac_text or "").split()),
+        "tac_tokens_after": len((tac_text or "").split()),
+        "tac_truncated": False,
+    }
+    if generated_text is not None:
+        diag["generated_chars"] = len(generated_text)
+        diag["generated_tokens"] = len(generated_text.split())
+    return diag
+
+
+def _selector_for_function(analyzer, fname: str) -> str | None:
+    func_obj = getattr(analyzer, "functions", {}).get(fname)
+    selector = getattr(func_obj, "selector", None) if func_obj is not None else None
+    if selector:
+        return str(selector)
+    match = re.search(r"(?:0x)?([0-9a-fA-F]{8})", fname or "")
+    return f"0x{match.group(1).lower()}" if match else None
+
+
+def _source_summary(function_sources: Dict[str, str], function_errors: Dict[str, str]) -> Dict[str, int]:
+    summary = {"exact_match": 0, "model_inference": 0, "error": 0, "unknown": 0}
+    for fname, source in function_sources.items():
+        if fname in function_errors or source == "error":
+            summary["error"] += 1
+        elif source in summary:
+            summary[source] += 1
+        else:
+            summary["unknown"] += 1
+    return summary
+
+
+def _function_results(
+    analyzer,
+    func_tac: Dict[str, str],
+    function_sources: Dict[str, str],
+    function_errors: Dict[str, str],
+    function_latencies: Dict[str, float],
+    function_validation: Dict[str, Dict[str, Any]],
+    prompt_diagnostics: Dict[str, Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    results: list[Dict[str, Any]] = []
+    for fname in func_tac:
+        validation = function_validation.get(fname)
+        error = function_errors.get(fname)
+        status = "error" if error else "ok"
+        if status == "ok" and validation and not validation.get("valid"):
+            status = "validation_failed"
+        selector = _selector_for_function(analyzer, fname)
+        item: Dict[str, Any] = {
+            "name": fname,
+            "status": status,
+            "source": function_sources.get(fname, "model_inference"),
+            "error": error,
+            "elapsed_s": function_latencies.get(fname),
+            "diagnostics": prompt_diagnostics.get(fname),
+            "validation": validation,
+            "selector": selector,
+        }
+        item["quality"] = build_function_quality(
+            validation=validation,
+            diagnostics=prompt_diagnostics.get(fname),
+            source=item["source"],
+            error=error,
+            selector_confidence=None,
+        )
+        results.append(item)
+    return results
+
+
 def _run_model_inference(
     args: argparse.Namespace, bytecode: str, metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -258,132 +338,67 @@ def _run_model_inference(
 
     from src.model_setup import SmartContractDecompiler
 
-    t0 = time.time()
-    analyzer, func_tac, combined_tac = _run_with_deadline(
-        lambda: _analyze_tac(bytecode),
-        deadline,
-        args.timeout_seconds,
-        "bytecode analysis",
-    )
-    tac_time = time.time() - t0
-    if len(func_tac) > args.max_functions:
-        raise DecompileWorkLimitError(
-            f"too many functions detected ({len(func_tac)}); maximum is {args.max_functions}"
-        )
-    _check_deadline(deadline, args.timeout_seconds, "loading the model")
-
-    decompiler = _run_with_deadline(
-        lambda: SmartContractDecompiler(str(model_path)),
-        deadline,
-        args.timeout_seconds,
-        "model load",
-    )
     generation = {
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
         "do_sample": args.do_sample,
         "repetition_penalty": args.repetition_penalty,
     }
-
-    function_solidity: Dict[str, str] = {}
-    function_errors: Dict[str, str] = {}
-    function_latencies: Dict[str, float] = {}
-
-    t1 = time.time()
-    for fname, tac_text in func_tac.items():
-        _check_deadline(deadline, args.timeout_seconds, f"decompiling {fname}")
-        func_metadata = _build_function_metadata(analyzer, fname, metadata)
-        call_started = time.time()
-        try:
-            function_solidity[fname] = _run_with_deadline(
-                lambda tac=tac_text, meta=func_metadata: decompiler.decompile_tac_to_solidity(
-                    tac,
-                    metadata=meta,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    do_sample=args.do_sample,
-                    repetition_penalty=args.repetition_penalty,
-                ),
-                deadline,
-                args.timeout_seconds,
-                f"model inference for {fname}",
-            )
-        except DecompileCliError:
-            raise
-        except Exception as exc:  # pragma: no cover - model runtime dependent
-            function_errors[fname] = str(exc)
-            function_solidity[fname] = f"// Decompilation failed: {exc}"
-        function_latencies[fname] = round(time.time() - call_started, 3)
-
-    gen_time = time.time() - t1
-    solidity = decompiler._assemble_contract(function_solidity, analyzer)
-    function_validation = {
-        fname: _validate_solidity(source, _build_function_metadata(analyzer, fname, metadata))
-        for fname, source in function_solidity.items()
-    }
-    validation = _validate_solidity(solidity, metadata)
-    validation_failed = not bool(validation.get("valid"))
-    analysis = {
-        "num_instructions": len(analyzer.instructions),
-        "num_basic_blocks": len(analyzer.basic_blocks),
-        "num_functions": len(func_tac),
-        "tac_generation_time_s": round(tac_time, 3),
-        "solidity_generation_time_s": round(gen_time, 3),
-        "function_errors": function_errors,
-        "function_latencies_s": function_latencies,
-        "function_validation": function_validation,
-        "validation": validation,
-    }
-    return {
-        "success": not function_errors and not validation_failed,
-        "decompilation_status": (
-            "partial_error"
-            if function_errors
-            else "validation_failed" if validation_failed else "model_generated"
-        ),
-        "model_path": str(model_path),
-        "model_config": _load_model_config(str(model_path)),
-        "generation_config": generation,
-        "tac": combined_tac,
-        "tac_per_function": func_tac,
-        "functions": function_solidity,
-        "solidity": solidity,
-        "validation": validation,
-        "function_validation": function_validation,
-        "analysis": analysis,
-    }
+    runner = lambda operation, description: _run_with_deadline(
+        operation,
+        deadline,
+        args.timeout_seconds,
+        description,
+    )
+    try:
+        return run_bytecode_inference(
+            bytecode,
+            decompiler_factory=lambda: SmartContractDecompiler(str(model_path)),
+            model_path=str(model_path),
+            model_config=_load_model_config(str(model_path)),
+            metadata=metadata,
+            generation_config=generation,
+            lookup_config={"enabled": False, "benchmark_mode": False},
+            max_functions=args.max_functions,
+            operation_runner=runner,
+            analyze_tac_fn=_analyze_tac,
+            fatal_exceptions=(DecompileCliError,),
+            request_id="cli",
+        )
+    except InferenceWorkLimitError as exc:
+        raise DecompileWorkLimitError(str(exc)) from exc
 
 
 def _run_tac_only(
     args: argparse.Namespace, bytecode: str, metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
     deadline = _deadline_from_timeout(args.timeout_seconds)
-    t0 = time.time()
-    analyzer, func_tac, combined_tac = _run_with_deadline(
-        lambda: _analyze_tac(bytecode),
+    runner = lambda operation, description: _run_with_deadline(
+        operation,
         deadline,
         args.timeout_seconds,
-        "bytecode analysis",
+        description,
     )
-    if len(func_tac) > args.max_functions:
-        raise DecompileWorkLimitError(
-            f"too many functions detected ({len(func_tac)}); maximum is {args.max_functions}"
+    try:
+        return run_bytecode_inference(
+            bytecode,
+            metadata=metadata,
+            generation_config={
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "do_sample": args.do_sample,
+                "repetition_penalty": args.repetition_penalty,
+            },
+            lookup_config={"enabled": False, "benchmark_mode": False},
+            max_functions=args.max_functions,
+            tac_only=True,
+            operation_runner=runner,
+            analyze_tac_fn=_analyze_tac,
+            fatal_exceptions=(DecompileCliError,),
+            request_id="cli",
         )
-    return {
-        "success": True,
-        "decompilation_status": "tac_only_no_model",
-        "tac": combined_tac,
-        "tac_per_function": func_tac,
-        "solidity": "",
-        "functions": {},
-        "analysis": {
-            "num_instructions": len(analyzer.instructions),
-            "num_basic_blocks": len(analyzer.basic_blocks),
-            "num_functions": len(func_tac),
-            "tac_generation_time_s": round(time.time() - t0, 3),
-            "function_errors": {},
-        },
-    }
+    except InferenceWorkLimitError as exc:
+        raise DecompileWorkLimitError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
