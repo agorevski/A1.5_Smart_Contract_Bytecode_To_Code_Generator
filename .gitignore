@@ -14,7 +14,10 @@ env/
 
 # IDE
 .idea/
-.vscode/
+# Ignore personal VS Code settings, but keep the shared launch config tracked.
+.vscode/*
+!.vscode/
+!.vscode/launch.json
 *.swp
 *.swo
 
