@@ -1595,17 +1595,32 @@ class DatasetBuilder:
         if output_format == "jsonl":
             with open(filepath, "w") as f:
                 for _, row in df.iterrows():
+                    stored_metadata = {}
+                    raw_metadata = row.get("metadata")
+                    if isinstance(raw_metadata, str) and raw_metadata.strip():
+                        try:
+                            parsed_metadata = json.loads(raw_metadata)
+                            if isinstance(parsed_metadata, dict):
+                                stored_metadata = parsed_metadata
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "Skipping invalid metadata JSON for %s",
+                                row["function_name"],
+                            )
+
+                    metadata = {
+                        **stored_metadata,
+                        "function_name": row["function_name"],
+                        "function_signature": row["function_signature"],
+                        "visibility": row["visibility"],
+                        "is_payable": bool(row["is_payable"]),
+                        "is_view": bool(row["is_view"]),
+                        "contract_address": row["contract_address"],
+                    }
                     record = {
                         "input": row["tac_representation"],
                         "output": row["solidity_code"],
-                        "metadata": {
-                            "function_name": row["function_name"],
-                            "function_signature": row["function_signature"],
-                            "visibility": row["visibility"],
-                            "is_payable": bool(row["is_payable"]),
-                            "is_view": bool(row["is_view"]),
-                            "contract_address": row["contract_address"],
-                        },
+                        "metadata": metadata,
                     }
                     f.write(json.dumps(record) + "\n")
 

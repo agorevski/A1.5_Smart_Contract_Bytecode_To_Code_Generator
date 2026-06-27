@@ -502,10 +502,12 @@ class TACLookupBuilder:
     # ── job tracking for re-runnability ───────────────────────────────────
 
     def get_completed_jobs(self) -> set:
-        """Return set of (address, solc_version, optimizer_enabled) already done."""
+        """Return compile jobs with confirmed successful lookup coverage."""
         with _db_connection(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT address, solc_version, optimizer_enabled FROM compiled_jobs"
+                """SELECT address, solc_version, optimizer_enabled
+                   FROM compiled_jobs
+                   WHERE status = 'ok'"""
             ).fetchall()
         return {(r[0], r[1], r[2]) for r in rows}
 
@@ -516,9 +518,14 @@ class TACLookupBuilder:
         """
         with _db_connection(self.db_path) as conn:
             conn.executemany(
-                """INSERT OR IGNORE INTO compiled_jobs
+                """INSERT INTO compiled_jobs
                    (address, solc_version, optimizer_enabled, status, pairs_found)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(address, solc_version, optimizer_enabled)
+                   DO UPDATE SET
+                       status = excluded.status,
+                       pairs_found = excluded.pairs_found,
+                       created_at = CURRENT_TIMESTAMP""",
                 jobs,
             )
             conn.commit()

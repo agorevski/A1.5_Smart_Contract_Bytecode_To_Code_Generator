@@ -473,8 +473,8 @@ def _get_parquet_files(config: str = "flattened", split: str = "train") -> List[
     return sorted(f for f in all_files if f.startswith(prefix) and f.endswith(".parquet"))
 
 
-def _flush_batch(cur: sqlite3.Cursor, batch: list):
-    """Bulk-insert a batch of contract rows (duplicates ignored)."""
+def _flush_batch(cur: sqlite3.Cursor, batch: list) -> int:
+    """Bulk-insert a batch of contract rows and return actual insert count."""
     cur.executemany("""
         INSERT OR IGNORE INTO contracts
             (address, source_code, bytecode, compiler_version,
@@ -482,6 +482,7 @@ def _flush_batch(cur: sqlite3.Cursor, batch: list):
              source, source_hash)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, batch)
+    return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
 
 
 def _parse_opt_used(value) -> bool:
@@ -517,6 +518,7 @@ def download_contracts(
     cur = conn.cursor()
 
     inserted = 0
+    ignored = 0
     skipped = 0
     deduped = 0
     total_seen = 0
@@ -563,7 +565,7 @@ def download_contracts(
 
                 address = str(row.get("contract_address", "") or "").strip()
                 if not address:
-                    address = f"hf_{hashlib.md5(src[:200].encode()).hexdigest()}"
+                    address = f"hf_{src_hash}"
 
                 compiler_version = str(row.get("compiler_version", "") or "")
                 opt_used = _parse_opt_used(row.get("optimization_used", False))
@@ -579,20 +581,22 @@ def download_contracts(
                 ))
 
                 if len(batch) >= BATCH_INSERT_SIZE:
-                    _flush_batch(cur, batch)
-                    inserted += len(batch)
+                    inserted_now = _flush_batch(cur, batch)
+                    inserted += inserted_now
+                    ignored += len(batch) - inserted_now
                     batch = []
                     conn.commit()
 
             if batch:
-                _flush_batch(cur, batch)
-                inserted += len(batch)
+                inserted_now = _flush_batch(cur, batch)
+                inserted += inserted_now
+                ignored += len(batch) - inserted_now
                 batch = []
                 conn.commit()
 
             logger.info(
-                f"  Running: {inserted} inserted, {deduped} deduped, "
-                f"{skipped} skipped, {total_seen} seen"
+                f"  Running: {inserted} inserted, {ignored} ignored, "
+                f"{deduped} deduped, {skipped} skipped, {total_seen} seen"
             )
             if limit and total_seen > limit:
                 logger.info(f"Reached download limit of {limit}")
@@ -603,8 +607,8 @@ def download_contracts(
 
     conn.close()
     logger.info(
-        f"Download complete: {inserted} stored, {deduped} source-deduped, "
-        f"{skipped} skipped, {total_seen} total"
+        f"Download complete: {inserted} stored, {ignored} ignored, "
+        f"{deduped} source-deduped, {skipped} skipped, {total_seen} total"
     )
     return inserted
 

@@ -632,9 +632,15 @@ def enrich_tac_with_abi(
 
         # Annotate LOG instructions with event names
         if abi_enricher and stripped.startswith("log") and "memory[" in stripped:
+            topic_match = re.search(r"topic0=(0x[a-fA-F0-9]{64})", stripped)
+            if topic_match:
+                annotation = abi_enricher.format_event_annotation(topic_match.group(1))
+                if annotation:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    enriched.append(line)
+                    enriched.append(f"{indent}{annotation}")
+                    continue
             enriched.append(line)
-            # Try to find topic0 in nearby lines (look back for recent PUSH)
-            # This is a best-effort annotation
             continue
 
         enriched.append(line)

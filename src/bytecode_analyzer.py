@@ -1435,7 +1435,24 @@ class BytecodeAnalyzer:
         if self.basic_blocks and not any(b.instructions for b in self.basic_blocks.values()):
             self._convert_and_integrate_tac()
 
-        # Collect blocks reachable from the entry block
+        blocks = self._blocks_for_function(func, fallback_to_all=True)
+
+        lines: List[str] = []
+        lines.append(f"function {func.name}:")
+        if func.selector:
+            lines.append(f"  // Function selector: {func.selector}")
+        lines.append(f"  // Entry block: {func.entry_block}")
+        lines.append("")
+
+        for b in blocks:
+            self._format_block_tac(lines, b, indent="  ")
+
+        return "\n".join(lines)
+
+    def _blocks_for_function(
+        self, func: Function, fallback_to_all: bool = False
+    ) -> List[BasicBlock]:
+        """Return blocks reachable from a function entry without global duplication."""
         reachable_ids: set = set()
 
         def _walk(bid: str) -> None:
@@ -1452,8 +1469,7 @@ class BytecodeAnalyzer:
         if not reachable_ids and func.basic_blocks:
             reachable_ids = {b.id for b in func.basic_blocks}
 
-        # Fall back to all blocks if still empty
-        if not reachable_ids:
+        if fallback_to_all and not reachable_ids:
             reachable_ids = set(self.basic_blocks.keys())
 
         blocks = [
@@ -1462,18 +1478,7 @@ class BytecodeAnalyzer:
             if bid in self.basic_blocks
         ]
         blocks.sort(key=lambda b: b.start_address)
-
-        lines: List[str] = []
-        lines.append(f"function {func.name}:")
-        if func.selector:
-            lines.append(f"  // Function selector: {func.selector}")
-        lines.append(f"  // Entry block: {func.entry_block}")
-        lines.append("")
-
-        for b in blocks:
-            self._format_block_tac(lines, b, indent="  ")
-
-        return "\n".join(lines)
+        return blocks
 
     def generate_per_function_tac(self) -> Dict[str, str]:
         """Run the full pipeline and return a dict mapping function name → TAC string.
@@ -1586,7 +1591,11 @@ class BytecodeAnalyzer:
             lines.append("  // View: true")
         lines.append("")
 
-        blocks = func.basic_blocks or list(self.basic_blocks.values())
+        blocks = self._blocks_for_function(func, fallback_to_all=False)
+        if not blocks:
+            lines.append("  // No reachable basic blocks found for this function")
+            lines.append("")
+            return
         for b in sorted(blocks, key=lambda x: x.start_address):
             self._format_block_tac(lines, b, indent="  ")
 
@@ -1693,7 +1702,12 @@ class BytecodeAnalyzer:
 
         if op == TACOperationType.LOG:
             tc = meta.get("topic_count", 0)
-            return f"log{tc}(memory[{instr.operand1}:{instr.operand2}])"
+            topics = meta.get("topics") or []
+            topic_args = [
+                f"topic{i}={topic}" for i, topic in enumerate(topics)
+            ]
+            args = [f"memory[{instr.operand1}:{instr.operand2}]"] + topic_args
+            return f"log{tc}({', '.join(args)})"
 
         if op == TACOperationType.NOP:
             if meta.get("shared_ref") and meta.get("comment"):

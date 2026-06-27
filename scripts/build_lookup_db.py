@@ -199,12 +199,12 @@ def _compile_one(
     solc_version: str,
     opt_enabled: bool,
     runs: int,
-) -> List[Dict]:
+) -> tuple[str, List[Dict]]:
     """Compile and extract TAC→Solidity pairs. Runs in a worker process."""
     logging.disable(logging.CRITICAL)
     try:
         if not install_solc_version(solc_version):
-            return []
+            return "error", []
 
         try:
             if len(source_files) > 1:
@@ -213,10 +213,10 @@ def _compile_one(
                 first_src = next(iter(source_files.values()))
                 comp = compile_source(first_src, solc_version, opt_enabled, runs)
         except Exception:
-            return []
+            return "error", []
 
         if not comp.success:
-            return []
+            return "error", []
 
         pairs: List[Dict] = []
         for cname, compiled in comp.contracts.items():
@@ -319,9 +319,10 @@ def _compile_one(
                     "optimizer_runs": runs,
                 })
 
-        return pairs
+        return ("ok" if pairs else "no_pairs"), pairs
+
     except Exception:
-        return []
+        return "error", []
 
 def _ensure_tac_integrated(analyzer) -> None:
     """Populate analyzer basic blocks with TAC instructions once."""
@@ -348,6 +349,7 @@ def build_lookup_db(
     lookup_db: str = "data/tac_lookup.db",
     max_versions: int = 0,
     workers: int = 0,
+    force: bool = False,
 ):
     """Build the exhaustive TAC lookup database.
 
@@ -356,6 +358,7 @@ def build_lookup_db(
         lookup_db: Path to the output lookup database.
         max_versions: Max solc versions per contract (0 = unlimited).
         workers: Number of parallel workers (0 = auto-detect).
+        force: Re-run all compile jobs, including previously successful ones.
     """
     if workers <= 0:
         workers = os.cpu_count() or 4
@@ -377,7 +380,7 @@ def build_lookup_db(
     builder = TACLookupBuilder(lookup_db)
 
     # Load set of already-completed jobs for re-runnability
-    completed_jobs = builder.get_completed_jobs()
+    completed_jobs = set() if force else builder.get_completed_jobs()
     logger.info(f"  Already done:    {len(completed_jobs)} compile jobs")
 
     # Load contracts from source DB
@@ -507,13 +510,13 @@ def build_lookup_db(
                 for fut in as_completed(futures):
                     addr, ver, opt = futures[fut]
                     try:
-                        pairs = fut.result()
+                        status, pairs = fut.result()
                         if pairs:
                             pair_buffer.extend(pairs)
                             total_pairs_seen += len(pairs)
                         done_buffer.append(
                             (addr, ver, int(opt),
-                             "ok" if pairs else "no_pairs",
+                             status,
                              len(pairs) if pairs else 0)
                         )
                     except Exception:
@@ -572,6 +575,8 @@ def main():
                     help="Max solc versions per contract (0 = unlimited, default: 0)")
     ap.add_argument("--workers", type=int, default=0,
                     help="Parallel workers (0 = auto-detect)")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-run every compile job, including successful jobs")
     ap.add_argument("--stats", action="store_true",
                     help="Print stats of existing lookup DB and exit")
 
@@ -595,6 +600,7 @@ def main():
         lookup_db=args.lookup_db,
         max_versions=args.max_versions,
         workers=args.workers,
+        force=args.force,
     )
 
 if __name__ == "__main__":
