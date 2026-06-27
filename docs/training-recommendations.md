@@ -36,7 +36,16 @@ The paper used **Llama 3.2 3B** — a deliberately small model chosen for practi
 - **Local smoke result**: A bounded local run on this repository completed successfully with `use_quantization=False`, batch size 1, one epoch, and max sequence length 1024. The run trained 40,370,176 LoRA parameters on top of 7,655,986,688 total parameters and produced train loss 1.087 / eval loss 1.129 on the tiny smoke split.
 - **Recommendation**: Use this as the first practical upgrade before moving to 14B/32B. It is large enough to test whether code-specialized pretraining materially improves TAC-to-Solidity quality without the operational cost of 32B+ experiments.
 
-> Current CLI note: `train.py` now defaults to full-precision LoRA with this Qwen 7B model and auto-launches up to 4 GPUs. Use `--precision bf16|fp16|fp32` to pin mixed precision, and add `--quantization` only when VRAM pressure requires 4-bit NF4 loading.
+> Current CLI note: `train.py` keeps the data-safe 2K sequence default, while
+> `THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh` applies the 4x RTX
+> 8000 sweep recipe: full-precision fp16 LoRA, 4-GPU torchrun, batch size 9 per
+> GPU, max sequence length 256, and gradient checkpointing disabled. Use
+> `--precision auto|bf16|fp16|fp32` to change mixed precision, and add
+> `--quantization` only when VRAM pressure requires 4-bit NF4 loading.
+> For fixed 8192-token Qwen 7B runs on this hardware, the measured viable setup
+> is QLoRA with batch size 1 per GPU, global batch size 4, fp16, and gradient
+> checkpointing enabled. Full fp16 and QLoRA without checkpointing OOMed even at
+> batch size 1, and QLoRA batch size 2 also OOMed.
 
 Repeated experiments should keep the default split/tokenization/preflight caches enabled. Use `--force-resplit` only when regenerating train/val/test files intentionally, `--train-eval-strategy no` for fast sweeps that should skip Trainer validation, and `--quality-gate --baseline-results <prior.json>` for regression-blocking eval runs.
 
@@ -157,7 +166,8 @@ Three training modes are available, from simplest to fastest:
 
 ```bash
 uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --batch-size 4 --epochs 3 --lr 2e-4 --max-seq-length 2048 --skip-eval
+    --batch-size 4 --epochs 3 --lr 2e-4 --max-seq-length 2048 \
+    --precision fp16 --no-gradient-checkpointing --skip-eval
 ```
 
 Automatically restricts to GPU 0 when using quantized models.
@@ -165,8 +175,15 @@ Automatically restricts to GPU 0 when using quantized models.
 ### 2. Multi-GPU DDP (`torchrun`)
 
 ```bash
-./run_train_torchrun.sh              # defaults: 4 GPUs, batch_size=4
+./run_train_torchrun.sh              # auto-detects max_seq_len and batch_size
+THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh  # sweep recipe: batch_size=9, max_seq_len=256
 NGPUS=2 ./run_train_torchrun.sh      # override GPU count
+
+# Long-context 8192-token recipe from the sweep result
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
+    --num-gpus 4 --batch-size 1 --global-batch-size 4 --max-seq-length 8192 \
+    --precision fp16 --quantization --gradient-checkpointing \
+    --train-eval-strategy no --skip-eval
 ```
 
 Standard PyTorch Distributed Data Parallel — each GPU holds a full copy of optimizer states and gradients.
@@ -174,11 +191,12 @@ Standard PyTorch Distributed Data Parallel — each GPU holds a full copy of opt
 ### 3. DeepSpeed (`deepspeed`)
 
 ```bash
-./run_train_deepspeed.sh                    # defaults: 4 GPUs, batch_size=4
+./run_train_deepspeed.sh                    # auto-detects max_seq_len and batch_size
+THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_deepspeed.sh # sweep recipe: batch_size=9, max_seq_len=256
 NGPUS=2 ./run_train_deepspeed.sh            # override GPU count
 ```
 
-Uses `ds_config.json` (ZeRO Stage 0 + BF16 by default).
+Uses `ds_config.json` (ZeRO Stage 0 + fp16 on RTX 8000 by default).
 
 > **Performance note for Llama 3.2 3B + LoRA**: For this small model (3B params,
 > 24M trainable LoRA parameters) with 4-bit quantization, **torchrun DDP is
