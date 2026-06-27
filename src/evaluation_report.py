@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import math
 import platform
 import shlex
 import subprocess
-import difflib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 
 DEFAULT_LATEST_RESULTS_PATH = "latest_results.txt"
+
+_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+_PRIORITY_BY_SEVERITY = {
+    "critical": "P0",
+    "high": "P1",
+    "medium": "P2",
+    "low": "P3",
+    "info": "P3",
+}
 
 
 def write_latest_results_report(
@@ -46,6 +55,557 @@ def write_latest_results_report(
     )
     output_path.write_text(text, encoding="utf-8")
     return str(output_path)
+
+
+def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
+    """Build an actionable, machine-readable model improvement plan."""
+    metrics_used: Dict[str, Any] = {}
+    strengths: list[Dict[str, Any]] = []
+    issues: list[Dict[str, Any]] = []
+    caveats: list[str] = []
+
+    def metric(name: str, *aliases: str) -> Optional[float]:
+        value = _first_numeric_summary_value(summary, name, *aliases)
+        if value is not None:
+            metrics_used[name] = _json_safe_number(value)
+        return value
+
+    num_evaluated = metric("num_evaluated")
+    if num_evaluated is not None and num_evaluated < 30:
+        caveats.append(
+            "Fewer than 30 examples were evaluated; treat this as a smoke test before changing model policy."
+        )
+
+    failure_rate = metric("failure_rate")
+    if failure_rate is not None:
+        if failure_rate > 0:
+            severity = "high" if failure_rate >= 0.10 else "medium"
+            issues.append(
+                _diagnostic_issue(
+                    issue_id="generation_failures",
+                    category="inference_reliability",
+                    severity=severity,
+                    title="Some evaluation rows failed before quality metrics could be computed.",
+                    evidence=[_diagnostic_metric_text("failure_rate", failure_rate, percent=True)],
+                    likely_root_causes=[
+                        "Inference runtime errors, CUDA memory pressure, or malformed dataset rows.",
+                        "Generation configuration may be too aggressive for the available model/context size.",
+                    ],
+                    suggested_experiments=[
+                        _experiment(
+                            "retry-failed-eval-rows",
+                            "Rerun only failed rows with batch size 1 and lower max_new_tokens to separate data errors from runtime errors.",
+                            "evaluation",
+                            "failure_rate returns to 0.00%",
+                        )
+                    ],
+                )
+            )
+        else:
+            strengths.append(
+                _diagnostic_strength(
+                    "no_generation_failures",
+                    "Evaluation completed without generation failures.",
+                    [_diagnostic_metric_text("failure_rate", failure_rate, percent=True)],
+                )
+            )
+
+    semantic_mean = metric("semantic_similarity_mean", "semantic_similarity")
+    pct_high_similarity = metric("pct_above_0.8_similarity")
+    if _below_any((semantic_mean, 0.82), (pct_high_similarity, 0.78)):
+        severity = (
+            "high" if _below_any((semantic_mean, 0.70), (pct_high_similarity, 0.50)) else "medium"
+        )
+        evidence = _available_evidence(
+            _target_evidence("semantic_similarity_mean", semantic_mean, ">=", 0.82),
+            _target_evidence(
+                "pct_above_0.8_similarity", pct_high_similarity, ">=", 0.78, percent=True
+            ),
+        )
+        issues.append(
+            _diagnostic_issue(
+                issue_id="semantic_fidelity_gap",
+                category="model_behavior",
+                severity=severity,
+                title="Generated Solidity is not consistently semantically close to the reference.",
+                evidence=evidence,
+                likely_root_causes=[
+                    "Training data may under-represent the failing opcode/control-flow slices.",
+                    "The model may be learning surface syntax while missing bytecode-grounded behavior.",
+                    "Learning rate, LoRA rank, or epoch count may not provide enough capacity for semantic recovery.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "segment-targeted-finetune",
+                        "Fine-tune on the weakest metadata/opcode segments and compare semantic_similarity_mean by segment.",
+                        "data/training",
+                        "semantic_similarity_mean improves without baseline regressions",
+                    ),
+                    _experiment(
+                        "generation-config-sweep",
+                        "Sweep temperature/top_p/max_new_tokens on the same eval split to separate decoding noise from model capacity.",
+                        "model",
+                        "pct_above_0.8_similarity increases and edit_distance_mean does not regress",
+                    ),
+                ],
+            )
+        )
+    elif semantic_mean is not None or pct_high_similarity is not None:
+        strengths.append(
+            _diagnostic_strength(
+                "semantic_similarity_on_target",
+                "Semantic similarity is on target for the available evaluation summary.",
+                _available_evidence(
+                    _target_evidence("semantic_similarity_mean", semantic_mean, ">=", 0.82),
+                    _target_evidence(
+                        "pct_above_0.8_similarity", pct_high_similarity, ">=", 0.78, percent=True
+                    ),
+                ),
+            )
+        )
+
+    edit_mean = metric(
+        "edit_distance_mean", "normalized_edit_distance_mean", "normalized_edit_distance"
+    )
+    pct_low_edit = metric("pct_below_0.4_edit_dist")
+    if _above_any((edit_mean, 0.40)) or _below_any((pct_low_edit, 0.82)):
+        severity = (
+            "high"
+            if _above_any((edit_mean, 0.55)) or _below_any((pct_low_edit, 0.60))
+            else "medium"
+        )
+        issues.append(
+            _diagnostic_issue(
+                issue_id="textual_distance_gap",
+                category="model_behavior",
+                severity=severity,
+                title="Generated Solidity differs substantially from reference source shape.",
+                evidence=_available_evidence(
+                    _target_evidence("edit_distance_mean", edit_mean, "<=", 0.40),
+                    _target_evidence(
+                        "pct_below_0.4_edit_dist", pct_low_edit, ">=", 0.82, percent=True
+                    ),
+                ),
+                likely_root_causes=[
+                    "The model may be producing generic scaffolds or omitting reference-specific statements.",
+                    "Training targets may mix formatting styles or include noisy boilerplate.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "target-normalization-audit",
+                        "Audit low-edit-distance failures for boilerplate/noisy target patterns before adding more training data.",
+                        "data",
+                        "edit_distance_mean decreases while replication_f1_micro stays stable or improves",
+                    )
+                ],
+            )
+        )
+
+    replication_f1 = metric(
+        "replication_f1_micro",
+        "replication_metrics.micro.f1",
+        "aggregate_statistics.replication_metrics.micro.f1",
+    )
+    replication_recall = metric(
+        "replication_recall_micro",
+        "replication_metrics.micro.recall",
+        "aggregate_statistics.replication_metrics.micro.recall",
+    )
+    replication_precision = metric(
+        "replication_precision_micro",
+        "replication_metrics.micro.precision",
+        "aggregate_statistics.replication_metrics.micro.precision",
+    )
+    category_gaps = _replication_category_gaps(summary)
+    replication_issue = _below_any((replication_f1, 0.75), (replication_recall, 0.75)) or bool(
+        category_gaps
+    )
+    if replication_issue:
+        severity = (
+            "high" if _below_any((replication_f1, 0.50), (replication_recall, 0.55)) else "medium"
+        )
+        top_categories = ", ".join(
+            f"{gap['category']} f1={_format_number(gap.get('f1'))}" for gap in category_gaps[:3]
+        )
+        evidence = _available_evidence(
+            _target_evidence("replication_f1_micro", replication_f1, ">=", 0.75),
+            _target_evidence("replication_recall_micro", replication_recall, ">=", 0.75),
+            _target_evidence("replication_precision_micro", replication_precision, ">=", 0.85),
+            f"weakest categories: {top_categories}" if top_categories else None,
+        )
+        issues.append(
+            _diagnostic_issue(
+                issue_id="structured_replication_gap",
+                category="model_behavior",
+                severity=severity,
+                title="Structured Solidity facts are missing or incorrect.",
+                evidence=evidence,
+                likely_root_causes=[
+                    "Dataflow-heavy examples such as state writes, guards, events, or ABI details are under-learned.",
+                    "Prompt evidence may not expose enough selector/opcode context for the failing fact categories.",
+                    "Training may need harder negative examples that penalize plausible but unsupported facts.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "category-balanced-replay",
+                        "Oversample rows from the weakest replication categories and rerun the same holdout split.",
+                        "data/training",
+                        "replication_by_category_micro improves for the targeted categories",
+                    ),
+                    _experiment(
+                        "fact-loss-review",
+                        "Manually inspect worst_samples missing/extra facts and propose target-specific data repairs.",
+                        "model/data",
+                        "replication_f1_micro improves and hallucination_rate does not increase",
+                    ),
+                ],
+                extra={"category_gaps": category_gaps[:5]},
+            )
+        )
+    elif replication_f1 is not None:
+        strengths.append(
+            _diagnostic_strength(
+                "structured_replication_on_target",
+                "Structured replication is on target.",
+                [_target_evidence("replication_f1_micro", replication_f1, ">=", 0.75)],
+            )
+        )
+
+    hallucination_rate = _hallucination_rate(summary)
+    if hallucination_rate is not None:
+        metrics_used["replication_hallucination_rate"] = _json_safe_number(hallucination_rate)
+    groundedness = metric(
+        "replication_groundedness_score_mean",
+        "replication_metrics.groundedness_score_mean",
+        "aggregate_statistics.replication_metrics.groundedness_score_mean",
+    )
+    hallucination_buckets = _top_hallucination_buckets(summary)
+    if (hallucination_rate is not None and hallucination_rate > 0.05) or (
+        groundedness is not None and groundedness < 0.95
+    ):
+        severity = (
+            "high"
+            if (hallucination_rate is not None and hallucination_rate > 0.15)
+            or (groundedness is not None and groundedness < 0.85)
+            else "medium"
+        )
+        bucket_text = ", ".join(f"{name}={count}" for name, count in hallucination_buckets[:3])
+        issues.append(
+            _diagnostic_issue(
+                issue_id="grounded_hallucinations",
+                category="model_behavior",
+                severity=severity,
+                title="The model is adding facts not grounded in the reference or bytecode evidence.",
+                evidence=_available_evidence(
+                    _target_evidence(
+                        "replication_hallucination_rate",
+                        hallucination_rate,
+                        "<=",
+                        0.05,
+                        percent=True,
+                    ),
+                    _target_evidence(
+                        "replication_groundedness_score_mean", groundedness, ">=", 0.95
+                    ),
+                    f"top hallucination buckets: {bucket_text}" if bucket_text else None,
+                ),
+                likely_root_causes=[
+                    "Training examples may reward common Solidity boilerplate even when bytecode evidence is absent.",
+                    "Decoding may be too permissive, causing over-generation of calls, guards, events, or returns.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "hallucination-negative-set",
+                        "Create a small negative eval slice from the top hallucination buckets and tune prompts/decoding against it.",
+                        "data/model",
+                        "replication_hallucination_rate drops without reducing replication_recall_micro",
+                    )
+                ],
+            )
+        )
+    elif hallucination_rate is not None or groundedness is not None:
+        strengths.append(
+            _diagnostic_strength(
+                "grounded_generation",
+                "Generated facts appear well grounded in the available replication metrics.",
+                _available_evidence(
+                    _target_evidence(
+                        "replication_hallucination_rate",
+                        hallucination_rate,
+                        "<=",
+                        0.05,
+                        percent=True,
+                    ),
+                    _target_evidence(
+                        "replication_groundedness_score_mean", groundedness, ">=", 0.95
+                    ),
+                ),
+            )
+        )
+
+    solidity_valid = metric("solidity_valid_mean")
+    if solidity_valid is not None and solidity_valid < 0.95:
+        issues.append(
+            _diagnostic_issue(
+                issue_id="solidity_validity_gap",
+                category="syntax_and_deployability",
+                severity="high" if solidity_valid < 0.75 else "medium",
+                title="Generated outputs often fail Solidity syntax or validation checks.",
+                evidence=[
+                    _target_evidence(
+                        "solidity_valid_mean", solidity_valid, ">=", 0.95, percent=True
+                    )
+                ],
+                likely_root_causes=[
+                    "Targets may contain inconsistent Solidity versions or formatting.",
+                    "Generation may stop early or exceed the model's learned function boundary patterns.",
+                    "Prompt truncation can remove declarations needed for syntactically valid output.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "syntax-error-cluster",
+                        "Cluster scaffold/compiler errors and patch the largest target/prompt class first.",
+                        "data/model",
+                        "solidity_valid_mean reaches at least 95%",
+                    )
+                ],
+            )
+        )
+
+    bytecode_checked = metric("bytecode_semantic_checked_mean")
+    bytecode_score = metric("bytecode_semantic_score_mean")
+    bytecode_deployable = metric("bytecode_deployable_mean")
+    runtime_checked = metric("bytecode_runtime_checked_mean")
+    runtime_match = metric("bytecode_runtime_match_mean")
+    if bytecode_checked is not None and bytecode_checked < 0.95:
+        issues.append(
+            _diagnostic_issue(
+                issue_id="bytecode_grounding_coverage_gap",
+                category="evaluation_data",
+                severity="medium",
+                title="Not enough rows have bytecode-grounded semantic checks.",
+                evidence=[
+                    _target_evidence(
+                        "bytecode_semantic_checked_mean", bytecode_checked, ">=", 0.95, percent=True
+                    )
+                ],
+                likely_root_causes=[
+                    "Evaluation rows may be missing runtime bytecode, opcode analysis, compiler version, or differential-call evidence.",
+                    "Dataset export may not be carrying bytecode metadata into the evaluation artifact.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "eval-metadata-backfill",
+                        "Backfill bytecode/opcode/runtime metadata for the holdout set before using bytecode metrics as model gates.",
+                        "data/evaluation",
+                        "bytecode_semantic_checked_mean reaches 95%+",
+                    )
+                ],
+            )
+        )
+    if bytecode_score is not None and bytecode_score < 0.80:
+        issues.append(
+            _diagnostic_issue(
+                issue_id="bytecode_semantic_gap",
+                category="model_behavior",
+                severity="high" if bytecode_score < 0.60 else "medium",
+                title="Bytecode-grounded behavior does not match reference behavior often enough.",
+                evidence=[
+                    _target_evidence("bytecode_semantic_score_mean", bytecode_score, ">=", 0.80)
+                ],
+                likely_root_causes=[
+                    "The model may recover text that looks plausible but changes guards, returns, calls, or state effects.",
+                    "Training may need examples that emphasize bytecode behavior over lexical similarity.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "bytecode-mismatch-slice",
+                        "Fine-tune or evaluate separately on rows with bytecode mismatch buckets before broad retraining.",
+                        "model/training",
+                        "bytecode_semantic_score_mean improves and replication_f1_micro does not regress",
+                    )
+                ],
+            )
+        )
+    if bytecode_deployable is not None and bytecode_deployable < 0.95:
+        issues.append(
+            _diagnostic_issue(
+                issue_id="deployability_gap",
+                category="syntax_and_deployability",
+                severity="medium",
+                title="Generated Solidity is not consistently deployable in bytecode-aware validation.",
+                evidence=[
+                    _target_evidence(
+                        "bytecode_deployable_mean", bytecode_deployable, ">=", 0.95, percent=True
+                    )
+                ],
+                likely_root_causes=[
+                    "Compiler version or constructor/runtime context may be missing.",
+                    "Generated source may pass scaffold syntax but fail real compiler/deployment checks.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "compiler-matrix-eval",
+                        "Run local solc validation for the dominant compiler-version segments and inspect deploy failures.",
+                        "evaluation/data",
+                        "bytecode_deployable_mean reaches 95%+ on compiler-checked rows",
+                    )
+                ],
+            )
+        )
+    if (
+        runtime_checked is not None
+        and runtime_checked > 0
+        and runtime_match is not None
+        and runtime_match < 0.95
+    ):
+        issues.append(
+            _diagnostic_issue(
+                issue_id="runtime_bytecode_mismatch",
+                category="model_behavior",
+                severity="high" if runtime_match < 0.50 else "medium",
+                title="Generated runtime bytecode does not match the reference runtime when checked.",
+                evidence=[
+                    _target_evidence(
+                        "bytecode_runtime_match_mean", runtime_match, ">=", 0.95, percent=True
+                    ),
+                    _diagnostic_metric_text(
+                        "bytecode_runtime_checked_mean", runtime_checked, percent=True
+                    ),
+                ],
+                likely_root_causes=[
+                    "The generated function may have the right shape but wrong low-level behavior.",
+                    "Compiler settings or metadata may be inconsistent between target and generated source.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "runtime-diff-triage",
+                        "Compare normalized runtime diffs for the lowest bytecode_semantic_score samples.",
+                        "model/evaluation",
+                        "bytecode_runtime_match_mean improves on checked rows",
+                    )
+                ],
+            )
+        )
+
+    prompt_diagnostics = summary.get("prompt_diagnostics")
+    if isinstance(prompt_diagnostics, Mapping):
+        truncated_rate = _coerce_float(prompt_diagnostics.get("truncated_rate"))
+        if truncated_rate is not None:
+            metrics_used["prompt_truncated_rate"] = _json_safe_number(truncated_rate)
+            if truncated_rate > 0:
+                severity = "high" if truncated_rate >= 0.20 else "medium"
+                issues.append(
+                    _diagnostic_issue(
+                        issue_id="prompt_truncation",
+                        category="prompting_and_context",
+                        severity=severity,
+                        title="Some TAC prompts are truncated before evaluation generation.",
+                        evidence=[
+                            _diagnostic_metric_text(
+                                "prompt_truncated_rate", truncated_rate, percent=True
+                            )
+                        ],
+                        likely_root_causes=[
+                            "TAC or metadata is too long for the current max sequence length and prompt budget.",
+                            "Important control-flow or storage evidence may be removed before the model sees it.",
+                        ],
+                        suggested_experiments=[
+                            _experiment(
+                                "context-budget-sweep",
+                                "Increase max sequence length or reduce nonessential metadata and compare truncated_low_quality samples.",
+                                "prompt/training",
+                                "prompt_truncated_rate decreases and low-quality truncated worst samples disappear",
+                            )
+                        ],
+                    )
+                )
+
+    baseline = summary.get("baseline_comparison") or summary.get("regression_comparison")
+    if isinstance(baseline, Mapping):
+        regressions = _coerce_float(baseline.get("num_regressions"))
+        if regressions is not None and regressions > 0:
+            regressed_metrics = _regressed_metric_names(baseline)
+            issues.append(
+                _diagnostic_issue(
+                    issue_id="baseline_regressions",
+                    category="regression_risk",
+                    severity="high" if regressions >= 3 else "medium",
+                    title="Current evaluation regressed against the configured baseline.",
+                    evidence=[
+                        f"num_regressions={int(regressions)}",
+                        (
+                            f"regressed metrics: {', '.join(regressed_metrics[:5])}"
+                            if regressed_metrics
+                            else "regressed metrics were not listed"
+                        ),
+                    ],
+                    likely_root_causes=[
+                        "Recent data, training, or decoding changes may have improved one metric while hurting another.",
+                        "Quality-gate thresholds may not cover the regressed metric directly.",
+                    ],
+                    suggested_experiments=[
+                        _experiment(
+                            "ablation-against-baseline",
+                            "Rerun the current and baseline configs on the same fixed eval sample and ablate one change at a time.",
+                            "training/evaluation",
+                            "num_regressions returns to 0 or accepted trade-offs are documented",
+                        )
+                    ],
+                )
+            )
+
+    quality_counts = _quality_issue_counts(summary)
+    if quality_counts:
+        top_counts = ", ".join(f"{key}={value}" for key, value in list(quality_counts.items())[:5])
+        issues.append(
+            _diagnostic_issue(
+                issue_id="quality_taxonomy_findings",
+                category="evaluation_data",
+                severity="medium",
+                title="The detailed evaluation taxonomy found recurring quality issue categories.",
+                evidence=[f"top categories: {top_counts}"],
+                likely_root_causes=[
+                    "Failures are clustered rather than random; use the largest category to choose the next data/model fix.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "taxonomy-first-triage",
+                        "Address the largest quality_issue_summary category and rerun the same evaluation split.",
+                        "evaluation/data/model",
+                        "largest quality issue category count decreases",
+                    )
+                ],
+                extra={"category_counts": dict(quality_counts)},
+            )
+        )
+
+    caveats.extend(_metadata_coverage_caveats(summary))
+    _add_missing_metric_caveats(summary, caveats)
+
+    issues = _dedupe_issues(issues)
+    issues.sort(
+        key=lambda item: (
+            -_SEVERITY_RANK.get(str(item.get("severity")), 0),
+            str(item.get("priority", "P9")),
+            str(item.get("id", "")),
+        )
+    )
+    strengths = strengths[:6]
+    next_experiments = _collect_next_experiments(issues)
+    issue_counts = _issue_counts_by_severity(issues)
+    overall_status = _overall_diagnostic_status(issues, caveats)
+
+    return {
+        "schema_version": 1,
+        "overall_status": overall_status,
+        "issue_counts_by_severity": issue_counts,
+        "metrics_used": metrics_used,
+        "strengths": strengths,
+        "issues": issues,
+        "next_experiments": next_experiments,
+        "caveats": list(dict.fromkeys(caveats)),
+    }
 
 
 def format_latest_results_report(
@@ -114,6 +674,16 @@ def format_latest_results_report(
             f"Dataset rows: {dataset.get('rows', 'unknown')}",
             f"Dataset size: {_format_bytes(dataset.get('bytes'))}",
             f"Detailed JSON: {results_json_path}",
+        ]
+    )
+
+    diagnostics = summary.get("evaluation_diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        diagnostics = build_evaluation_diagnostics(summary)
+    _append_evaluation_diagnostics_report(lines, diagnostics)
+
+    lines.extend(
+        [
             "",
             "Quality Summary",
             "---------------",
@@ -576,6 +1146,469 @@ def _format_number(value: Any) -> str:
     if not isinstance(value, (int, float)) or math.isnan(float(value)):
         return "n/a"
     return f"{float(value):.4f}"
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return None if math.isnan(numeric) else numeric
+
+
+def _json_safe_number(value: float) -> int | float:
+    return int(value) if float(value).is_integer() else float(value)
+
+
+def _first_numeric_summary_value(summary: Mapping[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = _numeric_summary_value(summary, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _numeric_summary_value(summary: Mapping[str, Any], key: str) -> Optional[float]:
+    if "." in key:
+        value = _mapping_path_value(summary, key.split("."))
+        return _coerce_float(value)
+
+    direct = summary.get(key)
+    value = _mean_or_numeric(direct)
+    if value is not None:
+        return value
+
+    if key.endswith("_mean"):
+        base_key = key[: -len("_mean")]
+        value = _mean_or_numeric(summary.get(base_key))
+        if value is not None:
+            return value
+        aggregate = summary.get("aggregate_statistics")
+        if isinstance(aggregate, Mapping):
+            value = _mean_or_numeric(aggregate.get(base_key))
+            if value is not None:
+                return value
+
+    aggregate = summary.get("aggregate_statistics")
+    if isinstance(aggregate, Mapping):
+        value = _mean_or_numeric(aggregate.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _mean_or_numeric(value: Any) -> Optional[float]:
+    numeric = _coerce_float(value)
+    if numeric is not None:
+        return numeric
+    if isinstance(value, Mapping):
+        return _coerce_float(value.get("mean"))
+    return None
+
+
+def _mapping_path_value(mapping: Mapping[str, Any], path: Sequence[str]) -> Any:
+    current: Any = mapping
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _below_any(*checks: tuple[Optional[float], float]) -> bool:
+    return any(value is not None and value < threshold for value, threshold in checks)
+
+
+def _above_any(*checks: tuple[Optional[float], float]) -> bool:
+    return any(value is not None and value > threshold for value, threshold in checks)
+
+
+def _diagnostic_issue(
+    *,
+    issue_id: str,
+    category: str,
+    severity: str,
+    title: str,
+    evidence: Sequence[str],
+    likely_root_causes: Sequence[str],
+    suggested_experiments: Sequence[Mapping[str, Any]],
+    extra: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "id": issue_id,
+        "category": category,
+        "severity": severity,
+        "priority": _PRIORITY_BY_SEVERITY.get(severity, "P3"),
+        "title": title,
+        "evidence": [item for item in evidence if item],
+        "likely_root_causes": list(likely_root_causes),
+        "suggested_experiments": [dict(experiment) for experiment in suggested_experiments],
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _diagnostic_strength(
+    strength_id: str,
+    title: str,
+    evidence: Sequence[str],
+) -> Dict[str, Any]:
+    return {
+        "id": strength_id,
+        "title": title,
+        "evidence": [item for item in evidence if item],
+    }
+
+
+def _experiment(
+    experiment_id: str,
+    action: str,
+    area: str,
+    success_metric: str,
+) -> Dict[str, Any]:
+    return {
+        "id": experiment_id,
+        "area": area,
+        "action": action,
+        "success_metric": success_metric,
+    }
+
+
+def _target_evidence(
+    name: str,
+    value: Optional[float],
+    operator: str,
+    target: float,
+    *,
+    percent: bool = False,
+) -> Optional[str]:
+    if value is None:
+        return None
+    actual = _diagnostic_metric_text(name, value, percent=percent)
+    target_text = f"{target * 100:.2f}%" if percent else _format_number(target)
+    return f"{actual} (target {operator} {target_text})"
+
+
+def _diagnostic_metric_text(name: str, value: float, *, percent: bool = False) -> str:
+    if percent:
+        return f"{name}={value * 100:.2f}%"
+    return f"{name}={_format_number(value)}"
+
+
+def _available_evidence(*items: Optional[str]) -> list[str]:
+    return [item for item in items if item]
+
+
+def _replication_category_gaps(summary: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    category_scores = summary.get("replication_by_category_micro")
+    if not isinstance(category_scores, Mapping):
+        category_scores = _mapping_path_value(summary, ("replication_metrics", "by_category_micro"))
+    if not isinstance(category_scores, Mapping):
+        category_scores = _mapping_path_value(
+            summary,
+            ("aggregate_statistics", "replication_metrics", "by_category_micro"),
+        )
+    if not isinstance(category_scores, Mapping):
+        return []
+
+    gaps: list[Dict[str, Any]] = []
+    for category, score in category_scores.items():
+        if not isinstance(score, Mapping):
+            continue
+        precision = _coerce_float(score.get("precision"))
+        recall = _coerce_float(score.get("recall"))
+        f1 = _coerce_float(score.get("f1"))
+        false_negatives = int(score.get("false_negatives", 0) or 0)
+        false_positives = int(score.get("false_positives", 0) or 0)
+        if not (
+            (f1 is not None and f1 < 0.75)
+            or (recall is not None and recall < 0.75)
+            or false_negatives
+            or false_positives
+        ):
+            continue
+        gaps.append(
+            {
+                "category": str(category),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "false_negatives": false_negatives,
+                "false_positives": false_positives,
+            }
+        )
+
+    gaps.sort(
+        key=lambda item: (
+            item["f1"] if isinstance(item.get("f1"), (int, float)) else 1.0,
+            -(int(item.get("false_negatives", 0)) + int(item.get("false_positives", 0))),
+            str(item.get("category", "")),
+        )
+    )
+    return gaps
+
+
+def _hallucination_rate(summary: Mapping[str, Any]) -> Optional[float]:
+    direct = _first_numeric_summary_value(
+        summary,
+        "replication_hallucination_rate",
+        "replication_metrics.hallucination_rate",
+        "aggregate_statistics.replication_metrics.hallucination_rate",
+    )
+    if direct is not None:
+        return direct
+    total = _first_numeric_summary_value(
+        summary,
+        "replication_hallucination_total",
+        "replication_metrics.hallucination_total",
+        "aggregate_statistics.replication_metrics.hallucination_total",
+    )
+    candidate_total = _first_numeric_summary_value(
+        summary,
+        "replication_candidate_fact_total",
+        "replication_metrics.candidate_fact_total",
+        "aggregate_statistics.replication_metrics.candidate_fact_total",
+    )
+    if total is None or candidate_total in (None, 0):
+        return None
+    return total / candidate_total
+
+
+def _top_hallucination_buckets(summary: Mapping[str, Any]) -> list[tuple[str, int]]:
+    buckets = summary.get("replication_hallucination_buckets")
+    if not isinstance(buckets, Mapping):
+        buckets = _mapping_path_value(summary, ("replication_metrics", "hallucination_buckets"))
+    if not isinstance(buckets, Mapping):
+        buckets = _mapping_path_value(
+            summary,
+            ("aggregate_statistics", "replication_metrics", "hallucination_buckets"),
+        )
+    if not isinstance(buckets, Mapping):
+        return []
+    counts = [
+        (str(bucket), _hallucination_bucket_count(value)) for bucket, value in buckets.items()
+    ]
+    counts.sort(key=lambda item: (-item[1], item[0]))
+    return [(bucket, count) for bucket, count in counts if count > 0]
+
+
+def _quality_issue_counts(summary: Mapping[str, Any]) -> Dict[str, int]:
+    issue_summary = summary.get("quality_issue_summary")
+    if not isinstance(issue_summary, Mapping):
+        return {}
+    counts = issue_summary.get("category_counts")
+    if not isinstance(counts, Mapping):
+        return {}
+    numeric_counts = {
+        str(category): int(count)
+        for category, count in counts.items()
+        if isinstance(count, (int, float)) and count > 0
+    }
+    return dict(sorted(numeric_counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _regressed_metric_names(comparison: Mapping[str, Any]) -> list[str]:
+    comparisons = comparison.get("comparisons")
+    if not isinstance(comparisons, Mapping):
+        return []
+    rows: list[tuple[str, float]] = []
+    for metric, item in comparisons.items():
+        if not isinstance(item, Mapping) or item.get("status") != "regressed":
+            continue
+        relative_delta = _coerce_float(item.get("relative_delta")) or 0.0
+        rows.append((str(metric), abs(relative_delta)))
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    return [metric for metric, _ in rows]
+
+
+def _metadata_coverage_caveats(summary: Mapping[str, Any]) -> list[str]:
+    metadata_segments = summary.get("metadata_segments")
+    if not isinstance(metadata_segments, Mapping):
+        return []
+    coverage = metadata_segments.get("coverage")
+    if not isinstance(coverage, Mapping):
+        return []
+
+    caveats: list[str] = []
+    for field_name in ("compiler_version", "optimizer_enabled", "opcode_group", "control_flow"):
+        field = coverage.get(field_name)
+        if not isinstance(field, Mapping):
+            continue
+        known = _coerce_float(field.get("known")) or 0.0
+        unknown = _coerce_float(field.get("unknown")) or 0.0
+        total = known + unknown
+        if total and unknown / total > 0.20:
+            caveats.append(
+                f"Metadata coverage for {field_name} is incomplete ({unknown / total:.0%} unknown); segment conclusions may be biased."
+            )
+    return caveats
+
+
+def _add_missing_metric_caveats(summary: Mapping[str, Any], caveats: list[str]) -> None:
+    checks = [
+        (
+            (
+                "replication_f1_micro",
+                "replication_metrics.micro.f1",
+                "aggregate_statistics.replication_metrics.micro.f1",
+            ),
+            "Replication metrics are missing; run structured fact evaluation before planning data/model changes.",
+        ),
+        (
+            ("solidity_valid_mean",),
+            "Solidity validity metrics are missing; syntax/deployability conclusions are incomplete.",
+        ),
+        (
+            ("bytecode_semantic_checked_mean",),
+            "Bytecode-grounded metrics are missing; semantic conclusions rely mainly on text similarity.",
+        ),
+    ]
+    for keys, caveat in checks:
+        if _first_numeric_summary_value(summary, *keys) is None:
+            caveats.append(caveat)
+
+
+def _dedupe_issues(issues: Sequence[Mapping[str, Any]]) -> list[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for issue in issues:
+        issue_id = str(issue.get("id", "unknown"))
+        existing = deduped.get(issue_id)
+        if existing is None or _SEVERITY_RANK.get(
+            str(issue.get("severity")), 0
+        ) > _SEVERITY_RANK.get(str(existing.get("severity")), 0):
+            deduped[issue_id] = dict(issue)
+    return list(deduped.values())
+
+
+def _collect_next_experiments(
+    issues: Sequence[Mapping[str, Any]], *, limit: int = 8
+) -> list[Dict[str, Any]]:
+    experiments: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for issue in issues:
+        issue_experiments = issue.get("suggested_experiments")
+        if not isinstance(issue_experiments, Sequence) or isinstance(
+            issue_experiments, (str, bytes)
+        ):
+            continue
+        for experiment in issue_experiments:
+            if not isinstance(experiment, Mapping):
+                continue
+            experiment_id = str(experiment.get("id", ""))
+            if not experiment_id or experiment_id in seen:
+                continue
+            payload = dict(experiment)
+            payload.setdefault("priority", issue.get("priority", "P3"))
+            payload.setdefault("triggered_by", issue.get("id"))
+            experiments.append(payload)
+            seen.add(experiment_id)
+            if len(experiments) >= limit:
+                return experiments
+    return experiments
+
+
+def _issue_counts_by_severity(issues: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+    counts = {severity: 0 for severity in ("critical", "high", "medium", "low")}
+    for issue in issues:
+        severity = str(issue.get("severity", "low"))
+        counts[severity] = counts.get(severity, 0) + 1
+    return {severity: count for severity, count in counts.items() if count}
+
+
+def _overall_diagnostic_status(issues: Sequence[Mapping[str, Any]], caveats: Sequence[str]) -> str:
+    if any(issue.get("severity") == "critical" for issue in issues):
+        return "blocked"
+    if any(issue.get("severity") == "high" for issue in issues):
+        return "needs_attention"
+    if issues:
+        return "watch"
+    if caveats:
+        return "insufficient_evidence"
+    return "healthy"
+
+
+def _append_evaluation_diagnostics_report(
+    lines: list[str],
+    diagnostics: Mapping[str, Any],
+) -> None:
+    if not diagnostics:
+        return
+    lines.extend(["", "Executive Evaluation Readout", "----------------------------"])
+    status = diagnostics.get("overall_status", "unknown")
+    lines.append(f"Overall status: {status}")
+
+    strengths = diagnostics.get("strengths")
+    lines.extend(["", "What is going well:"])
+    if isinstance(strengths, Sequence) and not isinstance(strengths, (str, bytes)) and strengths:
+        for strength in strengths[:4]:
+            if not isinstance(strength, Mapping):
+                continue
+            evidence = strength.get("evidence")
+            evidence_text = (
+                f" ({'; '.join(str(item) for item in evidence[:2])})"
+                if isinstance(evidence, Sequence)
+                and not isinstance(evidence, (str, bytes))
+                and evidence
+                else ""
+            )
+            lines.append(f"- {strength.get('title', 'Strength detected')}{evidence_text}")
+    else:
+        lines.append("- No clear strengths were detected from the available metrics.")
+
+    issues = diagnostics.get("issues")
+    lines.extend(["", "What needs attention:"])
+    if isinstance(issues, Sequence) and not isinstance(issues, (str, bytes)) and issues:
+        for issue in issues[:5]:
+            if not isinstance(issue, Mapping):
+                continue
+            evidence = issue.get("evidence")
+            evidence_text = (
+                f" Evidence: {'; '.join(str(item) for item in evidence[:2])}"
+                if isinstance(evidence, Sequence)
+                and not isinstance(evidence, (str, bytes))
+                and evidence
+                else ""
+            )
+            lines.append(
+                f"- [{issue.get('priority', 'P3')}/{issue.get('severity', 'low')}] "
+                f"{issue.get('title', issue.get('id', 'issue'))}{evidence_text}"
+            )
+            root_causes = issue.get("likely_root_causes")
+            if (
+                isinstance(root_causes, Sequence)
+                and not isinstance(root_causes, (str, bytes))
+                and root_causes
+            ):
+                lines.append(f"  Likely cause: {root_causes[0]}")
+    else:
+        lines.append("- No metric-driven issues were detected.")
+
+    experiments = diagnostics.get("next_experiments")
+    if (
+        isinstance(experiments, Sequence)
+        and not isinstance(experiments, (str, bytes))
+        and experiments
+    ):
+        lines.extend(["", "Suggested next experiments:"])
+        for experiment in experiments[:5]:
+            if not isinstance(experiment, Mapping):
+                continue
+            lines.append(
+                f"- [{experiment.get('priority', 'P3')}] {experiment.get('action')} "
+                f"Success metric: {experiment.get('success_metric')}"
+            )
+
+    caveats = diagnostics.get("caveats")
+    if isinstance(caveats, Sequence) and not isinstance(caveats, (str, bytes)) and caveats:
+        lines.extend(["", "Caveats:"])
+        for caveat in caveats[:5]:
+            lines.append(f"- {caveat}")
+
+    lines.extend(["", "Machine-readable diagnostics:", "```json"])
+    lines.append(json.dumps(diagnostics, indent=2, sort_keys=True))
+    lines.append("```")
 
 
 def _target_line(metric: str, value: Any, operator: str, target: float) -> str:

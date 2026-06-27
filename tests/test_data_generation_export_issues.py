@@ -561,6 +561,122 @@ def test_versioned_training_metadata_schema_validator():
     assert validate_training_record_schema(legacy, allow_legacy=True)["status"] == "passed"
 
 
+def test_sanitized_training_record_adds_hashes_and_quality_signals():
+    from src.dataset_export_primitives import (
+        build_training_record,
+        final_row_hash,
+        prompt_leakage_reject_reasons,
+        sanitize_tac_prompt_input,
+        validate_training_record_schema,
+    )
+
+    tac = """// Solidity compiler: 0.8.20
+// Optimizer: enabled
+// Function: transfer
+// Visibility: public
+// Payable: false
+// Storage layout:
+// [slot 1] uint256 totalSupply
+function transfer(address to, uint256 amount):
+// selector 0xa9059cbb
+block_0:
+  temp_1 = CALLDATALOAD 0x04
+  storage[0] = temp_1  // likely: mapping(address => uint256) balances
+"""
+    output = "function transfer(address to, uint256 amount) public { emit Done(to, amount); }"
+
+    sanitized = sanitize_tac_prompt_input(tac)
+    assert "function selector_a9059cbb:" in sanitized
+    assert "transfer(address" not in sanitized
+    assert "Compiler" not in sanitized
+    assert "Optimizer" not in sanitized
+    assert "Visibility" not in sanitized
+    assert "Storage layout" not in sanitized
+    assert "likely:" not in sanitized
+    assert prompt_leakage_reject_reasons(sanitized) == []
+    assert prompt_leakage_reject_reasons("  return memory[temp_1:temp_2]") == []
+    assert prompt_leakage_reject_reasons("// Returns: amount") == [
+        "prompt_source_metadata_leak"
+    ]
+
+    record = build_training_record(
+        tac,
+        output,
+        {
+            "selector": "0xa9059cbb",
+            "contract_address": "0x0000000000000000000000000000000000000001",
+        },
+    )
+    metadata = record["metadata"]
+    assert metadata["input_hash"]
+    assert metadata["output_hash"]
+    assert metadata["final_row_hash"] == final_row_hash(record["input"], record["output"])
+    assert metadata["quality"]["tac_instruction_lines"] == 2
+    assert validate_training_record_schema(record)["status"] == "passed"
+
+
+def test_export_training_data_quarantines_malformed_metadata_with_quality_signals(tmp_path):
+    import download_hf_contracts
+
+    db_path = tmp_path / "contracts.db"
+    output_path = tmp_path / "dataset.jsonl"
+    manifest_path = tmp_path / "dataset.manifest.json"
+    download_hf_contracts.init_database(db_path)
+
+    good_body = "function good() public { uint256 x = 1; uint256 y = x + 1; emit Done(y); }"
+    bad_body = "function bad() public { uint256 x = 2; uint256 y = x + 2; emit Done(y); }"
+    bad_pair = _make_pair(download_hf_contracts, 2, bad_body)
+    bad_pair["metadata"] = json.dumps({"compiler_version": "latest"})
+    assert (
+        download_hf_contracts._store_pairs_batch(
+            db_path,
+            [_make_pair(download_hf_contracts, 1, good_body), bad_pair],
+        )
+        == 2
+    )
+
+    download_hf_contracts.export_training_data(
+        str(output_path),
+        max_body_dupes=5,
+        db_path=db_path,
+        manifest_path=manifest_path,
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+    rejects = [json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()]
+    manifest = json.loads(manifest_path.read_text())
+
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["final_row_hash"]
+    assert rows[0]["metadata"]["quality"]["input_token_estimate"] > 0
+    assert len(rejects) == 1
+    assert rejects[0]["reasons"] == ["metadata_schema_invalid"]
+    assert rejects[0]["quality"]["tac_instruction_lines"] > 0
+    assert rejects[0]["schema_errors"][0]["code"] == "compiler_version_format"
+    assert manifest["validation"]["quality_filter"]["reason_counts"] == {
+        "metadata_schema_invalid": 1
+    }
+
+
+def test_record_quality_report_flags_selector_mismatch_and_bad_outputs():
+    from src.dataset_export_primitives import (
+        build_training_record,
+        training_record_quality_report,
+    )
+
+    record = build_training_record(
+        "function bytecode_function:\n  temp_1 = CALLDATALOAD 0x04",
+        "uint256 x = 1;",
+        {"selector": "0xdeadbeef"},
+    )
+
+    report = training_record_quality_report(record)
+
+    assert report["status"] == "failed"
+    assert "selector_input_mismatch" in report["reasons"]
+    assert "output_missing_solidity_entrypoint" in report["reasons"]
+
+
 def test_data_quality_ci_workflow_runs_regression_subset():
     workflow = Path(".github/workflows/data-quality.yml")
     assert workflow.exists()

@@ -133,9 +133,14 @@ class ReplicationEvaluation:
             },
             "reference_fact_count": self.reference_fact_count,
             "candidate_fact_count": self.candidate_fact_count,
+            "missing_fact_count": sum(len(values) for values in self.missing_facts.values()),
+            "extra_fact_count": sum(len(values) for values in self.extra_facts.values()),
             "missing_facts": self.missing_facts,
             "extra_facts": self.extra_facts,
             "hallucination_buckets": self.hallucination_buckets,
+            "hallucination_count": sum(
+                len(values) for values in self.hallucination_buckets.values()
+            ),
             "groundedness_score": self.groundedness_score,
         }
 
@@ -280,6 +285,11 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
             overall_counts["fp"],
             overall_counts["fn"],
         ).to_dict()
+        summary["fact_error_totals"] = {
+            "matched": overall_counts["tp"],
+            "extra": overall_counts["fp"],
+            "missing": overall_counts["fn"],
+        }
         summary["by_category_micro"] = {
             category: PrecisionRecallF1.from_counts(
                 counts["tp"],
@@ -288,6 +298,7 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
             ).to_dict()
             for category, counts in sorted(category_counts.items())
         }
+        summary["category_gap_summary"] = _category_gap_summary(category_counts)
 
     hallucination_total = sum(hallucination_counts.values())
     if hallucination_counts or groundedness_scores:
@@ -305,6 +316,40 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
             summary["groundedness_score_mean"] = sum(groundedness_scores) / len(groundedness_scores)
 
     return summary
+
+
+def _category_gap_summary(category_counts: Mapping[str, Mapping[str, int]]) -> List[Dict[str, Any]]:
+    gaps: List[Dict[str, Any]] = []
+    for category, counts in category_counts.items():
+        score = PrecisionRecallF1.from_counts(
+            int(counts.get("tp", 0)),
+            int(counts.get("fp", 0)),
+            int(counts.get("fn", 0)),
+        )
+        if score.false_positives == 0 and score.false_negatives == 0 and score.f1 >= 0.999:
+            continue
+        priority = "recall" if score.false_negatives >= score.false_positives else "precision"
+        gaps.append(
+            {
+                "category": category,
+                "precision": score.precision,
+                "recall": score.recall,
+                "f1": score.f1,
+                "true_positives": score.true_positives,
+                "false_positives": score.false_positives,
+                "false_negatives": score.false_negatives,
+                "primary_error": priority,
+            }
+        )
+
+    gaps.sort(
+        key=lambda row: (
+            float(row["f1"]),
+            -(int(row["false_negatives"]) + int(row["false_positives"])),
+            str(row["category"]),
+        )
+    )
+    return gaps
 
 
 def _normalized_grounding_facts(grounding_facts: Mapping[str, Iterable[str]]) -> FactMap:

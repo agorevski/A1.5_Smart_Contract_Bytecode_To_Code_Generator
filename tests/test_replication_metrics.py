@@ -172,7 +172,10 @@ class TestAggregateReplicationScores:
         assert 0 < summary["recall_mean"] < 1.0
         assert 0 < summary["f1_mean"] < 1.0
         assert summary["micro"]["false_negatives"] == 1
+        assert summary["fact_error_totals"] == {"matched": 10, "extra": 0, "missing": 1}
         assert summary["by_category_micro"]["state_write"]["false_negatives"] == 1
+        assert summary["category_gap_summary"][0]["category"] == "state_write"
+        assert summary["category_gap_summary"][0]["primary_error"] == "recall"
 
     def test_aggregates_hallucination_bucket_counts(self):
         row = evaluate_replication(

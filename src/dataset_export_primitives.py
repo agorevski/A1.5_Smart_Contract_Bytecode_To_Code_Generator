@@ -37,18 +37,52 @@ def normalize_tac(tac: str) -> str:
     return _collapse_whitespace(text).lower()
 
 
-_FUNCTION_HEADER_RE = re.compile(r"^(\s*)function\s+.+:\s*$")
+_FUNCTION_HEADER_RE = re.compile(r"^(\s*)function\s+(.+):\s*$", re.IGNORECASE)
 _SELECTOR_COMMENT_RE = re.compile(
-    r"//\s*(?:function\s+)?selector:\s*(0x[0-9a-fA-F]{8})",
+    r"//\s*(?:function\s+)?selector\s*(?::|\s+)\s*(0x[0-9a-fA-F]{8})",
     re.IGNORECASE,
 )
 _SOURCE_ONLY_COMMENT_RE = re.compile(
-    r"^\s*//\s*(?:Compiler:|Returns:|param\[\d+\]\s+at\s+0x[0-9a-fA-F]+:|event:)",
+    r"^\s*//\s*(?:"
+    r"Solidity\s+compiler|Compiler|Optimizer|EVM(?:\s+version)?|"
+    r"Function\s+signature|Function\s*:(?!\s*selector\b)|Signature|"
+    r"Visibility|Payable|View/Pure|View|Pure|State\s+mutability|Mutability|"
+    r"Returns?|Parameters?|Inputs?|param\[[^\]]+\]|event|ABI|Source|"
+    r"Contract(?:\s+name)?|Compiled\s+contract|Inheritance|Modifiers?|Base\s+contracts?"
+    r")(?:\s|:|$)",
     re.IGNORECASE,
 )
-_STORAGE_LAYOUT_HEADER_RE = re.compile(r"^\s*//\s*Storage layout:\s*$", re.IGNORECASE)
-_STORAGE_LAYOUT_ROW_RE = re.compile(r"^\s*//\s*slot\s+\d+:", re.IGNORECASE)
+_STORAGE_LAYOUT_HEADER_RE = re.compile(r"^\s*//\s*Storage\s+layout\s*:?\s*$", re.IGNORECASE)
+_STORAGE_LAYOUT_ROW_RE = re.compile(
+    r"^\s*//\s*(?:slot\s+\d+|\[slot\s+\d+\]|storage\s+slot\b|\d+\s*:)",
+    re.IGNORECASE,
+)
 _SOURCE_STORAGE_ANNOTATION_RE = re.compile(r"\s+//\s*likely:\s+.*$", re.IGNORECASE)
+_SAFE_TAC_FUNCTION_NAME_RE = re.compile(
+    r"^(?:selector_[0-9a-fA-F]{8}|function_0x[0-9a-fA-F]{8}|"
+    r"bytecode(?:_[A-Za-z0-9_]+)?|fallback(?:_function)?|receive|internal_[A-Za-z0-9_]+)$"
+)
+_PROMPT_SOURCE_LEAK_RE = re.compile(
+    r"^\s*(?://\s*)?(?:"
+    r"(?:Solidity\s+compiler|Compiler|Optimizer|Visibility|Payable|"
+    r"View/Pure|State\s+mutability|Storage\s+layout|Function\s+signature|"
+    r"ABI|Source|Contract\s+name|Returns?|Parameters?|Inputs?)\s*:|"
+    r"Function\s*:(?!\s*selector\b)|"
+    r"param\[[^\]]+\]\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SOURCE_SIGNATURE_HEADER_RE = re.compile(
+    r"^\s*function\s+(?!selector_[0-9a-fA-F]{8}\b|function_0x[0-9a-fA-F]{8}\b|"
+    r"bytecode(?:_[A-Za-z0-9_]+)?\b|fallback(?:_function)?\b|receive\b|"
+    r"internal_[A-Za-z0-9_]+\b)[A-Za-z_$][A-Za-z0-9_$]*\s*\([^)]*\)\s*:\s*$",
+    re.IGNORECASE,
+)
+_TAC_BLOCK_LABEL_RE = re.compile(r"^\s*(?:block|bb|label)[A-Za-z0-9_]*:\s*$", re.IGNORECASE)
+_COMPLETION_ENTRYPOINT_RE = re.compile(
+    r"\b(?:function\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\(|constructor\s*\(|"
+    r"fallback\s*\(|receive\s*\(|modifier\s+[A-Za-z_$][A-Za-z0-9_$]*\s*\()"
+)
 
 
 def _selector_safe_name(selector: Optional[str]) -> Optional[str]:
@@ -61,6 +95,13 @@ def _selector_safe_name(selector: Optional[str]) -> Optional[str]:
     if len(selector_text) != 8:
         return None
     return f"selector_{selector_text}"
+
+
+def _header_safe_name(header_text: str) -> Optional[str]:
+    name = str(header_text or "").strip().split("(", 1)[0].split(None, 1)[0].strip()
+    if not name:
+        return None
+    return name if _SAFE_TAC_FUNCTION_NAME_RE.match(name) else None
 
 
 def _safe_tac_function_name(bytecode_function: Any) -> str:
@@ -106,11 +147,20 @@ def sanitize_tac_prompt_input(tac: str) -> str:
 
     lines = tac.splitlines()
     sanitized: List[str] = []
+    in_storage_layout = False
     for idx, line in enumerate(lines):
         stripped = line.strip()
+        if in_storage_layout:
+            if not stripped or _STORAGE_LAYOUT_ROW_RE.match(stripped):
+                continue
+            in_storage_layout = False
+
         if _SOURCE_ONLY_COMMENT_RE.match(stripped):
             continue
-        if _STORAGE_LAYOUT_HEADER_RE.match(stripped) or _STORAGE_LAYOUT_ROW_RE.match(stripped):
+        if _STORAGE_LAYOUT_HEADER_RE.match(stripped):
+            in_storage_layout = True
+            continue
+        if _STORAGE_LAYOUT_ROW_RE.match(stripped):
             continue
 
         header_match = _FUNCTION_HEADER_RE.match(line)
@@ -119,7 +169,7 @@ def sanitize_tac_prompt_input(tac: str) -> str:
             selector_name = _selector_safe_name(selector)
             if selector_name:
                 sanitized.append(f"{header_match.group(1)}function {selector_name}:")
-            elif "(" in line or ")" in line:
+            elif not _header_safe_name(header_match.group(2)):
                 sanitized.append(f"{header_match.group(1)}function bytecode_function:")
             else:
                 sanitized.append(line)
@@ -172,6 +222,42 @@ def normalize_training_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str,
     normalized = dict(metadata or {})
     normalized.setdefault("schema_version", TRAINING_ROW_SCHEMA_VERSION)
     return normalized
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def _line_count(text: Any) -> int:
+    return len(str(text or "").splitlines())
+
+
+def _tac_instruction_line_count(tac: Any) -> int:
+    count = 0
+    for line in str(tac or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if stripped.lower().startswith("function ") and stripped.endswith(":"):
+            continue
+        if _TAC_BLOCK_LABEL_RE.match(stripped):
+            continue
+        count += 1
+    return count
+
+
+def training_record_quality_metadata(prompt_input: Any, output: Any) -> Dict[str, int]:
+    input_text = str(prompt_input or "")
+    output_text = str(output or "")
+    return {
+        "input_chars": len(input_text),
+        "output_chars": len(output_text),
+        "input_lines": _line_count(input_text),
+        "output_lines": _line_count(output_text),
+        "input_token_estimate": _token_count_estimate(input_text),
+        "output_token_estimate": _token_count_estimate(output_text),
+        "tac_instruction_lines": _tac_instruction_line_count(input_text),
+    }
 
 
 def validate_training_metadata_schema(
@@ -234,7 +320,16 @@ def validate_training_metadata_schema(
             }
         )
 
-    for key in ("source_hash", "source_code_hash", "body_hash", "input_hash", "output_hash"):
+    for key in (
+        "source_hash",
+        "source_code_hash",
+        "body_hash",
+        "input_hash",
+        "output_hash",
+        "pair_norm_hash",
+        "tac_hash",
+        "final_row_hash",
+    ):
         value = metadata.get(key)
         if value not in (None, "") and not (isinstance(value, str) and _HASH_RE.match(value)):
             errors.append(
@@ -345,16 +440,96 @@ def is_partial_training_pair(
     return str(function_name or "").startswith("unknown_")
 
 
+def prompt_leakage_reject_reasons(prompt_input: Any) -> List[str]:
+    text = str(prompt_input or "")
+    reasons: List[str] = []
+    if _PROMPT_SOURCE_LEAK_RE.search(text):
+        reasons.append("prompt_source_metadata_leak")
+    if any(_SOURCE_SIGNATURE_HEADER_RE.match(line) for line in text.splitlines()):
+        reasons.append("prompt_source_signature_leak")
+    return reasons
+
+
+def solidity_completion_quality_reject_reasons(output: Any) -> List[str]:
+    text = str(output or "")
+    stripped = text.strip()
+    reasons: List[str] = []
+    if not stripped:
+        return ["output_empty"]
+    if is_partial_training_pair(solidity_code=stripped):
+        reasons.append("partial_placeholder")
+    if not _COMPLETION_ENTRYPOINT_RE.search(stripped):
+        reasons.append("output_missing_solidity_entrypoint")
+    return reasons
+
+
+def metadata_alignment_reject_reasons(record: Dict[str, Any]) -> List[str]:
+    metadata = parse_metadata_object(record.get("metadata", {}))
+    selector = metadata.get("selector", metadata.get("function_selector"))
+    selector_name = _selector_safe_name(selector)
+    if not selector_name:
+        return []
+    selector_hex = str(selector).strip().lower()
+    input_text = str(record.get("input", "")).lower()
+    if selector_hex in input_text or selector_name.lower() in input_text:
+        return []
+    return ["selector_input_mismatch"]
+
+
+def training_record_quality_report(
+    record: Dict[str, Any],
+    *,
+    validate_schema: bool = True,
+    allow_legacy: bool = False,
+) -> Dict[str, Any]:
+    reasons: List[str] = []
+    input_text = record.get("input", "") if isinstance(record, dict) else ""
+    output_text = record.get("output", "") if isinstance(record, dict) else ""
+    reasons.extend(tac_quality_reject_reasons(input_text))
+    reasons.extend(prompt_leakage_reject_reasons(input_text))
+    reasons.extend(solidity_completion_quality_reject_reasons(output_text))
+    if isinstance(record, dict):
+        reasons.extend(metadata_alignment_reject_reasons(record))
+
+    schema_validation = (
+        validate_training_record_schema(record, allow_legacy=allow_legacy)
+        if validate_schema
+        else {"status": "skipped", "errors": []}
+    )
+    if schema_validation["status"] != "passed":
+        reasons.append("metadata_schema_invalid")
+
+    return {
+        "status": "failed" if reasons else "passed",
+        "reasons": reasons,
+        "quality": training_record_quality_metadata(input_text, output_text),
+        "schema_validation": schema_validation,
+    }
+
+
+def training_record_quality_reject_reasons(record: Dict[str, Any]) -> List[str]:
+    return list(training_record_quality_report(record, validate_schema=False)["reasons"])
+
+
 def build_training_record(
     prompt_input: str,
     output: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     sanitized_input = sanitize_tac_prompt_input(prompt_input)
+    output_text = str(output or "")
+    normalized_metadata = normalize_training_metadata(metadata)
+    normalized_metadata["input_hash"] = _sha256_text(sanitized_input)
+    normalized_metadata["output_hash"] = _sha256_text(output_text)
+    normalized_metadata["final_row_hash"] = final_row_hash(sanitized_input, output_text)
+    normalized_metadata["quality"] = training_record_quality_metadata(
+        sanitized_input,
+        output_text,
+    )
     return {
         "input": sanitized_input,
-        "output": str(output or ""),
-        "metadata": normalize_training_metadata(metadata),
+        "output": output_text,
+        "metadata": normalized_metadata,
     }
 
 
@@ -455,9 +630,13 @@ _TAC_QUALITY_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 def tac_quality_reject_reasons(tac: Any) -> List[str]:
     text = str(tac or "")
     reasons: List[str] = []
+    if not text.strip():
+        reasons.append("tac_empty")
     for reason, pattern in _TAC_QUALITY_PATTERNS:
         if pattern.search(text) and reason not in reasons:
             reasons.append(reason)
+    if text.strip() and _tac_instruction_line_count(text) == 0:
+        reasons.append("tac_no_operations")
     return reasons
 
 
@@ -619,4 +798,3 @@ def match_functions_by_selector(
                 }
             )
     return matches
-

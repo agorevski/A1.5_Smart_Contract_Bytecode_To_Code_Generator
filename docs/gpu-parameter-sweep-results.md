@@ -1,10 +1,17 @@
 # GPU Parameter Sweep Results
 
-## Recommendation
+## Scope
 
-Use the opt-in throughput recipe now configured in the repo. The wrapper runs
-evaluation by default; add `SKIP_EVAL=true` only when repeating a throughput
-sweep where post-train quality reports are intentionally out of scope:
+This document separates measured GPU sweep results from operational
+recommendations. The measured sweeps were short synthetic Qwen 7B LoRA trials on
+4x NVIDIA RTX 8000 GPUs. They are throughput/memory data, not model-quality
+benchmarks. The checked-in `latest_results.txt` is a tiny eval-only Llama 3B
+smoke result and is not used as GPU sweep evidence.
+
+## Short-context recommendation
+
+Use the opt-in throughput recipe wired into the wrappers when the goal is maximum
+short-context throughput on 4x RTX 8000:
 
 ```bash
 THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh
@@ -24,23 +31,28 @@ uv run torchrun --nproc_per_node=4 train.py \
   --no-gradient-checkpointing
 ```
 
-Recommended defaults:
+Recommended defaults from the measured short-context sweep:
 
-| Parameter | Default | Reason |
+| Parameter | Value | Basis |
 |---|---:|---|
-| GPUs | 4 | Uses all available RTX 8000 GPUs through `torchrun` DDP. |
+| GPUs | 4 | Uses all available RTX 8000 GPUs through DDP. |
 | Per-GPU batch size | 9 | Highest successful batch at `seq_len=256`; batch 10 OOMed. |
 | Global batch size | 36 | Keeps gradient accumulation at 1 on 4 GPUs. |
-| Max sequence length | 256 | Best observed memory/utilization point under the 1-minute sweep cap. |
-| Precision | fp16 | RTX 8000 is Turing generation; fp16 is the fast mixed-precision path. |
-| Gradient checkpointing | off | Disabling it fills VRAM and speeds steps; checkpointing under-used memory and timed out in short trials. |
-| Quantization | off | Full fp16 LoRA used much more GPU memory and throughput than 4-bit loading would. |
+| Max sequence length | 256 | Best observed memory/utilization point under the short sweep cap. |
+| Precision | fp16 | RTX 8000 is Turing; BF16 is not the native fast path. |
+| Gradient checkpointing | off | Checkpointing reduced memory use and did not complete within the short sweep window. |
+| Quantization | off | Short-context result was measured with full fp16 base loading plus LoRA. |
 
-If sequence context is more important than maximum throughput, use `MAX_SEQ_LEN=512 BATCH_SIZE=4 GLOBAL_BATCH_SIZE=16 ./run_train_torchrun.sh`. That was the largest successful 512-token configuration, but it was slightly slower and used less memory than the recommended 256-token recipe.
+If context length matters more than short-context throughput, use
+`MAX_SEQ_LEN=512 BATCH_SIZE=4 GLOBAL_BATCH_SIZE=16 ./run_train_torchrun.sh`.
+That was the largest successful 512-token configuration in the short sweep.
 
 ## Locked 8192-token recommendation
 
-For runs that must lock `max_seq_length=8192` on 4x RTX 8000, use 4-bit QLoRA, fp16 compute, gradient checkpointing, and per-GPU micro-batch size 1. This was the only successful 8192-token configuration in the follow-up sweep; batch size 2 OOMed, so larger micro-batches are not viable on this hardware.
+For fixed `max_seq_length=8192` on 4x RTX 8000, the measured viable setup is
+4-bit QLoRA, fp16 compute, gradient checkpointing, and per-GPU micro-batch size
+1. Full fp16 LoRA OOMed at batch size 1, QLoRA without checkpointing OOMed, and
+QLoRA batch size 2 also OOMed.
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=4 train.py \
@@ -56,21 +68,37 @@ uv run torchrun --standalone --nproc_per_node=4 train.py \
   --train-eval-strategy no
 ```
 
-Recommended 8192-token settings:
+Use gradient accumulation, not a larger per-GPU micro-batch, if a larger
+effective global batch is required.
 
-| Parameter | 8192-token value | Reason |
-|---|---:|---|
-| GPUs | 4 | Uses all available RTX 8000 GPUs through `torchrun` DDP. |
-| Per-GPU batch size | 1 | Only successful 8192-token micro-batch; batch 2 OOMed. |
-| Global batch size | 4 | Keeps gradient accumulation at 1 for fastest optimizer cadence. Increase only via gradient accumulation if a larger effective batch is needed. |
-| Max sequence length | 8192 | Locked for long-context training. |
-| Precision | fp16 | RTX 8000 is Turing generation; fp16 is the supported mixed-precision path. |
-| Gradient checkpointing | on | Required at 8192 tokens even with QLoRA. |
-| Quantization | on | Full fp16 LoRA OOMed at batch size 1, with and without gradient checkpointing. |
+## Current repository wiring
+
+- `train.py` data-safe defaults: `batch_size=1`, `global_batch_size=16`,
+  `max_seq_length=8192`, `precision=fp16`, `quantization=false`, and gradient
+  checkpointing enabled.
+- Direct `train.py` auto-relaunches with `torchrun --standalone` when
+  `--num-gpus > 1`, more than one CUDA GPU is visible, and it is not already in a
+  distributed launch. Use `--num-gpus 1` or `--no-auto-torchrun` to disable that.
+- `train_common.sh`: when `THROUGHPUT_SWEEP_DEFAULTS=true`, sets
+  `MAX_SEQ_LEN=256`, `BATCH_SIZE=9`, `GLOBAL_BATCH_SIZE=BATCH_SIZE * NGPUS`,
+  `PRECISION=fp16`, and `GRADIENT_CHECKPOINTING=false` unless explicitly
+  overridden.
+- Without throughput defaults, wrappers auto-detect P99 tokenizer sequence length
+  and cache it at `data/preflight_cache/sequence_lengths.json`; batch size is
+  `8192 / MAX_SEQ_LEN`, clamped to 1..32.
+- `run_train_torchrun.sh` passes the resolved batch/global batch, sequence
+  length, precision, gradient-checkpointing, reporting, and optional skip-eval
+  settings to `train.py`.
+- `run_train_deepspeed.sh` uses `DS_CONFIG` (default `ds_config.json`). The
+  checked-in config is ZeRO stage 0 with auto BF16/FP16 fields and auto batch
+  sizes; it is not a ZeRO-2/3 large-model config.
+- `src/model_setup.py` keeps inference prompt context at least 2048 tokens even
+  if a short sweep length such as 256 is saved in model config.
 
 ## Sweep method
 
-The sweeps intentionally avoided large dataset runs so each trial stayed near or under one minute.
+The sweeps intentionally avoided full dataset runs so each trial stayed near or
+under one minute.
 
 The default short-context sweep used:
 
@@ -82,15 +110,18 @@ The default short-context sweep used:
 - `nvidia-smi` sampling all four GPUs every 0.5 seconds
 - no batch sizes below 4
 
-The locked 8192-token follow-up used the same model, LoRA settings, DDP launcher, and fp16 compute path, but used one synthetic 8192-token batch per rank and swept quantization/checkpointing because full-precision LoRA could not fit. The follow-up table reports `torch.cuda` peak allocated/reserved memory instead of `nvidia-smi` sampling.
+The locked 8192-token follow-up used the same model, LoRA settings, DDP
+launcher, and fp16 compute path, but used one synthetic 8192-token batch per rank
+and swept quantization/checkpointing because full-precision LoRA did not fit. The
+follow-up table reports `torch.cuda` peak allocated/reserved memory instead of
+`nvidia-smi` sampling.
 
-Wall time includes process startup and model load. Step time is the measured optimizer step after the model is loaded.
+Wall time includes process startup and model load. Step time is the measured
+optimizer step after model load.
 
-## Results
+## Measured results
 
 ### Locked `seq_len=8192` follow-up
-
-The 8192-token follow-up used one synthetic fixed-length training batch per rank so every trial exercised the requested context length while staying under the one-minute sweep cap. The model, LoRA rank/alpha/dropout, DDP launcher, and fp16 compute path matched the default Qwen 7B training recipe.
 
 | Batch/GPU | Seq len | Quantization | Grad checkpointing | Status | Wall time (s) | Step time (s) | Global tokens/step | Tokens/s | Peak allocated/GPU (MiB) | Peak reserved/GPU (MiB) |
 |---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|
@@ -100,8 +131,6 @@ The 8192-token follow-up used one synthetic fixed-length training batch per rank
 | 1 | 8192 | on | on | ok | 49.25 | 33.55 | 32,768 | 977 | 45,137 | 46,296 |
 | 2 | 8192 | on | on | OOM | 46.26 | - | - | - | - | - |
 | 4 | 8192 | on | on | OOM | 24.61 | - | - | - | - | - |
-
-Interpretation: at 8192 tokens, batch size 1 per GPU is the practical ceiling and therefore the most efficient viable micro-batch. Use gradient accumulation, not a larger per-GPU batch, if the training run needs an effective global batch above 4.
 
 ### Default short-context sweep
 
@@ -122,16 +151,18 @@ Interpretation: at 8192 tokens, batch size 1 per GPU is the practical ceiling an
 
 ## Interpretation
 
-`batch_size=9`, `max_seq_length=256`, and `--no-gradient-checkpointing` is the best default for the stated goal: keep all four GPUs busy and close to full memory without OOM. It reached 100% observed GPU utilization, used about 46.1 GiB of the 48 GiB available per GPU, and batch size 10 failed with CUDA OOM, so batch 9 is the practical ceiling for this sequence length.
+`batch_size=9`, `max_seq_length=256`, and `--no-gradient-checkpointing` is the
+best measured short-context recipe for filling 4x RTX 8000 memory without OOM. It
+reached 100% observed GPU utilization, used about 46.1 GiB of the 48 GiB
+available per GPU, and batch size 10 failed with CUDA OOM.
 
-The `seq_len=512, batch_size=4` alternative also completed and reached 100% utilization, but it used about 44.4 GiB and processed fewer tokens per measured optimizer step than `seq_len=256, batch_size=9`. Gradient checkpointing should stay off for the default recipe because it reduced memory use substantially and did not complete within the short sweep window.
+The `seq_len=512, batch_size=4` alternative also completed and reached 100%
+utilization, but it used less memory and processed fewer tokens per measured step
+than `seq_len=256, batch_size=9`. Gradient checkpointing should stay off for the
+short-context throughput recipe because it reduced memory use and did not finish
+inside the short sweep cap.
 
-## Throughput recipe wiring
-
-The repository keeps data-safe `train.py` defaults, but exposes this sweep as an
-opt-in wrapper recipe:
-
-- `train.py`: data-safe defaults remain `batch_size=4`, `global_batch_size=16`, and `max_seq_length=2048`; precision defaults to `fp16`, and gradient checkpointing defaults to disabled.
-- `src/model_setup.py`: `ModelConfig` defaults to `max_sequence_length=2048`, `precision="fp16"`, and `gradient_checkpointing=False`; inference keeps at least a 2048-token prompt context even when a short training sweep length is saved in model config.
-- `train_common.sh`: `THROUGHPUT_SWEEP_DEFAULTS=true` sets `BATCH_SIZE=9`, `MAX_SEQ_LEN=256`, `GLOBAL_BATCH_SIZE=BATCH_SIZE * NGPUS`, `PRECISION=fp16`, and `GRADIENT_CHECKPOINTING=false`.
-- `run_train_torchrun.sh` and `run_train_deepspeed.sh`: pass the recommended precision, global batch size, and gradient-checkpointing setting through to `train.py`
+At 8192 tokens, batch size 1 per GPU is the practical ceiling on this hardware,
+and only with QLoRA plus gradient checkpointing. Increase effective batch size
+through accumulation, and validate quality separately with the eval/quality-gate
+pipeline.

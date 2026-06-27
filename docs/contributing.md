@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator.git
 cd A1.5_Smart_Contract_Bytecode_To_Code_Generator
-uv sync
+uv sync --dev
 ```
 
 ## Development Workflow
@@ -17,7 +17,7 @@ uv sync
 5. Commit with conventional messages (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`)
 6. Push and open a pull request
 
-No CI workflow is configured for this repository; run the local `uv` commands before opening a pull request.
+The data-quality GitHub Actions workflow runs targeted CPU regression checks, but contributors should still run the relevant local `uv` commands before opening a pull request.
 
 ## Code Standards
 
@@ -30,11 +30,10 @@ No CI workflow is configured for this repository; run the local `uv` commands be
 ## Testing
 
 ```bash
-uv run pytest                              # all tests (~380 across 8 files)
+uv run pytest                              # all tests
 uv run pytest tests/test_bytecode_analyzer.py -v  # specific module
 uv run pytest tests/test_vulnerability_detector.py -v  # vulnerability detection
 uv run pytest tests/test_e2e.py -v                # end-to-end integration
-uv run pytest --cov=src tests/             # with coverage
 ```
 
 ## Areas for Contribution

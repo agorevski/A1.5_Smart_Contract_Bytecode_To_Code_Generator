@@ -69,14 +69,14 @@ import yaml
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_NUM_GPUS = 4
-DEFAULT_BATCH_SIZE = 4
+DEFAULT_BATCH_SIZE = 1
 DEFAULT_GLOBAL_BATCH_SIZE = 16
-DEFAULT_MAX_SEQ_LENGTH = 2048
+DEFAULT_MAX_SEQ_LENGTH = 8192
 DEFAULT_EVAL_MAX_NEW_TOKENS = 256
 DEFAULT_GLOBAL_SEED = 42
 DEFAULT_USE_QUANTIZATION = False
 DEFAULT_PRECISION = "fp16"
-DEFAULT_GRADIENT_CHECKPOINTING = False
+DEFAULT_GRADIENT_CHECKPOINTING = True
 DEFAULT_LORA_RANK = 16
 DEFAULT_LORA_ALPHA = 32
 DEFAULT_LORA_DROPOUT = 0.1
@@ -2018,6 +2018,7 @@ def _runtime_metadata(seed: int | None) -> dict:
 def _seed_everything(seed: int | None) -> None:
     if seed is None:
         return
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
     random.seed(seed)
     try:
         import numpy as np
@@ -2031,6 +2032,15 @@ def _seed_everything(seed: int | None) -> None:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+    except Exception:
+        pass
+    try:
+        from transformers import set_seed
+
+        set_seed(seed)
     except Exception:
         pass
 
@@ -2135,11 +2145,15 @@ def _collect_training_artifacts(output_dir: str, model_path: str | None) -> dict
     model = Path(model_path) if model_path else None
     metrics_path = model / "training_metrics.json" if model else None
     model_config_path = model / "model_config.json" if model else None
+    model_input_manifest_path = model / "training_input_manifest.json" if model else None
+    output_input_manifest_path = output / "training_input_manifest.json"
     log_history_json_path = model / "training_log_history.json" if model else None
     log_history_csv_path = model / "training_log_history.csv" if model else None
     artifacts = {
         "model": _file_artifact(model),
         "model_config": _file_artifact(model_config_path),
+        "training_input_manifest": _file_artifact(model_input_manifest_path),
+        "training_input_manifest_working": _file_artifact(output_input_manifest_path),
         "training_metrics": _file_artifact(metrics_path),
         "training_log_history_json": _file_artifact(log_history_json_path),
         "training_log_history_csv": _file_artifact(log_history_csv_path),
@@ -2157,6 +2171,14 @@ def _collect_training_artifacts(output_dir: str, model_path: str | None) -> dict
             model_config = _load_json(model_config_path)
         except Exception:
             model_config = None
+    training_input_manifest = None
+    for candidate in (model_input_manifest_path, output_input_manifest_path):
+        if candidate and candidate.exists():
+            try:
+                training_input_manifest = _load_json(candidate)
+                break
+            except Exception:
+                training_input_manifest = None
 
     trainer_state_paths = []
     for candidate in [output / "trainer_state.json"]:
@@ -2170,6 +2192,7 @@ def _collect_training_artifacts(output_dir: str, model_path: str | None) -> dict
     return {
         "artifacts": artifacts,
         "model_config": model_config,
+        "training_input_manifest": training_input_manifest,
         "final_metrics": metrics,
         "log_history_references": [_summarize_trainer_state(path) for path in trainer_state_paths],
     }
@@ -2796,10 +2819,10 @@ def train_model(
     train_path: str,
     val_path: str = None,
     output_dir: str = "models",
-    batch_size: int = 4,
+    batch_size: int = DEFAULT_BATCH_SIZE,
     learning_rate: float = 2e-4,
     num_epochs: int = 3,
-    max_seq_length: int = 2048,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     model_name: str = DEFAULT_MODEL_NAME,
     resume_from: str = None,
     use_quantization: bool = DEFAULT_USE_QUANTIZATION,
@@ -3707,8 +3730,8 @@ def main():
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=DEFAULT_MAX_SEQ_LENGTH,
-        help="Max sequence length",
+        default=None,
+        help=f"Max sequence length (default: {DEFAULT_MAX_SEQ_LENGTH})",
     )
     parser.add_argument(
         "--max-steps",
@@ -4129,6 +4152,8 @@ def main():
             args.epochs = 1
         if args.batch_size is None:
             args.batch_size = 2
+        if args.max_seq_length is None:
+            args.max_seq_length = 512
 
     # Apply --small defaults
     if args.small:
@@ -4136,16 +4161,22 @@ def main():
             args.epochs = 1
         if args.batch_size is None:
             args.batch_size = 2
+        if args.max_seq_length is None:
+            args.max_seq_length = min(DEFAULT_MAX_SEQ_LENGTH, 2048)
 
     # Final defaults
     if args.epochs is None:
         args.epochs = 3
     if args.batch_size is None:
         args.batch_size = DEFAULT_BATCH_SIZE
+    if args.max_seq_length is None:
+        args.max_seq_length = DEFAULT_MAX_SEQ_LENGTH
     if args.num_gpus < 1:
         raise SystemExit("--num-gpus must be at least 1")
     if args.batch_size < 1:
         raise SystemExit("--batch-size must be at least 1")
+    if args.max_seq_length < 1:
+        raise SystemExit("--max-seq-length must be at least 1")
     if args.global_batch_size is not None and args.global_batch_size < 1:
         raise SystemExit("--global-batch-size must be at least 1")
     if args.seed is not None and args.seed < 0:
@@ -4602,6 +4633,7 @@ def main():
             {
                 "model_path": model_path,
                 "model_config": training_artifacts["model_config"],
+                "input_manifest": training_artifacts["training_input_manifest"],
                 "final_metrics": training_artifacts["final_metrics"],
                 "log_history_references": training_artifacts["log_history_references"],
             }

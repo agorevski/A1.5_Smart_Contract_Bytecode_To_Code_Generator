@@ -13,11 +13,13 @@ import csv
 import hashlib
 import inspect
 import math
+import random
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from collections.abc import Mapping as MappingABC
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +37,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig,
     GenerationConfig,
+    set_seed,
 )
 from peft import (
     LoraConfig,
@@ -49,7 +52,7 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-TOKENIZATION_CACHE_VERSION = 1
+TOKENIZATION_CACHE_VERSION = 2
 
 SOLIDITY_RESERVED_WORDS = {
     "address",
@@ -117,7 +120,7 @@ class ModelConfig:
     """Configuration for the base model and optional LoRA adapter setup."""
 
     model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
-    max_sequence_length: int = 2048  # Practical training/inference default.
+    max_sequence_length: int = 8192  # Long-context training/inference default.
     use_lora: bool = True
     lora_rank: int = 16  # As specified in paper
     lora_alpha: int = 32
@@ -130,7 +133,7 @@ class ModelConfig:
     dataloader_pin_memory: Optional[bool] = None
     dataloader_persistent_workers: Optional[bool] = None
     dataloader_prefetch_factor: Optional[int] = None
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
     include_bytecode_metadata: bool = True
     include_compiler_metadata: bool = False  # Deprecated; ignored for prompt safety.
     report_to: Union[str, List[str]] = "none"
@@ -673,6 +676,147 @@ def _safe_tokenizer_len(tokenizer) -> Optional[int]:
             return None
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _numeric_summary(values: Sequence[int]) -> Dict[str, Any]:
+    if not values:
+        return {"count": 0}
+    sorted_values = sorted(int(value) for value in values)
+
+    def percentile(q: float) -> int:
+        idx = min(
+            max(math.ceil(len(sorted_values) * q) - 1, 0),
+            len(sorted_values) - 1,
+        )
+        return sorted_values[idx]
+
+    return {
+        "count": len(sorted_values),
+        "min": sorted_values[0],
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": sorted_values[-1],
+        "mean": float(sum(sorted_values) / len(sorted_values)),
+    }
+
+
+def _append_eos_if_supported(tokenizer, token_ids: List[Any]) -> List[Any]:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None or not token_ids:
+        return token_ids
+    if not all(isinstance(token_id, (int, np.integer)) for token_id in token_ids):
+        return token_ids
+    eos_id = int(eos_token_id)
+    if int(token_ids[-1]) == eos_id:
+        return token_ids
+    return [*token_ids, eos_id]
+
+
+def _set_global_training_seed(seed: int | None) -> None:
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    set_seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def _context_limit_from_config(config: Any) -> Optional[int]:
+    candidates: List[int] = []
+    for key in (
+        "max_position_embeddings",
+        "n_positions",
+        "max_seq_len",
+        "seq_length",
+        "model_max_length",
+    ):
+        value = getattr(config, key, None)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0 < parsed < 10_000_000:
+            candidates.append(parsed)
+    return max(candidates) if candidates else None
+
+
+def _configure_tokenizer_context(tokenizer, max_sequence_length: int) -> None:
+    try:
+        tokenizer.model_max_length = int(max_sequence_length)
+    except Exception:
+        logger.debug("Tokenizer model_max_length could not be set", exc_info=True)
+
+
+def _validate_context_window(model_config: Any, max_sequence_length: int) -> Dict[str, Any]:
+    requested = int(max_sequence_length)
+    model_limit = _context_limit_from_config(model_config)
+    report = {
+        "requested_max_sequence_length": requested,
+        "model_context_limit": model_limit,
+        "valid": model_limit is None or requested <= model_limit,
+    }
+    if model_limit is not None and requested > model_limit:
+        raise ValueError(
+            f"Configured max_sequence_length={requested} exceeds model context "
+            f"limit {model_limit}. Use a longer-context base model or lower --max-seq-length."
+        )
+    return report
+
+
+def _artifact_for_path(path: Optional[Union[str, Path]], *, jsonl: bool = False) -> Dict[str, Any]:
+    if path is None:
+        return {"path": None, "exists": False}
+    artifact_path = Path(path)
+    artifact: Dict[str, Any] = {"path": str(artifact_path), "exists": artifact_path.exists()}
+    if not artifact_path.exists():
+        return artifact
+    artifact["artifact_type"] = "directory" if artifact_path.is_dir() else "file"
+    if artifact_path.is_dir():
+        return artifact
+    stat = artifact_path.stat()
+    artifact.update(
+        {
+            "size_bytes": stat.st_size,
+            "sha256": _sha256_file(artifact_path),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+    )
+    if jsonl:
+        rows = 0
+        with open(artifact_path, "r") as f:
+            for line in f:
+                if line.strip():
+                    rows += 1
+        artifact["row_count"] = rows
+    return artifact
+
+
 def tokenizer_cache_identity(tokenizer) -> Dict[str, Any]:
     """Return stable tokenizer identity fields for cache invalidation."""
     tokenizer_name = (
@@ -730,7 +874,7 @@ def detect_max_sequence_length(
     tokenizer,
     percentile: float = 0.99,
     min_length: int = 128,
-    max_length: int = 4096,
+    max_length: int = 8192,
     default_length: int = 512,
     include_bytecode_metadata: bool = True,
     include_compiler_metadata: bool = False,
@@ -768,6 +912,37 @@ def _cuda_supports_bf16() -> bool:
         return False
     major, _minor = torch.cuda.get_device_capability()
     return major >= 8
+
+
+def _cuda_supports_flash_attention_2() -> bool:
+    """Return True when the current CUDA device can use Flash Attention 2."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except Exception as exc:
+        logger.warning("Could not read CUDA device capability for Flash Attention 2: %s", exc)
+        return False
+    return major >= 8
+
+
+def resolve_attention_implementation(has_cuda: Optional[bool] = None) -> Optional[str]:
+    """Select a safe attention implementation for the current CUDA hardware."""
+    if has_cuda is None:
+        has_cuda = torch.cuda.is_available()
+    if not has_cuda:
+        return None
+    if _cuda_supports_flash_attention_2():
+        try:
+            import flash_attn  # noqa: F401
+        except Exception as exc:
+            logger.info("Flash Attention 2 unavailable; using PyTorch SDPA: %s", exc)
+        else:
+            logger.info("Flash Attention 2 available and supported by this GPU")
+            return "flash_attention_2"
+    else:
+        logger.info("CUDA device does not support Flash Attention 2; using PyTorch SDPA")
+    return "sdpa"
 
 
 def resolve_training_precision(
@@ -870,6 +1045,9 @@ class SmartContractDataset(Dataset):
         self._tokenized_cache: Optional[List[Dict[str, List[Any]]]] = None
 
         cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
+        self.tokenization_cache_config = cache_config
+        resolved_cache_dir = cache_config.resolved_cache_dir(data_path)
+        self.tokenization_cache_dir = str(resolved_cache_dir) if resolved_cache_dir else None
         if cache_config.enabled:
             self._tokenized_cache = self._load_or_build_tokenization_cache(data_path, cache_config)
 
@@ -1116,6 +1294,10 @@ class SmartContractDataset(Dataset):
         prefix = f"{prefix_before_tac}{tac_text}{prefix_after_tac}"
         return prefix, target, suffix
 
+    def _target_token_ids(self, target: str, suffix: str) -> List[Any]:
+        target_ids = _tokenize_to_ids(self.tokenizer, f"{target}{suffix}")
+        return _append_eos_if_supported(self.tokenizer, target_ids)
+
     def __len__(self) -> int:
         return len(self.data)
 
@@ -1140,7 +1322,7 @@ class SmartContractDataset(Dataset):
             item["input"], output, item.get("metadata", {})
         )
 
-        target_ids = _tokenize_to_ids(self.tokenizer, f"{target}{suffix}")
+        target_ids = self._target_token_ids(target, suffix)
         if not target_ids:
             raise ValueError(f"Training example {idx} has an empty tokenized target")
 
@@ -1189,6 +1371,100 @@ class SmartContractDataset(Dataset):
             )
 
         return tokenized
+
+    def _summary_indices(self, max_examples: int) -> List[int]:
+        if not self.data or max_examples <= 0:
+            return []
+        if len(self.data) <= max_examples:
+            return list(range(len(self.data)))
+        return np.linspace(0, len(self.data) - 1, num=max_examples, dtype=int).tolist()
+
+    def _length_diagnostics_for_item(self, idx: int) -> Dict[str, Any]:
+        item = self.data[idx]
+        output = item["output"]
+        if self.augment_names and (idx % 10) < int(self.AUGMENT_RATE * 10):
+            output = augment_variable_names(output, seed=idx)
+
+        prefix_before_tac, tac_text, prefix_after_tac, target, suffix = (
+            self._format_prompt_components(item["input"], output, item.get("metadata", {}))
+        )
+        header_ids = _tokenize_to_ids(self.tokenizer, prefix_before_tac)
+        tac_ids = _tokenize_to_ids(self.tokenizer, tac_text)
+        footer_ids = _tokenize_to_ids(self.tokenizer, prefix_after_tac)
+        target_ids = self._target_token_ids(target, suffix)
+        fixed_prefix_len = len(header_ids) + len(footer_ids)
+        raw_length = fixed_prefix_len + len(tac_ids) + len(target_ids)
+
+        target_over_context = len(target_ids) >= self.max_length
+        prefix_budget = max(0, self.max_length - len(target_ids))
+        fixed_prefix_over_budget = not target_over_context and fixed_prefix_len > prefix_budget
+        if target_over_context or fixed_prefix_over_budget:
+            tac_tokens_retained = 0
+        else:
+            tac_tokens_retained = min(len(tac_ids), max(0, prefix_budget - fixed_prefix_len))
+
+        tokenized = self[idx]
+        supervised_tokens = sum(1 for label in tokenized["labels"] if label != -100)
+        return {
+            "dataset_index": idx,
+            "raw_prompt_tokens": raw_length,
+            "sequence_tokens": len(tokenized["input_ids"]),
+            "target_tokens": len(target_ids),
+            "supervised_tokens": supervised_tokens,
+            "tac_tokens_before": len(tac_ids),
+            "tac_tokens_retained": tac_tokens_retained,
+            "truncated": raw_length > self.max_length,
+            "target_over_context": target_over_context,
+            "fixed_prefix_over_budget": fixed_prefix_over_budget,
+            "has_supervised_tokens": supervised_tokens > 0,
+        }
+
+    def tokenization_summary(self, max_examples: int = 512) -> Dict[str, Any]:
+        """Return sampled token-length/truncation diagnostics for run manifests."""
+        indices = self._summary_indices(max_examples)
+        diagnostics = [self._length_diagnostics_for_item(idx) for idx in indices]
+        truncated = [item for item in diagnostics if item["truncated"]]
+        target_over_context = [item for item in diagnostics if item["target_over_context"]]
+        fixed_prefix_over_budget = [
+            item for item in diagnostics if item["fixed_prefix_over_budget"]
+        ]
+        empty_supervision = [item for item in diagnostics if not item["has_supervised_tokens"]]
+
+        sample_count = len(diagnostics)
+        return {
+            "row_count": len(self.data),
+            "max_sequence_length": int(self.max_length),
+            "sample_count": sample_count,
+            "max_examples": int(max_examples),
+            "sample_strategy": "all" if sample_count == len(self.data) else "linspace",
+            "tokenization_cache": {
+                "enabled": bool(self.tokenization_cache_config.enabled),
+                "cache_dir": self.tokenization_cache_dir,
+                "materialized": self._tokenized_cache is not None,
+                "overwrite": bool(self.tokenization_cache_config.overwrite),
+            },
+            "sequence_lengths": _numeric_summary([item["sequence_tokens"] for item in diagnostics]),
+            "raw_prompt_tokens": _numeric_summary(
+                [item["raw_prompt_tokens"] for item in diagnostics]
+            ),
+            "target_tokens": _numeric_summary([item["target_tokens"] for item in diagnostics]),
+            "supervised_tokens": _numeric_summary(
+                [item["supervised_tokens"] for item in diagnostics]
+            ),
+            "tac_tokens_before": _numeric_summary(
+                [item["tac_tokens_before"] for item in diagnostics]
+            ),
+            "tac_tokens_retained": _numeric_summary(
+                [item["tac_tokens_retained"] for item in diagnostics]
+            ),
+            "truncated_count": len(truncated),
+            "truncated_rate": float(len(truncated) / sample_count) if sample_count else 0.0,
+            "target_over_context_count": len(target_over_context),
+            "fixed_prefix_over_budget_count": len(fixed_prefix_over_budget),
+            "empty_supervision_count": len(empty_supervision),
+            "example_diagnostics": diagnostics[:10],
+            "truncated_examples": truncated[:10],
+        }
 
 
 class MemoryLoggingCallback(TrainerCallback):
@@ -1467,6 +1743,7 @@ class SmartContractModelTrainer:
         self.tokenizer = None
         self.model = None
         self.peft_model = None
+        self.context_window_report: Dict[str, Any] = {}
 
     def _get_hf_token(self) -> Optional[str]:
         """Get HuggingFace token from environment or settings."""
@@ -1516,6 +1793,7 @@ class SmartContractModelTrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        _configure_tokenizer_context(self.tokenizer, self.config.max_sequence_length)
 
         # Determine dtype and device based on GPU availability
         has_cuda = torch.cuda.is_available()
@@ -1556,15 +1834,8 @@ class SmartContractModelTrainer:
                 logger.warning("Could not set CUDA device to LOCAL_RANK=%s: %s", local_rank, e)
 
         # Load base model
-        # Use SDPA (Scaled Dot-Product Attention) for fused attention kernels
-        attn_impl = None
-        if has_cuda:
-            try:
-                import flash_attn  # noqa: F401
-
-                attn_impl = "flash_attention_2"
-            except ImportError:
-                attn_impl = "sdpa"  # PyTorch 2.x built-in efficient attention
+        # Use SDPA (Scaled Dot-Product Attention) unless Flash Attention 2 is supported.
+        attn_impl = resolve_attention_implementation(has_cuda)
 
         load_kwargs = {
             "trust_remote_code": True,
@@ -1584,6 +1855,14 @@ class SmartContractModelTrainer:
             self.config.model_name,
             **load_kwargs,
         )
+        self.context_window_report = _validate_context_window(
+            self.model.config,
+            self.config.max_sequence_length,
+        )
+        if hasattr(self.model.config, "max_length"):
+            self.model.config.max_length = int(self.config.max_sequence_length)
+        if hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = False
 
         if post_load_device is not None:
             self.model = self.model.to(post_load_device)
@@ -1648,7 +1927,7 @@ class SmartContractModelTrainer:
 
     def create_training_arguments(
         self,
-        batch_size: int = 4,
+        batch_size: int = 1,
         learning_rate: float = 2e-4,
         num_epochs: int = 3,
         warmup_steps: int = 100,
@@ -1669,7 +1948,7 @@ class SmartContractModelTrainer:
         dataloader_pin_memory: Optional[bool] = None,
         dataloader_persistent_workers: Optional[bool] = None,
         dataloader_prefetch_factor: Optional[int] = None,
-        gradient_checkpointing: bool = False,
+        gradient_checkpointing: bool = True,
         seed: int = 42,
         report_to: Union[str, List[str]] = "none",
     ) -> TrainingArguments:
@@ -1823,11 +2102,120 @@ class SmartContractModelTrainer:
 
         return TrainingArguments(**args)
 
+    def _training_args_manifest(self, training_args: TrainingArguments) -> Dict[str, Any]:
+        fields = (
+            "output_dir",
+            "num_train_epochs",
+            "per_device_train_batch_size",
+            "per_device_eval_batch_size",
+            "gradient_accumulation_steps",
+            "learning_rate",
+            "weight_decay",
+            "warmup_steps",
+            "lr_scheduler_type",
+            "optim",
+            "max_steps",
+            "max_grad_norm",
+            "logging_steps",
+            "save_strategy",
+            "save_steps",
+            "eval_strategy",
+            "evaluation_strategy",
+            "eval_steps",
+            "load_best_model_at_end",
+            "metric_for_best_model",
+            "greater_is_better",
+            "bf16",
+            "fp16",
+            "gradient_checkpointing",
+            "group_by_length",
+            "dataloader_num_workers",
+            "dataloader_pin_memory",
+            "dataloader_persistent_workers",
+            "dataloader_prefetch_factor",
+            "dataloader_drop_last",
+            "seed",
+            "data_seed",
+            "report_to",
+            "deepspeed",
+            "remove_unused_columns",
+        )
+        return {
+            field: _json_safe(getattr(training_args, field))
+            for field in fields
+            if hasattr(training_args, field)
+        }
+
+    def _write_training_input_manifest(
+        self,
+        path: Path,
+        *,
+        train_dataset_path: str,
+        eval_dataset_path: Optional[str],
+        train_dataset: SmartContractDataset,
+        eval_dataset: Optional[SmartContractDataset],
+        training_args: TrainingArguments,
+        tokenization_cache_config: TokenizationCacheConfig,
+        instrumentation: TrainingInstrumentationConfig,
+        seed: int,
+        eval_sample_indices: Optional[List[int]],
+        status: str,
+        final_model_path: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        manifest: Dict[str, Any] = {
+            "manifest_kind": "training_inputs",
+            "schema_version": 1,
+            "status": status,
+            "created_at": _utc_now_iso(),
+            "seed": int(seed),
+            "environment": {
+                "local_rank": os.environ.get("LOCAL_RANK"),
+                "world_size": os.environ.get("WORLD_SIZE"),
+                "tokenizers_parallelism": os.environ.get("TOKENIZERS_PARALLELISM"),
+            },
+            "context_window": {
+                **self.context_window_report,
+                "tokenizer_model_max_length": getattr(
+                    self.tokenizer,
+                    "model_max_length",
+                    None,
+                ),
+            },
+            "model_config": self.config.to_dict(),
+            "datasets": {
+                "train": {
+                    "artifact": _artifact_for_path(train_dataset_path, jsonl=True),
+                    "tokenization": train_dataset.tokenization_summary(),
+                },
+                "eval": {
+                    "artifact": _artifact_for_path(eval_dataset_path, jsonl=True),
+                    "tokenization": (
+                        eval_dataset.tokenization_summary() if eval_dataset is not None else None
+                    ),
+                    "sample_indices": eval_sample_indices,
+                },
+            },
+            "training_args": self._training_args_manifest(training_args),
+            "tokenization_cache": {
+                "enabled": bool(tokenization_cache_config.enabled),
+                "cache_dir": tokenization_cache_config.cache_dir,
+                "overwrite": bool(tokenization_cache_config.overwrite),
+            },
+            "instrumentation": _json_safe(instrumentation.__dict__),
+            "artifacts": {
+                "final_model": _artifact_for_path(final_model_path) if final_model_path else None,
+            },
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(_json_safe(manifest), f, indent=2, sort_keys=True)
+        return manifest
+
     def train(
         self,
         train_dataset_path: str,
         eval_dataset_path: Optional[str] = None,
-        batch_size: int = 4,
+        batch_size: int = 1,
         learning_rate: float = 2e-4,
         num_epochs: int = 3,
         gradient_accumulation_steps: int = 4,
@@ -1851,6 +2239,7 @@ class SmartContractModelTrainer:
         report_to: Optional[Union[str, List[str]]] = None,
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
+        _set_global_training_seed(seed)
         tokenizer, peft_model = self.setup_model(use_deepspeed=deepspeed_config is not None)
         tokenization_cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
         instrumentation = TrainingInstrumentationConfig.from_value(instrumentation_config)
@@ -1865,6 +2254,7 @@ class SmartContractModelTrainer:
         )
 
         eval_dataset = None
+        eval_sample_indices: Optional[List[int]] = None
         eval_strategy_requested = str(train_eval_strategy or "auto").lower()
         if (
             eval_strategy_requested != "no"
@@ -1883,14 +2273,21 @@ class SmartContractModelTrainer:
                 logger.warning("Evaluation dataset is empty; disabling evaluation")
                 eval_dataset = None
             elif train_eval_max_samples is not None and len(eval_dataset) > train_eval_max_samples:
-                eval_dataset.data = eval_dataset.data[:train_eval_max_samples]
+                rng = np.random.default_rng(int(seed))
+                eval_sample_indices = rng.choice(
+                    len(eval_dataset),
+                    size=int(train_eval_max_samples),
+                    replace=False,
+                ).tolist()
+                eval_dataset.data = [eval_dataset.data[i] for i in eval_sample_indices]
                 if eval_dataset._tokenized_cache is not None:
-                    eval_dataset._tokenized_cache = eval_dataset._tokenized_cache[
-                        :train_eval_max_samples
+                    eval_dataset._tokenized_cache = [
+                        eval_dataset._tokenized_cache[i] for i in eval_sample_indices
                     ]
                 logger.info(
-                    "Capped train-time evaluation dataset to %d examples",
+                    "Seed-sampled train-time evaluation dataset to %d examples with seed %d",
                     train_eval_max_samples,
+                    seed,
                 )
 
         do_eval = eval_dataset is not None
@@ -1968,6 +2365,21 @@ class SmartContractModelTrainer:
             report_to=report_to if report_to is not None else self.config.report_to,
         )
 
+        training_input_manifest_path = self.output_dir / "training_input_manifest.json"
+        self._write_training_input_manifest(
+            training_input_manifest_path,
+            train_dataset_path=train_dataset_path,
+            eval_dataset_path=eval_dataset_path,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            training_args=training_args,
+            tokenization_cache_config=tokenization_cache_config,
+            instrumentation=instrumentation,
+            seed=seed,
+            eval_sample_indices=eval_sample_indices,
+            status="prepared",
+        )
+
         callbacks = []
         if do_eval:
             callbacks.append(
@@ -2036,6 +2448,36 @@ class SmartContractModelTrainer:
                     if isinstance(entry, dict):
                         writer.writerow({field: entry.get(field) for field in fieldnames})
 
+        final_input_manifest_path = final_model_path / "training_input_manifest.json"
+        self._write_training_input_manifest(
+            training_input_manifest_path,
+            train_dataset_path=train_dataset_path,
+            eval_dataset_path=eval_dataset_path,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            training_args=training_args,
+            tokenization_cache_config=tokenization_cache_config,
+            instrumentation=instrumentation,
+            seed=seed,
+            eval_sample_indices=eval_sample_indices,
+            status="completed",
+            final_model_path=final_model_path,
+        )
+        self._write_training_input_manifest(
+            final_input_manifest_path,
+            train_dataset_path=train_dataset_path,
+            eval_dataset_path=eval_dataset_path,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            training_args=training_args,
+            tokenization_cache_config=tokenization_cache_config,
+            instrumentation=instrumentation,
+            seed=seed,
+            eval_sample_indices=eval_sample_indices,
+            status="completed",
+            final_model_path=final_model_path,
+        )
+
         logger.info(f"Training completed. Model saved to {final_model_path}")
         return str(final_model_path)
 
@@ -2066,9 +2508,9 @@ class SmartContractModelTrainer:
           tokens at every generation step (major speedup).
         * **BFloat16 compute** — faster and more numerically stable on
           Ampere+ GPUs (RTX 30xx / 40xx / A100 / H100).
-        * **Flash Attention 2** — fused attention kernels that are both
-          faster and more memory-efficient.  Falls back to eager attention
-          if the ``flash_attn`` package is not installed.
+        * **Flash Attention 2** — fused attention kernels on supported
+          Ampere+ GPUs. Falls back to PyTorch SDPA if ``flash_attn`` is not
+          installed or the GPU architecture is unsupported.
         * **torch.compile()** — JIT-compiles the model graph, fusing
           operations and reducing kernel-launch overhead.
 
@@ -2094,6 +2536,7 @@ class SmartContractModelTrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        _configure_tokenizer_context(self.tokenizer, self.config.max_sequence_length)
 
         # For batched generation the tokenizer must pad on the LEFT so that
         # the generated tokens are contiguous on the right.
@@ -2123,18 +2566,8 @@ class SmartContractModelTrainer:
                 bnb_4bit_quant_type="nf4",
             )
 
-        # ---- Flash Attention 2 ----
-        attn_impl = None
-        if has_cuda and for_inference:
-            try:
-                import flash_attn  # noqa: F401
-
-                attn_impl = "flash_attention_2"
-                logger.info("Flash Attention 2 available — enabling")
-            except ImportError:
-                # Try SDPA (PyTorch 2.x built-in efficient attention)
-                attn_impl = "sdpa"
-                logger.info("flash_attn not installed — using PyTorch SDPA")
+        # ---- Attention implementation ----
+        attn_impl = resolve_attention_implementation(has_cuda) if for_inference else None
 
         # ---- Build load kwargs ----
         load_kwargs = {
@@ -2162,6 +2595,12 @@ class SmartContractModelTrainer:
             self.config.model_name,
             **load_kwargs,
         )
+        self.context_window_report = _validate_context_window(
+            base_model.config,
+            self.config.max_sequence_length,
+        )
+        if hasattr(base_model.config, "max_length"):
+            base_model.config.max_length = int(self.config.max_sequence_length)
 
         self.peft_model = PeftModel.from_pretrained(base_model, str(load_path))
 

@@ -77,6 +77,7 @@ from src.dataset_export_primitives import (
     parse_metadata_object,
     sanitize_tac_prompt_input,
     tac_quality_reject_reasons,
+    training_record_quality_report,
     validate_jsonl_final_row_duplicates,
 )
 from src.abi_enrichment import (
@@ -108,7 +109,7 @@ DB_PATH = Path("data/contracts.db")
 FLUSH_SIZE = 200
 BATCH_INSERT_SIZE = 500
 PARQUET_READ_BATCH_SIZE = 4096
-DEFAULT_EXPORT_MAX_SEQ_LENGTH = 2048
+DEFAULT_EXPORT_MAX_SEQ_LENGTH = 8192
 HF_DATASET_REPO = "andstor/smart_contracts"
 MANIFEST_SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parent
@@ -2380,7 +2381,11 @@ def export_training_data(
     quality_row_rejects = 0
     overlength_counts: Counter = Counter()
     reject_reason_counts: Counter = Counter()
+    quality_reason_counts: Counter = Counter()
     tac_quality_counts: Counter = Counter()
+    prompt_quality_counts: Counter = Counter()
+    completion_quality_counts: Counter = Counter()
+    metadata_quality_counts: Counter = Counter()
     auxiliary_counts: Counter = Counter()
     compiled_contract_export_counts: Counter = Counter()
     seen_final_hashes: Dict[str, Dict[str, Any]] = {}
@@ -2444,7 +2449,8 @@ def export_training_data(
             else:
                 compiled_contract_export_counts["rows_without_compiled_contract_metadata"] += 1
 
-            quality_reasons = tac_quality_reject_reasons(prompt_input)
+            quality_report = training_record_quality_report(record)
+            quality_reasons = list(quality_report["reasons"])
             aux_reasons = auxiliary_contract_reject_reasons(
                 target_contract_name,
                 compiled_contract,
@@ -2467,7 +2473,15 @@ def export_training_data(
                 if duplicate_reasons:
                     final_duplicate_rejects += 1
                 for reason in quality_reasons:
-                    tac_quality_counts[reason] += 1
+                    quality_reason_counts[reason] += 1
+                    if reason.startswith("tac_"):
+                        tac_quality_counts[reason] += 1
+                    elif reason.startswith("prompt_") or reason == "selector_input_mismatch":
+                        prompt_quality_counts[reason] += 1
+                    elif reason.startswith("output_") or reason == "partial_placeholder":
+                        completion_quality_counts[reason] += 1
+                    elif reason.startswith("metadata_schema"):
+                        metadata_quality_counts[reason] += 1
                 for reason in aux_reasons:
                     auxiliary_counts[reason] += 1
                 for reason in length_reasons:
@@ -2485,7 +2499,10 @@ def export_training_data(
                     "lengths": {
                         key: value for key, value in length_report.items() if key != "reasons"
                     },
+                    "quality": quality_report["quality"],
                 }
+                if quality_report["schema_validation"]["status"] != "passed":
+                    reject_record["schema_errors"] = quality_report["schema_validation"]["errors"]
                 if duplicate_reasons:
                     reject_record["duplicate_of"] = seen_final_hashes[row_hash]
                     if len(final_duplicate_samples) < 10:
@@ -2558,6 +2575,7 @@ def export_training_data(
                 "filter_overlength": filter_overlength,
                 "final_row_duplicate_policy": "quarantine",
                 "tac_quality_policy": "quarantine",
+                "record_quality_policy": "quarantine",
                 "auxiliary_contract_policy": "quarantine",
             },
             "artifacts": {
@@ -2587,6 +2605,11 @@ def export_training_data(
                 "rejected_rows": rejected_count,
                 "overlength_rows": overlength_row_rejects,
                 "tac_error_rows": sum(tac_quality_counts.values()),
+                "prompt_quality_rows": sum(prompt_quality_counts.values()),
+                "completion_quality_rows": sum(completion_quality_counts.values()),
+                "metadata_schema_invalid_rows": metadata_quality_counts.get(
+                    "metadata_schema_invalid", 0
+                ),
                 "auxiliary_compiled_contract_rows": auxiliary_counts.get(
                     "auxiliary_compiled_contract", 0
                 ),
@@ -2602,6 +2625,13 @@ def export_training_data(
                     **final_duplicate_validation,
                     "export_reject_count": final_duplicate_rejects,
                     "reject_samples": final_duplicate_samples,
+                },
+                "quality_filter": {
+                    "status": "filtered" if quality_reason_counts else "passed",
+                    "reason_counts": dict(sorted(quality_reason_counts.items())),
+                    "prompt_reason_counts": dict(sorted(prompt_quality_counts.items())),
+                    "completion_reason_counts": dict(sorted(completion_quality_counts.items())),
+                    "metadata_reason_counts": dict(sorted(metadata_quality_counts.items())),
                 },
                 "tac_quality_filter": {
                     "status": "filtered" if tac_quality_counts else "passed",
@@ -2709,7 +2739,10 @@ def main():
         "--max-seq-length",
         type=int,
         default=DEFAULT_EXPORT_MAX_SEQ_LENGTH,
-        help="Default training context budget used for export-time filtering.",
+        help=(
+            "Default training context budget used for export-time filtering "
+            f"(default: {DEFAULT_EXPORT_MAX_SEQ_LENGTH})."
+        ),
     )
     parser.add_argument(
         "--no-filter-overlength",

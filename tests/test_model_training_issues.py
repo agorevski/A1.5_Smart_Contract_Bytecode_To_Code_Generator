@@ -1,4 +1,6 @@
 import json
+import inspect
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +10,7 @@ from src.model_setup import (
     ModelConfig,
     SmartContractDataset,
     SmartContractDecompiler,
+    SmartContractModelTrainer,
     TokenizationCacheConfig,
     TrainingInstrumentationCallback,
     TrainingInstrumentationConfig,
@@ -63,6 +66,42 @@ class CountingTokenizer:
     def encode(self, text, add_special_tokens=False):
         self.calls += 1
         return text.split()
+
+
+class NumericTokenizer:
+    pad_token = "<pad>"
+    pad_token_id = 0
+    eos_token = "</s>"
+    eos_token_id = 1
+    name_or_path = "numeric-tokenizer"
+    model_max_length = 8192
+
+    def __init__(self):
+        self._vocab = {"<pad>": 0, "</s>": 1}
+
+    def __len__(self):
+        return len(self._vocab)
+
+    def _ids(self, text):
+        ids = []
+        for token in str(text).split():
+            if token not in self._vocab:
+                self._vocab[token] = len(self._vocab)
+            ids.append(self._vocab[token])
+        return ids
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+    def __call__(self, text, **_kwargs):
+        return {"input_ids": self._ids(text)}
+
+    def encode(self, text, add_special_tokens=False):
+        return self._ids(text)
+
+    def save_pretrained(self, path):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "tokenizer_config.json").write_text(json.dumps({"name": self.name_or_path}))
 
 
 def _write_jsonl(path: Path, rows):
@@ -201,6 +240,25 @@ def test_dataset_truncation_preserves_full_short_target_span():
     assert supervised_labels == ["TARGET_A", "TARGET_B", "TARGET_C"]
 
 
+def test_numeric_tokenizer_targets_include_eos_for_stop_learning():
+    dataset = SmartContractDataset.__new__(SmartContractDataset)
+    dataset.tokenizer = NumericTokenizer()
+    dataset.max_length = 64
+    dataset.template_format = "alpaca"
+    dataset.augment_names = False
+    dataset.include_bytecode_metadata = True
+    dataset.include_compiler_metadata = False
+    dataset.AUGMENT_RATE = 0.3
+    dataset.data = [{"input": "TAC", "output": "TARGET", "metadata": {}}]
+    dataset._tokenized_cache = None
+
+    item = dataset[0]
+    supervised_labels = [label for label in item["labels"] if label != -100]
+
+    assert supervised_labels[-1] == dataset.tokenizer.eos_token_id
+    assert dataset.tokenizer.eos_token_id in item["input_ids"]
+
+
 def test_deepspeed_precision_falls_back_to_fp16_on_pre_ampere(tmp_path, monkeypatch):
     ds_config = tmp_path / "ds_config.json"
     ds_config.write_text(json.dumps({"bf16": {"enabled": True}, "zero_optimization": {"stage": 0}}))
@@ -253,6 +311,22 @@ def test_deepspeed_precision_uses_bf16_on_ampere(tmp_path, monkeypatch):
     assert args.kwargs["fp16"] is False
     assert args.kwargs["deepspeed"]["bf16"]["enabled"] is True
     assert args.kwargs["deepspeed"]["fp16"]["enabled"] is False
+
+
+def test_attention_impl_falls_back_to_sdpa_on_pre_ampere(monkeypatch):
+    monkeypatch.setattr(model_setup.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(model_setup.torch.cuda, "get_device_capability", lambda: (7, 5))
+    monkeypatch.setitem(sys.modules, "flash_attn", SimpleNamespace(__version__="test"))
+
+    assert model_setup.resolve_attention_implementation(True) == "sdpa"
+
+
+def test_attention_impl_uses_flash_attention_on_ampere_when_available(monkeypatch):
+    monkeypatch.setattr(model_setup.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(model_setup.torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setitem(sys.modules, "flash_attn", SimpleNamespace(__version__="test"))
+
+    assert model_setup.resolve_attention_implementation(True) == "flash_attention_2"
 
 
 def test_training_arguments_expose_precision_eval_cadence_and_dataloader(tmp_path, monkeypatch):
@@ -326,25 +400,31 @@ def test_training_arguments_disable_eval_and_safe_cpu_dataloader_defaults(tmp_pa
 
 def test_default_training_recipe_uses_qwen_lora_and_preserves_global_batch():
     config = ModelConfig()
+    training_config = TrainingConfig(etherscan_api_key="test")
+    train_signature = inspect.signature(train.train_model)
 
     assert train.DEFAULT_MODEL_NAME == "Qwen/Qwen2.5-Coder-7B-Instruct"
     assert config.model_name == "Qwen/Qwen2.5-Coder-7B-Instruct"
     assert config.use_lora is True
     assert config.use_quantization is False
     assert train.DEFAULT_NUM_GPUS == 4
-    assert train.DEFAULT_BATCH_SIZE == 4
+    assert train.DEFAULT_BATCH_SIZE == 1
     assert train.DEFAULT_GLOBAL_BATCH_SIZE == 16
-    assert train.DEFAULT_MAX_SEQ_LENGTH == 2048
-    assert config.max_sequence_length == 2048
+    assert train.DEFAULT_MAX_SEQ_LENGTH == 8192
+    assert train_signature.parameters["batch_size"].default == train.DEFAULT_BATCH_SIZE
+    assert train_signature.parameters["max_seq_length"].default == train.DEFAULT_MAX_SEQ_LENGTH
+    assert config.max_sequence_length == 8192
     assert config.precision == "fp16"
-    assert config.gradient_checkpointing is False
+    assert config.gradient_checkpointing is True
+    assert training_config.batch_size == train.DEFAULT_BATCH_SIZE
+    assert training_config.max_sequence_length == train.DEFAULT_MAX_SEQ_LENGTH
     assert (
         train.resolve_gradient_accumulation_steps(
             per_device_batch_size=train.DEFAULT_BATCH_SIZE,
             world_size=1,
             global_batch_size=train.DEFAULT_GLOBAL_BATCH_SIZE,
         )
-        == 4
+        == 16
     )
     assert (
         train.resolve_gradient_accumulation_steps(
@@ -352,7 +432,7 @@ def test_default_training_recipe_uses_qwen_lora_and_preserves_global_batch():
             world_size=4,
             global_batch_size=train.DEFAULT_GLOBAL_BATCH_SIZE,
         )
-        == 1
+        == 4
     )
 
 
@@ -490,6 +570,20 @@ def test_tokenizer_based_max_seq_detection_changes_with_tokenizer(tmp_path):
     assert character_length > word_length
 
 
+def test_tokenizer_based_max_seq_detection_can_reach_8192_cap(tmp_path):
+    row = {
+        "input": " ".join(["context"] * 5000),
+        "output": " ".join(["target"] * 100),
+        "metadata": {"function_name": "long"},
+    }
+    dataset_path = tmp_path / "lengths.jsonl"
+    _write_jsonl(dataset_path, [row])
+
+    detected = detect_max_sequence_length(str(dataset_path), WhitespaceTokenizer())
+
+    assert detected == 8192
+
+
 def test_train_common_wrapper_uses_tokenizer_detection():
     wrapper = Path("train_common.sh").read_text()
     torchrun_wrapper = Path("run_train_torchrun.sh").read_text()
@@ -497,6 +591,7 @@ def test_train_common_wrapper_uses_tokenizer_detection():
 
     assert "AutoTokenizer.from_pretrained" in wrapper
     assert "detect_max_sequence_length" in wrapper
+    assert "MAX_SEQ_LEN_CAP" in wrapper
     assert "/ 3.5" not in wrapper
     assert "REPORT_TO" in wrapper
     assert "SKIP_EVAL" in wrapper
@@ -785,6 +880,93 @@ def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprin
     assert len(after_bytecode_flag_files) == len(initial_cache_files) + 1
     assert len(after_augment_flag_files) == len(after_bytecode_flag_files) + 1
     assert len(after_dataset_change_files) == len(after_augment_flag_files) + 1
+
+
+def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_path, monkeypatch):
+    train_path = tmp_path / "train.jsonl"
+    val_path = tmp_path / "val.jsonl"
+    _write_jsonl(
+        train_path,
+        [
+            {"input": f"train tac {i}", "output": f"train sol {i}", "metadata": {"id": i}}
+            for i in range(6)
+        ],
+    )
+    _write_jsonl(
+        val_path,
+        [
+            {"input": f"val tac {i}", "output": f"val sol {i}", "metadata": {"id": i}}
+            for i in range(10)
+        ],
+    )
+    captured = {}
+
+    class FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            captured["eval_ids"] = [row["metadata"]["id"] for row in kwargs["eval_dataset"].data]
+            self.state = SimpleNamespace(log_history=[{"loss": 0.5, "step": 1}])
+
+        def train(self, **_kwargs):
+            return SimpleNamespace(metrics={"train_loss": 0.5})
+
+        def save_model(self, path):
+            Path(path).mkdir(parents=True, exist_ok=True)
+
+    def fake_setup_model(self, *args, **kwargs):
+        tokenizer = NumericTokenizer()
+        self.tokenizer = tokenizer
+        self.peft_model = object()
+        self.context_window_report = {
+            "requested_max_sequence_length": self.config.max_sequence_length,
+            "model_context_limit": 32768,
+            "valid": True,
+        }
+        return tokenizer, self.peft_model
+
+    monkeypatch.setattr(model_setup, "TrainingArguments", FakeTrainingArguments)
+    monkeypatch.setattr(model_setup, "Trainer", FakeTrainer)
+    monkeypatch.setattr(SmartContractModelTrainer, "setup_model", fake_setup_model)
+
+    trainer = SmartContractModelTrainer(
+        ModelConfig(max_sequence_length=128, use_quantization=False),
+        output_dir=str(tmp_path / "models"),
+    )
+    model_path = trainer.train(
+        train_dataset_path=str(train_path),
+        eval_dataset_path=str(val_path),
+        batch_size=4,
+        train_eval_max_samples=4,
+        train_eval_strategy="steps",
+        seed=123,
+        max_steps=1,
+        tokenization_cache=False,
+    )
+
+    expected_indices = (
+        model_setup.np.random.default_rng(123)
+        .choice(
+            10,
+            size=4,
+            replace=False,
+        )
+        .tolist()
+    )
+    manifest = json.loads((Path(model_path) / "training_input_manifest.json").read_text())
+
+    assert captured["eval_ids"] == expected_indices
+    assert captured["eval_ids"] != [0, 1, 2, 3]
+    assert manifest["status"] == "completed"
+    assert manifest["seed"] == 123
+    assert manifest["datasets"]["train"]["artifact"]["row_count"] == 6
+    assert manifest["datasets"]["eval"]["sample_indices"] == expected_indices
+    assert manifest["datasets"]["train"]["tokenization"]["max_sequence_length"] == 128
+    assert manifest["training_args"]["gradient_accumulation_steps"] == 1
 
 
 def test_non_quantized_ddp_setup_loads_without_device_map_and_moves_to_local_rank(

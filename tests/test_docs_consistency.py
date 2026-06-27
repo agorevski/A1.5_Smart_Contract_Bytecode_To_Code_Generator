@@ -35,14 +35,32 @@ def test_downloader_defaults_are_documented_from_cli_help():
 
     assert re.search(r"--max-compiler-versions .*default: 5", help_text)
     assert re.search(r"--max-body-dupes .*default: 2", help_text)
+    assert re.search(r"--max-seq-length .*default: 8192", help_text)
     assert "| `--max-compiler-versions N` | `5` |" in readme
     assert "| `--max-body-dupes N` | `2` |" in readme
+    assert "| `--max-seq-length N` | `8192` |" in readme
     assert "| `--max-compiler-versions N` | 5 |" in runbook
     assert "| `--max-body-dupes N` | 2 |" in runbook
+    assert "| `--max-seq-length N` | 8192 |" in runbook
     for flag in ("--cache-dir", "--hf-revision", "--export-selectors", "--import-selectors"):
         assert flag in help_text
         assert flag in readme
         assert flag in runbook
+
+
+def test_training_defaults_are_documented_from_cli_constants():
+    import train
+
+    readme = read_project_file("README.md")
+    runbook = read_project_file("docs/runbook.md")
+    gpu_notes = read_project_file("docs/gpu-parameter-sweep-results.md")
+
+    assert f"| `--batch-size N` | `{train.DEFAULT_BATCH_SIZE}` |" in readme
+    assert f"| `--max-seq-length N` | `{train.DEFAULT_MAX_SEQ_LENGTH}` |" in readme
+    assert "| `--gradient-checkpointing` / `--no-gradient-checkpointing` | on |" in readme
+    assert f"`max_seq_length={train.DEFAULT_MAX_SEQ_LENGTH}`" in gpu_notes
+    assert f"`batch_size={train.DEFAULT_BATCH_SIZE}`" in gpu_notes
+    assert f"--max-seq-length {train.DEFAULT_MAX_SEQ_LENGTH}" in runbook
 
 
 def test_test_inventory_docs_do_not_hard_code_stale_counts():

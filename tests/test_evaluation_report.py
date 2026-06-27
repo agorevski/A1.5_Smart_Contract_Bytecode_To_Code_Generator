@@ -2,7 +2,11 @@
 
 import json
 
-from src.evaluation_report import format_latest_results_report, write_latest_results_report
+from src.evaluation_report import (
+    build_evaluation_diagnostics,
+    format_latest_results_report,
+    write_latest_results_report,
+)
 
 
 def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_path):
@@ -342,6 +346,88 @@ def test_format_latest_results_report_renders_prompt_diagnostics_and_truncated_w
     assert "tac_tokens_before | 125.0000 | 125.0000 | 185.0000 | 192.5000 | 200.0000" in report
     assert "reason=truncated_low_quality" in report
     assert "prompt_diagnostics=tac_truncated=True, strategy=hard_truncate" in report
+
+
+def test_evaluation_diagnostics_explain_strengths_issues_and_next_experiments(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    dataset = tmp_path / "test_dataset.jsonl"
+    dataset.write_text('{"input": "a", "output": "b"}\n')
+    summary = {
+        "num_evaluated": 12,
+        "failure_rate": 0.0,
+        "semantic_similarity_mean": 0.64,
+        "pct_above_0.8_similarity": 0.25,
+        "edit_distance_mean": 0.58,
+        "replication_f1_micro": 0.42,
+        "replication_recall_micro": 0.38,
+        "replication_precision_micro": 0.91,
+        "replication_by_category_micro": {
+            "state_write": {
+                "precision": 1.0,
+                "recall": 0.2,
+                "f1": 0.3333,
+                "true_positives": 1,
+                "false_positives": 0,
+                "false_negatives": 4,
+            }
+        },
+        "replication_hallucination_total": 3,
+        "replication_candidate_fact_total": 30,
+        "replication_hallucination_buckets": {"unsupported_calls": 2, "invented_guards": 1},
+        "replication_groundedness_score_mean": 0.90,
+        "solidity_valid_mean": 0.60,
+        "bytecode_semantic_checked_mean": 0.50,
+        "prompt_diagnostics": {"truncated_rate": 0.25},
+    }
+
+    diagnostics = build_evaluation_diagnostics(summary)
+
+    assert diagnostics["overall_status"] == "needs_attention"
+    assert diagnostics["strengths"][0]["id"] == "no_generation_failures"
+    issue_ids = {issue["id"] for issue in diagnostics["issues"]}
+    assert "structured_replication_gap" in issue_ids
+    assert "prompt_truncation" in issue_ids
+    assert "bytecode_grounding_coverage_gap" in issue_ids
+    replication_issue = next(
+        issue for issue in diagnostics["issues"] if issue["id"] == "structured_replication_gap"
+    )
+    assert replication_issue["priority"] == "P1"
+    assert replication_issue["category_gaps"][0]["category"] == "state_write"
+    assert diagnostics["next_experiments"]
+
+    report = format_latest_results_report(
+        summary=summary,
+        model_path=str(model_dir),
+        test_dataset_path=str(dataset),
+        results_json_path="results/eval_test.json",
+    )
+
+    assert "Executive Evaluation Readout" in report
+    assert "What is going well" in report
+    assert "What needs attention" in report
+    assert "Machine-readable diagnostics" in report
+    assert '"structured_replication_gap"' in report
+
+
+def test_evaluation_diagnostics_accept_nested_replication_metrics_without_missing_caveat():
+    diagnostics = build_evaluation_diagnostics(
+        {
+            "num_evaluated": 40,
+            "replication_metrics": {
+                "micro": {
+                    "precision": 0.82,
+                    "recall": 0.81,
+                    "f1": 0.815,
+                }
+            },
+            "solidity_valid_mean": 1.0,
+            "bytecode_semantic_checked_mean": 1.0,
+        }
+    )
+
+    assert diagnostics["metrics_used"]["replication_f1_micro"] == 0.815
+    assert not any("Replication metrics are missing" in caveat for caveat in diagnostics["caveats"])
 
 
 def test_write_latest_results_report_creates_file(tmp_path):

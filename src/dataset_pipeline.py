@@ -73,11 +73,13 @@ from .dataset_export_primitives import (
     record_final_row_hash,
     sanitize_tac_prompt_input,
     tac_quality_reject_reasons,
+    training_record_quality_report,
     validate_training_metadata_schema,
     validate_training_record_schema,
 )
 
 logger = logging.getLogger(__name__)
+ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -2209,7 +2211,7 @@ class DatasetBuilder:
         output_format: str = "jsonl",
         *,
         include_partial: bool = False,
-        max_seq_length: int = 2048,
+        max_seq_length: int = 8192,
         filter_overlength: bool = True,
         rejects_path: Optional[str] = None,
         write_manifest: bool = True,
@@ -2306,36 +2308,43 @@ class DatasetBuilder:
                     "Skipping invalid metadata JSON for %s",
                     row["function_name"],
                 )
-            metadata = normalize_training_metadata(
-                {
-                    **stored_metadata,
-                    "function_name": row["function_name"],
-                    "function_signature": row["function_signature"],
-                    "visibility": row["visibility"],
-                    "is_payable": bool(row["is_payable"]),
-                    "is_view": bool(row["is_view"]),
-                    "contract_address": row["contract_address"],
-                }
-            )
-            return {
-                "input": row["tac_representation"],
-                "output": row["solidity_code"],
-                "metadata": metadata,
+            metadata = {
+                **stored_metadata,
+                "function_name": row["function_name"],
+                "function_signature": row["function_signature"],
+                "visibility": row["visibility"],
+                "is_payable": bool(row["is_payable"]),
+                "is_view": bool(row["is_view"]),
             }
+            contract_address = row["contract_address"]
+            if isinstance(contract_address, str) and ETH_ADDRESS_RE.match(contract_address):
+                metadata["contract_address"] = contract_address
+            else:
+                metadata["contract_id"] = contract_address
+            return build_training_record(
+                row["tac_representation"],
+                row["solidity_code"],
+                metadata,
+            )
 
         main_records: List[Dict[str, Any]] = []
         keep_indices: List[Any] = []
         export_rejects: List[Dict[str, Any]] = []
         reject_reason_counts: Counter = Counter()
+        quality_reason_counts: Counter = Counter()
         overlength_counts: Counter = Counter()
         tac_quality_counts: Counter = Counter()
+        prompt_quality_counts: Counter = Counter()
+        completion_quality_counts: Counter = Counter()
+        metadata_quality_counts: Counter = Counter()
         seen_final_hashes: Dict[str, Dict[str, Any]] = {}
         final_duplicate_rejects = 0
         overlength_row_rejects = 0
 
         for source_number, (idx, row) in enumerate(main_df.iterrows(), start=1):
             record = row_to_record(row)
-            reasons = tac_quality_reject_reasons(record["input"])
+            quality_report = training_record_quality_report(record)
+            reasons = list(quality_report["reasons"])
             length_report = export_length_report(record, max_seq_length)
             length_reasons = length_report["reasons"] if filter_overlength else []
             reasons.extend(length_reasons)
@@ -2345,9 +2354,16 @@ class DatasetBuilder:
 
             if reasons:
                 reject_reason_counts.update(reasons)
-                tac_quality_counts.update(
-                    reason for reason in reasons if reason.startswith("tac_")
-                )
+                quality_reason_counts.update(quality_report["reasons"])
+                for reason in quality_report["reasons"]:
+                    if reason.startswith("tac_"):
+                        tac_quality_counts[reason] += 1
+                    elif reason.startswith("prompt_") or reason == "selector_input_mismatch":
+                        prompt_quality_counts[reason] += 1
+                    elif reason.startswith("output_") or reason == "partial_placeholder":
+                        completion_quality_counts[reason] += 1
+                    elif reason.startswith("metadata_schema"):
+                        metadata_quality_counts[reason] += 1
                 overlength_counts.update(length_reasons)
                 if length_reasons:
                     overlength_row_rejects += 1
@@ -2363,7 +2379,10 @@ class DatasetBuilder:
                     "lengths": {
                         key: value for key, value in length_report.items() if key != "reasons"
                     },
+                    "quality": quality_report["quality"],
                 }
+                if quality_report["schema_validation"]["status"] != "passed":
+                    reject_record["schema_errors"] = quality_report["schema_validation"]["errors"]
                 if row_hash in seen_final_hashes:
                     reject_record["duplicate_of"] = seen_final_hashes[row_hash]
                 export_rejects.append(reject_record)
@@ -2413,6 +2432,11 @@ class DatasetBuilder:
                 "rejected_rows": int(len(export_rejects)),
                 "overlength_rows": overlength_row_rejects,
                 "tac_error_rows": sum(tac_quality_counts.values()),
+                "prompt_quality_rows": sum(prompt_quality_counts.values()),
+                "completion_quality_rows": sum(completion_quality_counts.values()),
+                "metadata_schema_invalid_rows": metadata_quality_counts.get(
+                    "metadata_schema_invalid", 0
+                ),
                 "final_row_duplicate_rows": final_duplicate_rejects,
                 **dict(sorted(reject_reason_counts.items())),
             }
@@ -2433,6 +2457,7 @@ class DatasetBuilder:
                     "filter_overlength": filter_overlength,
                     "final_row_duplicate_policy": "quarantine",
                     "tac_quality_policy": "quarantine",
+                    "record_quality_policy": "quarantine",
                 },
                 "artifacts": {
                     "dataset": _file_artifact(filepath, jsonl=output_format == "jsonl"),
@@ -2453,6 +2478,13 @@ class DatasetBuilder:
                     "final_row_duplicates": {
                         "status": "filtered" if final_duplicate_rejects else "passed",
                         "reject_count": final_duplicate_rejects,
+                    },
+                    "quality_filter": {
+                        "status": "filtered" if quality_reason_counts else "passed",
+                        "reason_counts": dict(sorted(quality_reason_counts.items())),
+                        "prompt_reason_counts": dict(sorted(prompt_quality_counts.items())),
+                        "completion_reason_counts": dict(sorted(completion_quality_counts.items())),
+                        "metadata_reason_counts": dict(sorted(metadata_quality_counts.items())),
                     },
                     "tac_quality_filter": {
                         "status": "filtered" if tac_quality_counts else "passed",

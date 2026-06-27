@@ -1609,7 +1609,7 @@ class TrainingConfig:
 
     # Dataset processing
     min_function_length: int = 50
-    max_sequence_length: int = 2048
+    max_sequence_length: int = 8192
     train_test_split: float = 0.85
     validation_split: float = 0.1
     split_seed: int = 42
@@ -1630,7 +1630,7 @@ class TrainingConfig:
 
     # Model training
     model_config: ModelConfig = None
-    batch_size: int = 4
+    batch_size: int = 1
     learning_rate: float = 2e-4
     num_epochs: int = 3
     gradient_accumulation_steps: int = 4
@@ -1646,7 +1646,7 @@ class TrainingConfig:
 
     def __post_init__(self):
         if self.model_config is None:
-            self.model_config = ModelConfig()
+            self.model_config = ModelConfig(max_sequence_length=self.max_sequence_length)
 
 
 class SmartContractEvaluator:
@@ -2319,6 +2319,7 @@ class SmartContractTrainingPipeline:
             learning_rate=self.config.learning_rate,
             num_epochs=self.config.num_epochs,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            seed=self.config.split_seed,
         )
 
         logger.info(f"Model training completed. Model saved to {model_path}")

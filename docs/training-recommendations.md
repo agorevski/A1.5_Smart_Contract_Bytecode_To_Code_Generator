@@ -1,567 +1,247 @@
-# Training Recommendations: Model Selection & Configuration
+# Training Recommendations: Current Pipeline
 
-> **Hardware assumed**: 4× NVIDIA RTX 8000 (48 GB VRAM each, ~180 GB total)
->
-> **Paper baseline**: Llama 3.2 3B with LoRA fine-tuning on 238,446 TAC-to-Solidity function pairs
->
-> **Reference**: "Decompiling Smart Contracts with a Large Language Model" (arXiv:2506.19624v1)
+## Defaults to know first
 
----
+`train.py` now defaults to a Qwen 7B LoRA recipe, not the old Llama 3B paper
+baseline:
 
-## Hardware Budget Analysis
-
-The paper used **Llama 3.2 3B** — a deliberately small model chosen for practical deployment constraints. With 4× RTX 8000 (48 GB each, ~180 GB usable), dramatically larger models can be leveraged that should meaningfully improve accuracy, especially on the failure cases the paper documents (complex DeFi logic, fixed-point arithmetic, nested storage patterns).
-
-| Config | VRAM Required (approx) | Fits on 4× RTX 8000? |
-|---|---|---|
-| 3B (paper baseline, 4-bit) | ~2–4 GB | ✅ Trivially |
-| 8B (4-bit LoRA) | ~6–8 GB | ✅ Trivially |
-| 14B (4-bit LoRA) | ~10–12 GB | ✅ Easily |
-| 32B (4-bit LoRA) | ~20–24 GB | ✅ Single GPU |
-| 70B (4-bit LoRA) | ~40–48 GB | ✅ 1–2 GPUs |
-| 70B (full bf16, LoRA) | ~140 GB | ✅ Across 4 GPUs |
-| 72B (4-bit LoRA, training) | ~80–100 GB | ✅ Across 2–3 GPUs |
-| 405B (4-bit) | ~200+ GB | ❌ Too tight |
-
----
-
-## Recommended Models (Ranked)
-
-### Best <=8B Pick: Qwen 2.5 Coder 7B Instruct
-
-**Model ID**: `Qwen/Qwen2.5-Coder-7B-Instruct`
-
-- **Why**: Purpose-built for code generation and instruction following, with much stronger code/Solidity priors than the current general-purpose Llama 3.2 3B baseline while still fitting comfortably on a single 48 GB RTX 8000 in full fp16 LoRA mode.
-- **Context length**: 128K tokens natively, so the model family has ample headroom for longer TAC/function examples than the current 2K setup.
-- **Local smoke result**: A bounded local run on this repository completed successfully with `use_quantization=False`, batch size 1, one epoch, and max sequence length 1024. The run trained 40,370,176 LoRA parameters on top of 7,655,986,688 total parameters and produced train loss 1.087 / eval loss 1.129 on the tiny smoke split.
-- **Recommendation**: Use this as the first practical upgrade before moving to 14B/32B. It is large enough to test whether code-specialized pretraining materially improves TAC-to-Solidity quality without the operational cost of 32B+ experiments.
-
-> Current CLI note: `train.py` keeps the data-safe 2K sequence default, while
-> `THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh` applies the 4x RTX
-> 8000 sweep recipe: full-precision fp16 LoRA, 4-GPU torchrun, batch size 9 per
-> GPU, max sequence length 256, and gradient checkpointing disabled. Use
-> `--precision auto|bf16|fp16|fp32` to change mixed precision, and add
-> `--quantization` only when VRAM pressure requires 4-bit NF4 loading.
-> For fixed 8192-token Qwen 7B runs on this hardware, the measured viable setup
-> is QLoRA with batch size 1 per GPU, global batch size 4, fp16, and gradient
-> checkpointing enabled. Full fp16 and QLoRA without checkpointing OOMed even at
-> batch size 1, and QLoRA batch size 2 also OOMed.
-
-Repeated experiments should keep the default split/tokenization/preflight caches enabled. Use `--force-resplit` only when regenerating train/val/test files intentionally, `--train-eval-strategy no` for fast sweeps that should skip Trainer validation, and `--quality-gate --baseline-results <prior.json>` for regression-blocking eval runs.
-
-### 🥇 Top Pick: Qwen 2.5 Coder 32B
-
-**Model ID**: `Qwen/Qwen2.5-Coder-32B`
-
-- **Why**: Purpose-built for code generation/understanding. 32B parameters is the sweet spot for this hardware — large enough for significant quality gains, small enough to train comfortably with LoRA on a single RTX 8000 (4-bit) or across 2 GPUs (bf16).
-- **Context length**: 128K tokens natively (massive improvement over Llama 3.2's 128K theoretical / 2K practical in the current setup).
-- **Code benchmarks**: Outperforms many 70B general models on code tasks.
-- **Training fit**: 4-bit LoRA training uses ~24 GB — fits on one GPU, leaving 3 GPUs free for data loading / larger batches.
-
-### 🥈 Strong Alternative: DeepSeek-Coder-V2 33B / DeepSeek-V3 (MoE, 37B active)
-
-- Excellent code understanding, particularly strong on structured/formal languages.
-- MoE (Mixture of Experts) architecture means fewer active parameters → faster training.
-
-### 🥉 Maximum Quality: Llama 3.1 70B / Qwen 2.5 72B
-
-- With 4-bit quantization + LoRA, training fits across 2 GPUs (~48 GB each for 4-bit 70B + optimizer states).
-- Would require `accelerate` with DeepSpeed ZeRO Stage 2/3 for distributed training.
-- Significant quality leap but 2–3× slower training iteration.
-
-### Honorable Mentions
-
-| Model | Size | Strengths |
-|---|---|---|
-| **Qwen2.5-Coder-Instruct** | 7B | Best <=8B practical upgrade; local full-fp16 LoRA smoke run succeeded |
-| **CodeLlama 34B** | 34B | Strong code model, Llama architecture (minimal code changes) |
-| **StarCoder2 15B** | 15B | Trained on The Stack v2, excellent code understanding, very efficient |
-| **Llama 3.1 8B** | 8B | 2.5× bigger than current, minimal infrastructure changes, fast iteration |
-| **Phi-3-medium 14B** | 14B | Microsoft's efficient model, surprisingly strong on code |
-
----
-
-## Why Qwen 2.5 Coder 32B Is the Clear Winner
-
-1. **Code-specialized pre-training**: Unlike general-purpose Llama 3.2 3B, Qwen 2.5 Coder was trained on massive code corpora. It already understands Solidity syntax, EVM patterns, and structured code transformations before fine-tuning.
-
-2. **10× more parameters**: 32B vs 3B. The paper's Case Study 2 (staking rewards, 0.52 similarity) failed precisely because the 3B model lacked capacity to represent complex DeFi patterns. A 32B model has far more capacity for these long-tail patterns.
-
-3. **Comfortable fit**: 4-bit LoRA fine-tuning of 32B uses ~24 GB VRAM. With 4 × 48 GB available, training can run on 1 GPU with the others used for larger batch sizes or parallel experiments.
-
-4. **128K context window**: The paper mentions a max of 20,000 tokens and the current code uses 2,048. With 32B + 128K context, training at 4,096–8,192 tokens is realistic, capturing far more complex functions without truncation.
-
----
-
-## Token Length Recommendations
-
-The paper states a maximum of **20,000 tokens** for sequence management, but the current code caps at **2,048**. Here is what is reasonable for each model size:
-
-| Model | Practical Training Seq Length | Reasoning |
-|---|---|---|
-| 3B (current) | 2,048–4,096 | Memory-constrained, limited attention capacity |
-| 8B | 4,096 | Good balance, 2× current |
-| 14–15B | 4,096–8,192 | Can handle most complex functions |
-| **32B (recommended)** | **4,096–8,192** | **Sweet spot: captures 95%+ of functions without truncation** |
-| 70B+ | 8,192–16,384 | Diminishing returns beyond 8K for this task |
-
-### Why 4,096 Tokens for the 32B Model
-
-- The dataset's TAC inputs + Solidity outputs need to fit in one sequence.
-- The paper found 67.64% of functions have length differences within ±50 characters, with most functions in the 200–300 character range.
-- At ~4 characters per token, most functions are 50–150 tokens of TAC + 50–150 tokens of Solidity.
-- 4,096 gives 10–20× headroom for complex functions.
-- Going to 8,192 captures even the longest DeFi functions but doubles memory per sample.
-
-### VRAM Estimate for 32B 4-bit LoRA Training at 4,096 Seq Length
-
-| Component | VRAM |
+| Setting | Default |
 |---|---|
-| Model weights (4-bit) | ~18 GB |
-| LoRA adapters + optimizer | ~4 GB |
-| Activations (batch_size=4, seq_len=4096) | ~8–12 GB |
-| **Total** | **~30–34 GB** → fits on a single RTX 8000 |
+| Base model | `Qwen/Qwen2.5-Coder-7B-Instruct` |
+| LoRA | enabled, rank 16, alpha 32, dropout 0.1 |
+| Target modules | `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` |
+| Quantization | disabled (`--quantization` opts into 4-bit NF4 loading) |
+| Precision | `fp16` (`--precision auto|bf16|fp16|fp32`) |
+| Max sequence length | 8192 |
+| Per-device batch | 1 |
+| Target global batch | 16, with accumulation auto-derived from world size |
+| GPU count | 4 for automatic torchrun relaunch when multiple CUDA GPUs are visible |
+| Gradient checkpointing | enabled |
+| Split ratios | 85% train, 10% validation, 5% test |
+| Split/preflight caches | split reuse and tokenization cache enabled; preflight cache under `data/preflight_cache/` |
 
----
+Compiler/source metadata is retained in JSONL `metadata` for analysis, but
+training and inference prompts only include bytecode/TAC-derived metadata.
+`--no-compiler-metadata` is a deprecated no-op.
 
-## Implementation Changes Required
+## Recommended commands
 
-To switch from Llama 3.2 3B to Qwen 2.5 Coder 32B, the following changes are needed:
-
-1. **Change `model_name`** in `ModelConfig` and `train.py`: set to `"Qwen/Qwen2.5-Coder-32B"`.
-2. **Update `max_sequence_length`**: from 2048 → 4096.
-3. **Adjust batch size**: likely 2 per GPU (instead of 4) with gradient accumulation of 8–16.
-4. **Keep LoRA config identical**: r=16, alpha=32 works well for 32B models too.
-5. **Multi-GPU setup**: Add `accelerate` config for FSDP or DeepSpeed if training across multiple GPUs (optional — single GPU works).
-6. **Tokenizer handling**: Qwen uses its own tokenizer, but the HuggingFace `AutoTokenizer` abstraction handles this transparently.
-
-The code as written already supports this — pass the following to `train.py`:
+After generating or restoring the local HF dataset, use the current
+split/preflight pipeline:
 
 ```bash
-uv run python train.py --model-name Qwen/Qwen2.5-Coder-32B --max-seq-length 4096 --batch-size 2
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl
 ```
 
----
+On a 4x RTX 8000 host, prefer the wrapper when you want explicit DDP launch and
+auto sequence/batch sizing:
 
-## Summary Comparison
+```bash
+./run_train_torchrun.sh
+```
 
-| Aspect | Current (Paper) | Recommended |
+Use the measured throughput recipe only when maximizing short-context throughput:
+
+```bash
+THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh
+```
+
+DeepSpeed is supported through the wrapper and `ds_config.json`:
+
+```bash
+./run_train_deepspeed.sh
+```
+
+Evaluate an existing adapter/model:
+
+```bash
+uv run python train.py --eval-only \
+  --model-path models/final_model \
+  --test-dataset data/test_dataset.jsonl \
+  --eval-batch-size 4
+```
+
+Refresh only splits/preflight without training:
+
+```bash
+uv run python train.py --skip-collection \
+  --dataset ./data/hf_training_dataset.jsonl \
+  --dataset-only
+```
+
+## Wrapper environment variables
+
+`train_common.sh` is sourced by both wrapper scripts. Override these with
+environment variables:
+
+| Variable | Default | Notes |
 |---|---|---|
-| **Model** | Llama 3.2 3B | Qwen 2.5 Coder 32B |
-| **Parameters** | 3B | 32B (10.7×) |
-| **Token limit** | 2,048 | 4,096 (2×) |
-| **Quantization** | 4-bit NF4 | 4-bit NF4 (same) |
-| **LoRA rank** | 16 | 16 (same) |
-| **Batch size** | 4 | 2 per device × 4 GPUs |
-| **VRAM used** | ~4 GB | ~30–34 GB per GPU |
-| **Expected quality gain** | Baseline (0.82 avg sim) | Estimated 0.88–0.92 avg sim |
+| `NGPUS` | `4` | Passed to `torchrun --nproc_per_node` or `deepspeed --num_gpus`. |
+| `EPOCHS` | `3` | `--epochs`. |
+| `LR` | `2e-4` | `--lr`. |
+| `DATASET` | `./data/hf_training_dataset.jsonl` | Source JSONL; wrappers still let `train.py` split/reuse splits. |
+| `MODEL` | `Qwen/Qwen2.5-Coder-7B-Instruct` | `--model-name`. |
+| `PRECISION` | `fp16` | Use `auto` for BF16 on Ampere+ and FP16 elsewhere. |
+| `GRADIENT_CHECKPOINTING` | `true` | Emits `--gradient-checkpointing` or `--no-gradient-checkpointing`. |
+| `REPORT_TO` | `tensorboard` | Wrapper default; direct `train.py` default is `none`. |
+| `SKIP_EVAL` | `false` | Adds `--skip-eval` to skip post-training evaluation. |
+| `MAX_SEQ_LEN` | auto | If unset, tokenizer P99 rounded to a power of two and capped by `MAX_SEQ_LEN_CAP`, cached at `data/preflight_cache/sequence_lengths.json`. |
+| `MAX_SEQ_LEN_CAP` | `8192` | Upper bound for wrapper sequence-length detection. |
+| `BATCH_SIZE` | auto | If unset, `8192 / MAX_SEQ_LEN`, clamped to 1..32; throughput sweep sets 9. |
+| `GLOBAL_BATCH_SIZE` | `BATCH_SIZE * NGPUS` | Controls auto gradient accumulation. |
+| `THROUGHPUT_SWEEP_DEFAULTS` | `false` | Sets `MAX_SEQ_LEN=256`, `BATCH_SIZE=9`, and matching global batch. |
+| `SEQ_LEN_CACHE` | `./data/preflight_cache/sequence_lengths.json` | Wrapper sequence-length detection cache. |
+| `DS_CONFIG` | `ds_config.json` | DeepSpeed wrapper only. |
+| `HF_TOKEN` | unset | Used for tokenizer/model access where required. |
 
----
+## Launch mode behavior
 
-## Multi-GPU Training & DeepSpeed
+- Direct `train.py` auto-relaunches itself with `torchrun --standalone` when
+  `--num-gpus > 1`, more than one CUDA GPU is visible, and it is not already in a
+  distributed launch. Add `--no-auto-torchrun` or `--num-gpus 1` for a true
+  single-process run.
+- `run_train_torchrun.sh` always uses `uv run torchrun --nproc_per_node=$NGPUS`.
+- `run_train_deepspeed.sh` uses `uv run --extra deepspeed deepspeed` with
+  `DS_CONFIG` (default `ds_config.json`). The checked-in config is ZeRO stage 0
+  with auto BF16/FP16 fields, auto batch sizes, `steps_per_print: 50`, and no
+  wall-clock breakdown.
+- Quantized models launched without torchrun/DeepSpeed are restricted to GPU 0
+  unless you set `CUDA_VISIBLE_DEVICES`; use distributed launch for multi-GPU
+  QLoRA.
 
-Three training modes are available, from simplest to fastest:
+## Precision, quantization, and checkpointing
 
-### 1. Single GPU (`uv run python`)
+- `--precision auto` chooses BF16 on Ampere+ GPUs (`sm_80+`) and FP16 on older
+  CUDA GPUs. RTX 8000 is Turing, so use FP16.
+- `--quantization` enables 4-bit NF4 loading through bitsandbytes. Leave it off
+  unless VRAM pressure or model size requires QLoRA.
+- Gradient checkpointing is on by default for the 8192-token context. Disable it
+  only after verifying the target hardware has enough headroom.
+- For fixed 8192-token Qwen 7B on 4x RTX 8000, the measured viable recipe is
+  QLoRA + FP16 + gradient checkpointing + batch size 1 per GPU + global batch 4.
+  Larger per-GPU 8192-token batches OOMed; scale effective batch with gradient
+  accumulation instead.
 
-```bash
-uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --batch-size 4 --epochs 3 --lr 2e-4 --max-seq-length 2048 \
-    --precision fp16 --no-gradient-checkpointing --skip-eval
-```
+## Data, splits, and preflight
 
-Automatically restricts to GPU 0 when using quantized models.
+`train.py --skip-collection --dataset <source.jsonl>` treats the dataset as a
+full source dataset and writes/reuses `data/train_dataset.jsonl`,
+`data/val_dataset.jsonl`, `data/test_dataset.jsonl`, and
+`data/split_manifest.json`. It refuses to re-split existing split artifacts
+unless `--allow-split-artifact-source` is set.
 
-### 2. Multi-GPU DDP (`torchrun`)
+Useful flags:
 
-```bash
-./run_train_torchrun.sh              # auto-detects max_seq_len and batch_size
-THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh  # sweep recipe: batch_size=9, max_seq_len=256
-NGPUS=2 ./run_train_torchrun.sh      # override GPU count
-
-# Long-context 8192-token recipe from the sweep result
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
-    --num-gpus 4 --batch-size 1 --global-batch-size 4 --max-seq-length 8192 \
-    --precision fp16 --quantization --gradient-checkpointing \
-    --train-eval-strategy no --skip-eval
-```
-
-Standard PyTorch Distributed Data Parallel — each GPU holds a full copy of optimizer states and gradients.
-
-### 3. DeepSpeed (`deepspeed`)
-
-```bash
-./run_train_deepspeed.sh                    # auto-detects max_seq_len and batch_size
-THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_deepspeed.sh # sweep recipe: batch_size=9, max_seq_len=256
-NGPUS=2 ./run_train_deepspeed.sh            # override GPU count
-```
-
-Uses `ds_config.json` (ZeRO Stage 0 + fp16 on RTX 8000 by default).
-
-> **Performance note for Llama 3.2 3B + LoRA**: For this small model (3B params,
-> 24M trainable LoRA parameters) with 4-bit quantization, **torchrun DDP is
-> ~40-60% faster** than DeepSpeed due to DeepSpeed's per-step engine overhead.
-> The quantized model is only ~2 GB per GPU, so ZeRO memory sharding provides
-> no benefit and its communication adds overhead.
->
-> **Use DeepSpeed when**:
-> - Training larger models (7B+) where ZeRO memory savings matter
-> - Doing full fine-tuning (not LoRA) where optimizer states are large
-> - GPU memory is constrained and you need ZeRO stage 2/3 to fit the model
-> - Training 32B+ models across multiple GPUs
-
-For larger models, switch to ZeRO Stage 2 in `ds_config.json`:
-
-```json
-{
-  "bf16": { "enabled": true },
-  "zero_optimization": {
-    "stage": 2,
-    "overlap_comm": true,
-    "contiguous_gradients": true,
-    "reduce_bucket_size": 2e8,
-    "allgather_bucket_size": 2e8
-  }
-}
-```
-
-| Feature | DDP (torchrun) | DeepSpeed ZeRO-0 | DeepSpeed ZeRO-2 |
-|---|---|---|---|
-| Optimizer state memory | Full per GPU | Full per GPU | Sharded (1/N) |
-| Gradient memory | Full per GPU | Full per GPU | Sharded (1/N) |
-| Per-step overhead | Lowest | ~40-60% higher | ~60-100% higher |
-| Best for | Small models + LoRA | N/A (use torchrun) | Large models, full FT |
-
-To use DeepSpeed manually (without the wrapper script):
-
-```bash
-uv run --extra deepspeed deepspeed --num_gpus=4 train.py \
-    --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --batch-size 4 --epochs 3 --deepspeed ds_config.json --skip-eval
-```
-
-### DeepSpeed ZeRO Stage 3 (for 70B+ models)
-
-For models that don't fit on a single GPU even in 4-bit (e.g., full bf16 70B), use ZeRO Stage 3 which additionally shards model parameters. Create a `ds_config_z3.json`:
-
-```json
-{
-  "bf16": { "enabled": true },
-  "zero_optimization": {
-    "stage": 3,
-    "overlap_comm": true,
-    "contiguous_gradients": true,
-    "reduce_bucket_size": 5e7,
-    "stage3_prefetch_bucket_size": 5e7,
-    "stage3_param_persistence_threshold": 1e5
-  },
-  "gradient_accumulation_steps": "auto",
-  "gradient_clipping": 1.0,
-  "train_batch_size": "auto",
-  "train_micro_batch_size_per_gpu": "auto"
-}
-```
-
-Then: `DS_CONFIG=ds_config_z3.json ./run_train_deepspeed.sh`
-
----
-
-## Detailed Model Profiles & Training Parameters
-
-The following sections provide complete training configurations for each recommended model, including exact commands and VRAM estimates.
-
----
-
-### DeepSeek-Coder-V2 33B
-
-**Model ID**: `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` (33B dense variant)
-
-**Why it's interesting for decompilation:**
-
-- Exceptional at formal/structured languages — compiler-adjacent tasks are a sweet spot
-- Stronger than Qwen on reconstructing nested storage layouts and fixed-point math
-- Better handling of complex dispatcher patterns in DeFi contracts (AMMs, staking, rebasing)
-
-**Where it may beat Qwen 2.5 Coder 32B:**
-
-- Complex bitwise logic and fixed-point arithmetic (common in DeFi)
-- Multi-level storage slot resolution
-- Contracts with non-standard dispatcher patterns
-
-**Tradeoffs:**
-
-- More finicky training — requires careful hyperparameter selection
-- Less forgiving tokenization for bytecode-adjacent text
-- Fewer community LoRA examples → less proven fine-tuning recipe
-
-| Parameter | Value |
+| Flag | Use |
 |---|---|
-| **LoRA rank (r)** | 16 |
-| **LoRA alpha** | 32 |
-| **LoRA dropout** | 0.1 |
-| **Target modules** | `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj` |
-| **Quantization** | 4-bit NF4 (double quant) |
-| **Batch size** | 2 per GPU |
-| **Gradient accumulation** | 8 |
-| **Sequence length** | 4,096 |
-| **Learning rate** | 1.5e-4 (slightly lower than Qwen — DeepSeek is more sensitive) |
-| **LR scheduler** | Cosine with warmup ratio 0.05 |
-| **Epochs** | 3–5 |
-| **VRAM per GPU (4-bit LoRA)** | ~28–34 GB → fits on 1× RTX 8000 |
+| `--force-resplit` | Regenerate splits even if the manifest matches. |
+| `--reuse-splits / --no-reuse-splits` | Enable/disable split manifest cache reuse. |
+| `--skip-split-validation` | Skip leakage/coverage/split-quality gates. |
+| `--min-holdout-stratum-count N` | Require common strata to appear in validation and test. |
+| `--allow-degenerate-splits` | Allow leakage-free but highly imbalanced splits. |
+| `--skip-data-preflight` | Skip JSONL schema/token-length preflight; use only for legacy smoke tests. |
+| `--preflight-tokenizer-download` | Allow tokenizer downloads during preflight. |
+| `--allow-whitespace-preflight-fallback` | Use approximate whitespace token counts if tokenizer load fails. |
+| `--allow-legacy-metadata-schema` | Permit rows missing `metadata.schema_version`. |
 
-```bash
-uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --model-name deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
-    --batch-size 2 --epochs 3 --lr 1.5e-4 --max-seq-length 4096 --skip-eval
-```
+Tokenized datasets are cached by default under `.tokenized_cache` next to the
+split file. Use `--no-tokenization-cache`, `--tokenization-cache-dir`, or
+`--overwrite-tokenization-cache` to control it.
 
----
+## Output paths
 
-### DeepSeek-V3 (MoE, ~37B active / 671B total)
-
-**Model ID**: `deepseek-ai/DeepSeek-V3` (Mixture of Experts)
-
-**Why it's interesting:**
-
-- MoE architecture: ~37B active parameters out of 671B total — higher effective capacity without full 70B training cost
-- State-of-the-art on code benchmarks as of early 2026
-- Multi-head latent attention for improved long-range reasoning
-
-**MoE-specific considerations:**
-
-- **Determinism**: MoE routing introduces non-determinism across runs. Set `torch.use_deterministic_algorithms(True)` and fixed seeds for reproducibility, but expect small variations.
-- **Load balancing loss**: MoE models include an auxiliary load-balancing loss. The default coefficient is usually fine, but monitor expert utilization during training.
-- **Memory**: Despite 671B total parameters, only ~37B are active per token. However, all expert weights must be loaded into memory. 4-bit quantization brings this to ~80–100 GB across 2–3 GPUs.
-
-| Parameter | Value |
+| Path | Contents |
 |---|---|
-| **LoRA rank (r)** | 16 |
-| **LoRA alpha** | 32 |
-| **LoRA dropout** | 0.1 |
-| **Target modules** | All linear layers (use `"all-linear"`) |
-| **Quantization** | 4-bit NF4 |
-| **Batch size** | 1 per GPU |
-| **Gradient accumulation** | 16 |
-| **Sequence length** | 4,096 |
-| **Learning rate** | 1e-4 |
-| **LR scheduler** | Cosine with warmup ratio 0.03 |
-| **Epochs** | 3 |
-| **VRAM** | ~80–100 GB → requires 2–3× RTX 8000 with DeepSpeed ZeRO-2 |
-| **Multi-GPU** | Required — use `run_train_deepspeed.sh` |
+| `models/checkpoints/checkpoint-*` | Trainer checkpoints; `--resume auto` selects the latest valid one. |
+| `models/final_model/` | Final adapter/model, tokenizer, and `model_config.json`. |
+| `models/final_model/training_input_manifest.json` | Dataset hashes, token-length/truncation summaries, context-window checks, and effective Trainer arguments. |
+| `models/final_model/training_metrics.json` | Final Trainer metrics. |
+| `models/final_model/training_log_history.{json,csv}` | Trainer log history. |
+| `models/training_throughput.{json,csv}` | Throughput telemetry unless `--no-throughput-metrics`. |
+| `models/run_manifests/*.manifest.json` | Run manifests unless overridden by `--manifest-dir` or `--run-manifest`. |
+| `results/eval_*.json` | Evaluation summary plus per-example details. |
+| `latest_results.txt` | Human-readable latest evaluation report. |
+
+## Evaluation and quality gates
+
+Post-training evaluation runs by default unless `--skip-eval` is set. Train-time
+validation is controlled separately by `--train-eval-strategy auto|steps|epoch|no`;
+`auto` uses epoch validation for tiny datasets and step validation otherwise.
+
+Evaluation supports seeded sampling (`--eval-limit`, `--eval-seed`), first-N
+debug sampling (`--eval-first-n`), batched generation (`--eval-batch-size`), and
+multi-GPU sharding when launched with torchrun. Results include semantic
+similarity, normalized edit distance, BLEU, ROUGE-L, token accuracy, structural
+preservation, structured replication precision/recall/F1, hallucination buckets,
+Solidity scaffold/compiler/AST validity, bytecode semantic/deployability signals,
+prompt truncation diagnostics, metadata segment metrics, confidence intervals,
+worst samples, benchmark-suite summaries, and optional baseline comparisons.
+
+Regression-blocking evaluation:
 
 ```bash
-NGPUS=3 uv run --extra deepspeed deepspeed --num_gpus=3 train.py \
-    --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --model-name deepseek-ai/DeepSeek-V3 \
-    --batch-size 1 --epochs 3 --lr 1e-4 --max-seq-length 4096 \
-    --deepspeed ds_config.json --skip-eval
+uv run python train.py --eval-only \
+  --model-path models/final_model \
+  --test-dataset data/test_dataset.jsonl \
+  --baseline-results results/prior_eval.json \
+  --quality-gate
 ```
 
-> ⚠️ **Important**: MoE models may require custom LoRA target module selection. If training fails with the default targets, use `"all-linear"` or inspect the model architecture with `model.named_modules()` to find the correct MoE expert layer names.
+`latest_results.txt` currently records a small eval-only snapshot of
+`models/final_model_378` using `meta-llama/Llama-3.2-3B`, 4-bit LoRA, max
+sequence length 2048, and `--eval-limit 3`. Its semantic similarity mean is
+0.7340 and replication F1 mean is 0.6062, but this is a tiny checked-in smoke
+result, not a Qwen 7B benchmark.
 
----
+## Hardware recommendations
 
-### Codestral (Mistral)
+### 4x RTX 8000 (48 GB, Turing)
 
-**Model ID**: `mistralai/Codestral-22B-v0.1`
-
-**Why it's interesting:**
-
-- Very strong at structured generation — produces syntactically correct code consistently
-- Smaller parameter count (22B) but high per-parameter efficiency
-- Excellent instruction following for code transformation tasks
-- 32K context window
-
-**Where it excels:**
-
-- Syntactically perfect Solidity output (fewer parse errors in generated code)
-- Clean function boundary reconstruction
-- Efficient inference — faster generation than 32B models
-
-**Limitations:**
-
-- Weaker on ultra-long context reasoning compared to Qwen/DeepSeek
-- Less capacity for memorizing rare DeFi patterns
-- 22B may underperform 32B on the hardest decomposition cases
-
-| Parameter | Value |
-|---|---|
-| **LoRA rank (r)** | 16 |
-| **LoRA alpha** | 32 |
-| **LoRA dropout** | 0.1 |
-| **Target modules** | `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj` |
-| **Quantization** | 4-bit NF4 |
-| **Batch size** | 4 per GPU |
-| **Gradient accumulation** | 4 |
-| **Sequence length** | 4,096 |
-| **Learning rate** | 2e-4 |
-| **LR scheduler** | Cosine |
-| **Epochs** | 3–5 |
-| **VRAM per GPU (4-bit LoRA)** | ~16–20 GB → fits easily on 1× RTX 8000 |
+- Use FP16, not BF16.
+- Default safe training: `./run_train_torchrun.sh` with tokenizer P99 sequence
+  length detection capped at 8192 and memory-scaled batch sizing.
+- Throughput sweep recipe: `THROUGHPUT_SWEEP_DEFAULTS=true ./run_train_torchrun.sh`.
+- Long-context 8192 recipe:
 
 ```bash
-uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --model-name mistralai/Codestral-22B-v0.1 \
-    --batch-size 4 --epochs 3 --lr 2e-4 --max-seq-length 4096 --skip-eval
+uv run torchrun --standalone --nproc_per_node=4 train.py \
+  --skip-collection \
+  --dataset ./data/hf_training_dataset.jsonl \
+  --batch-size 1 \
+  --global-batch-size 4 \
+  --max-seq-length 8192 \
+  --precision fp16 \
+  --quantization \
+  --gradient-checkpointing \
+  --report-to tensorboard \
+  --train-eval-strategy no
 ```
 
----
+### Single GPU or CPU smoke runs
 
-### StarCoder2 15B / 33B
-
-**Model ID**: `bigcode/starcoder2-15b` or `bigcode/starcoder2-33b` (BigCode open-weight)
-
-**Why it's interesting:**
-
-- Trained on The Stack v2 — one of the highest-quality code training corpora
-- Lower hallucination rate than general-purpose models
-- 15B version is extremely efficient for iteration and experimentation
-- Fill-in-the-middle (FIM) capability could help with partial function reconstruction
-
-**Where it excels:**
-
-- Clean, non-hallucinated output — when it doesn't know something, it generates less rather than inventing
-- Fast iteration cycles (especially 15B variant)
-- Good baseline for ablation studies
-
-**Limitations:**
-
-- Weaker global reasoning than Qwen/DeepSeek for cross-function dependencies
-- 15B may lack capacity for the hardest cases
-- Less instruction-tuned — may need more careful prompt engineering
-
-| Parameter | 15B | 33B |
-|---|---|---|
-| **LoRA rank (r)** | 16 | 16 |
-| **LoRA alpha** | 32 | 32 |
-| **LoRA dropout** | 0.1 | 0.1 |
-| **Target modules** | `c_attn, c_proj, c_fc` | `c_attn, c_proj, c_fc` |
-| **Quantization** | 4-bit NF4 | 4-bit NF4 |
-| **Batch size** | 4 per GPU | 2 per GPU |
-| **Gradient accumulation** | 4 | 8 |
-| **Sequence length** | 4,096 | 4,096 |
-| **Learning rate** | 2e-4 | 2e-4 |
-| **Epochs** | 3–5 | 3–5 |
-| **VRAM (4-bit LoRA)** | ~12–14 GB | ~24–28 GB |
+Use a bounded run and disable auto multi-GPU launch:
 
 ```bash
-# StarCoder2 15B — fast iteration
-uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --model-name bigcode/starcoder2-15b \
-    --batch-size 4 --epochs 5 --lr 2e-4 --max-seq-length 4096 --skip-eval
-
-# StarCoder2 33B — higher quality
-uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --model-name bigcode/starcoder2-33b \
-    --batch-size 2 --epochs 3 --lr 2e-4 --max-seq-length 4096 --skip-eval
+uv run python train.py --skip-collection \
+  --dataset ./data/hf_training_dataset.jsonl \
+  --num-gpus 1 --no-auto-torchrun \
+  --max-steps 10 --train-eval-strategy no --skip-eval
 ```
 
-> **Note**: StarCoder2 uses GPT-style attention layer names (`c_attn`, `c_proj`, `c_fc`). If the auto-detection in `model_setup.py` selects the wrong modules, the code will fall back to `"all-linear"` automatically.
+For CI-style functionality checks, `--tiny` switches to `facebook/opt-125m` and
+small defaults.
 
----
+### Larger model exploration
 
-### Phi-3 Medium 14B
+The repository supports changing `--model-name`, LoRA settings, quantization,
+precision, and DeepSpeed config. Current checked-in quality data does not prove a
+32B/70B gain. Treat these as recommendations to validate, not measured results:
 
-**Model ID**: `microsoft/Phi-3-medium-14b-4k-instruct`
-
-**Why it's interesting:**
-
-- Surprisingly strong code performance for its size (14B)
-- Excellent for auxiliary tasks: pattern classification, IR cleanup, TAC normalization
-- Very fast iteration — ideal for prototyping and hyperparameter sweeps
-- Strong instruction following
-
-**Best use cases:**
-
-- **Auxiliary model**: Use as a pre-processor to clean/classify TAC before feeding to the primary 32B model
-- **Rapid experimentation**: Test new training strategies cheaply before committing to 32B runs
-- **Ensemble component**: Generate multiple candidates, rank with a separate model
-
-**Not recommended as primary decompiler** — 14B lacks capacity for complex DeFi patterns.
-
-| Parameter | Value |
-|---|---|
-| **LoRA rank (r)** | 16 |
-| **LoRA alpha** | 32 |
-| **LoRA dropout** | 0.1 |
-| **Target modules** | `qkv_proj, o_proj, gate_up_proj, down_proj` |
-| **Quantization** | 4-bit NF4 |
-| **Batch size** | 4 per GPU |
-| **Gradient accumulation** | 4 |
-| **Sequence length** | 4,096 (native 4K context) |
-| **Learning rate** | 2e-4 |
-| **Epochs** | 3–5 |
-| **VRAM (4-bit LoRA)** | ~10–12 GB → fits trivially on any RTX 8000 |
-
-```bash
-uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
-    --model-name microsoft/Phi-3-medium-14b-4k-instruct \
-    --batch-size 4 --epochs 5 --lr 2e-4 --max-seq-length 4096 --skip-eval
-```
-
----
-
-## Model Comparison Matrix
-
-| Model | Params | VRAM (4-bit LoRA) | Best For | Risk Level | Context |
-|---|---|---|---|---|---|
-| **Qwen 2.5 Coder 32B** 🥇 | 32B | ~30 GB | General decompilation | Low | 128K |
-| **DeepSeek-Coder-V2 33B** 🥈 | 33B | ~32 GB | DeFi/complex math | Medium | 128K |
-| **DeepSeek-V3 (MoE)** | 37B active | ~90 GB | Maximum capacity | High | 128K |
-| **Codestral 22B** | 22B | ~18 GB | Syntactic correctness | Low | 32K |
-| **StarCoder2 15B** | 15B | ~13 GB | Fast iteration / low hallucination | Low | 16K |
-| **StarCoder2 33B** | 33B | ~26 GB | Quality + low hallucination | Low | 16K |
-| **Phi-3 Medium** | 14B | ~11 GB | Auxiliary tasks / prototyping | Low | 4K |
-| **Qwen 2.5 72B** | 72B | ~90 GB | Maximum quality (diminishing returns) | Medium | 128K |
-| **Llama 3.1 70B** | 70B | ~45 GB | NL explanation, not reconstruction | Medium | 128K |
-
-## Model Selection Decision Tree
-
-```
-START: What is your priority?
-│
-├─ Fast iteration / prototyping?
-│  └─ Phi-3 Medium 14B or StarCoder2 15B
-│
-├─ Best quality/cost ratio? (RECOMMENDED)
-│  └─ Qwen 2.5 Coder 32B
-│     ├─ Struggling with DeFi contracts?
-│     │  └─ Try DeepSeek-Coder-V2 33B head-to-head
-│     └─ Struggling with syntax correctness?
-│        └─ Try Codestral 22B head-to-head
-│
-├─ Absolute maximum quality?
-│  └─ Have you exhausted 32B improvements?
-│     ├─ No → Stay with 32B, improve dataset first
-│     └─ Yes → Qwen 2.5 72B with ZeRO-3
-│
-└─ Lowest hallucination rate?
-   └─ StarCoder2 33B
-```
-
----
-
-## Why NOT "The Biggest Llama"?
-
-Even at 70B, Llama 3.x models are suboptimal for bytecode decompilation:
-
-- **Trained primarily for natural language** — tokenizer is not optimized for bytecode-like text (hex, opcodes, IR syntax)
-- **Hallucination tendency** — tends to invent missing logic rather than indicating "unknown"
-- **Worse deterministic reconstruction** — bytecode decompilation requires exact pattern matching, not creative writing
-- **Tokenizer inefficiency** — hex sequences and opcode mnemonics encode into more tokens than code-specialized tokenizers
-
-Llama is excellent for *explaining* contracts in natural language, but not for *reconstructing* them from bytecode.
-
----
-
-## Scaling Strategy
-
-A recommended iterative approach:
-
-1. **Phase 1** — Train with **Qwen 2.5 Coder 32B** at 4,096 tokens (primary recommendation). Evaluate against the paper's benchmarks.
-2. **Phase 2** — If results are strong, experiment with 8,192 token sequences to capture the long-tail complex functions.
-3. **Phase 2b** — Run a head-to-head comparison with **DeepSeek-Coder-V2 33B** on your hardest DeFi samples. If DeepSeek wins on complex math/storage patterns, consider an ensemble or model selection strategy.
-4. **Phase 3** — Optionally scale to **70B** (Qwen 2.5 72B preferred over Llama 3.1 70B) using DeepSpeed ZeRO-3 across all 4 GPUs for maximum quality.
-5. **Phase 4** — Compare 32B vs 70B results. The 70B may show diminishing returns relative to training cost for this domain-specific task.
-
-> **Critical insight**: Dataset quality improvements (see `docs/runbook.md` and `docs/data-format.md`) will almost always yield larger gains than scaling from 32B -> 70B. Prioritize data quality before model size.
+1. Start with the default Qwen 7B recipe and establish a full test-set baseline.
+2. If quality is insufficient, try code-specialized 14B-32B models with
+   `--quantization`, lower per-GPU batch size, and 4096-8192 sequence lengths.
+3. Use DeepSpeed ZeRO-2/3 only after editing `ds_config.json` or supplying a new
+   config; the checked-in `ds_config.json` is ZeRO-0.
+4. Do not compare models on the checked-in `latest_results.txt` smoke result;
+   run the same test split, eval limit, generation settings, and quality gate for
+   each candidate.

@@ -20,7 +20,7 @@ The system implements four analysis pipelines coordinated by `PipelineOrchestrat
 
 1. **Bytecode → TAC → Solidity** — `BytecodeAnalyzer` disassembles EVM bytecode, constructs control-flow graphs, and emits TAC; a LoRA fine-tuned LLM translates TAC into readable Solidity
 2. **Vulnerability Detection** — `VulnerabilityDetector` scans bytecode and source for reentrancy, timestamp dependence, overflow, delegatecall, access control, and selfdestruct vulnerabilities
-3. **Malicious Classification** — `MaliciousContractClassifier` uses opcode frequency features + LightGBM with LIME explainability to classify contracts as malicious or legitimate
+3. **Malicious Classification** — `MaliciousContractClassifier` uses opcode frequency features with a LightGBM/LIME path when a fitted artifact is available, otherwise heuristic fallback classification
 4. **Audit Report Generation** — `AuditReportGenerator` aggregates all findings into a comprehensive security audit with risk scoring
 
 ## Quick Start
@@ -31,7 +31,7 @@ The system implements four analysis pipelines coordinated by `PipelineOrchestrat
 uv sync
 ```
 
-> **Requirements:** Python ≥ 3.10, CUDA-compatible GPU with ≥ 4 GB VRAM (inference) / ≥ 16 GB (training).
+> **Requirements:** Python 3.13.x, CUDA-compatible GPU with ≥ 4 GB VRAM (inference) / ≥ 16 GB (training). The locked training stack is validated on Linux x86_64 with CUDA 13 PyTorch wheels.
 
 ### 2. Download Training Data
 
@@ -72,7 +72,7 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
 
 # Full training with custom parameters
 uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
-    --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 2048
+    --epochs 5 --batch-size 1 --lr 2e-4 --max-seq-length 8192
 
 # Force single-GPU or memory-saving quantized LoRA when needed
 uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
@@ -148,6 +148,7 @@ For the full operator guide, including current-data sufficiency checks, data reg
 
 The pytest configuration disables Web3's unrelated `pytest_ethereum` entry
 point so repository tests collect consistently in supported `uv` environments.
+Install development dependencies with `uv sync --dev` before running tests.
 
 ```bash
 # Run all tests
@@ -167,9 +168,6 @@ uv run pytest tests/test_pipeline_orchestrator.py -v
 uv run pytest tests/test_opcode_features.py -v
 uv run pytest tests/test_web_app.py -v
 uv run pytest tests/test_e2e.py -v
-
-# Run with coverage
-uv run pytest --cov=src tests/
 ```
 
 ## Project Structure
@@ -184,23 +182,37 @@ uv run pytest --cov=src tests/
 │   ├── __init__.py            # Package exports (v2.0.0)
 │   ├── bytecode_analyzer.py   # EVM bytecode → TAC conversion, CFG construction
 │   ├── dataset_pipeline.py    # Etherscan data collection, Solidity parsing, DB
+│   ├── dataset_export_primitives.py  # Shared JSONL schema, sanitization, dedup helpers
 │   ├── local_compiler.py      # Local solc compilation (py-solc-x)
 │   ├── model_setup.py         # Model config, LoRA fine-tuning, inference
+│   ├── inference.py           # Shared bytecode inference schema for CLI/web/orchestrator
+│   ├── contract_reconstruction.py  # Contract scaffold assembly and quality/source summaries
+│   ├── abi_enrichment.py      # ABI/source-derived annotations kept out of prompts
+│   ├── tac_lookup.py          # Exact TAC→Solidity lookup database integration
 │   ├── training_pipeline.py   # Evaluation metrics (similarity, edit distance, replication precision/recall)
+│   ├── replication_metrics.py # Structured Solidity fact extraction and replication metrics
+│   ├── evaluation_report.py   # Human-readable latest-results report writer
 │   ├── opcode_features.py     # Opcode frequency, TF-IDF, entropy-based features
 │   ├── vulnerability_detector.py  # Vulnerability scanning (6 types, 5 severities)
-│   ├── malicious_classifier.py    # Malicious contract classification + LIME explainability
+│   ├── malicious_classifier.py    # Malicious classification + heuristic/LIME explanations
 │   ├── audit_report.py        # Security audit report generation + risk scoring
 │   ├── pipeline_orchestrator.py   # Coordinates all analysis stages
 │   ├── selector_resolver.py   # 4-byte selector → function signature (4-tier lookup)
-│   └── settings.yaml          # API keys config
+│   └── settings.yaml.example  # Template for optional local API-key config
 │
 ├── tests/                     # Unit, integration, docs, and web tests (pytest)
 │   ├── test_bytecode_analyzer.py   # Bytecode parsing, CFG, TAC, stack sim
+│   ├── test_contract_reconstruction.py  # Contract assembly and source summaries
+│   ├── test_data_generation_export_issues.py  # HF export and manifest regressions
 │   ├── test_dataset_pipeline.py    # Data collection and function pairing
 │   ├── test_dataset_quality_issues.py  # Dataset quality regression coverage
+│   ├── test_decompile_cli.py       # CLI inference behavior
 │   ├── test_docs_consistency.py    # README/runbook workflow drift checks
+│   ├── test_evaluation_report.py   # Latest-results report formatting
+│   ├── test_evaluation_quality_metrics.py  # Evaluation/quality metric regressions
+│   ├── test_model_training_issues.py   # Training pipeline regressions
 │   ├── test_opcode_features.py     # Feature extraction, TF-IDF, entropy
+│   ├── test_train_cli_issues.py    # train.py CLI and quality-gate regressions
 │   ├── test_prompt_metadata.py     # Bytecode-only prompt metadata coverage
 │   ├── test_vulnerability_detector.py  # Vulnerability scanning
 │   ├── test_malicious_classifier.py    # Classification and explainability
@@ -217,6 +229,8 @@ uv run pytest --cov=src tests/
 │
 ├── scripts/                   # Debug & utility scripts
 │   ├── decompile.py            # CLI: bytecode → TAC/Solidity inference
+│   ├── build_lookup_db.py      # Exact TAC lookup database builder
+│   ├── run_compiler_metadata_ablation.py  # Historical prompt-ablation helper
 │   ├── demo.py
 │   ├── check_bytecode_format.py
 │   ├── inspect_bytecode.py
@@ -238,7 +252,7 @@ uv run pytest --cov=src tests/
 │   ├── training-recommendations.md  # Model selection & multi-GPU training
 │   ├── runbook.md             # E2E training, evaluation, and inference guide
 │   └── contributing.md        # Development setup & guidelines
-├── demo_dataset.jsonl         # Sample training data (3 examples)
+├── demo_dataset.jsonl         # Smoke-test/demo fixture (55 examples)
 └── reference/                 # Research paper PDF, enhancement plans
 ```
 
@@ -259,6 +273,7 @@ uv run pytest --cov=src tests/
 | `--compile-only` | — | Only compile downloaded contracts |
 | `--export-only` | — | Only export existing pairs to JSONL |
 | `--output PATH` | `data/hf_training_dataset.jsonl` | Output file |
+| `--max-seq-length N` | `8192` | Export-time prompt/target length budget |
 | `--export-selectors PATH` | — | Export selector registry JSON |
 | `--import-selectors PATH` | — | Import selector registry JSON before processing |
 | `--db PATH` | `data/contracts.db` | SQLite database path |
@@ -274,15 +289,15 @@ For the 4-GPU RTX 8000 throughput recipe from
 | `--config PATH` | — | YAML/JSON training config; CLI flags override file values |
 | `--skip-collection` | — | Use existing dataset (skip Etherscan) |
 | `--dataset PATH` | auto | Path to a full-source JSONL dataset; cached split artifacts require `--allow-split-artifact-source` |
-| `--allow-split-artifact-source` | off | Explicitly allow re-splitting `train/val/test_dataset.jsonl` artifacts |
+| `--allow-split-artifact-source` | off | Explicitly allow re-splitting cached split artifacts: `train_dataset.jsonl`, `val_dataset.jsonl`, `validation_dataset.jsonl`, or `test_dataset.jsonl` |
 | `--small` | — | Quick test: 1 epoch, batch=2 |
 | `--tiny` | — | Use `facebook/opt-125m` for fast testing |
 | `--epochs N` | `3` | Training epochs |
-| `--batch-size N` | `4` | Per-device batch size |
+| `--batch-size N` | `1` | Per-device batch size |
 | `--global-batch-size N` | `16` | Target effective batch size used to auto-compute gradient accumulation |
 | `--gradient-accumulation-steps N` | auto | Override automatic gradient accumulation |
 | `--lr FLOAT` | `2e-4` | Learning rate |
-| `--max-seq-length N` | `2048` | Max token sequence length |
+| `--max-seq-length N` | `8192` | Max token sequence length |
 | `--eval-max-new-tokens N` | `256` | Max generated Solidity tokens per eval example |
 | `--model-name NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Base model |
 | `--precision MODE` | `fp16` | Trainer/DeepSpeed precision mode (`auto`, `bf16`, `fp16`, or `fp32`) |
@@ -294,7 +309,7 @@ For the 4-GPU RTX 8000 throughput recipe from
 | `--lora-alpha N` | `32` | LoRA alpha |
 | `--lora-dropout FLOAT` | `0.1` | LoRA dropout |
 | `--quantization` / `--no-quantization` | off | Enable or disable 4-bit NF4 loading |
-| `--gradient-checkpointing` / `--no-gradient-checkpointing` | off | Activation checkpointing; disabled by default for the 4x RTX 8000 throughput recipe |
+| `--gradient-checkpointing` / `--no-gradient-checkpointing` | on | Activation checkpointing; disable only when trading memory for throughput |
 | `--collection-workers N` | `3` | Etherscan collection worker count when supported |
 | `--max-compiler-configs N` | `2` | Compiler configs per collected contract |
 | `--allow-demo-fallback` | off | Explicitly allow `demo_dataset.jsonl` when real collection yields no pairs |
@@ -349,7 +364,7 @@ script no longer creates a true compiler-metadata control.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `HF_TOKEN` | For Llama access | HuggingFace token (gated model) |
+| `HF_TOKEN` | For gated/private HF models | HuggingFace token for model/tokenizer access or rate-limit reduction |
 | `ETHERSCAN_API_KEY` | For Etherscan collection | Only needed with `train.py` without `--skip-collection` |
 | `WEB_API_KEY` | Shared/remote web deployments | Protects API endpoints and GPU telemetry; the browser UI has an in-memory API key field |
 | `WEB_HOST` | Optional | Web bind address, default `127.0.0.1`; use with `WEB_API_KEY` for non-loopback hosts |
@@ -397,7 +412,7 @@ See [docs/model-details.md](docs/model-details.md) for more.
 | Problem | Solution |
 |---------|----------|
 | CUDA out of memory | Reduce `--batch-size` or use `--tiny` |
-| `HF_TOKEN` required | Set `HF_TOKEN` env var or add to `src/settings.yaml` |
+| `HF_TOKEN` required | Set `HF_TOKEN` env var, or copy `src/settings.yaml.example` to `src/settings.yaml` and add it there |
 | No training pairs generated | Check solc installation: `uv run python -c "from solcx import get_installed_solc_versions; print(get_installed_solc_versions())"` |
 | Download hangs | HuggingFace data is cached after first download; check `~/.cache/huggingface/hub/` |
 

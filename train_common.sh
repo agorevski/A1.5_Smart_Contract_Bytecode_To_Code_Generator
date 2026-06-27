@@ -14,10 +14,11 @@ LR="${LR:-2e-4}"
 DATASET="${DATASET:-./data/hf_training_dataset.jsonl}"
 MODEL="${MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}"
 PRECISION="${PRECISION:-fp16}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 THROUGHPUT_SWEEP_DEFAULTS="${THROUGHPUT_SWEEP_DEFAULTS:-false}"
 REPORT_TO="${REPORT_TO:-tensorboard}"
 SKIP_EVAL="${SKIP_EVAL:-false}"
+MAX_SEQ_LEN_CAP="${MAX_SEQ_LEN_CAP:-8192}"
 
 if [ "${GRADIENT_CHECKPOINTING}" = "false" ] || [ "${GRADIENT_CHECKPOINTING}" = "0" ]; then
     GRADIENT_CHECKPOINTING_ARG="--no-gradient-checkpointing"
@@ -39,7 +40,7 @@ if [ -z "${MAX_SEQ_LEN:-}" ] && [ "${THROUGHPUT_SWEEP_DEFAULTS}" = "true" ]; the
 elif [ -z "${MAX_SEQ_LEN:-}" ]; then
     echo "Auto-detecting optimal max sequence length from tokenizer counts..."
     SEQ_LEN_CACHE="${SEQ_LEN_CACHE:-./data/preflight_cache/sequence_lengths.json}"
-    MAX_SEQ_LEN=$(DATASET="${DATASET}" MODEL="${MODEL}" SEQ_LEN_CACHE="${SEQ_LEN_CACHE}" uv run python - <<'PY'
+    MAX_SEQ_LEN=$(DATASET="${DATASET}" MODEL="${MODEL}" SEQ_LEN_CACHE="${SEQ_LEN_CACHE}" MAX_SEQ_LEN_CAP="${MAX_SEQ_LEN_CAP}" uv run python - <<'PY'
 import hashlib
 import json
 import os
@@ -53,6 +54,7 @@ from src.model_setup import detect_max_sequence_length
 dataset = os.environ["DATASET"]
 model = os.environ["MODEL"]
 cache_path = Path(os.environ["SEQ_LEN_CACHE"])
+max_length = int(os.environ.get("MAX_SEQ_LEN_CAP", "8192"))
 kwargs = {"trust_remote_code": True}
 if os.environ.get("HF_TOKEN"):
     kwargs["token"] = os.environ["HF_TOKEN"]
@@ -66,6 +68,7 @@ cache_key = json.dumps(
         "dataset_sha256": digest.hexdigest(),
         "model": model,
         "percentile": 0.99,
+        "max_length": max_length,
         "detector": "src.model_setup.detect_max_sequence_length",
     },
     sort_keys=True,
@@ -90,7 +93,7 @@ except Exception as exc:
     )
     sys.exit(2)
 
-detected = detect_max_sequence_length(dataset, tokenizer)
+detected = detect_max_sequence_length(dataset, tokenizer, max_length=max_length)
 try:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
@@ -102,7 +105,7 @@ except Exception as exc:
 print(detected)
 PY
 )
-    echo "  Auto-detected max seq length: ${MAX_SEQ_LEN} (tokenizer P99, rounded to power of 2)"
+    echo "  Auto-detected max seq length: ${MAX_SEQ_LEN} (tokenizer P99, rounded to power of 2, cap ${MAX_SEQ_LEN_CAP})"
 fi
 
 # ── Batch size ───────────────────────────────────────────────
