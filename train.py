@@ -6,7 +6,7 @@ This script provides a single command to:
 1. Collect verified contracts from Etherscan
 2. Convert bytecode to TAC and pair with Solidity source
 3. Build and split the training dataset
-4. Fine-tune Llama 3.2 3B with LoRA
+4. Fine-tune Qwen2.5-Coder-7B-Instruct with LoRA
 5. Evaluate the trained model
 
 Usage:
@@ -34,14 +34,17 @@ Usage:
     # Evaluate after re-splitting a source dataset
     python train.py --eval-only --model-path models/smart_contract_decompiler --dataset data/my_dataset.jsonl
 
-    # Ablate compiler metadata from prompts
-    python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --no-compiler-metadata --max-steps 300
+    # Train with safe bytecode/TAC-derived prompt metadata (default)
+    python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --max-steps 300
 
     # Resume the latest checkpoint under --output-dir and persist a manifest
     python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --resume auto
 
     # Multi-GPU evaluation with torchrun (shards test data across GPUs)
     torchrun --nproc_per_node=4 train.py --eval-only --model-path models/smart_contract_decompiler
+
+    # Override the default 4-GPU LoRA/Qwen recipe
+    python train.py --config training_config.yaml --num-gpus 1 --quantization
 """
 
 import argparse
@@ -59,9 +62,193 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
+
+DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
+DEFAULT_NUM_GPUS = 4
+DEFAULT_GLOBAL_BATCH_SIZE = 16
+DEFAULT_USE_QUANTIZATION = False
+DEFAULT_PRECISION = "auto"
+DEFAULT_LORA_RANK = 16
+DEFAULT_LORA_ALPHA = 32
+DEFAULT_LORA_DROPOUT = 0.1
+DEFAULT_EVAL_SEED = 42
+SPLIT_CACHE_SCHEMA_VERSION = 2
+PREFLIGHT_CACHE_SCHEMA_VERSION = 2
+DEFAULT_MIN_SPLIT_TARGET_RATIO = 0.5
+DEFAULT_MAX_COMPONENT_TARGET_RATIO = 1.0
+DEFAULT_QUALITY_THRESHOLDS = {
+    "semantic_similarity_mean": {"op": ">=", "value": 0.82, "required": True},
+    "pct_above_0.8_similarity": {"op": ">=", "value": 0.78, "required": True},
+    "pct_below_0.4_edit_dist": {"op": ">=", "value": 0.82, "required": True},
+    "failure_rate": {"op": "<=", "value": 0.0, "required": True},
+    "replication_f1_mean": {"op": ">=", "value": 0.0, "required": False},
+    "solidity_valid_mean": {"op": ">=", "value": 0.0, "required": False},
+    "solidity_compiler_checked_mean": {"op": ">=", "value": 0.0, "required": False},
+    "solidity_ast_valid_mean": {"op": ">=", "value": 0.0, "required": False},
+}
+
+
+def _distributed_world_size() -> int:
+    raw_world_size = os.getenv("WORLD_SIZE")
+    try:
+        return max(1, int(raw_world_size)) if raw_world_size else 1
+    except ValueError:
+        return 1
+
+
+def resolve_gradient_accumulation_steps(
+    per_device_batch_size: int,
+    world_size: int = 1,
+    global_batch_size: int | None = DEFAULT_GLOBAL_BATCH_SIZE,
+    explicit_steps: int | None = None,
+) -> int:
+    """Resolve gradient accumulation while preserving the target global batch."""
+    if explicit_steps is not None:
+        return max(1, int(explicit_steps))
+    if not global_batch_size:
+        return 1
+    denominator = max(1, int(per_device_batch_size) * max(1, int(world_size)))
+    return max(1, (int(global_batch_size) + denominator - 1) // denominator)
+
+
+def _cuda_device_count() -> int:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 0
+
+
+def _is_distributed_launch() -> bool:
+    return "LOCAL_RANK" in os.environ or _distributed_world_size() > 1
+
+
+def _maybe_relaunch_with_torchrun(args: argparse.Namespace) -> None:
+    """Use torchrun for the default multi-GPU training/eval path."""
+    if args.dataset_only or args.no_auto_torchrun or _is_distributed_launch():
+        return
+    if args.num_gpus <= 1:
+        return
+
+    available_gpus = _cuda_device_count()
+    if available_gpus <= 1:
+        return
+
+    nproc = min(args.num_gpus, available_gpus)
+    if nproc < args.num_gpus:
+        print(
+            f"Requested {args.num_gpus} GPUs but only {available_gpus} are visible; "
+            f"launching with {nproc}.",
+            flush=True,
+        )
+
+    print(f"Launching distributed run with torchrun on {nproc} GPUs.", flush=True)
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={nproc}",
+        *sys.argv,
+    ]
+    os.execv(sys.executable, cmd)
+
+
+def _normalize_config_key(key: str) -> str:
+    return str(key).strip().replace("-", "_")
+
+
+def _flatten_cli_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten supported nested YAML/JSON training config sections to argparse dests."""
+    flattened: dict[str, Any] = {}
+
+    key_aliases = {
+        "learning_rate": "lr",
+        "max_sequence_length": "max_seq_length",
+        "gpus": "num_gpus",
+        "gpu_count": "num_gpus",
+        "quantization": "use_quantization",
+    }
+
+    def merge_mapping(mapping: Mapping[str, Any], section: str | None = None) -> None:
+        for raw_key, value in mapping.items():
+            key = _normalize_config_key(raw_key)
+            if key == "model" and isinstance(value, Mapping):
+                merge_mapping(value, "model")
+                continue
+            if key == "lora" and isinstance(value, Mapping):
+                merge_lora_mapping(value)
+                continue
+            if key in {"training", "trainer", "data", "dataset", "evaluation"} and isinstance(
+                value, Mapping
+            ):
+                merge_mapping(value, key)
+                continue
+
+            if section == "model":
+                if key in {"name", "model"}:
+                    flattened["model_name"] = value
+                    continue
+                if key == "max_sequence_length":
+                    flattened["max_seq_length"] = value
+                    continue
+            if section in {"data", "dataset"} and key in {"path", "dataset_path"}:
+                flattened["dataset"] = value
+                continue
+            if section == "evaluation" and key == "batch_size":
+                flattened["eval_batch_size"] = value
+                continue
+
+            flattened[key_aliases.get(key, key)] = value
+
+    def merge_lora_mapping(mapping: Mapping[str, Any]) -> None:
+        for raw_key, value in mapping.items():
+            key = _normalize_config_key(raw_key)
+            if key == "enabled":
+                flattened["use_lora"] = value
+            elif key in {"rank", "r"}:
+                flattened["lora_rank"] = value
+            elif key in {"alpha", "lora_alpha"}:
+                flattened["lora_alpha"] = value
+            elif key in {"dropout", "lora_dropout"}:
+                flattened["lora_dropout"] = value
+            elif key in {"target_modules", "targets"}:
+                flattened["lora_target_modules"] = value
+            else:
+                flattened[f"lora_{key}"] = value
+
+    merge_mapping(config)
+    return flattened
+
+
+def _load_cli_config(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    config_path = Path(path)
+    with open(config_path, "r") as f:
+        if config_path.suffix.lower() == ".json":
+            payload = json.load(f)
+        else:
+            payload = yaml.safe_load(f)
+    if payload is None:
+        return {}
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Training config must be a mapping: {config_path}")
+    return _flatten_cli_config(payload)
+
+
+def _parser_destinations(parser: argparse.ArgumentParser) -> set[str]:
+    return {
+        action.dest
+        for action in parser._actions
+        if action.dest and action.dest != argparse.SUPPRESS and action.dest != "help"
+    }
 
 
 def setup_logging(log_file: str = "train.log"):
@@ -117,8 +304,8 @@ def collect_dataset(
 
     Uses local solc compilation (via py-solc-x) for each contract, optionally
     compiling with multiple compiler versions for data augmentation. Compiler
-    metadata is stored in each record's metadata field and included in the
-    training prompt by default when present.
+    metadata is stored in each record's metadata field, but prompts only use
+    bytecode/TAC-derived metadata and sanitize oracle annotations.
 
     Returns path to the exported JSONL dataset file.
     """
@@ -138,8 +325,10 @@ def collect_dataset(
 
     # Collect, compile locally, and build function pairs in one pass
     logger.info(
-        f"Downloading source from Etherscan and compiling locally "
-        f"(up to {max_compiler_configs} configs per contract)..."
+        "Downloading source from Etherscan and compiling locally "
+        "(up to %s configs per contract; requested workers=%s)...",
+        max_compiler_configs,
+        max_workers,
     )
     collect_kwargs = {"max_compiler_configs": max_compiler_configs}
     collect_signature = inspect.signature(builder.collect_and_compile_contracts)
@@ -149,6 +338,7 @@ def collect_dataset(
     )
     if supports_max_workers:
         collect_kwargs["max_workers"] = max_workers
+        logger.info("Collection/compile worker count: %s", max_workers)
     elif max_workers not in (None, 1):
         logger.warning(
             "DatasetBuilder.collect_and_compile_contracts does not support "
@@ -199,8 +389,7 @@ def _ensure_demo_dataset(output_dir: str, reason: str = "explicit_demo_fallback"
     logger = logging.getLogger(__name__)
     demo_path = Path("demo_dataset.jsonl")
     if not demo_path.exists():
-        logger.error("demo_dataset.jsonl not found. Cannot proceed without data.")
-        sys.exit(1)
+        raise RuntimeError("demo_dataset.jsonl not found. Cannot proceed without data.")
 
     target = Path(output_dir) / "dataset_from_demo.jsonl"
     import shutil
@@ -501,9 +690,7 @@ def _coverage_dimensions(item: dict) -> dict[str, str]:
                 "optimizer",
             )
         ),
-        "visibility": _normalize_key_value(
-            _metadata_value(item, "visibility"), lowercase=True
-        )
+        "visibility": _normalize_key_value(_metadata_value(item, "visibility"), lowercase=True)
         or "unknown",
         "source": _normalize_key_value(
             _metadata_value(item, "source", "dataset_source", "origin"), lowercase=True
@@ -624,9 +811,7 @@ def _stratified_component_split(
 
     assigned: dict[str, list[dict]] = {name: [] for name in SPLIT_NAMES}
     row_counts = {name: 0 for name in SPLIT_NAMES}
-    split_coverage = {
-        name: {field: Counter() for field in COVERAGE_FIELDS} for name in SPLIT_NAMES
-    }
+    split_coverage = {name: {field: Counter() for field in COVERAGE_FIELDS} for name in SPLIT_NAMES}
 
     for component in ordered:
         eligible = [name for name in SPLIT_NAMES if ratios[name] > 0]
@@ -723,9 +908,7 @@ def validate_split_leakage(
                         "split_counts": split_counts,
                     }
                 )
-        category_overlaps.sort(
-            key=lambda item: (-sum(item["split_counts"].values()), item["key"])
-        )
+        category_overlaps.sort(key=lambda item: (-sum(item["split_counts"].values()), item["key"]))
         overlap_counts[category] = len(category_overlaps)
         for item in category_overlaps[:sample_limit]:
             overlaps.append({"category": category, **item})
@@ -817,10 +1000,202 @@ def split_coverage_report(
     }
 
 
+def _split_parameters(
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+    min_holdout_stratum_count: int = 0,
+    min_split_target_ratio: float = DEFAULT_MIN_SPLIT_TARGET_RATIO,
+    max_component_target_ratio: float = DEFAULT_MAX_COMPONENT_TARGET_RATIO,
+    allow_degenerate_splits: bool = False,
+) -> dict:
+    test_ratio = 1.0 - train_ratio - val_ratio
+    return {
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "test_ratio": test_ratio,
+        "seed": seed,
+        "group_key_precedence": list(GROUP_KEY_PRECEDENCE),
+        "leakage_key_categories": list(LEAKAGE_KEY_CATEGORIES),
+        "stratification_fields": list(COVERAGE_FIELDS),
+        "min_holdout_stratum_count": int(min_holdout_stratum_count or 0),
+        "min_split_target_ratio": float(min_split_target_ratio),
+        "max_component_target_ratio": float(max_component_target_ratio),
+        "allow_degenerate_splits": bool(allow_degenerate_splits),
+    }
+
+
+def _split_quality_report(
+    components: list[dict],
+    split_rows: dict[str, list[dict]],
+    train_ratio: float,
+    val_ratio: float,
+    *,
+    min_split_target_ratio: float = DEFAULT_MIN_SPLIT_TARGET_RATIO,
+    max_component_target_ratio: float = DEFAULT_MAX_COMPONENT_TARGET_RATIO,
+    allow_degenerate_splits: bool = False,
+) -> dict:
+    """Report target-vs-actual split quality and oversized leakage components."""
+    total_rows = sum(len(rows) for rows in split_rows.values())
+    ratios = {
+        "train": train_ratio,
+        "val": val_ratio,
+        "test": max(0.0, 1.0 - train_ratio - val_ratio),
+    }
+    row_counts = {name: len(split_rows.get(name, [])) for name in SPLIT_NAMES}
+    target_rows = {name: total_rows * ratios[name] for name in SPLIT_NAMES}
+    deltas = {
+        name: {
+            "target": target_rows[name],
+            "actual": row_counts[name],
+            "delta": row_counts[name] - target_rows[name],
+            "actual_to_target_ratio": (
+                row_counts[name] / target_rows[name] if target_rows[name] > 0 else None
+            ),
+        }
+        for name in SPLIT_NAMES
+    }
+
+    component_sizes = sorted((len(component["rows"]) for component in components), reverse=True)
+    largest_component = component_sizes[0] if component_sizes else 0
+    largest_component_ratio = largest_component / total_rows if total_rows else 0.0
+    largest_target = max(target_rows.values()) if target_rows else 0.0
+    max_allowed_component = largest_target * float(max_component_target_ratio)
+
+    violations = []
+    if not allow_degenerate_splits and total_rows >= 100:
+        for split_name in SPLIT_NAMES:
+            target = target_rows[split_name]
+            if target < 10:
+                continue
+            actual_ratio = deltas[split_name]["actual_to_target_ratio"]
+            if actual_ratio is not None and actual_ratio < min_split_target_ratio:
+                violations.append(
+                    {
+                        "type": "split_below_target_ratio",
+                        "split": split_name,
+                        "actual_rows": row_counts[split_name],
+                        "target_rows": target,
+                        "actual_to_target_ratio": actual_ratio,
+                        "required_min_ratio": min_split_target_ratio,
+                    }
+                )
+
+        if largest_target > 0 and largest_component > max_allowed_component:
+            violations.append(
+                {
+                    "type": "oversized_leakage_component",
+                    "largest_component_rows": largest_component,
+                    "largest_component_ratio": largest_component_ratio,
+                    "max_allowed_rows": max_allowed_component,
+                    "max_component_target_ratio": max_component_target_ratio,
+                }
+            )
+
+    return {
+        "status": "failed" if violations else "passed",
+        "total_rows": total_rows,
+        "row_counts": row_counts,
+        "target_rows": target_rows,
+        "target_vs_actual": deltas,
+        "component_count": len(components),
+        "largest_component_rows": largest_component,
+        "largest_component_ratio": largest_component_ratio,
+        "largest_components": component_sizes[:10],
+        "min_split_target_ratio": float(min_split_target_ratio),
+        "max_component_target_ratio": float(max_component_target_ratio),
+        "allow_degenerate_splits": bool(allow_degenerate_splits),
+        "violations": violations,
+        "violation_count": len(violations),
+    }
+
+
 def _write_split_manifest(path: Path, manifest: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(_json_safe(manifest), f, indent=2, sort_keys=True)
+
+
+def _split_manifest_matches(
+    manifest: Mapping[str, Any],
+    dataset_path: Path,
+    output_dir: Path,
+    parameters: Mapping[str, Any],
+    source_sha256: str,
+) -> tuple[bool, str, dict[str, str]]:
+    if manifest.get("manifest_kind") != "dataset_split":
+        return False, "manifest_kind_mismatch", {}
+    if manifest.get("input_sha256") != source_sha256:
+        return False, "source_sha256_mismatch", {}
+    manifest_params = manifest.get("parameters")
+    if not isinstance(manifest_params, Mapping):
+        return False, "missing_parameters", {}
+    for key, expected in parameters.items():
+        if manifest_params.get(key) != expected:
+            return False, f"parameter_mismatch:{key}", {}
+
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, Mapping):
+        return False, "missing_outputs", {}
+
+    paths: dict[str, str] = {}
+    for split_name in SPLIT_NAMES:
+        artifact = outputs.get(split_name)
+        if not isinstance(artifact, Mapping):
+            return False, f"missing_output:{split_name}", {}
+        candidate = Path(str(artifact.get("path") or output_dir / f"{split_name}_dataset.jsonl"))
+        if not candidate.exists():
+            return False, f"missing_output_file:{split_name}", {}
+        expected_size = artifact.get("size_bytes")
+        if expected_size is not None and candidate.stat().st_size != expected_size:
+            return False, f"output_size_mismatch:{split_name}", {}
+        paths[split_name] = str(candidate)
+
+    return True, "cache_hit", paths
+
+
+def _try_reuse_split_manifest(
+    manifest_path: Path,
+    dataset_path: Path,
+    output_dir: Path,
+    parameters: Mapping[str, Any],
+    source_sha256: str,
+) -> tuple[tuple[str, str, str] | None, dict]:
+    status = {
+        "reused": False,
+        "manifest_path": str(manifest_path),
+        "reason": "not_checked",
+    }
+    if not manifest_path.exists():
+        status["reason"] = "manifest_missing"
+        return None, status
+    try:
+        manifest = _load_json(manifest_path)
+    except Exception as exc:
+        status["reason"] = "manifest_read_error"
+        status["error"] = str(exc)
+        return None, status
+
+    matched, reason, paths = _split_manifest_matches(
+        manifest,
+        dataset_path,
+        output_dir,
+        parameters,
+        source_sha256,
+    )
+    status["reason"] = reason
+    if not matched:
+        return None, status
+
+    status.update(
+        {
+            "reused": True,
+            "source_sha256": source_sha256,
+            "paths": paths,
+            "reused_at": _utc_now_iso(),
+        }
+    )
+    return (paths["train"], paths["val"], paths["test"]), status
 
 
 def split_dataset(
@@ -832,6 +1207,11 @@ def split_dataset(
     manifest_path: str | Path | None = None,
     validate_leakage: bool = True,
     min_holdout_stratum_count: int = 0,
+    reuse_existing: bool = False,
+    force_resplit: bool = False,
+    min_split_target_ratio: float = DEFAULT_MIN_SPLIT_TARGET_RATIO,
+    max_component_target_ratio: float = DEFAULT_MAX_COMPONENT_TARGET_RATIO,
+    allow_degenerate_splits: bool = False,
 ) -> tuple:
     """Split a JSONL dataset into train/val/test sets.
 
@@ -844,6 +1224,41 @@ def split_dataset(
     if train_ratio + val_ratio + test_ratio > 1.0 + 1e-9:
         raise ValueError("train_ratio, val_ratio, and test_ratio must sum to 1.0")
 
+    out = Path(output_dir)
+    out.mkdir(exist_ok=True)
+    source_path = Path(dataset_path)
+    manifest_target = Path(manifest_path) if manifest_path else out / "split_manifest.json"
+    parameters = _split_parameters(
+        train_ratio,
+        val_ratio,
+        seed,
+        min_holdout_stratum_count=min_holdout_stratum_count,
+        min_split_target_ratio=min_split_target_ratio,
+        max_component_target_ratio=max_component_target_ratio,
+        allow_degenerate_splits=allow_degenerate_splits,
+    )
+    source_sha256 = _sha256_file(source_path)
+    split_status = {
+        "reused": False,
+        "manifest_path": str(manifest_target),
+        "reason": "regenerated",
+    }
+    if reuse_existing and not force_resplit:
+        reused_paths, split_status = _try_reuse_split_manifest(
+            manifest_target,
+            source_path,
+            out,
+            parameters,
+            source_sha256,
+        )
+        if reused_paths:
+            logger.info("Reusing cached dataset splits from %s", manifest_target)
+            split_dataset.last_status = split_status
+            return reused_paths
+        logger.info("Split cache miss (%s); regenerating splits.", split_status.get("reason"))
+    elif force_resplit:
+        split_status["reason"] = "force_resplit"
+
     # Load data
     data = []
     with open(dataset_path, "r") as f:
@@ -852,10 +1267,19 @@ def split_dataset(
             if line:
                 data.append(json.loads(line))
 
-    train_data, val_data, test_data = _grouped_split(data, train_ratio, val_ratio, seed=seed)
-
-    out = Path(output_dir)
-    out.mkdir(exist_ok=True)
+    components = _build_leakage_components(data)
+    if len(components) < 3:
+        logging.getLogger(__name__).warning(
+            "Dataset has only %d split groups; writing all rows to train and "
+            "leaving validation/test empty to avoid leakage.",
+            len(components),
+        )
+        train_data, val_data, test_data = list(data), [], []
+    else:
+        assigned = _stratified_component_split(components, train_ratio, val_ratio, seed)
+        train_data = [row for component in assigned["train"] for row in component["rows"]]
+        val_data = [row for component in assigned["val"] for row in component["rows"]]
+        test_data = [row for component in assigned["test"] for row in component["rows"]]
 
     paths = {}
     for name, split_data in [
@@ -876,23 +1300,22 @@ def split_dataset(
         split_rows,
         min_holdout_stratum_count=min_holdout_stratum_count,
     )
-    source_path = Path(dataset_path)
+    split_quality = _split_quality_report(
+        components,
+        split_rows,
+        train_ratio,
+        val_ratio,
+        min_split_target_ratio=min_split_target_ratio,
+        max_component_target_ratio=max_component_target_ratio,
+        allow_degenerate_splits=allow_degenerate_splits,
+    )
     manifest = {
         "manifest_kind": "dataset_split",
-        "schema_version": 1,
+        "schema_version": SPLIT_CACHE_SCHEMA_VERSION,
         "created_at": _utc_now_iso(),
         "source_dataset": _file_artifact(source_path, jsonl=True),
-        "input_sha256": _sha256_file(source_path),
-        "parameters": {
-            "train_ratio": train_ratio,
-            "val_ratio": val_ratio,
-            "test_ratio": test_ratio,
-            "seed": seed,
-            "group_key_precedence": list(GROUP_KEY_PRECEDENCE),
-            "leakage_key_categories": list(LEAKAGE_KEY_CATEGORIES),
-            "stratification_fields": list(COVERAGE_FIELDS),
-            "min_holdout_stratum_count": int(min_holdout_stratum_count or 0),
-        },
+        "input_sha256": source_sha256,
+        "parameters": parameters,
         "row_counts": {
             "source": len(data),
             "train": len(train_data),
@@ -910,8 +1333,9 @@ def split_dataset(
         },
         "leakage_validation": leakage_validation,
         "coverage": coverage,
+        "split_quality": split_quality,
+        "cache": split_status,
     }
-    manifest_target = Path(manifest_path) if manifest_path else out / "split_manifest.json"
     _write_split_manifest(manifest_target, manifest)
     logger.info("Split manifest written to %s", manifest_target)
 
@@ -925,7 +1349,21 @@ def split_dataset(
             "Split holdout coverage validation failed: "
             f"{coverage['violation_count']} strata below minimum count"
         )
+    if validate_leakage and split_quality["status"] != "passed":
+        first_violation = split_quality["violations"][0] if split_quality["violations"] else {}
+        raise ValueError(
+            "Split quality validation failed: "
+            f"{split_quality['violation_count']} violations; first={first_violation}"
+        )
 
+    split_dataset.last_status = {
+        "reused": False,
+        "manifest_path": str(manifest_target),
+        "reason": split_status.get("reason", "regenerated"),
+        "source_sha256": source_sha256,
+        "paths": paths,
+        "generated_at": manifest["created_at"],
+    }
     return paths["train"], paths["val"], paths["test"]
 
 
@@ -942,13 +1380,16 @@ class _WhitespacePreflightTokenizer:
 def _load_preflight_tokenizer(
     model_name_or_path: str | None,
     allow_download: bool = False,
-) -> tuple[Any, dict]:
+    allow_whitespace_fallback: bool = False,
+) -> tuple[Any | None, dict]:
     """Load a tokenizer for data preflight without forcing network downloads."""
     if not model_name_or_path:
-        return _WhitespacePreflightTokenizer(), {
-            "mode": "whitespace_fallback",
-            "reason": "no_model_name_or_path",
-        }
+        info = {"mode": "unavailable", "reason": "no_model_name_or_path"}
+        if allow_whitespace_fallback:
+            info["mode"] = "whitespace_fallback"
+            info["fallback_allowed"] = True
+            return _WhitespacePreflightTokenizer(), info
+        return None, info
 
     try:
         from transformers import AutoTokenizer
@@ -963,16 +1404,30 @@ def _load_preflight_tokenizer(
             "local_files_only": not allow_download,
         }
     except Exception as exc:
+        info = {
+            "mode": "unavailable",
+            "name_or_path": model_name_or_path,
+            "error": str(exc),
+            "local_files_only": not allow_download,
+        }
+        if not allow_whitespace_fallback:
+            logging.getLogger(__name__).error(
+                "Could not load tokenizer %s for preflight (%s). "
+                "Use --preflight-tokenizer-download or explicitly pass "
+                "--allow-whitespace-preflight-fallback to use approximate counts.",
+                model_name_or_path,
+                exc,
+            )
+            return None, info
         logging.getLogger(__name__).warning(
-            "Could not load tokenizer %s for preflight (%s); falling back to whitespace counts.",
+            "Could not load tokenizer %s for preflight (%s); falling back to whitespace counts "
+            "because fallback was explicitly allowed.",
             model_name_or_path,
             exc,
         )
-        return _WhitespacePreflightTokenizer(), {
-            "mode": "whitespace_fallback",
-            "name_or_path": model_name_or_path,
-            "error": str(exc),
-        }
+        info["mode"] = "whitespace_fallback"
+        info["fallback_allowed"] = True
+        return _WhitespacePreflightTokenizer(), info
 
 
 def _record_preflight_error(
@@ -984,21 +1439,20 @@ def _record_preflight_error(
 ) -> None:
     report["error_counts"][code] += 1
     if len(report["errors"]) < max_errors:
-        report["errors"].append(
-            {"line": line_number, "code": code, "message": message}
-        )
+        report["errors"].append({"line": line_number, "code": code, "message": message})
 
 
 def _preflight_prompt_parts(
     item: dict,
-    include_compiler_metadata: bool,
+    include_bytecode_metadata: bool,
     template_format: str,
 ) -> tuple[str, str, str]:
     from src.model_setup import SmartContractDataset
 
     dataset = SmartContractDataset.__new__(SmartContractDataset)
     dataset.template_format = template_format
-    dataset.include_compiler_metadata = include_compiler_metadata
+    dataset.include_bytecode_metadata = include_bytecode_metadata
+    dataset.include_compiler_metadata = False
     return dataset._format_prompt_parts(
         item.get("input", ""),
         item.get("output", ""),
@@ -1011,13 +1465,19 @@ def validate_jsonl_schema_and_lengths(
     tokenizer: Any | None = None,
     *,
     max_seq_length: int = 2048,
-    include_compiler_metadata: bool = True,
+    include_bytecode_metadata: bool = True,
+    include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
     fail_on_context_overlength: bool = True,
+    allow_legacy_metadata_schema: bool = False,
     max_errors: int = 50,
 ) -> dict:
     """Validate JSONL schema and token lengths before training/evaluation."""
     from src.model_setup import _tokenize_to_ids
+    from src.dataset_pipeline import (
+        TRAINING_ROW_SCHEMA_VERSION,
+        validate_training_metadata_schema,
+    )
 
     path = Path(dataset_path)
     tokenizer = tokenizer or _WhitespacePreflightTokenizer()
@@ -1029,6 +1489,11 @@ def validate_jsonl_schema_and_lengths(
         "blank_line_count": 0,
         "max_seq_length": max_seq_length,
         "fail_on_context_overlength": fail_on_context_overlength,
+        "metadata_schema": {
+            "schema_version": TRAINING_ROW_SCHEMA_VERSION,
+            "allow_legacy": bool(allow_legacy_metadata_schema),
+            "validator": "src.dataset_pipeline.validate_training_metadata_schema",
+        },
         "error_counts": Counter(),
         "errors": [],
         "lengths": {
@@ -1114,7 +1579,8 @@ def validate_jsonl_schema_and_lengths(
 
             metadata = item.get("metadata", {})
             if metadata is None:
-                item["metadata"] = {}
+                metadata = {}
+                item["metadata"] = metadata
             elif not isinstance(metadata, dict):
                 row_has_error = True
                 _record_preflight_error(
@@ -1125,6 +1591,24 @@ def validate_jsonl_schema_and_lengths(
                     max_errors,
                 )
 
+            if isinstance(metadata, dict):
+                metadata_validation = validate_training_metadata_schema(
+                    metadata,
+                    allow_legacy=allow_legacy_metadata_schema,
+                )
+                if metadata_validation.get("status") != "passed":
+                    row_has_error = True
+                    for error in metadata_validation.get("errors", []):
+                        field = error.get("field", "metadata")
+                        message = error.get("message", "metadata schema validation failed")
+                        _record_preflight_error(
+                            report,
+                            line_number,
+                            error.get("code", "metadata_schema_error"),
+                            f"{field}: {message}",
+                            max_errors,
+                        )
+
             if row_has_error:
                 continue
 
@@ -1132,7 +1616,7 @@ def validate_jsonl_schema_and_lengths(
             try:
                 prefix, target, suffix = _preflight_prompt_parts(
                     item,
-                    include_compiler_metadata=include_compiler_metadata,
+                    include_bytecode_metadata=include_bytecode_metadata,
                     template_format=template_format,
                 )
                 context_tokens = len(_tokenize_to_ids(tokenizer, prefix))
@@ -1193,14 +1677,78 @@ def validate_jsonl_schema_and_lengths(
     return report
 
 
+def _stable_json_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            _json_safe(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _preflight_cache_paths(
+    cache_dir: str | Path,
+    dataset_name: str,
+    dataset_path: str | Path,
+    cache_key: str,
+) -> tuple[Path, Path]:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", dataset_name)[:40] or "dataset"
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(dataset_path).stem)[:80] or "data"
+    base = Path(cache_dir) / f"{safe_name}-{safe_stem}-{cache_key[:32]}"
+    return base.with_suffix(".preflight.json"), base.with_suffix(".preflight.meta.json")
+
+
+def _read_preflight_cache(
+    report_path: Path,
+    metadata_path: Path,
+    expected_metadata: Mapping[str, Any],
+) -> dict | None:
+    if not report_path.exists() or not metadata_path.exists():
+        return None
+    try:
+        metadata = _load_json(metadata_path)
+        if metadata != expected_metadata:
+            return None
+        report = _load_json(report_path)
+        if isinstance(report, dict):
+            report.setdefault("cache", {})["hit"] = True
+            report["cache"]["path"] = str(report_path)
+            return report
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Could not read preflight cache %s: %s", report_path, exc
+        )
+    return None
+
+
+def _write_preflight_cache(
+    report_path: Path,
+    metadata_path: Path,
+    metadata: Mapping[str, Any],
+    report: Mapping[str, Any],
+) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w") as f:
+        json.dump(_json_safe(report), f, indent=2, sort_keys=True)
+    with open(metadata_path, "w") as f:
+        json.dump(_json_safe(metadata), f, indent=2, sort_keys=True)
+
+
 def run_data_preflight(
     dataset_paths: dict[str, str],
     *,
     tokenizer_source: str | None,
     max_seq_length: int,
-    include_compiler_metadata: bool,
+    include_bytecode_metadata: bool = True,
+    include_compiler_metadata: bool = False,
     skip: bool = False,
     allow_tokenizer_download: bool = False,
+    allow_whitespace_fallback: bool = False,
+    cache_dir: str | Path | None = None,
+    overwrite_cache: bool = False,
+    allow_legacy_metadata_schema: bool = False,
 ) -> dict:
     """Run schema and token-length preflight over one or more JSONL datasets."""
     if skip:
@@ -1209,17 +1757,67 @@ def run_data_preflight(
     tokenizer, tokenizer_info = _load_preflight_tokenizer(
         tokenizer_source,
         allow_download=allow_tokenizer_download,
+        allow_whitespace_fallback=allow_whitespace_fallback,
     )
+    if tokenizer is None:
+        return {
+            "status": "failed",
+            "tokenizer": tokenizer_info,
+            "datasets": {},
+            "failed_datasets": sorted(name for name, path in dataset_paths.items() if path),
+            "error": "tokenizer_unavailable",
+        }
     datasets = {}
     for name, path in dataset_paths.items():
         if not path:
             continue
-        datasets[name] = validate_jsonl_schema_and_lengths(
+        cache_metadata = None
+        if cache_dir:
+            path_obj = Path(path)
+            cache_metadata = {
+                "schema_version": PREFLIGHT_CACHE_SCHEMA_VERSION,
+                "dataset_sha256": _sha256_file(path_obj),
+                "dataset_path": str(path_obj),
+                "tokenizer": tokenizer_info,
+                "max_seq_length": int(max_seq_length),
+                "include_bytecode_metadata": bool(include_bytecode_metadata),
+                "include_compiler_metadata": False,
+                "template_format": "alpaca",
+                "allow_legacy_metadata_schema": bool(allow_legacy_metadata_schema),
+            }
+            cache_key = _stable_json_digest(cache_metadata)
+            report_path, metadata_path = _preflight_cache_paths(
+                cache_dir, name, path_obj, cache_key
+            )
+            if not overwrite_cache:
+                cached = _read_preflight_cache(report_path, metadata_path, cache_metadata)
+                if cached is not None:
+                    logging.getLogger(__name__).info(
+                        "Loaded %s preflight report from cache: %s", name, report_path
+                    )
+                    datasets[name] = cached
+                    continue
+
+        report = validate_jsonl_schema_and_lengths(
             path,
             tokenizer=tokenizer,
             max_seq_length=max_seq_length,
-            include_compiler_metadata=include_compiler_metadata,
+            include_bytecode_metadata=include_bytecode_metadata,
+            allow_legacy_metadata_schema=allow_legacy_metadata_schema,
         )
+        if cache_dir and cache_metadata:
+            report.setdefault("cache", {}).update(
+                {
+                    "hit": False,
+                    "path": str(report_path),
+                    "metadata_path": str(metadata_path),
+                }
+            )
+            _write_preflight_cache(report_path, metadata_path, cache_metadata, report)
+            logging.getLogger(__name__).info(
+                "Wrote %s preflight report cache to %s", name, report_path
+            )
+        datasets[name] = report
 
     failed = {name: result for name, result in datasets.items() if result["status"] != "passed"}
     return {
@@ -1227,10 +1825,19 @@ def run_data_preflight(
         "tokenizer": tokenizer_info,
         "datasets": datasets,
         "failed_datasets": sorted(failed),
+        "cache_dir": str(cache_dir) if cache_dir else None,
+        "allow_legacy_metadata_schema": bool(allow_legacy_metadata_schema),
     }
 
 
 def _format_preflight_failure(preflight_report: dict) -> str:
+    if preflight_report.get("error") == "tokenizer_unavailable":
+        tokenizer = preflight_report.get("tokenizer", {})
+        return (
+            "data preflight tokenizer unavailable: "
+            f"{tokenizer.get('name_or_path') or tokenizer.get('reason')}; "
+            f"{tokenizer.get('error', '')}"
+        ).strip()
     parts = []
     for name, result in preflight_report.get("datasets", {}).items():
         if result.get("status") == "passed":
@@ -1337,7 +1944,9 @@ def _git_state() -> dict:
 def _default_run_manifest_path(args: argparse.Namespace, run_id: str) -> Path:
     if args.run_manifest:
         return Path(args.run_manifest)
-    manifest_dir = Path(args.manifest_dir) if args.manifest_dir else Path(args.output_dir) / "run_manifests"
+    manifest_dir = (
+        Path(args.manifest_dir) if args.manifest_dir else Path(args.output_dir) / "run_manifests"
+    )
     return manifest_dir / f"{run_id}.manifest.json"
 
 
@@ -1455,14 +2064,15 @@ def _collect_training_artifacts(output_dir: str, model_path: str | None) -> dict
         if candidate.exists():
             trainer_state_paths.append(candidate)
     trainer_state_paths.extend(sorted(output.glob("checkpoint-*/trainer_state.json")))
+    trainer_state_paths.extend(
+        sorted((output / "checkpoints").glob("checkpoint-*/trainer_state.json"))
+    )
 
     return {
         "artifacts": artifacts,
         "model_config": model_config,
         "final_metrics": metrics,
-        "log_history_references": [
-            _summarize_trainer_state(path) for path in trainer_state_paths
-        ],
+        "log_history_references": [_summarize_trainer_state(path) for path in trainer_state_paths],
     }
 
 
@@ -1490,6 +2100,10 @@ def _finalize_manifest(
     _write_run_manifest(manifest_path, manifest)
 
 
+def _manifest_finalized(manifest: Mapping[str, Any]) -> bool:
+    return manifest.get("status") != "running" and bool(manifest.get("finished_at"))
+
+
 def _checkpoint_step(path: Path) -> int:
     match = re.fullmatch(r"checkpoint-(\d+)", path.name)
     return int(match.group(1)) if match else -1
@@ -1510,63 +2124,99 @@ def _looks_like_checkpoint(path: Path) -> bool:
 
 def resolve_resume_checkpoint(resume: str | None, output_dir: str) -> str | None:
     """Resolve a checkpoint path, supporting --resume auto."""
+    resolve_resume_checkpoint.last_result = {
+        "resume": resume,
+        "output_dir": output_dir,
+        "searched_roots": [],
+        "selected_checkpoint": None,
+    }
     if not resume:
         return None
     if resume.lower() != "auto":
+        resolve_resume_checkpoint.last_result["selected_checkpoint"] = resume
         return resume
 
     root = Path(output_dir)
+    searched_roots = [root, root / "checkpoints"]
+    resolve_resume_checkpoint.last_result["searched_roots"] = [str(path) for path in searched_roots]
     candidates = [
         path
-        for path in root.glob("checkpoint-*")
-        if path.is_dir() and _checkpoint_step(path) >= 0 and _looks_like_checkpoint(path)
+        for search_root in searched_roots
+        for path in search_root.glob("checkpoint-*")
+        if search_root.exists()
+        and path.is_dir()
+        and _checkpoint_step(path) >= 0
+        and _looks_like_checkpoint(path)
     ]
     if not candidates:
         logging.getLogger(__name__).info(
-            "--resume auto requested but no checkpoints found under %s; starting fresh.",
-            root,
+            "--resume auto requested but no checkpoints found under any searched roots: %s; "
+            "starting fresh.",
+            ", ".join(str(path) for path in searched_roots),
         )
         return None
 
     latest = max(candidates, key=lambda path: (_checkpoint_step(path), path.stat().st_mtime))
     logging.getLogger(__name__).info("Auto-resuming from latest checkpoint: %s", latest)
+    resolve_resume_checkpoint.last_result["selected_checkpoint"] = str(latest)
     return str(latest)
 
 
 def _worst_evaluation_samples(results: list[dict], limit: int = 5) -> dict:
     """Return compact, traceable worst-example samples for quality triage."""
 
-    def sample(record: dict) -> dict:
+    def sample(record: dict, reason: str | None = None) -> dict:
         metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
         metadata = record.get("metadata", {}) if isinstance(record.get("metadata"), dict) else {}
-        return {
+        selected_metrics = {
+            "semantic_similarity": metrics.get("semantic_similarity"),
+            "normalized_edit_distance": metrics.get("normalized_edit_distance"),
+            "replication_f1": metrics.get("replication_f1"),
+            "bytecode_semantic_score": metrics.get("bytecode_semantic_score"),
+        }
+        payload = {
             "dataset_index": record.get("dataset_index"),
             "success": record.get("success", True),
             "input_hash": record.get("input_hash"),
             "output_hash": record.get("output_hash"),
             "function_name": metadata.get("function_name") or metadata.get("name"),
             "function_signature": metadata.get("function_signature") or metadata.get("signature"),
-            "semantic_similarity": metrics.get("semantic_similarity"),
-            "normalized_edit_distance": metrics.get("normalized_edit_distance"),
-            "replication_f1": metrics.get("replication_f1"),
+            "semantic_similarity": selected_metrics["semantic_similarity"],
+            "normalized_edit_distance": selected_metrics["normalized_edit_distance"],
+            "replication_f1": selected_metrics["replication_f1"],
+            "metrics": selected_metrics,
+            "prompt_diagnostics": record.get("prompt_diagnostics"),
+            "original": record.get("original"),
+            "decompiled": record.get("decompiled"),
             "error": record.get("error"),
         }
+        if reason:
+            payload["reason"] = reason
+        return payload
 
     def metric(record: dict, key: str, default: float) -> float:
         metrics = record.get("metrics", {}) if isinstance(record.get("metrics"), dict) else {}
         value = metrics.get(key)
         return float(value) if isinstance(value, (int, float)) else default
 
+    def truncated(record: dict) -> bool:
+        diagnostics = record.get("prompt_diagnostics")
+        return isinstance(diagnostics, Mapping) and diagnostics.get("tac_truncated") is True
+
+    truncated_records = [record for record in results if truncated(record)]
+
     return {
-        "failed": [sample(record) for record in results if not record.get("success", True)][:limit],
+        "failed": [
+            sample(record, "failed") for record in results if not record.get("success", True)
+        ][:limit],
         "lowest_semantic_similarity": [
-            sample(record)
+            sample(record, "lowest_semantic_similarity")
             for record in sorted(results, key=lambda r: metric(r, "semantic_similarity", 1.0))[
                 :limit
             ]
         ],
         "highest_edit_distance": [
-            sample(record)
+            sample(record, "highest_edit_distance")
             for record in sorted(
                 results,
                 key=lambda r: metric(r, "normalized_edit_distance", 0.0),
@@ -1574,12 +2224,335 @@ def _worst_evaluation_samples(results: list[dict], limit: int = 5) -> dict:
             )[:limit]
         ],
         "lowest_replication_f1": [
-            sample(record)
-            for record in sorted(results, key=lambda r: metric(r, "replication_f1", 1.0))[
-                :limit
-            ]
+            sample(record, "lowest_replication_f1")
+            for record in sorted(results, key=lambda r: metric(r, "replication_f1", 1.0))[:limit]
+        ],
+        "truncated_low_quality": [
+            sample(record, "truncated_low_quality")
+            for record in sorted(
+                truncated_records,
+                key=lambda r: (
+                    metric(r, "semantic_similarity", 1.0),
+                    -metric(r, "normalized_edit_distance", 0.0),
+                    metric(r, "replication_f1", 1.0),
+                ),
+            )[:limit]
         ],
     }
+
+
+def _load_baseline_summary(path: str | Path | None) -> dict | None:
+    if not path:
+        return None
+    payload = _load_json(Path(path))
+    if isinstance(payload, Mapping) and isinstance(payload.get("summary"), Mapping):
+        return dict(payload["summary"])
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    raise ValueError(f"Baseline results file does not contain a JSON object: {path}")
+
+
+def _merge_aggregate_statistics(
+    summary: dict, results: list[dict], baseline_summary: dict | None
+) -> None:
+    """Add the full training-pipeline aggregate metric shape plus flat aliases."""
+    if not results:
+        return
+    from src.training_pipeline import SmartContractTrainingPipeline
+
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    aggregate = pipeline._compute_aggregate_statistics(results, baseline_summary=baseline_summary)
+    summary["aggregate_statistics"] = aggregate
+
+    confidence_intervals = dict(summary.get("confidence_intervals") or {})
+    for metric, stats in aggregate.items():
+        if not isinstance(stats, Mapping):
+            continue
+        if "mean" in stats:
+            summary[f"{metric}_mean"] = stats.get("mean")
+            summary[f"{metric}_std"] = stats.get("std")
+            summary[f"{metric}_median"] = stats.get("median")
+            summary[f"{metric}_min"] = stats.get("min")
+            summary[f"{metric}_max"] = stats.get("max")
+        interval = stats.get("confidence_interval_95")
+        if isinstance(interval, Mapping):
+            confidence_intervals[f"{metric}_mean"] = interval
+
+    if confidence_intervals:
+        summary["confidence_intervals"] = confidence_intervals
+
+    paper_metrics = aggregate.get("paper_metrics")
+    if isinstance(paper_metrics, Mapping):
+        if "functions_above_0_8_semantic_similarity" in paper_metrics:
+            summary["pct_above_0.8_similarity"] = paper_metrics[
+                "functions_above_0_8_semantic_similarity"
+            ]
+        if "functions_below_0_4_edit_distance" in paper_metrics:
+            summary["pct_below_0.4_edit_dist"] = paper_metrics["functions_below_0_4_edit_distance"]
+
+    replication = aggregate.get("replication_metrics")
+    if isinstance(replication, Mapping):
+        micro = replication.get("micro", {})
+        summary.update(
+            {
+                "replication_precision_mean": replication.get("precision_mean"),
+                "replication_recall_mean": replication.get("recall_mean"),
+                "replication_f1_mean": replication.get("f1_mean"),
+                "pct_above_0.8_replication_f1": replication.get("pct_above_0_8_f1"),
+                "replication_precision_micro": (
+                    micro.get("precision") if isinstance(micro, Mapping) else None
+                ),
+                "replication_recall_micro": (
+                    micro.get("recall") if isinstance(micro, Mapping) else None
+                ),
+                "replication_f1_micro": micro.get("f1") if isinstance(micro, Mapping) else None,
+                "replication_by_category_micro": replication.get("by_category_micro", {}),
+            }
+        )
+
+    if isinstance(aggregate.get("metadata_segments"), Mapping):
+        summary["metadata_segments"] = aggregate["metadata_segments"]
+    if isinstance(aggregate.get("baseline_comparison"), Mapping):
+        summary["baseline_comparison"] = aggregate["baseline_comparison"]
+
+
+def _compare_numeric(value: Any, op: str, threshold: float) -> bool:
+    if not isinstance(value, (int, float)):
+        return False
+    if op == ">=":
+        return float(value) >= threshold
+    if op == "<=":
+        return float(value) <= threshold
+    raise ValueError(f"Unsupported quality threshold operator: {op}")
+
+
+def evaluate_quality_gate(summary: Mapping[str, Any], config: Mapping[str, Any]) -> dict:
+    thresholds = dict(DEFAULT_QUALITY_THRESHOLDS)
+    thresholds.update(config.get("thresholds") or {})
+    checks = []
+    failures = []
+    for metric, rule in thresholds.items():
+        if not isinstance(rule, Mapping):
+            continue
+        if rule.get("value") is None:
+            continue
+        value = summary.get(metric)
+        required = bool(rule.get("required", False))
+        if value is None and not required:
+            status = "skipped"
+            passed = True
+        else:
+            passed = _compare_numeric(value, str(rule.get("op", ">=")), float(rule["value"]))
+            status = "passed" if passed else "failed"
+        check = {
+            "metric": metric,
+            "value": value,
+            "op": rule.get("op", ">="),
+            "threshold": rule.get("value"),
+            "required": required,
+            "status": status,
+        }
+        checks.append(check)
+        if not passed:
+            failures.append(check)
+
+    baseline_comparison = summary.get("baseline_comparison")
+    max_regressions = config.get("max_baseline_regressions")
+    if isinstance(baseline_comparison, Mapping) and max_regressions is not None:
+        regressions = int(baseline_comparison.get("num_regressions", 0) or 0)
+        passed = regressions <= int(max_regressions)
+        check = {
+            "metric": "baseline_regressions",
+            "value": regressions,
+            "op": "<=",
+            "threshold": int(max_regressions),
+            "required": True,
+            "status": "passed" if passed else "failed",
+        }
+        checks.append(check)
+        if not passed:
+            failures.append(check)
+
+    return {
+        "status": "passed" if not failures else "failed",
+        "checks": checks,
+        "failures": failures,
+        "failure_count": len(failures),
+    }
+
+
+def _quality_threshold_config_from_args(args: argparse.Namespace) -> dict:
+    thresholds = {
+        "semantic_similarity_mean": {
+            "op": ">=",
+            "value": args.min_semantic_similarity,
+            "required": True,
+        },
+        "pct_above_0.8_similarity": {
+            "op": ">=",
+            "value": args.min_pct_above_08_similarity,
+            "required": True,
+        },
+        "pct_below_0.4_edit_dist": {
+            "op": ">=",
+            "value": args.min_pct_below_04_edit_dist,
+            "required": True,
+        },
+        "failure_rate": {"op": "<=", "value": args.max_failure_rate, "required": True},
+        "replication_f1_mean": {
+            "op": ">=",
+            "value": args.min_replication_f1,
+            "required": args.min_replication_f1 is not None,
+        },
+        "solidity_valid_mean": {
+            "op": ">=",
+            "value": args.min_solidity_valid,
+            "required": args.min_solidity_valid is not None,
+        },
+        "solidity_compiler_checked_mean": {
+            "op": ">=",
+            "value": args.min_solidity_compiler_checked,
+            "required": args.min_solidity_compiler_checked is not None,
+        },
+        "solidity_ast_valid_mean": {
+            "op": ">=",
+            "value": args.min_solidity_ast_valid,
+            "required": args.min_solidity_ast_valid is not None,
+        },
+    }
+    return {
+        "enabled": bool(args.quality_gate),
+        "thresholds": thresholds,
+        "max_baseline_regressions": args.max_baseline_regressions,
+    }
+
+
+def _count_jsonl_rows(path: str | Path | None) -> int:
+    if not path or not Path(path).exists():
+        return 0
+    rows = 0
+    with open(path, "r") as f:
+        for line in f:
+            if line.strip():
+                rows += 1
+    return rows
+
+
+def _effective_training_runtime_settings(args: argparse.Namespace, train_path: str) -> dict:
+    train_rows = _count_jsonl_rows(train_path)
+    has_cuda = _cuda_device_count() > 0
+    is_small = 0 < train_rows < 200
+    eval_strategy = args.train_eval_strategy
+    if eval_strategy == "auto":
+        eval_strategy = "epoch" if is_small else "steps"
+    workers = args.dataloader_num_workers
+    if workers is None:
+        workers = 0 if is_small or not has_cuda else 4
+    pin_memory = args.dataloader_pin_memory
+    if pin_memory is None:
+        pin_memory = bool(has_cuda)
+    persistent_workers = args.dataloader_persistent_workers
+    if persistent_workers is None:
+        persistent_workers = bool(has_cuda and workers > 0 and not is_small)
+    else:
+        persistent_workers = bool(persistent_workers and workers > 0)
+    prefetch_factor = args.dataloader_prefetch_factor
+    if prefetch_factor is None and workers > 0:
+        prefetch_factor = 2
+    if workers == 0:
+        persistent_workers = False
+        prefetch_factor = None
+    return {
+        "train_rows": train_rows,
+        "has_cuda": has_cuda,
+        "is_small": is_small,
+        "train_eval_strategy": eval_strategy,
+        "dataloader": {
+            "num_workers": workers,
+            "pin_memory": bool(pin_memory),
+            "persistent_workers": bool(persistent_workers),
+            "prefetch_factor": prefetch_factor,
+        },
+    }
+
+
+def _read_jsonl_rows(path: str | Path) -> list[dict]:
+    rows = []
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    rows.append(item)
+    return rows
+
+
+def verify_autodetected_test_dataset(
+    test_path: str | Path,
+    split_manifest_path: str | Path,
+    *,
+    allow_unverified: bool = False,
+) -> dict:
+    """Require cached eval-only test data to match a current split manifest."""
+    test_path = Path(test_path)
+    split_manifest_path = Path(split_manifest_path)
+    info = {
+        "status": "verified",
+        "allow_unverified": bool(allow_unverified),
+        "test_dataset": _file_artifact(test_path, jsonl=True),
+        "split_manifest": _file_artifact(split_manifest_path),
+    }
+    problems = []
+
+    if not split_manifest_path.exists():
+        problems.append("split_manifest_missing")
+    else:
+        try:
+            split_manifest = _load_json(split_manifest_path)
+        except Exception as exc:
+            split_manifest = None
+            problems.append(f"split_manifest_read_error:{exc}")
+
+        if isinstance(split_manifest, Mapping):
+            outputs = split_manifest.get("outputs")
+            test_artifact = outputs.get("test") if isinstance(outputs, Mapping) else None
+            expected_sha = (
+                test_artifact.get("sha256") if isinstance(test_artifact, Mapping) else None
+            )
+            actual_sha = _sha256_file(test_path) if test_path.exists() else None
+            info["manifest_input_sha256"] = split_manifest.get("input_sha256")
+            info["test_artifact_sha256"] = actual_sha
+            if expected_sha != actual_sha:
+                problems.append("test_sha256_mismatch")
+
+            split_paths = {}
+            if isinstance(outputs, Mapping):
+                for name in SPLIT_NAMES:
+                    artifact = outputs.get(name)
+                    if isinstance(artifact, Mapping) and artifact.get("path"):
+                        split_paths[name] = str(artifact["path"])
+            if {"train", "val", "test"} <= set(split_paths) and all(
+                Path(path).exists() for path in split_paths.values()
+            ):
+                leakage = validate_split_leakage(
+                    {name: _read_jsonl_rows(path) for name, path in split_paths.items()}
+                )
+                info["leakage_validation"] = leakage
+                if leakage.get("status") != "passed":
+                    problems.append("split_leakage_validation_failed")
+
+    if problems:
+        info["status"] = "unverified_allowed" if allow_unverified else "failed"
+        info["problems"] = problems
+        if not allow_unverified:
+            raise ValueError(
+                "Auto-detected test dataset is not verified by split manifest: "
+                + ", ".join(problems)
+                + ". Provide --dataset to regenerate splits, --test-dataset explicitly, "
+                + "or pass --allow-unverified-test-dataset."
+            )
+    return info
 
 
 def train_model(
@@ -1590,16 +2563,31 @@ def train_model(
     learning_rate: float = 2e-4,
     num_epochs: int = 3,
     max_seq_length: int = 2048,
-    model_name: str = "meta-llama/Llama-3.2-3B",
+    model_name: str = DEFAULT_MODEL_NAME,
     resume_from: str = None,
-    use_quantization: bool = True,
+    use_quantization: bool = DEFAULT_USE_QUANTIZATION,
+    precision: str = DEFAULT_PRECISION,
+    use_lora: bool = True,
+    lora_rank: int = DEFAULT_LORA_RANK,
+    lora_alpha: int = DEFAULT_LORA_ALPHA,
+    lora_dropout: float = DEFAULT_LORA_DROPOUT,
+    lora_target_modules: list[str] | str | None = None,
     deepspeed_config: str = None,
     enable_memory_monitoring: bool = False,
-    gradient_accumulation_steps: int = 4,
-    include_compiler_metadata: bool = True,
+    gradient_accumulation_steps: int | None = None,
+    global_batch_size: int | None = DEFAULT_GLOBAL_BATCH_SIZE,
+    include_bytecode_metadata: bool = True,
+    include_compiler_metadata: bool | None = None,
     max_steps: int = -1,
     tokenization_cache: dict | str | bool | None = None,
     instrumentation_config: dict | bool | None = None,
+    train_eval_strategy: str = "auto",
+    train_eval_steps: int | None = None,
+    train_eval_max_samples: int | None = None,
+    dataloader_num_workers: int | None = None,
+    dataloader_pin_memory: bool | None = None,
+    dataloader_persistent_workers: bool | None = None,
+    dataloader_prefetch_factor: int | None = None,
 ) -> str:
     """Fine-tune the model and return path to saved model."""
     # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
@@ -1617,15 +2605,34 @@ def train_model(
     from src.model_setup import ModelConfig, SmartContractModelTrainer, TokenizationCacheConfig
 
     logger = logging.getLogger(__name__)
+    if include_compiler_metadata is not None:
+        logger.warning(
+            "include_compiler_metadata is deprecated and ignored; prompts never "
+            "include compiler metadata."
+        )
+    world_size = _distributed_world_size()
+    gradient_accumulation_steps = resolve_gradient_accumulation_steps(
+        batch_size,
+        world_size=world_size,
+        global_batch_size=global_batch_size,
+        explicit_steps=gradient_accumulation_steps,
+    )
 
     config = ModelConfig(
         model_name=model_name,
         max_sequence_length=max_seq_length,
-        lora_rank=16,
-        lora_alpha=32,
-        lora_dropout=0.1,
+        use_lora=use_lora,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=lora_target_modules,
         use_quantization=use_quantization,
-        include_compiler_metadata=include_compiler_metadata,
+        precision=precision,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_pin_memory=dataloader_pin_memory,
+        dataloader_persistent_workers=dataloader_persistent_workers,
+        dataloader_prefetch_factor=dataloader_prefetch_factor,
+        include_bytecode_metadata=include_bytecode_metadata,
     )
 
     trainer = SmartContractModelTrainer(config, output_dir=output_dir)
@@ -1636,7 +2643,17 @@ def train_model(
     logger.info(f"  Train dataset: {train_path}")
     logger.info(f"  Val dataset:   {val_path}")
     logger.info(f"  Model:         {model_name}")
-    logger.info(f"  Compiler metadata prompts: {include_compiler_metadata}")
+    logger.info(f"  LoRA enabled:  {use_lora}")
+    logger.info(f"  Quantization:  {use_quantization}")
+    logger.info(f"  Precision:     {precision}")
+    logger.info(
+        "  Effective batch target: global=%s, world_size=%d, per_device=%d, grad_accum=%d",
+        global_batch_size,
+        world_size,
+        batch_size,
+        gradient_accumulation_steps,
+    )
+    logger.info(f"  Bytecode metadata prompts: {include_bytecode_metadata}")
 
     model_path = trainer.train(
         train_dataset_path=train_path,
@@ -1651,6 +2668,13 @@ def train_model(
         max_steps=max_steps,
         tokenization_cache=tokenization_cache,
         instrumentation_config=instrumentation_config,
+        train_eval_strategy=train_eval_strategy,
+        train_eval_steps=train_eval_steps,
+        train_eval_max_samples=train_eval_max_samples,
+        dataloader_num_workers=dataloader_num_workers,
+        dataloader_pin_memory=dataloader_pin_memory,
+        dataloader_persistent_workers=dataloader_persistent_workers,
+        dataloader_prefetch_factor=dataloader_prefetch_factor,
     )
 
     logger.info(f"Training complete. Model saved to {model_path}")
@@ -1664,6 +2688,11 @@ def evaluate_model(
     latest_results_path: str = "latest_results.txt",
     eval_limit: int = None,
     eval_batch_size: int = 1,
+    eval_seed: int = DEFAULT_EVAL_SEED,
+    eval_first_n: bool = False,
+    baseline_results_path: str | None = None,
+    baseline_tolerance: float = 0.0,
+    quality_gate_config: dict | None = None,
 ) -> dict:
     """Evaluate the trained model on the test set.
 
@@ -1671,7 +2700,12 @@ def evaluate_model(
     the model onto its assigned GPU, evaluates a shard of the test data, and
     rank 0 gathers all results for aggregation and saving.
     """
-    from src.training_pipeline import SmartContractEvaluator
+    from src.training_pipeline import (
+        SmartContractEvaluator,
+        aggregate_prompt_diagnostics,
+        compare_evaluation_to_baseline,
+        sample_evaluation_data,
+    )
     from src.model_setup import SmartContractDecompiler
     from src.evaluation_report import write_latest_results_report
     from src.replication_metrics import aggregate_replication_scores
@@ -1727,8 +2761,26 @@ def evaluate_model(
                 test_data.append(item)
 
     dataset_rows = len(test_data)
+    sampled_indices = None
+    sampling_strategy = "all"
     if eval_limit is not None:
-        test_data = test_data[:eval_limit]
+        if eval_first_n:
+            test_data = test_data[:eval_limit]
+            sampled_indices = [
+                int(item.get("_dataset_index", idx)) if isinstance(item, dict) else idx
+                for idx, item in enumerate(test_data)
+            ]
+            sampling_strategy = "first_n"
+        else:
+            test_data, sampled_indices = sample_evaluation_data(
+                test_data,
+                sample_size=eval_limit,
+                seed=eval_seed,
+            )
+            for fallback_idx, item in zip(sampled_indices, test_data):
+                if isinstance(item, dict):
+                    item.setdefault("_dataset_index", fallback_idx)
+            sampling_strategy = "seeded_sample"
         logger.info(f"Evaluation limited to {len(test_data)}/{dataset_rows} examples")
 
     total_examples = len(test_data)
@@ -1760,6 +2812,32 @@ def evaluate_model(
         "max_new_tokens": 256,
         "eval_batch_size": eval_batch_size,
     }
+
+    def _prompt_diagnostics(item: dict, generated_text: str | None = None) -> dict | None:
+        diagnostics_fn = getattr(decompiler, "prompt_diagnostics", None)
+        if not callable(diagnostics_fn):
+            diagnostics_fn = getattr(decompiler, "get_prompt_diagnostics", None)
+        if not callable(diagnostics_fn):
+            return None
+        kwargs = {
+            "metadata": item.get("metadata", {}),
+            "max_new_tokens": generation_config["max_new_tokens"],
+        }
+        if generated_text is not None:
+            kwargs["generated_text"] = generated_text
+        try:
+            diagnostics = diagnostics_fn(item.get("input", ""), **kwargs)
+        except TypeError:
+            kwargs.pop("generated_text", None)
+            try:
+                diagnostics = diagnostics_fn(item.get("input", ""), **kwargs)
+            except Exception as exc:
+                logger.debug("Prompt diagnostics unavailable for row: %s", exc)
+                return None
+        except Exception as exc:
+            logger.debug("Prompt diagnostics unavailable for row: %s", exc)
+            return None
+        return diagnostics if isinstance(diagnostics, dict) else None
 
     def _zero_metrics(error: Exception | None = None) -> dict:
         metadata = {
@@ -1828,6 +2906,9 @@ def evaluate_model(
             "decompiled": decompiled,
             "metrics": metrics,
         }
+        diagnostics = _prompt_diagnostics(item, decompiled if decompiled else None)
+        if diagnostics:
+            record["prompt_diagnostics"] = diagnostics
         if error is not None:
             record["error"] = {
                 "type": error.__class__.__name__,
@@ -1857,9 +2938,7 @@ def evaluate_model(
                 error=error,
             )
         )
-        logger.error(
-            f"  [rank {rank}] [{item_number}/{len(test_data)}] Error: {error}"
-        )
+        logger.error(f"  [rank {rank}] [{item_number}/{len(test_data)}] Error: {error}")
 
     def _record_result(
         item: dict,
@@ -1870,9 +2949,7 @@ def evaluate_model(
         generation_mode: str = "single",
     ) -> None:
         metric_start = time.time()
-        metrics = evaluator.evaluate_function(
-            item["output"], decompiled, item.get("metadata", {})
-        )
+        metrics = evaluator.evaluate_function(item["output"], decompiled, item.get("metadata", {}))
         results.append(
             _detail_record(
                 item,
@@ -2020,6 +3097,9 @@ def evaluate_model(
                 "failure_rate": float(len(failures) / len(results)),
                 "test_dataset_rows": dataset_rows,
                 "eval_limit": eval_limit,
+                "eval_seed": eval_seed,
+                "eval_sampling_strategy": sampling_strategy,
+                "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
                 "model_path": model_path,
                 "test_dataset": test_path,
@@ -2034,6 +3114,11 @@ def evaluate_model(
                     sum(1 for d in edit_dists if d < 0.4) / len(edit_dists)
                 ),
             }
+            prompt_summary = aggregate_prompt_diagnostics(results)
+            if prompt_summary:
+                summary["prompt_diagnostics"] = prompt_summary
+                summary["prompt_truncation_count"] = prompt_summary.get("truncated_count", 0)
+                summary["prompt_truncation_rate"] = prompt_summary.get("truncated_rate", 0.0)
             summary["worst_samples"] = _worst_evaluation_samples(results)
             if replication_summary:
                 replication_micro = replication_summary.get("micro", {})
@@ -2060,11 +3145,28 @@ def evaluate_model(
                 "failure_rate": 0.0,
                 "test_dataset_rows": dataset_rows,
                 "eval_limit": eval_limit,
+                "eval_seed": eval_seed,
+                "eval_sampling_strategy": sampling_strategy,
+                "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
                 "model_path": model_path,
                 "test_dataset": test_path,
                 "error": "No successful evaluations",
             }
+
+        baseline_summary = _load_baseline_summary(baseline_results_path)
+        if baseline_results_path:
+            summary["baseline_results_path"] = baseline_results_path
+            summary["baseline_tolerance"] = baseline_tolerance
+        _merge_aggregate_statistics(summary, results, baseline_summary)
+        if baseline_summary:
+            summary["baseline_comparison"] = compare_evaluation_to_baseline(
+                summary,
+                baseline_summary,
+                tolerance=baseline_tolerance,
+            )
+        if quality_gate_config and quality_gate_config.get("enabled"):
+            summary["quality_gate"] = evaluate_quality_gate(summary, quality_gate_config)
 
         # Save
         results_path = Path(results_dir) / f"eval_{int(time.time())}.json"
@@ -2104,6 +3206,12 @@ def evaluate_model(
 def main():
     parser = argparse.ArgumentParser(
         description="End-to-end training pipeline for smart contract decompilation"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; CLI flags override config values",
     )
     parser.add_argument(
         "--small",
@@ -2172,6 +3280,34 @@ def main():
         default=0,
         help="Minimum per-val/test count for common coverage strata; 0 disables fail gate",
     )
+    parser.add_argument(
+        "--reuse-splits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse existing split files when split_manifest.json matches the source dataset",
+    )
+    parser.add_argument(
+        "--force-resplit",
+        action="store_true",
+        help="Regenerate train/val/test splits even when the split manifest matches",
+    )
+    parser.add_argument(
+        "--min-split-target-ratio",
+        type=float,
+        default=DEFAULT_MIN_SPLIT_TARGET_RATIO,
+        help="Minimum actual/target row ratio for non-tiny splits before split validation fails",
+    )
+    parser.add_argument(
+        "--max-component-target-ratio",
+        type=float,
+        default=DEFAULT_MAX_COMPONENT_TARGET_RATIO,
+        help="Fail if the largest leakage component exceeds this fraction of the largest target split",
+    )
+    parser.add_argument(
+        "--allow-degenerate-splits",
+        action="store_true",
+        help="Allow leakage-free but highly imbalanced splits that fail split quality gates",
+    )
     parser.add_argument("--output-dir", type=str, default="models", help="Model output directory")
     parser.add_argument("--data-dir", type=str, default="data", help="Dataset output directory")
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
@@ -2179,13 +3315,20 @@ def main():
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=4,
-        help="Gradient accumulation steps",
+        default=None,
+        help=(
+            "Gradient accumulation steps. Default auto-computes from "
+            "--global-batch-size, --batch-size, and distributed world size."
+        ),
+    )
+    parser.add_argument(
+        "--global-batch-size",
+        type=int,
+        default=DEFAULT_GLOBAL_BATCH_SIZE,
+        help="Target effective global batch size used when gradient accumulation is auto",
     )
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument(
-        "--max-seq-length", type=int, default=2048, help="Max sequence length"
-    )
+    parser.add_argument("--max-seq-length", type=int, default=2048, help="Max sequence length")
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -2195,8 +3338,63 @@ def main():
     parser.add_argument(
         "--model-name",
         type=str,
-        default="meta-llama/Llama-3.2-3B",
+        default=DEFAULT_MODEL_NAME,
         help="Base model name",
+    )
+    parser.add_argument(
+        "--lora",
+        dest="use_lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable LoRA adapter fine-tuning (default: enabled)",
+    )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=DEFAULT_LORA_RANK,
+        help="LoRA rank",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=DEFAULT_LORA_ALPHA,
+        help="LoRA alpha",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=DEFAULT_LORA_DROPOUT,
+        help="LoRA dropout",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default=None,
+        help="Comma-separated LoRA target modules, or 'all-linear'",
+    )
+    parser.add_argument(
+        "--quantization",
+        dest="use_quantization",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_USE_QUANTIZATION,
+        help="Enable 4-bit NF4 quantized loading for lower VRAM use (default: disabled)",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        default=DEFAULT_PRECISION,
+        help="Trainer/DeepSpeed precision mode (auto selects bf16 on Ampere+, fp16 on older CUDA)",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=DEFAULT_NUM_GPUS,
+        help="GPU count for automatic torchrun launch; use 1 for single-GPU/CPU",
+    )
+    parser.add_argument(
+        "--no-auto-torchrun",
+        action="store_true",
+        help="Do not auto-relaunch train.py with torchrun when multiple GPUs are available",
     )
     parser.add_argument(
         "--tiny",
@@ -2216,6 +3414,48 @@ def main():
         help="Path to DeepSpeed config JSON (e.g. ds_config.json)",
     )
     parser.add_argument("--skip-eval", action="store_true", help="Skip evaluation after training")
+    parser.add_argument(
+        "--train-eval-strategy",
+        choices=["auto", "steps", "epoch", "no"],
+        default="auto",
+        help="Trainer validation cadence during training (separate from post-training eval)",
+    )
+    parser.add_argument(
+        "--train-eval-steps",
+        type=int,
+        default=None,
+        help="Trainer validation interval when --train-eval-strategy=steps",
+    )
+    parser.add_argument(
+        "--train-eval-max-samples",
+        type=int,
+        default=None,
+        help="Cap validation rows used by Trainer during training",
+    )
+    parser.add_argument(
+        "--dataloader-num-workers",
+        type=int,
+        default=None,
+        help="Trainer DataLoader worker count (default adapts to CUDA/smoke runs)",
+    )
+    parser.add_argument(
+        "--dataloader-pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable pinned memory for Trainer DataLoaders (default adapts to CUDA)",
+    )
+    parser.add_argument(
+        "--dataloader-persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep DataLoader workers persistent between epochs when worker count > 0",
+    )
+    parser.add_argument(
+        "--dataloader-prefetch-factor",
+        type=int,
+        default=None,
+        help="DataLoader prefetch factor when workers > 0",
+    )
     parser.add_argument(
         "--eval-only",
         action="store_true",
@@ -2243,7 +3483,18 @@ def main():
         "--eval-limit",
         type=int,
         default=None,
-        help="Evaluate only the first N test examples (useful for smoke demos)",
+        help="Evaluate a seeded sample of N test examples (use --eval-first-n for debug first-N)",
+    )
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=DEFAULT_EVAL_SEED,
+        help="Seed for reproducible --eval-limit sampling",
+    )
+    parser.add_argument(
+        "--eval-first-n",
+        action="store_true",
+        help="Debug mode: make --eval-limit take the first N rows instead of seeded sampling",
     )
     parser.add_argument(
         "--eval-batch-size",
@@ -2252,7 +3503,81 @@ def main():
         help="Number of examples to decompile per evaluation batch",
     )
     parser.add_argument(
+        "--baseline-results",
+        type=str,
+        default=None,
+        help="Prior evaluation JSON/summary to compare against during eval",
+    )
+    parser.add_argument(
+        "--baseline-tolerance",
+        type=float,
+        default=0.0,
+        help="Absolute tolerance before baseline deltas count as regressions/improvements",
+    )
+    parser.add_argument(
+        "--quality-gate",
+        action="store_true",
+        help="Exit non-zero if evaluation metrics miss configured quality thresholds",
+    )
+    parser.add_argument(
+        "--min-semantic-similarity",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["semantic_similarity_mean"]["value"],
+        help="Quality gate minimum semantic_similarity_mean",
+    )
+    parser.add_argument(
+        "--min-pct-above-0.8-similarity",
+        dest="min_pct_above_08_similarity",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["pct_above_0.8_similarity"]["value"],
+        help="Quality gate minimum fraction above 0.8 semantic similarity",
+    )
+    parser.add_argument(
+        "--min-pct-below-0.4-edit-dist",
+        dest="min_pct_below_04_edit_dist",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["pct_below_0.4_edit_dist"]["value"],
+        help="Quality gate minimum fraction below 0.4 normalized edit distance",
+    )
+    parser.add_argument(
+        "--max-failure-rate",
+        type=float,
+        default=DEFAULT_QUALITY_THRESHOLDS["failure_rate"]["value"],
+        help="Quality gate maximum row failure rate",
+    )
+    parser.add_argument(
+        "--min-replication-f1",
+        type=float,
+        default=None,
+        help="Optional quality gate minimum replication_f1_mean",
+    )
+    parser.add_argument(
+        "--min-solidity-valid",
+        type=float,
+        default=None,
+        help="Optional quality gate minimum solidity_valid_mean",
+    )
+    parser.add_argument(
+        "--min-solidity-compiler-checked",
+        type=float,
+        default=None,
+        help="Optional quality gate minimum solidity_compiler_checked_mean",
+    )
+    parser.add_argument(
+        "--min-solidity-ast-valid",
+        type=float,
+        default=None,
+        help="Optional quality gate minimum solidity_ast_valid_mean",
+    )
+    parser.add_argument(
+        "--max-baseline-regressions",
+        type=int,
+        default=0,
+        help="Quality gate maximum allowed baseline regressions when --baseline-results is supplied",
+    )
+    parser.add_argument(
         "--local_rank",
+        "--local-rank",
         type=int,
         default=0,
         help="Local rank passed by DeepSpeed launcher (do not set manually)",
@@ -2265,9 +3590,14 @@ def main():
     parser.add_argument(
         "--no-compiler-metadata",
         action="store_true",
+        help=("Deprecated no-op; compiler/optimizer/EVM metadata is never " "included in prompts"),
+    )
+    parser.add_argument(
+        "--no-bytecode-metadata",
+        action="store_true",
         help=(
-            "Do not include compiler version/optimizer metadata in training "
-            "prompts even when dataset rows contain it"
+            "Do not include the safe bytecode/TAC-derived metadata line in "
+            "prompts; TAC sanitization still runs"
         ),
     )
     parser.add_argument(
@@ -2281,9 +3611,39 @@ def main():
         help="Allow tokenizer downloads during data preflight (default is local cache only)",
     )
     parser.add_argument(
-        "--tokenization-cache",
+        "--allow-whitespace-preflight-fallback",
         action="store_true",
-        help="Cache tokenized datasets on disk for repeat training runs",
+        help="Explicitly allow approximate whitespace token counts if the tokenizer cannot load",
+    )
+    parser.add_argument(
+        "--allow-legacy-metadata-schema",
+        action="store_true",
+        help=(
+            "Allow legacy rows without metadata.schema_version during preflight; "
+            "critical metadata fields are still validated"
+        ),
+    )
+    parser.add_argument(
+        "--preflight-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for cached data-preflight reports (default: <data-dir>/preflight_cache)",
+    )
+    parser.add_argument(
+        "--overwrite-preflight-cache",
+        action="store_true",
+        help="Recompute data-preflight reports even when the cache matches",
+    )
+    parser.add_argument(
+        "--allow-unverified-test-dataset",
+        action="store_true",
+        help="Allow eval-only auto-detected test data without matching split lineage validation",
+    )
+    parser.add_argument(
+        "--tokenization-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cache tokenized datasets on disk for repeat training runs (default: enabled)",
     )
     parser.add_argument(
         "--tokenization-cache-dir",
@@ -2325,6 +3685,18 @@ def main():
         help="Exact path for this run's manifest JSON",
     )
 
+    config_args, _remaining = parser.parse_known_args()
+    if config_args.config:
+        try:
+            config_defaults = _load_cli_config(config_args.config)
+        except Exception as exc:
+            raise SystemExit(f"Could not load training config {config_args.config}: {exc}")
+        valid_dests = _parser_destinations(parser)
+        unknown_keys = sorted(key for key in config_defaults if key not in valid_dests)
+        if unknown_keys:
+            raise SystemExit("Unsupported training config keys: " + ", ".join(unknown_keys))
+        parser.set_defaults(**config_defaults)
+
     args = parser.parse_args()
 
     # Apply --tiny defaults (overrides --small)
@@ -2347,9 +3719,60 @@ def main():
         args.epochs = 3
     if args.batch_size is None:
         args.batch_size = 4
+    if args.num_gpus < 1:
+        raise SystemExit("--num-gpus must be at least 1")
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be at least 1")
+    if args.global_batch_size is not None and args.global_batch_size < 1:
+        raise SystemExit("--global-batch-size must be at least 1")
+    if args.gradient_accumulation_steps is not None and args.gradient_accumulation_steps < 1:
+        raise SystemExit("--gradient-accumulation-steps must be at least 1")
+    if args.lora_rank < 1:
+        raise SystemExit("--lora-rank must be at least 1")
+    if args.lora_alpha < 1:
+        raise SystemExit("--lora-alpha must be at least 1")
+    if args.lora_dropout < 0:
+        raise SystemExit("--lora-dropout must be non-negative")
+    if args.min_split_target_ratio < 0 or args.min_split_target_ratio > 1:
+        raise SystemExit("--min-split-target-ratio must be between 0 and 1")
+    if args.max_component_target_ratio <= 0:
+        raise SystemExit("--max-component-target-ratio must be positive")
+    if args.collection_workers is not None and args.collection_workers < 1:
+        raise SystemExit("--collection-workers must be at least 1")
+    if args.train_eval_steps is not None and args.train_eval_steps < 1:
+        raise SystemExit("--train-eval-steps must be at least 1")
+    if args.train_eval_max_samples is not None and args.train_eval_max_samples < 1:
+        raise SystemExit("--train-eval-max-samples must be at least 1")
+    if args.dataloader_num_workers is not None and args.dataloader_num_workers < 0:
+        raise SystemExit("--dataloader-num-workers must be non-negative")
+    if args.dataloader_prefetch_factor is not None and args.dataloader_prefetch_factor < 1:
+        raise SystemExit("--dataloader-prefetch-factor must be at least 1")
+    if args.eval_limit is not None and args.eval_limit < 0:
+        raise SystemExit("--eval-limit must be non-negative")
+    if args.baseline_tolerance < 0:
+        raise SystemExit("--baseline-tolerance must be non-negative")
+    if args.max_baseline_regressions is not None and args.max_baseline_regressions < 0:
+        raise SystemExit("--max-baseline-regressions must be non-negative")
+
+    if isinstance(args.lora_target_modules, str):
+        if args.lora_target_modules.strip().lower() == "all-linear":
+            args.lora_target_modules = "all-linear"
+        elif args.lora_target_modules.strip():
+            args.lora_target_modules = [
+                module.strip() for module in args.lora_target_modules.split(",") if module.strip()
+            ]
+        else:
+            args.lora_target_modules = None
+
+    _maybe_relaunch_with_torchrun(args)
 
     setup_logging()
     logger = logging.getLogger(__name__)
+    if args.no_compiler_metadata:
+        logger.warning(
+            "--no-compiler-metadata is deprecated and ignored; compiler metadata "
+            "is never included in prompts."
+        )
     run_id = _make_run_id()
     started_perf = time.perf_counter()
     started_at = _utc_now_iso()
@@ -2360,71 +3783,254 @@ def main():
         if args.split_manifest
         else Path(args.data_dir) / "split_manifest.json"
     )
+    preflight_cache_dir = args.preflight_cache_dir or str(Path(args.data_dir) / "preflight_cache")
+    quality_gate_config = _quality_threshold_config_from_args(args)
     _write_run_manifest(manifest_path, manifest)
 
-    if args.enable_memory_monitoring:
-        logger.info("Memory monitoring enabled")
+    try:
+        if args.enable_memory_monitoring:
+            logger.info("Memory monitoring enabled")
 
-    settings = load_settings()
+        settings = load_settings()
 
-    logger.info("=" * 60)
-    logger.info("Smart Contract Decompilation — E2E Training Pipeline")
-    logger.info("=" * 60)
-    logger.info(f"Mode: {'small/test' if args.small else 'full'}")
-    logger.info(f"Run manifest: {manifest_path}")
+        logger.info("=" * 60)
+        logger.info("Smart Contract Decompilation — E2E Training Pipeline")
+        logger.info("=" * 60)
+        logger.info(f"Mode: {'small/test' if args.small else 'full'}")
+        logger.info(f"Run manifest: {manifest_path}")
 
-    # ── Eval-only mode ───────────────────────────────────────────
-    if args.eval_only:
-        if not args.model_path:
-            logger.error("--model-path is required when using --eval-only.")
-            sys.exit(1)
-        if not Path(args.model_path).exists():
-            logger.error(f"Model path does not exist: {args.model_path}")
-            sys.exit(1)
+        # ── Eval-only mode ───────────────────────────────────────────
+        if args.eval_only:
+            if not args.model_path:
+                raise SystemExit("--model-path is required when using --eval-only.")
+            if not Path(args.model_path).exists():
+                raise SystemExit(f"Model path does not exist: {args.model_path}")
 
-        # Resolve test dataset
-        test_path = args.test_dataset
-        if not test_path:
-            if args.dataset:
-                # Re-split the provided dataset to obtain the test split
-                _, _, test_path = split_dataset(
-                    args.dataset,
-                    args.data_dir,
-                    seed=args.split_seed,
-                    manifest_path=split_manifest_path,
-                    validate_leakage=not args.skip_split_validation,
-                    min_holdout_stratum_count=args.min_holdout_stratum_count,
+            # Resolve test dataset
+            test_path = args.test_dataset
+            autodetected_test_dataset = False
+            test_lineage = None
+            if not test_path:
+                if args.dataset:
+                    # Re-split the provided dataset to obtain the test split
+                    _, _, test_path = split_dataset(
+                        args.dataset,
+                        args.data_dir,
+                        seed=args.split_seed,
+                        manifest_path=split_manifest_path,
+                        validate_leakage=not args.skip_split_validation,
+                        min_holdout_stratum_count=args.min_holdout_stratum_count,
+                        reuse_existing=args.reuse_splits,
+                        force_resplit=args.force_resplit,
+                        min_split_target_ratio=args.min_split_target_ratio,
+                        max_component_target_ratio=args.max_component_target_ratio,
+                        allow_degenerate_splits=args.allow_degenerate_splits,
+                    )
+                else:
+                    # Auto-detect from previous run
+                    candidate = Path(args.data_dir) / "test_dataset.jsonl"
+                    if candidate.exists():
+                        test_path = str(candidate)
+                        autodetected_test_dataset = True
+
+            if not test_path or not Path(test_path).exists():
+                raise SystemExit(
+                    "No test dataset found. Provide --test-dataset, --dataset, "
+                    "or ensure data/test_dataset.jsonl exists from a previous run."
                 )
-            else:
-                # Auto-detect from previous run
-                candidate = Path(args.data_dir) / "test_dataset.jsonl"
-                if candidate.exists():
-                    test_path = str(candidate)
+            if autodetected_test_dataset:
+                test_lineage = verify_autodetected_test_dataset(
+                    test_path,
+                    split_manifest_path,
+                    allow_unverified=args.allow_unverified_test_dataset,
+                )
 
-        if not test_path or not Path(test_path).exists():
-            logger.error(
-                "No test dataset found. Provide --test-dataset, --dataset, "
-                "or ensure data/test_dataset.jsonl exists from a previous run."
+            logger.info(f"Eval-only mode. Model: {args.model_path}")
+            logger.info(f"Test dataset: {test_path}")
+            manifest["mode"] = "eval_only"
+            manifest["artifacts"]["model"] = _file_artifact(args.model_path)
+            _record_dataset_artifacts(
+                manifest,
+                args.dataset,
+                test_path=test_path,
+                split_manifest_path=(
+                    split_manifest_path if args.dataset or autodetected_test_dataset else None
+                ),
             )
-            sys.exit(1)
+            if test_lineage:
+                manifest["datasets"]["test_lineage"] = test_lineage
+            if getattr(split_dataset, "last_status", None):
+                manifest["datasets"]["split_cache"] = split_dataset.last_status
+            preflight = run_data_preflight(
+                {"test": test_path},
+                tokenizer_source=args.model_path,
+                max_seq_length=args.max_seq_length,
+                include_bytecode_metadata=not args.no_bytecode_metadata,
+                skip=args.skip_data_preflight,
+                allow_tokenizer_download=args.preflight_tokenizer_download,
+                allow_whitespace_fallback=args.allow_whitespace_preflight_fallback,
+                cache_dir=preflight_cache_dir,
+                overwrite_cache=args.overwrite_preflight_cache,
+                allow_legacy_metadata_schema=args.allow_legacy_metadata_schema,
+            )
+            manifest["datasets"]["preflight"] = preflight
+            _write_run_manifest(manifest_path, manifest)
+            if preflight["status"] == "failed":
+                error = ValueError(_format_preflight_failure(preflight))
+                _finalize_manifest(manifest, manifest_path, started_perf, "failed", error)
+                raise SystemExit(str(error))
+            summary = evaluate_model(
+                args.model_path,
+                test_path,
+                latest_results_path=args.latest_results,
+                eval_limit=args.eval_limit,
+                eval_batch_size=args.eval_batch_size,
+                eval_seed=args.eval_seed,
+                eval_first_n=args.eval_first_n,
+                baseline_results_path=args.baseline_results,
+                baseline_tolerance=args.baseline_tolerance,
+                quality_gate_config=quality_gate_config,
+            )
+            manifest["evaluation"] = {
+                "summary": summary,
+                "config": {
+                    "eval_limit": args.eval_limit,
+                    "eval_seed": args.eval_seed,
+                    "eval_first_n": args.eval_first_n,
+                    "eval_batch_size": args.eval_batch_size,
+                    "latest_results_path": args.latest_results,
+                    "baseline_results": args.baseline_results,
+                    "baseline_tolerance": args.baseline_tolerance,
+                    "quality_gate": quality_gate_config,
+                },
+            }
+            if summary.get("results_path"):
+                manifest["artifacts"]["evaluation_results"] = _file_artifact(
+                    summary["results_path"]
+                )
+            if args.latest_results:
+                manifest["artifacts"]["latest_results"] = _file_artifact(args.latest_results)
+            if summary.get("quality_gate", {}).get("status") == "failed":
+                error = RuntimeError(
+                    "quality gate failed: "
+                    f"{summary['quality_gate'].get('failure_count', 0)} checks failed"
+                )
+                _finalize_manifest(manifest, manifest_path, started_perf, "failed", error)
+                raise SystemExit(str(error))
+            _finalize_manifest(manifest, manifest_path, started_perf, "completed")
 
-        logger.info(f"Eval-only mode. Model: {args.model_path}")
-        logger.info(f"Test dataset: {test_path}")
-        manifest["mode"] = "eval_only"
-        manifest["artifacts"]["model"] = _file_artifact(args.model_path)
+            logger.info("=" * 60)
+            logger.info("Evaluation complete!")
+            logger.info("=" * 60)
+            return
+
+        # ── Step 1: Dataset ──────────────────────────────────────────
+        if args.skip_collection:
+            dataset_path = args.dataset
+            if not dataset_path:
+                # Look for existing datasets
+                for candidate in [
+                    Path(args.data_dir) / "hf_training_dataset.jsonl",
+                    Path(args.data_dir) / "train_dataset.jsonl",
+                    Path("demo_dataset.jsonl"),
+                ]:
+                    if candidate.name == "demo_dataset.jsonl" and not args.allow_demo_fallback:
+                        continue
+                    if candidate.exists():
+                        dataset_path = str(candidate)
+                        break
+
+            if not dataset_path or not Path(dataset_path).exists():
+                raise SystemExit("No dataset found. Provide --dataset or remove --skip-collection.")
+            if Path(dataset_path).name in {"demo_dataset.jsonl", "dataset_from_demo.jsonl"}:
+                if not args.allow_demo_fallback:
+                    raise SystemExit(
+                        "Demo dataset use requires --allow-demo-fallback; provide a real "
+                        "dataset with --dataset for training."
+                    )
+                logger.warning("Using demo dataset because --allow-demo-fallback was provided.")
+
+            logger.info(f"Using existing dataset: {dataset_path}")
+
+            # Always re-split from the source dataset to ensure consistency
+            train_path, val_path, test_path = split_dataset(
+                dataset_path,
+                args.data_dir,
+                seed=args.split_seed,
+                manifest_path=split_manifest_path,
+                validate_leakage=not args.skip_split_validation,
+                min_holdout_stratum_count=args.min_holdout_stratum_count,
+                reuse_existing=args.reuse_splits,
+                force_resplit=args.force_resplit,
+                min_split_target_ratio=args.min_split_target_ratio,
+                max_component_target_ratio=args.max_component_target_ratio,
+                allow_degenerate_splits=args.allow_degenerate_splits,
+            )
+        else:
+            api_key = settings.get("ETHERSCAN_API_KEY")
+            if not api_key:
+                raise SystemExit(
+                    "ETHERSCAN_API_KEY not found. Set it in src/settings.yaml or as env var."
+                )
+
+            max_contracts = 10 if args.small else None
+            dataset_path = collect_dataset(
+                api_key,
+                args.addresses,
+                args.data_dir,
+                max_contracts,
+                max_compiler_configs=args.max_compiler_configs,
+                max_workers=args.collection_workers,
+                allow_demo_fallback=args.allow_demo_fallback,
+            )
+
+            train_path, val_path, test_path = split_dataset(
+                dataset_path,
+                args.data_dir,
+                seed=args.split_seed,
+                manifest_path=split_manifest_path,
+                validate_leakage=not args.skip_split_validation,
+                min_holdout_stratum_count=args.min_holdout_stratum_count,
+                reuse_existing=args.reuse_splits,
+                force_resplit=args.force_resplit,
+                min_split_target_ratio=args.min_split_target_ratio,
+                max_component_target_ratio=args.max_component_target_ratio,
+                allow_degenerate_splits=args.allow_degenerate_splits,
+            )
+
+        logger.info(f"Train: {train_path}")
+        logger.info(f"Val:   {val_path}")
+        logger.info(f"Test:  {test_path}")
         _record_dataset_artifacts(
             manifest,
-            args.dataset,
-            test_path=test_path,
-            split_manifest_path=split_manifest_path if args.dataset else None,
+            dataset_path,
+            train_path,
+            val_path,
+            test_path,
+            split_manifest_path=split_manifest_path,
         )
+        if getattr(split_dataset, "last_status", None):
+            manifest["datasets"]["split_cache"] = split_dataset.last_status
+        demo_manifest = Path(f"{dataset_path}.manifest.json") if dataset_path else None
+        if demo_manifest and demo_manifest.exists():
+            try:
+                demo_payload = _load_json(demo_manifest)
+            except Exception:
+                demo_payload = None
+            if isinstance(demo_payload, dict) and demo_payload.get("demo_fallback"):
+                manifest["datasets"]["demo_fallback"] = demo_payload
+
         preflight = run_data_preflight(
-            {"test": test_path},
-            tokenizer_source=args.model_path,
+            {"train": train_path, "val": val_path, "test": test_path},
+            tokenizer_source=args.model_name,
             max_seq_length=args.max_seq_length,
-            include_compiler_metadata=not args.no_compiler_metadata,
+            include_bytecode_metadata=not args.no_bytecode_metadata,
             skip=args.skip_data_preflight,
             allow_tokenizer_download=args.preflight_tokenizer_download,
+            allow_whitespace_fallback=args.allow_whitespace_preflight_fallback,
+            cache_dir=preflight_cache_dir,
+            overwrite_cache=args.overwrite_preflight_cache,
+            allow_legacy_metadata_schema=args.allow_legacy_metadata_schema,
         )
         manifest["datasets"]["preflight"] = preflight
         _write_run_manifest(manifest_path, manifest)
@@ -2432,259 +4038,207 @@ def main():
             error = ValueError(_format_preflight_failure(preflight))
             _finalize_manifest(manifest, manifest_path, started_perf, "failed", error)
             raise SystemExit(str(error))
-        summary = evaluate_model(
-            args.model_path,
-            test_path,
-            latest_results_path=args.latest_results,
-            eval_limit=args.eval_limit,
-            eval_batch_size=args.eval_batch_size,
-        )
-        manifest["evaluation"] = {
-            "summary": summary,
-            "config": {
-                "eval_limit": args.eval_limit,
-                "eval_batch_size": args.eval_batch_size,
-                "latest_results_path": args.latest_results,
-            },
+
+        if args.dataset_only:
+            logger.info("Dataset-only mode. Stopping here.")
+            manifest["mode"] = "dataset_only"
+            _finalize_manifest(manifest, manifest_path, started_perf, "completed")
+            return
+
+        # ── Step 2: Training ─────────────────────────────────────────
+        # Disable quantization for tiny smoke runs.
+        use_quant = bool(args.use_quantization and not args.tiny)
+        resume_from = resolve_resume_checkpoint(args.resume, args.output_dir)
+        tokenization_cache_config = None
+        if (
+            args.tokenization_cache
+            or args.tokenization_cache_dir
+            or args.overwrite_tokenization_cache
+        ):
+            tokenization_cache_config = {
+                "enabled": True,
+                "cache_dir": args.tokenization_cache_dir,
+                "overwrite": args.overwrite_tokenization_cache,
+            }
+        output_dir_path = Path(args.output_dir)
+        instrumentation_config = {
+            "enable_throughput_metrics": not args.no_throughput_metrics,
+            "throughput_summary_path": str(output_dir_path / "training_throughput.json"),
+            "throughput_csv_path": str(output_dir_path / "training_throughput.csv"),
+            "enable_torch_profiler": args.enable_torch_profiler,
+            "profiler_trace_dir": args.profiler_trace_dir,
         }
-        if summary.get("results_path"):
-            manifest["artifacts"]["evaluation_results"] = _file_artifact(summary["results_path"])
-        if args.latest_results:
-            manifest["artifacts"]["latest_results"] = _file_artifact(args.latest_results)
-        _finalize_manifest(manifest, manifest_path, started_perf, "completed")
+        effective_runtime_settings = _effective_training_runtime_settings(args, train_path)
+        manifest["mode"] = "train"
+        manifest["training"] = {
+            "config": {
+                "output_dir": args.output_dir,
+                "batch_size": args.batch_size,
+                "learning_rate": args.lr,
+                "epochs": args.epochs,
+                "max_seq_length": args.max_seq_length,
+                "model_name": args.model_name,
+                "use_quantization": use_quant,
+                "precision": args.precision,
+                "use_lora": args.use_lora,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "lora_target_modules": args.lora_target_modules,
+                "num_gpus": args.num_gpus,
+                "global_batch_size": args.global_batch_size,
+                "resume": args.resume,
+                "resume_from_checkpoint": resume_from,
+                "resume_resolution": getattr(resolve_resume_checkpoint, "last_result", None),
+                "deepspeed_config": args.deepspeed,
+                "enable_memory_monitoring": args.enable_memory_monitoring,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "include_bytecode_metadata": not args.no_bytecode_metadata,
+                "max_steps": args.max_steps,
+                "tokenization_cache": tokenization_cache_config,
+                "train_eval_strategy": args.train_eval_strategy,
+                "train_eval_steps": args.train_eval_steps,
+                "train_eval_max_samples": args.train_eval_max_samples,
+                "dataloader": {
+                    "num_workers": args.dataloader_num_workers,
+                    "pin_memory": args.dataloader_pin_memory,
+                    "persistent_workers": args.dataloader_persistent_workers,
+                    "prefetch_factor": args.dataloader_prefetch_factor,
+                },
+                "effective_train_eval_strategy": effective_runtime_settings["train_eval_strategy"],
+                "effective_dataloader": effective_runtime_settings["dataloader"],
+            },
+            "instrumentation": instrumentation_config,
+        }
+        manifest["telemetry"] = {
+            "throughput_summary_path": instrumentation_config["throughput_summary_path"],
+            "throughput_csv_path": instrumentation_config["throughput_csv_path"],
+            "profiler_trace_dir": instrumentation_config["profiler_trace_dir"],
+        }
+        _write_run_manifest(manifest_path, manifest)
+        model_path = train_model(
+            train_path=train_path,
+            val_path=val_path,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            num_epochs=args.epochs,
+            max_seq_length=args.max_seq_length,
+            model_name=args.model_name,
+            resume_from=resume_from,
+            use_quantization=use_quant,
+            precision=args.precision,
+            use_lora=args.use_lora,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            lora_target_modules=args.lora_target_modules,
+            deepspeed_config=args.deepspeed,
+            enable_memory_monitoring=args.enable_memory_monitoring,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            global_batch_size=args.global_batch_size,
+            include_bytecode_metadata=not args.no_bytecode_metadata,
+            max_steps=args.max_steps,
+            tokenization_cache=tokenization_cache_config,
+            instrumentation_config=instrumentation_config,
+            train_eval_strategy=args.train_eval_strategy,
+            train_eval_steps=args.train_eval_steps,
+            train_eval_max_samples=args.train_eval_max_samples,
+            dataloader_num_workers=args.dataloader_num_workers,
+            dataloader_pin_memory=args.dataloader_pin_memory,
+            dataloader_persistent_workers=args.dataloader_persistent_workers,
+            dataloader_prefetch_factor=args.dataloader_prefetch_factor,
+        )
+        training_artifacts = _collect_training_artifacts(args.output_dir, model_path)
+        manifest["training"].update(
+            {
+                "model_path": model_path,
+                "model_config": training_artifacts["model_config"],
+                "final_metrics": training_artifacts["final_metrics"],
+                "log_history_references": training_artifacts["log_history_references"],
+            }
+        )
+        manifest["artifacts"].update(training_artifacts["artifacts"])
+        for telemetry_name, telemetry_path in [
+            ("throughput_summary", instrumentation_config["throughput_summary_path"]),
+            ("throughput_csv", instrumentation_config["throughput_csv_path"]),
+            ("profiler_trace", instrumentation_config["profiler_trace_dir"]),
+        ]:
+            if telemetry_path:
+                manifest["artifacts"][telemetry_name] = _file_artifact(telemetry_path)
+        _write_run_manifest(manifest_path, manifest)
 
-        logger.info("=" * 60)
-        logger.info("Evaluation complete!")
-        logger.info("=" * 60)
-        return
+        # ── Step 3: Evaluation ───────────────────────────────────────
+        if not args.skip_eval:
+            # Free GPU memory from training before loading model for evaluation
+            import torch, gc
 
-    # ── Step 1: Dataset ──────────────────────────────────────────
-    if args.skip_collection:
-        dataset_path = args.dataset
-        if not dataset_path:
-            # Look for existing datasets
-            for candidate in [
-                Path(args.data_dir) / "hf_training_dataset.jsonl",
-                Path(args.data_dir) / "train_dataset.jsonl",
-                Path("demo_dataset.jsonl"),
-            ]:
-                if candidate.name == "demo_dataset.jsonl" and not args.allow_demo_fallback:
-                    continue
-                if candidate.exists():
-                    dataset_path = str(candidate)
-                    break
-
-        if not dataset_path or not Path(dataset_path).exists():
-            logger.error("No dataset found. Provide --dataset or remove --skip-collection.")
-            sys.exit(1)
-        if Path(dataset_path).name in {"demo_dataset.jsonl", "dataset_from_demo.jsonl"}:
-            if not args.allow_demo_fallback:
-                logger.error(
-                    "Demo dataset use requires --allow-demo-fallback; provide a real "
-                    "dataset with --dataset for training."
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            summary = evaluate_model(
+                model_path,
+                test_path,
+                latest_results_path=args.latest_results,
+                eval_limit=args.eval_limit,
+                eval_batch_size=args.eval_batch_size,
+                eval_seed=args.eval_seed,
+                eval_first_n=args.eval_first_n,
+                baseline_results_path=args.baseline_results,
+                baseline_tolerance=args.baseline_tolerance,
+                quality_gate_config=quality_gate_config,
+            )
+            manifest["evaluation"] = {
+                "summary": summary,
+                "config": {
+                    "eval_limit": args.eval_limit,
+                    "eval_seed": args.eval_seed,
+                    "eval_first_n": args.eval_first_n,
+                    "eval_batch_size": args.eval_batch_size,
+                    "latest_results_path": args.latest_results,
+                    "baseline_results": args.baseline_results,
+                    "baseline_tolerance": args.baseline_tolerance,
+                    "quality_gate": quality_gate_config,
+                },
+            }
+            if summary.get("results_path"):
+                manifest["artifacts"]["evaluation_results"] = _file_artifact(
+                    summary["results_path"]
                 )
-                sys.exit(1)
-            logger.warning("Using demo dataset because --allow-demo-fallback was provided.")
-
-        logger.info(f"Using existing dataset: {dataset_path}")
-
-        # Always re-split from the source dataset to ensure consistency
-        train_path, val_path, test_path = split_dataset(
-            dataset_path,
-            args.data_dir,
-            seed=args.split_seed,
-            manifest_path=split_manifest_path,
-            validate_leakage=not args.skip_split_validation,
-            min_holdout_stratum_count=args.min_holdout_stratum_count,
-        )
-    else:
-        api_key = settings.get("ETHERSCAN_API_KEY")
-        if not api_key:
-            logger.error("ETHERSCAN_API_KEY not found. Set it in src/settings.yaml or as env var.")
-            sys.exit(1)
-
-        max_contracts = 10 if args.small else None
-        dataset_path = collect_dataset(
-            api_key,
-            args.addresses,
-            args.data_dir,
-            max_contracts,
-            max_compiler_configs=args.max_compiler_configs,
-            max_workers=args.collection_workers,
-            allow_demo_fallback=args.allow_demo_fallback,
-        )
-
-        train_path, val_path, test_path = split_dataset(
-            dataset_path,
-            args.data_dir,
-            seed=args.split_seed,
-            manifest_path=split_manifest_path,
-            validate_leakage=not args.skip_split_validation,
-            min_holdout_stratum_count=args.min_holdout_stratum_count,
-        )
-
-    logger.info(f"Train: {train_path}")
-    logger.info(f"Val:   {val_path}")
-    logger.info(f"Test:  {test_path}")
-    _record_dataset_artifacts(
-        manifest,
-        dataset_path,
-        train_path,
-        val_path,
-        test_path,
-        split_manifest_path=split_manifest_path,
-    )
-    demo_manifest = Path(f"{dataset_path}.manifest.json") if dataset_path else None
-    if demo_manifest and demo_manifest.exists():
-        try:
-            demo_payload = _load_json(demo_manifest)
-        except Exception:
-            demo_payload = None
-        if isinstance(demo_payload, dict) and demo_payload.get("demo_fallback"):
-            manifest["datasets"]["demo_fallback"] = demo_payload
-
-    preflight = run_data_preflight(
-        {"train": train_path, "val": val_path, "test": test_path},
-        tokenizer_source=args.model_name,
-        max_seq_length=args.max_seq_length,
-        include_compiler_metadata=not args.no_compiler_metadata,
-        skip=args.skip_data_preflight,
-        allow_tokenizer_download=args.preflight_tokenizer_download,
-    )
-    manifest["datasets"]["preflight"] = preflight
-    _write_run_manifest(manifest_path, manifest)
-    if preflight["status"] == "failed":
-        error = ValueError(_format_preflight_failure(preflight))
-        _finalize_manifest(manifest, manifest_path, started_perf, "failed", error)
-        raise SystemExit(str(error))
-
-    if args.dataset_only:
-        logger.info("Dataset-only mode. Stopping here.")
-        manifest["mode"] = "dataset_only"
+            if args.latest_results:
+                manifest["artifacts"]["latest_results"] = _file_artifact(args.latest_results)
+            if summary.get("quality_gate", {}).get("status") == "failed":
+                error = RuntimeError(
+                    "quality gate failed: "
+                    f"{summary['quality_gate'].get('failure_count', 0)} checks failed"
+                )
+                _finalize_manifest(manifest, manifest_path, started_perf, "failed", error)
+                raise SystemExit(str(error))
+        else:
+            logger.info("Skipping evaluation (--skip-eval).")
+            manifest["evaluation"] = {"skipped": True}
         _finalize_manifest(manifest, manifest_path, started_perf, "completed")
-        return
 
-    # ── Step 2: Training ─────────────────────────────────────────
-    # Disable quantization for tiny/non-llama models
-    use_quant = not args.tiny
-    resume_from = resolve_resume_checkpoint(args.resume, args.output_dir)
-    tokenization_cache_config = None
-    if args.tokenization_cache or args.tokenization_cache_dir or args.overwrite_tokenization_cache:
-        tokenization_cache_config = {
-            "enabled": True,
-            "cache_dir": args.tokenization_cache_dir,
-            "overwrite": args.overwrite_tokenization_cache,
-        }
-    output_dir_path = Path(args.output_dir)
-    instrumentation_config = {
-        "enable_throughput_metrics": not args.no_throughput_metrics,
-        "throughput_summary_path": str(output_dir_path / "training_throughput.json"),
-        "throughput_csv_path": str(output_dir_path / "training_throughput.csv"),
-        "enable_torch_profiler": args.enable_torch_profiler,
-        "profiler_trace_dir": args.profiler_trace_dir,
-    }
-    manifest["mode"] = "train"
-    manifest["training"] = {
-        "config": {
-            "output_dir": args.output_dir,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "epochs": args.epochs,
-            "max_seq_length": args.max_seq_length,
-            "model_name": args.model_name,
-            "use_quantization": use_quant,
-            "resume": args.resume,
-            "resume_from_checkpoint": resume_from,
-            "deepspeed_config": args.deepspeed,
-            "enable_memory_monitoring": args.enable_memory_monitoring,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "include_compiler_metadata": not args.no_compiler_metadata,
-            "max_steps": args.max_steps,
-            "tokenization_cache": tokenization_cache_config,
-        },
-        "instrumentation": instrumentation_config,
-    }
-    manifest["telemetry"] = {
-        "throughput_summary_path": instrumentation_config["throughput_summary_path"],
-        "throughput_csv_path": instrumentation_config["throughput_csv_path"],
-        "profiler_trace_dir": instrumentation_config["profiler_trace_dir"],
-    }
-    _write_run_manifest(manifest_path, manifest)
-    model_path = train_model(
-        train_path=train_path,
-        val_path=val_path,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        num_epochs=args.epochs,
-        max_seq_length=args.max_seq_length,
-        model_name=args.model_name,
-        resume_from=resume_from,
-        use_quantization=use_quant,
-        deepspeed_config=args.deepspeed,
-        enable_memory_monitoring=args.enable_memory_monitoring,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        include_compiler_metadata=not args.no_compiler_metadata,
-        max_steps=args.max_steps,
-        tokenization_cache=tokenization_cache_config,
-        instrumentation_config=instrumentation_config,
-    )
-    training_artifacts = _collect_training_artifacts(args.output_dir, model_path)
-    manifest["training"].update(
-        {
-            "model_path": model_path,
-            "model_config": training_artifacts["model_config"],
-            "final_metrics": training_artifacts["final_metrics"],
-            "log_history_references": training_artifacts["log_history_references"],
-        }
-    )
-    manifest["artifacts"].update(training_artifacts["artifacts"])
-    for telemetry_name, telemetry_path in [
-        ("throughput_summary", instrumentation_config["throughput_summary_path"]),
-        ("throughput_csv", instrumentation_config["throughput_csv_path"]),
-        ("profiler_trace", instrumentation_config["profiler_trace_dir"]),
-    ]:
-        if telemetry_path:
-            manifest["artifacts"][telemetry_name] = _file_artifact(telemetry_path)
-    _write_run_manifest(manifest_path, manifest)
-
-    # ── Step 3: Evaluation ───────────────────────────────────────
-    if not args.skip_eval:
-        # Free GPU memory from training before loading model for evaluation
-        import torch, gc
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        summary = evaluate_model(
-            model_path,
-            test_path,
-            latest_results_path=args.latest_results,
-            eval_limit=args.eval_limit,
-            eval_batch_size=args.eval_batch_size,
-        )
-        manifest["evaluation"] = {
-            "summary": summary,
-            "config": {
-                "eval_limit": args.eval_limit,
-                "eval_batch_size": args.eval_batch_size,
-                "latest_results_path": args.latest_results,
-            },
-        }
-        if summary.get("results_path"):
-            manifest["artifacts"]["evaluation_results"] = _file_artifact(summary["results_path"])
-        if args.latest_results:
-            manifest["artifacts"]["latest_results"] = _file_artifact(args.latest_results)
-    else:
-        logger.info("Skipping evaluation (--skip-eval).")
-        manifest["evaluation"] = {"skipped": True}
-    _finalize_manifest(manifest, manifest_path, started_perf, "completed")
-
-    logger.info("=" * 60)
-    logger.info("Pipeline complete!")
-    logger.info(f"Model saved to: {model_path}")
-    logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info("Pipeline complete!")
+        logger.info(f"Model saved to: {model_path}")
+        logger.info("=" * 60)
+    except SystemExit as exc:
+        if not _manifest_finalized(manifest):
+            code = exc.code
+            if code in (None, 0):
+                message = "pipeline exited"
+            else:
+                message = str(code)
+            _finalize_manifest(
+                manifest, manifest_path, started_perf, "failed", RuntimeError(message)
+            )
+        raise
+    except Exception as exc:
+        if not _manifest_finalized(manifest):
+            _finalize_manifest(manifest, manifest_path, started_perf, "failed", exc)
+        raise
 
 
 if __name__ == "__main__":

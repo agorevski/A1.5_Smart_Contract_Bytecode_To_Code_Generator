@@ -36,7 +36,9 @@ The paper used **Llama 3.2 3B** — a deliberately small model chosen for practi
 - **Local smoke result**: A bounded local run on this repository completed successfully with `use_quantization=False`, batch size 1, one epoch, and max sequence length 1024. The run trained 40,370,176 LoRA parameters on top of 7,655,986,688 total parameters and produced train loss 1.087 / eval loss 1.129 on the tiny smoke split.
 - **Recommendation**: Use this as the first practical upgrade before moving to 14B/32B. It is large enough to test whether code-specialized pretraining materially improves TAC-to-Solidity quality without the operational cost of 32B+ experiments.
 
-> Current CLI note: `train.py` only disables quantization for `--tiny`. For full fp16 Qwen training, call `train_model(..., use_quantization=False)` from Python or add a `--no-quantization` CLI flag.
+> Current CLI note: `train.py` now defaults to full-precision LoRA with this Qwen 7B model and auto-launches up to 4 GPUs. Use `--precision bf16|fp16|fp32` to pin mixed precision, and add `--quantization` only when VRAM pressure requires 4-bit NF4 loading.
+
+Repeated experiments should keep the default split/tokenization/preflight caches enabled. Use `--force-resplit` only when regenerating train/val/test files intentionally, `--train-eval-strategy no` for fast sweeps that should skip Trainer validation, and `--quality-gate --baseline-results <prior.json>` for regression-blocking eval runs.
 
 ### 🥇 Top Pick: Qwen 2.5 Coder 32B
 

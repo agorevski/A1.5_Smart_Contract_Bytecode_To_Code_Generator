@@ -143,7 +143,10 @@ def test_grouped_split_keeps_compiler_variants_in_one_split(tmp_path):
     }.items():
         for row in _read_jsonl(path):
             meta = row["metadata"]
-            if meta["contract_address"].lower() == "0xaaa" and meta["function_signature"] == "foo()":
+            if (
+                meta["contract_address"].lower() == "0xaaa"
+                and meta["function_signature"] == "foo()"
+            ):
                 variant_locations.append(split_name)
 
     assert len(variant_locations) == 2
@@ -252,6 +255,138 @@ def test_deepspeed_precision_uses_bf16_on_ampere(tmp_path, monkeypatch):
     assert args.kwargs["deepspeed"]["fp16"]["enabled"] is False
 
 
+def test_training_arguments_expose_precision_eval_cadence_and_dataloader(tmp_path, monkeypatch):
+    class FakeTrainingArguments:
+        def __init__(self, eval_strategy=None, dataloader_prefetch_factor=None, **kwargs):
+            if eval_strategy is not None:
+                kwargs["eval_strategy"] = eval_strategy
+            if dataloader_prefetch_factor is not None:
+                kwargs["dataloader_prefetch_factor"] = dataloader_prefetch_factor
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(model_setup, "TrainingArguments", FakeTrainingArguments)
+    monkeypatch.setattr(model_setup.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(model_setup.torch.cuda, "get_device_capability", lambda: (8, 0))
+
+    trainer = model_setup.SmartContractModelTrainer(
+        ModelConfig(use_quantization=False, precision="fp16"),
+        output_dir=str(tmp_path / "models"),
+    )
+    args = trainer.create_training_arguments(
+        train_dataset_size=500,
+        train_eval_strategy="steps",
+        train_eval_steps=25,
+        dataloader_num_workers=8,
+        dataloader_pin_memory=False,
+        dataloader_persistent_workers=True,
+        dataloader_prefetch_factor=4,
+        precision="fp16",
+    )
+
+    assert args.kwargs["fp16"] is True
+    assert args.kwargs["bf16"] is False
+    assert args.kwargs["eval_strategy"] == "steps"
+    assert args.kwargs["eval_steps"] == 25
+    assert args.kwargs["save_strategy"] == "steps"
+    assert args.kwargs["dataloader_num_workers"] == 8
+    assert args.kwargs["dataloader_pin_memory"] is False
+    assert args.kwargs["dataloader_persistent_workers"] is True
+    assert args.kwargs["dataloader_prefetch_factor"] == 4
+
+
+def test_training_arguments_disable_eval_and_safe_cpu_dataloader_defaults(tmp_path, monkeypatch):
+    class FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(model_setup, "TrainingArguments", FakeTrainingArguments)
+    monkeypatch.setattr(model_setup.torch.cuda, "is_available", lambda: False)
+
+    trainer = model_setup.SmartContractModelTrainer(
+        ModelConfig(use_quantization=False, precision="fp32"),
+        output_dir=str(tmp_path / "models"),
+    )
+    args = trainer.create_training_arguments(
+        train_dataset_size=16,
+        do_eval=True,
+        train_eval_strategy="no",
+        dataloader_persistent_workers=True,
+    )
+
+    assert args.kwargs["evaluation_strategy"] == "no"
+    assert args.kwargs["dataloader_num_workers"] == 0
+    assert args.kwargs["dataloader_pin_memory"] is False
+    assert args.kwargs["dataloader_persistent_workers"] is False
+
+
+def test_default_training_recipe_uses_qwen_lora_and_preserves_global_batch():
+    config = ModelConfig()
+
+    assert train.DEFAULT_MODEL_NAME == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert config.model_name == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert config.use_lora is True
+    assert config.use_quantization is False
+    assert train.DEFAULT_NUM_GPUS == 4
+    assert (
+        train.resolve_gradient_accumulation_steps(
+            per_device_batch_size=4,
+            world_size=1,
+            global_batch_size=16,
+        )
+        == 4
+    )
+    assert (
+        train.resolve_gradient_accumulation_steps(
+            per_device_batch_size=4,
+            world_size=4,
+            global_batch_size=16,
+        )
+        == 1
+    )
+
+
+def test_train_model_passes_lora_config_and_auto_gradient_accumulation(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeTrainer:
+        def __init__(self, config, output_dir):
+            captured["config"] = config
+            captured["output_dir"] = output_dir
+
+        def train(self, **kwargs):
+            captured["train_kwargs"] = kwargs
+            return str(tmp_path / "final_model")
+
+    monkeypatch.setattr(model_setup, "SmartContractModelTrainer", FakeTrainer)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+
+    model_path = train.train_model(
+        train_path=str(tmp_path / "train.jsonl"),
+        val_path=str(tmp_path / "val.jsonl"),
+        output_dir=str(tmp_path / "models"),
+        batch_size=2,
+        global_batch_size=16,
+        use_lora=True,
+        lora_rank=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        lora_target_modules=["q_proj", "v_proj"],
+        use_quantization=False,
+    )
+
+    config = captured["config"]
+    assert model_path == str(tmp_path / "final_model")
+    assert config.model_name == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert config.use_lora is True
+    assert config.lora_rank == 8
+    assert config.lora_alpha == 16
+    assert config.lora_dropout == 0.05
+    assert config.target_modules == ["q_proj", "v_proj"]
+    assert config.use_quantization is False
+    assert captured["train_kwargs"]["gradient_accumulation_steps"] == 8
+
+
 def test_inference_tac_budget_scales_with_configured_context_length():
     decompiler = SmartContractDecompiler.__new__(SmartContractDecompiler)
     decompiler.tokenizer = WhitespaceTokenizer()
@@ -268,6 +403,30 @@ def test_inference_tac_budget_scales_with_configured_context_length():
     assert large_budget - small_budget == 2048
     assert retained_tac_tokens > 1380
     assert len(prompt.split()) <= 4096 - 512
+
+
+def test_decompiler_prompt_diagnostics_capture_over_budget_tac():
+    decompiler = SmartContractDecompiler.__new__(SmartContractDecompiler)
+    decompiler.tokenizer = WhitespaceTokenizer()
+    decompiler.config = ModelConfig(max_sequence_length=32)
+
+    long_tac = "\n".join(f"OP_{i}" for i in range(80))
+    diagnostics = decompiler.prompt_diagnostics(
+        long_tac,
+        max_new_tokens=8,
+        generated_text="function foo() public {}",
+    )
+
+    assert diagnostics["context_window"] == 32
+    assert diagnostics["prompt_budget"] == 24
+    assert diagnostics["max_new_tokens"] == 8
+    assert diagnostics["tac_tokens_before"] == 80
+    assert diagnostics["tac_tokens_after"] < diagnostics["tac_tokens_before"]
+    assert diagnostics["prompt_tokens"] > 0
+    assert diagnostics["generated_tokens"] == 4
+    assert diagnostics["tac_truncated"] is True
+    assert diagnostics["strategy"] in {"strip_comments", "drop_dead_code", "hard_truncate"}
+    assert diagnostics["marker"] or diagnostics["strategy"] != "hard_truncate"
 
 
 def test_seeded_evaluation_sampling_is_reproducible():
@@ -314,7 +473,8 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
             "input": "tac shared off",
             "output": "function shared() public {}",
             "metadata": {
-                "contract_address": "0xShared",
+                "schema_version": 1,
+                "contract_address": "0x1111111111111111111111111111111111111111",
                 "function_signature": "shared()",
                 "optimizer_enabled": False,
             },
@@ -323,7 +483,8 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
             "input": "tac shared on",
             "output": "function shared() public {}",
             "metadata": {
-                "contract_address": "0xShared",
+                "schema_version": 1,
+                "contract_address": "0x1111111111111111111111111111111111111111",
                 "function_signature": "shared()",
                 "optimizer_enabled": True,
             },
@@ -335,7 +496,8 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
                 "input": f"tac {i}",
                 "output": f"function f{i}() public {{}}",
                 "metadata": {
-                    "contract_address": f"0x{i}",
+                    "schema_version": 1,
+                    "contract_address": f"0x{i + 2:040x}",
                     "function_signature": f"f{i}()",
                 },
             }
@@ -351,6 +513,7 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
         data_dir=str(data_dir),
         train_test_split=0.6,
         validation_split=0.2,
+        allow_whitespace_preflight_fallback=True,
     )
 
     train_path, val_path, test_path = pipeline._split_dataset(str(dataset_path))
@@ -367,11 +530,98 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
     }.items():
         for row in _read_jsonl(path):
             metadata = row["metadata"]
-            if metadata["contract_address"].lower() == "0xshared":
+            if metadata["contract_address"].lower() == "0x1111111111111111111111111111111111111111":
                 shared_locations.append(split_name)
 
     assert len(shared_locations) == 2
     assert len(set(shared_locations)) == 1
+
+
+def test_training_pipeline_split_invokes_shared_preflight_and_manifest(tmp_path, monkeypatch):
+    rows = [
+        {
+            "input": f"tac {i}",
+            "output": f"function f{i}() public {{}}",
+            "metadata": {
+                "schema_version": 1,
+                "contract_address": f"0x{i + 1:040x}",
+                "function_signature": f"f{i}()",
+            },
+        }
+        for i in range(6)
+    ]
+    dataset_path = tmp_path / "dataset.jsonl"
+    data_dir = tmp_path / "pipeline-data"
+    _write_jsonl(dataset_path, rows)
+
+    captured = {}
+
+    def fake_run_data_preflight(dataset_paths, **kwargs):
+        captured["dataset_paths"] = dict(dataset_paths)
+        captured["kwargs"] = kwargs
+        return {
+            "status": "passed",
+            "datasets": {name: {"status": "passed"} for name in dataset_paths},
+        }
+
+    monkeypatch.setattr(train, "run_data_preflight", fake_run_data_preflight)
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    pipeline.config = TrainingConfig(
+        etherscan_api_key="test",
+        data_dir=str(data_dir),
+        train_test_split=0.6,
+        validation_split=0.2,
+    )
+
+    train_path, val_path, test_path = pipeline._split_dataset(str(dataset_path))
+
+    manifest = json.loads((data_dir / "split_manifest.json").read_text())
+    assert manifest["manifest_kind"] == "dataset_split"
+    assert manifest["leakage_validation"]["status"] == "passed"
+    assert captured["dataset_paths"] == {
+        "train": train_path,
+        "val": val_path,
+        "test": test_path,
+    }
+    assert captured["kwargs"]["allow_legacy_metadata_schema"] is False
+    assert pipeline.last_preflight_report["status"] == "passed"
+
+
+def test_training_pipeline_split_fails_on_invalid_metadata_preflight(tmp_path):
+    dataset_path = tmp_path / "invalid.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [
+            {
+                "input": "tac invalid",
+                "output": "function bad() public {}",
+                "metadata": {
+                    "schema_version": 1,
+                    "contract_address": "not-an-address",
+                    "selector": "0x123",
+                    "optimizer_enabled": "false",
+                    "compiler_version": "not-solc",
+                },
+            }
+        ],
+    )
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    pipeline.config = TrainingConfig(
+        etherscan_api_key="test",
+        data_dir=str(tmp_path / "pipeline-data"),
+        allow_whitespace_preflight_fallback=True,
+    )
+
+    try:
+        pipeline._split_dataset(str(dataset_path))
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("invalid metadata unexpectedly passed preflight")
+
+    assert "data preflight failed" in message
+    assert "contract_address_format" in message
+    assert pipeline.last_preflight_report["status"] == "failed"
 
 
 def test_tokenized_dataset_cache_reuses_examples_and_max_length_invalidates(tmp_path):
@@ -449,29 +699,29 @@ def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprin
         str(dataset_path),
         CountingTokenizer(),
         max_length=64,
-        include_compiler_metadata=True,
+        include_bytecode_metadata=True,
         augment_names=False,
         tokenization_cache=cache_config,
     )
     initial_cache_files = set(cache_dir.glob("*.jsonl"))
 
-    compiler_flag_tokenizer = CountingTokenizer()
+    bytecode_flag_tokenizer = CountingTokenizer()
     SmartContractDataset(
         str(dataset_path),
-        compiler_flag_tokenizer,
+        bytecode_flag_tokenizer,
         max_length=64,
-        include_compiler_metadata=False,
+        include_bytecode_metadata=False,
         augment_names=False,
         tokenization_cache=cache_config,
     )
-    after_compiler_flag_files = set(cache_dir.glob("*.jsonl"))
+    after_bytecode_flag_files = set(cache_dir.glob("*.jsonl"))
 
     augment_flag_tokenizer = CountingTokenizer()
     SmartContractDataset(
         str(dataset_path),
         augment_flag_tokenizer,
         max_length=64,
-        include_compiler_metadata=True,
+        include_bytecode_metadata=True,
         augment_names=True,
         tokenization_cache=cache_config,
     )
@@ -486,17 +736,17 @@ def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprin
         str(dataset_path),
         changed_data_tokenizer,
         max_length=64,
-        include_compiler_metadata=True,
+        include_bytecode_metadata=True,
         augment_names=False,
         tokenization_cache=cache_config,
     )
     after_dataset_change_files = set(cache_dir.glob("*.jsonl"))
 
-    assert compiler_flag_tokenizer.calls > 0
+    assert bytecode_flag_tokenizer.calls > 0
     assert augment_flag_tokenizer.calls > 0
     assert changed_data_tokenizer.calls > 0
-    assert len(after_compiler_flag_files) == len(initial_cache_files) + 1
-    assert len(after_augment_flag_files) == len(after_compiler_flag_files) + 1
+    assert len(after_bytecode_flag_files) == len(initial_cache_files) + 1
+    assert len(after_augment_flag_files) == len(after_bytecode_flag_files) + 1
     assert len(after_dataset_change_files) == len(after_augment_flag_files) + 1
 
 
@@ -605,9 +855,7 @@ def test_training_instrumentation_writes_throughput_summary_and_csv(tmp_path):
     assert len(csv_lines) == 3
 
 
-def test_training_instrumentation_starts_bounded_torch_profiler(
-    tmp_path, monkeypatch
-):
+def test_training_instrumentation_starts_bounded_torch_profiler(tmp_path, monkeypatch):
     events = []
     captured_profile_kwargs = {}
     captured_schedule_kwargs = {}

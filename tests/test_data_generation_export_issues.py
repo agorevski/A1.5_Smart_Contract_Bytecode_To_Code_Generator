@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -7,7 +8,7 @@ import pytest
 def _make_pair(download_hf_contracts, idx, body):
     tac = f"function same:\n  block_{idx}:\n    temp = {idx}"
     return {
-        "contract_address": f"0x{idx}",
+        "contract_address": f"0x{idx:040x}",
         "function_name": "same",
         "tac_representation": tac,
         "solidity_code": body,
@@ -53,6 +54,9 @@ def test_export_manifest_records_lineage_artifacts_and_duplicate_validation(tmp_
     assert manifest["artifacts"]["jsonl"]["sha256"]
     assert manifest["drop_counts"]["body_cap_rows"] == 1
     assert manifest["validation"]["body_duplicate_cap"]["status"] == "passed"
+    assert manifest["training_row_schema_version"] == 1
+    first_row = json.loads(output_path.read_text().splitlines()[0])
+    assert first_row["metadata"]["schema_version"] == 1
 
 
 def test_jsonl_duplicate_cap_validation_reports_top_samples(tmp_path):
@@ -136,8 +140,230 @@ def test_compile_manifest_summarizes_persisted_failure_diagnostics(tmp_path):
 
     assert payload["failure_diagnostics"]["total_diagnostics"] == 1
     assert payload["failure_diagnostics"]["top_errors"][0]["status"] == "compile_failed"
-    assert payload["failure_diagnostics"]["top_errors"][0]["sample_contract_addresses"] == [
-        "0xabc"
-    ]
+    assert payload["failure_diagnostics"]["top_errors"][0]["sample_contract_addresses"] == ["0xabc"]
     assert payload["status_counts"]["contracts"]["compile_failed"] == 1
     assert json.loads(manifest_path.read_text())["run_id"] == run_id
+
+
+def test_download_contracts_streams_parquet_batches_without_full_dataframe(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import inspect
+    import download_hf_contracts
+
+    parquet_path = tmp_path / "contracts.parquet"
+    source_a = "pragma solidity ^0.8.0; contract A { function a() public {} }"
+    source_b = "pragma solidity ^0.8.0; contract B { function b() public {} }"
+    table = pa.table(
+        {
+            "language": ["Solidity", "Vyper", "Solidity"],
+            "source_code": [source_a, "contract ignored", source_b],
+            "contract_address": [
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000002",
+                "0x0000000000000000000000000000000000000003",
+            ],
+            "compiler_version": ["v0.8.20", "", "v0.8.19"],
+            "optimization_used": [True, False, False],
+            "runs": [200, None, 300],
+            "abi": ["[]", "", "[]"],
+            "contract_name": ["A", "", "B"],
+        }
+    )
+    pq.write_table(table, parquet_path)
+
+    monkeypatch.setattr(
+        download_hf_contracts, "_get_parquet_files", lambda *a, **k: ["data/train/0.parquet"]
+    )
+    monkeypatch.setattr(download_hf_contracts, "_resolve_hf_revision", lambda _revision: "resolved")
+    monkeypatch.setattr(
+        download_hf_contracts, "hf_hub_download", lambda **_kwargs: str(parquet_path)
+    )
+
+    db_path = tmp_path / "contracts.db"
+    manifest_path = tmp_path / "download.manifest.json"
+    download_hf_contracts.init_database(db_path)
+
+    inserted = download_hf_contracts.download_contracts(
+        db_path=db_path,
+        manifest_path=manifest_path,
+        parquet_batch_size=2,
+    )
+
+    assert inserted == 2
+    assert "read_parquet" not in inspect.getsource(download_hf_contracts.download_contracts)
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["parameters"]["parquet_batch_size"] == 2
+    assert manifest["performance"]["max_rss_mb"] > 0
+    assert manifest["performance"]["parquet_streams"][0]["batch_size"] == 2
+    assert manifest["drop_counts"]["non_solidity"] == 1
+
+
+def test_export_training_data_quarantines_overlength_rows(tmp_path):
+    import download_hf_contracts
+
+    db_path = tmp_path / "contracts.db"
+    output_path = tmp_path / "dataset.jsonl"
+    manifest_path = tmp_path / "dataset.manifest.json"
+    download_hf_contracts.init_database(db_path)
+
+    good_body = "function good() public { uint256 x = 1; uint256 y = x + 1; emit Done(y); }"
+    target_long = "function huge() public { " + " ".join(["uint256 x = 1;"] * 200) + " }"
+    context_long = "function huge:\n  " + " ".join(["temp = ADD temp 1"] * 200)
+    pairs = [
+        _make_pair(download_hf_contracts, 1, good_body),
+        _make_pair(download_hf_contracts, 2, target_long),
+        {
+            **_make_pair(download_hf_contracts, 3, good_body.replace("good", "contextHeavy")),
+            "tac_representation": context_long,
+        },
+    ]
+    assert download_hf_contracts._store_pairs_batch(db_path, pairs) == 3
+
+    download_hf_contracts.export_training_data(
+        str(output_path),
+        max_body_dupes=5,
+        db_path=db_path,
+        manifest_path=manifest_path,
+        max_seq_length=128,
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+    rejects = [
+        json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 1
+    assert len(rejects) == 2
+    assert {reason for row in rejects for reason in row["reasons"]} >= {
+        "target_overlength",
+        "context_overlength",
+    }
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["drop_counts"]["overlength_rows"] == 2
+    assert manifest["artifacts"]["rejects_jsonl"]["row_count"] == 2
+
+
+def test_dataset_builder_manifest_filter_drops_and_partial_quarantine(tmp_path):
+    from src.dataset_pipeline import DatasetBuilder, FunctionPair
+
+    builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
+    rich_body = (
+        "function rich() public { uint256 a = 1; uint256 b = 2; uint256 c = 3; "
+        "uint256 d = 4; uint256 e = a + b + c + d; emit Done(e); }"
+    )
+    normal = FunctionPair(
+        function_name="rich",
+        tac_representation="function selector_12345678:\n  // Selector: 0x12345678\n  temp = 1",
+        solidity_code=rich_body,
+        function_signature="function rich()",
+        visibility="public",
+        is_payable=False,
+        is_view=False,
+        contract_address="0x0000000000000000000000000000000000000001",
+    )
+    partial = FunctionPair(
+        function_name="unknown_deadbeef",
+        tac_representation="function selector_deadbeef:\n  // Selector: 0xdeadbeef\n  temp = 2",
+        solidity_code=(
+            "// Partial decompilation — selector: 0xdeadbeef\n"
+            "function unknown_deadbeef(/* params unknown */) public {\n"
+            "    // TODO: Full logic not reconstructed\n"
+            "}"
+        ),
+        function_signature="function unknown_deadbeef()",
+        visibility="public",
+        is_payable=False,
+        is_view=False,
+        contract_address="0x0000000000000000000000000000000000000001",
+        metadata={"partial": True, "selector": "0xdeadbeef"},
+    )
+    builder._store_function_pair(normal)
+    builder._store_function_pair(partial)
+    builder._record_generation_diagnostic(
+        stage="compile",
+        contract_address=normal.contract_address,
+        compiler_version="0.8.20",
+        optimizer_enabled=True,
+        optimization_runs=200,
+        status="compile_failed",
+        error="sample solc error",
+    )
+
+    exported = Path(builder.export_dataset("jsonl", include_partial=True))
+    main_rows = [json.loads(line) for line in exported.read_text().splitlines()]
+    partial_rows = [
+        json.loads(line)
+        for line in (exported.parent / "smart_contract_dataset.partial.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert len(main_rows) == 1
+    assert "Partial decompilation" not in main_rows[0]["output"]
+    assert len(partial_rows) == 1
+    assert partial_rows[0]["metadata"]["partial"] is True
+    assert partial_rows[0]["metadata"]["partial_split"] == "partial_placeholders"
+
+    builder.filter_and_clean_dataset(min_length=20, max_length=1000)
+    filtered_manifest_path = Path(builder.export_dataset("jsonl")).with_suffix(
+        ".jsonl.manifest.json"
+    )
+    manifest = json.loads(filtered_manifest_path.read_text())
+    assert manifest["drop_counts"]["partial_placeholder"] == 1
+    assert manifest["failure_diagnostics"]["status_counts"]["compile_failed"] == 1
+
+
+def test_versioned_training_metadata_schema_validator():
+    from src.dataset_pipeline import (
+        normalize_training_metadata,
+        validate_training_record_schema,
+    )
+
+    valid = {
+        "input": "function selector_a9059cbb:",
+        "output": "function transfer() public {}",
+        "metadata": normalize_training_metadata(
+            {
+                "contract_address": "0x0000000000000000000000000000000000000001",
+                "selector": "0xa9059cbb",
+                "compiler_version": "0.8.20",
+                "optimizer_enabled": True,
+                "body_hash": "a" * 32,
+            }
+        ),
+    }
+    assert validate_training_record_schema(valid)["status"] == "passed"
+
+    malformed = {
+        "input": "tac",
+        "output": "solidity",
+        "metadata": {
+            "schema_version": 1,
+            "contract_address": "0xabc",
+            "selector": "0x1234",
+            "optimizer_enabled": "true",
+            "compiler_version": "latest",
+            "body_hash": "not-a-hash",
+        },
+    }
+    result = validate_training_record_schema(malformed)
+    assert result["status"] == "failed"
+    assert {
+        "contract_address_format",
+        "selector_format",
+        "boolean_type_error",
+        "compiler_version_format",
+        "hash_format",
+    } <= {error["code"] for error in result["errors"]}
+
+    legacy = {"input": "tac", "output": "solidity", "metadata": {}}
+    assert validate_training_record_schema(legacy)["status"] == "failed"
+    assert validate_training_record_schema(legacy, allow_legacy=True)["status"] == "passed"
+
+
+def test_data_quality_ci_workflow_runs_regression_subset():
+    workflow = Path(".github/workflows/data-quality.yml")
+    assert workflow.exists()
+    text = workflow.read_text()
+    assert "tests/test_dataset_quality_issues.py" in text
+    assert "tests/test_data_generation_export_issues.py" in text
+    assert "pull_request" in text

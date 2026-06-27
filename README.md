@@ -61,7 +61,7 @@ uv run python download_hf_contracts.py --export-only        # Phase 3: Export JS
 ### 3. Train the Model
 
 ```bash
-# Train on the downloaded dataset (Llama 3.2 3B with LoRA)
+# Train on the downloaded dataset (Qwen2.5-Coder-7B-Instruct with LoRA)
 uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
 
 # Quick test (1 epoch, small batch)
@@ -73,6 +73,10 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
 # Full training with custom parameters
 uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
     --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 4096
+
+# Force single-GPU or memory-saving quantized LoRA when needed
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
+    --num-gpus 1 --quantization
 ```
 
 **Output:** Trained model saved to `models/`; run manifests are written under
@@ -114,14 +118,19 @@ ls results/
 uv run python scripts/decompile.py \
   --model-path models/final_model \
   --bytecode 0x60806040... \
-  --compiler-version 0.8.20 \
-  --optimizer-enabled true \
-  --optimizer-runs 200 \
   --format json
 
 # TAC-only analysis does not require a model artifact
 uv run python scripts/decompile.py --format tac --bytecode 0x60806040...
 ```
+
+Production inference assumes only Etherscan **Contract > Bytecode** is
+available. Do not pass true compiler version or optimizer settings as prompt
+inputs. High-value safe inputs are bytecode-derived TAC/CFG, function selector,
+basic block/branch counts, TAC/op counts, storage read/write counts, external
+call count, event/log/revert counts, bytecode length/instruction/function
+counts, and selector/signature guesses only when inferred from bytecode
+selectors or selector databases and marked inferred.
 
 The web API streams Server-Sent Events from `POST /api/decompile`:
 
@@ -190,7 +199,7 @@ uv run pytest --cov=src tests/
 │   ├── test_dataset_quality_issues.py  # Dataset quality regression coverage
 │   ├── test_docs_consistency.py    # README/runbook workflow drift checks
 │   ├── test_opcode_features.py     # Feature extraction, TF-IDF, entropy
-│   ├── test_prompt_metadata.py     # Prompt compiler metadata coverage
+│   ├── test_prompt_metadata.py     # Bytecode-only prompt metadata coverage
 │   ├── test_vulnerability_detector.py  # Vulnerability scanning
 │   ├── test_malicious_classifier.py    # Classification and explainability
 │   ├── test_audit_report.py        # Audit reports and risk scoring
@@ -256,15 +265,25 @@ uv run pytest --cov=src tests/
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config PATH` | — | YAML/JSON training config; CLI flags override file values |
 | `--skip-collection` | — | Use existing dataset (skip Etherscan) |
 | `--dataset PATH` | auto | Path to JSONL dataset |
 | `--small` | — | Quick test: 1 epoch, batch=2 |
 | `--tiny` | — | Use `facebook/opt-125m` for fast testing |
 | `--epochs N` | `3` | Training epochs |
 | `--batch-size N` | `4` | Per-device batch size |
+| `--global-batch-size N` | `16` | Target effective batch size used to auto-compute gradient accumulation |
+| `--gradient-accumulation-steps N` | auto | Override automatic gradient accumulation |
 | `--lr FLOAT` | `2e-4` | Learning rate |
 | `--max-seq-length N` | `2048` | Max token sequence length |
-| `--model-name NAME` | `meta-llama/Llama-3.2-3B` | Base model |
+| `--model-name NAME` | `Qwen/Qwen2.5-Coder-7B-Instruct` | Base model |
+| `--num-gpus N` | `4` | GPU count for automatic `torchrun` launch |
+| `--no-auto-torchrun` | off | Do not auto-relaunch with `torchrun` |
+| `--lora` / `--no-lora` | on | Enable or disable LoRA adapter training |
+| `--lora-rank N` | `16` | LoRA rank |
+| `--lora-alpha N` | `32` | LoRA alpha |
+| `--lora-dropout FLOAT` | `0.1` | LoRA dropout |
+| `--quantization` / `--no-quantization` | off | Enable or disable 4-bit NF4 loading |
 | `--collection-workers N` | `3` | Etherscan collection worker count when supported |
 | `--max-compiler-configs N` | `2` | Compiler configs per collected contract |
 | `--allow-demo-fallback` | off | Explicitly allow `demo_dataset.jsonl` when real collection yields no pairs |
@@ -276,7 +295,8 @@ uv run pytest --cov=src tests/
 | `--skip-eval` | — | Skip post-training evaluation |
 | `--eval-batch-size N` | `1` | Batch size for evaluation decompilation |
 | `--dataset-only` | — | Only build dataset, skip training |
-| `--no-compiler-metadata` | — | Omit compiler/optimizer metadata from prompts |
+| `--no-compiler-metadata` | — | Deprecated no-op; compiler/optimizer metadata is never included in prompts |
+| `--no-bytecode-metadata` | off | Disable the compact bytecode/TAC-derived metadata line; TAC sanitization still runs |
 | `--skip-data-preflight` | off | Skip JSONL schema/token-length preflight |
 | `--preflight-tokenizer-download` | off | Allow tokenizer downloads during preflight |
 | `--max-steps N` | `-1` | Cap optimizer steps for bounded experiments |
@@ -286,25 +306,28 @@ uv run pytest --cov=src tests/
 | `--no-throughput-metrics` | off | Disable default throughput telemetry |
 | `--enable-torch-profiler` | off | Write bounded torch profiler traces |
 
-For the compiler-metadata control-vs-ablation experiment, use
-`scripts/run_compiler_metadata_ablation.py`; the full workflow is documented in
-`docs/runbook.md`.
+`scripts/run_compiler_metadata_ablation.py` is historical/deprecated for
+production prompt design. Current prompt code ignores compiler metadata, so the
+script no longer creates a true compiler-metadata control.
 
 ### `scripts/decompile.py`
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model-path PATH` | — | Trained model artifact for Solidity generation |
+| `--model-path PATH` | Auto | Trained model artifact; otherwise checks `WEB_MODEL_PATH`, `models/final_model/`, then newest `models/final_model*/` |
 | `--bytecode HEX` | — | EVM bytecode with or without `0x` |
 | `--bytecode-file PATH` | — | Read bytecode from a file instead of the command line |
 | `--format json\|solidity\|tac` | `json` | Output machine JSON, Solidity only, or TAC only |
-| `--compiler-version VERSION` | — | Optional compiler metadata for prompts |
-| `--optimizer-enabled true\|false` | — | Optional optimizer metadata |
-| `--optimizer-runs N` | — | Optional optimizer run count |
+| `--compiler-version VERSION` | — | Deprecated no-op; ignored for bytecode-only inference |
+| `--optimizer-enabled true\|false` | — | Deprecated no-op; ignored for bytecode-only inference |
+| `--optimizer-runs N` | — | Deprecated no-op; ignored for bytecode-only inference |
+| `--evm-version VERSION` | — | Deprecated no-op; ignored for bytecode-only inference |
 | `--max-new-tokens N` | `1024` | Per-function generation cap |
 | `--temperature FLOAT` | `0.1` | Sampling temperature |
 | `--do-sample` | off | Enable stochastic sampling |
 | `--repetition-penalty FLOAT` | `1.15` | Repetition penalty |
+| `--timeout-seconds N` | `WEB_DECOMPILE_TIMEOUT_SECONDS` or `900` | Wall-clock timeout for analysis/model work; `0` disables |
+| `--max-functions N` | `WEB_MAX_DECOMPILE_FUNCTIONS` or `128` | Abort when more functions are detected |
 
 ## Environment Variables
 
@@ -315,17 +338,40 @@ For the compiler-metadata control-vs-ablation experiment, use
 | `WEB_API_KEY` | Shared/remote web deployments | Protects API endpoints and GPU telemetry; the browser UI has an in-memory API key field |
 | `WEB_HOST` | Optional | Web bind address, default `127.0.0.1`; use with `WEB_API_KEY` for non-loopback hosts |
 | `WEB_CORS_ORIGINS` | Optional | Comma-separated allowed API origins, default `http://127.0.0.1:5000,http://localhost:5000` |
-| `WEB_INFERENCE_TRACE_ENABLED` | Optional | Write request traces under `results/inference_traces/` (default true) |
+| `WEB_MODEL_PATH` | Optional | Web/CLI model artifact override before `models/final_model/` and newest `models/final_model*/` |
 | `WEB_MAX_BYTECODE_HEX_LENGTH` | Optional | Max accepted bytecode hex characters (default 200000) |
+| `WEB_MAX_CONCURRENT_DECOMPILES` | Optional | Concurrent `/api/decompile` jobs (default 1) |
 | `WEB_MAX_DECOMPILE_FUNCTIONS` | Optional | Max functions per web decompile job (default 128) |
+| `WEB_DECOMPILE_TIMEOUT_SECONDS` | Optional | Hard request timeout for blocking analysis/model calls (default 900; `0` disables) |
+| `WEB_MAX_NEW_TOKENS` | Optional | Upper bound for requested `generation.max_new_tokens` (default 4096) |
+| `WEB_DEFAULT_MAX_NEW_TOKENS` | Optional | Default web generation cap (default 1024) |
+| `WEB_DEFAULT_TEMPERATURE` | Optional | Default web generation temperature (default 0.1) |
+| `WEB_DEFAULT_DO_SAMPLE` | Optional | Default web sampling mode (default false) |
+| `WEB_DEFAULT_REPETITION_PENALTY` | Optional | Default repetition penalty (default 1.15) |
+| `WEB_ENABLE_REMOTE_SELECTOR_LOOKUP` | Optional | Allow 4byte.directory lookups (default false) |
+| `WEB_INFERENCE_TRACE_ENABLED` | Optional | Write request traces under `results/inference_traces/` (default true) |
+| `WEB_INFERENCE_TRACE_INCLUDE_SAMPLES` | Optional | Include raw bytecode/TAC samples in traces (default false) |
+| `WEB_INFERENCE_TRACE_DIR` | Optional | Trace directory (default `results/inference_traces/`) |
+| `WEB_MAX_ABI_JSON_CHARS` | Optional | Max ABI JSON characters accepted by `/api/decompile` (default 200000) |
+| `WEB_MAX_CONTRACT_METADATA_JSON_CHARS` | Optional | Max metadata JSON characters (default 200000) |
+| `WEB_MAX_ABI_ENTRIES` | Optional | Max ABI entries (default 512) |
+| `WEB_MODEL_WARMUP_ENABLED` | Optional | Run bounded startup inference warmup (default false; also `web/app.py --warmup`) |
+| `WEB_MODEL_WARMUP_TIMEOUT_SECONDS` | Optional | Warmup timeout (default 30) |
+| `WEB_MODEL_WARMUP_MAX_NEW_TOKENS` | Optional | Warmup generation cap (default 8) |
 
-Alternatively, set these in `src/settings.yaml`.
+Web inference settings are read from environment variables and `web/app.py`
+CLI flags, not `src/settings.yaml`.
+
+`web/app.py` also supports `--model-path`, `--remote-selector-lookup`,
+`--host`, `--port`, `--debug`, `--mockmodel`, `--warmup`, and `--no-warmup`.
+`/api/health` reports the effective `limits`, `generation_defaults`, `tracing`,
+`warmup`, model readiness/path, and lookup status.
 
 ## Model Details
 
-- **Base model:** Llama 3.2 3B (`meta-llama/Llama-3.2-3B`)
+- **Base model:** Qwen2.5-Coder-7B-Instruct (`Qwen/Qwen2.5-Coder-7B-Instruct`)
 - **Fine-tuning:** LoRA (r=16, α=32, dropout=0.1)
-- **Quantization:** 4-bit NF4 via bitsandbytes by default (`load_in_4bit=True`)
+- **Quantization:** Off by default for full-precision LoRA; enable 4-bit NF4 with `--quantization`
 - **Target metrics:** Semantic similarity > 0.8, Edit distance < 0.4
 
 See [docs/model-details.md](docs/model-details.md) for more.

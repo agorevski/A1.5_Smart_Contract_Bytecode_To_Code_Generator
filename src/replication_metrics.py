@@ -59,6 +59,19 @@ _RESERVED_IDENTIFIERS = {
     "uint",
     "uint256",
 }
+_HALLUCINATION_BUCKET_BY_CATEGORY = {
+    "abi": "unsupported_abi_elements",
+    "visibility": "unsupported_abi_elements",
+    "mutability": "unsupported_abi_elements",
+    "modifier": "unsupported_abi_elements",
+    "call": "unsupported_calls",
+    "member_call": "unsupported_calls",
+    "guard": "invented_guards",
+    "state_write": "invented_state_writes",
+    "event": "invented_events",
+    "return": "unsupported_return_expressions",
+    "control_flow": "unsupported_control_flow",
+}
 
 
 @dataclass(frozen=True)
@@ -109,6 +122,8 @@ class ReplicationEvaluation:
     candidate_fact_count: int
     missing_facts: Dict[str, List[str]]
     extra_facts: Dict[str, List[str]]
+    hallucination_buckets: Dict[str, List[str]]
+    groundedness_score: float
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -120,6 +135,8 @@ class ReplicationEvaluation:
             "candidate_fact_count": self.candidate_fact_count,
             "missing_facts": self.missing_facts,
             "extra_facts": self.extra_facts,
+            "hallucination_buckets": self.hallucination_buckets,
+            "groundedness_score": self.groundedness_score,
         }
 
 
@@ -149,10 +166,15 @@ def extract_solidity_facts(solidity_code: str) -> FactMap:
     return facts
 
 
-def evaluate_replication(reference_code: str, candidate_code: str) -> ReplicationEvaluation:
+def evaluate_replication(
+    reference_code: str,
+    candidate_code: str,
+    grounding_facts: Optional[Mapping[str, Iterable[str]]] = None,
+) -> ReplicationEvaluation:
     """Compare reference and candidate Solidity using structured fact overlap."""
     reference = extract_solidity_facts(reference_code)
     candidate = extract_solidity_facts(candidate_code)
+    grounding = _normalized_grounding_facts(grounding_facts) if grounding_facts else reference
     categories = sorted(set(reference) | set(candidate))
 
     by_category: Dict[str, PrecisionRecallF1] = {}
@@ -183,6 +205,11 @@ def evaluate_replication(reference_code: str, candidate_code: str) -> Replicatio
 
     reference_fact_count = sum(len(values) for values in reference.values())
     candidate_fact_count = sum(len(values) for values in candidate.values())
+    hallucination_buckets = _classify_hallucination_buckets(extra, grounding)
+    hallucination_count = sum(len(values) for values in hallucination_buckets.values())
+    groundedness_score = (
+        max(0.0, 1.0 - hallucination_count / candidate_fact_count) if candidate_fact_count else 1.0
+    )
 
     return ReplicationEvaluation(
         overall=PrecisionRecallF1.from_counts(total_tp, total_fp, total_fn),
@@ -191,6 +218,8 @@ def evaluate_replication(reference_code: str, candidate_code: str) -> Replicatio
         candidate_fact_count=candidate_fact_count,
         missing_facts=missing,
         extra_facts=extra,
+        hallucination_buckets=hallucination_buckets,
+        groundedness_score=groundedness_score,
     )
 
 
@@ -215,6 +244,9 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
 
     overall_counts = {"tp": 0, "fp": 0, "fn": 0}
     category_counts: Dict[str, Dict[str, int]] = {}
+    hallucination_counts: Dict[str, int] = {}
+    candidate_fact_total = 0
+    groundedness_scores: List[float] = []
 
     for row in metric_rows:
         replication = _replication_payload(row)
@@ -225,12 +257,22 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
         overall_counts["tp"] += int(overall.get("true_positives", 0))
         overall_counts["fp"] += int(overall.get("false_positives", 0))
         overall_counts["fn"] += int(overall.get("false_negatives", 0))
+        candidate_fact_total += int(replication.get("candidate_fact_count", 0))
+        groundedness = replication.get("groundedness_score")
+        if isinstance(groundedness, (int, float)):
+            groundedness_scores.append(float(groundedness))
 
         for category, score in replication.get("by_category", {}).items():
             counts = category_counts.setdefault(category, {"tp": 0, "fp": 0, "fn": 0})
             counts["tp"] += int(score.get("true_positives", 0))
             counts["fp"] += int(score.get("false_positives", 0))
             counts["fn"] += int(score.get("false_negatives", 0))
+
+        for bucket, values in replication.get("hallucination_buckets", {}).items():
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                hallucination_counts[str(bucket)] = hallucination_counts.get(str(bucket), 0) + len(
+                    values
+                )
 
     if overall_counts["tp"] or overall_counts["fp"] or overall_counts["fn"]:
         summary["micro"] = PrecisionRecallF1.from_counts(
@@ -247,7 +289,49 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
             for category, counts in sorted(category_counts.items())
         }
 
+    hallucination_total = sum(hallucination_counts.values())
+    if hallucination_counts or groundedness_scores:
+        summary["hallucination_buckets"] = dict(sorted(hallucination_counts.items()))
+        summary["hallucination_total"] = hallucination_total
+        summary["hallucination_rate"] = (
+            hallucination_total / candidate_fact_total if candidate_fact_total else 0.0
+        )
+        summary["hallucination_rate_by_bucket"] = {
+            bucket: count / candidate_fact_total if candidate_fact_total else 0.0
+            for bucket, count in sorted(hallucination_counts.items())
+        }
+        if groundedness_scores:
+            summary["groundedness_score_mean"] = sum(groundedness_scores) / len(groundedness_scores)
+
     return summary
+
+
+def _normalized_grounding_facts(grounding_facts: Mapping[str, Iterable[str]]) -> FactMap:
+    normalized: FactMap = {}
+    for category, values in grounding_facts.items():
+        if isinstance(values, str):
+            normalized[str(category)] = {values}
+            continue
+        try:
+            normalized[str(category)] = {str(value) for value in values}
+        except TypeError:
+            normalized[str(category)] = {str(values)}
+    return normalized
+
+
+def _classify_hallucination_buckets(
+    extra_facts: Mapping[str, Sequence[str]],
+    grounding_facts: Mapping[str, Set[str]],
+) -> Dict[str, List[str]]:
+    buckets: Dict[str, List[str]] = {}
+    for category, values in sorted(extra_facts.items()):
+        bucket = _HALLUCINATION_BUCKET_BY_CATEGORY.get(category, "unsupported_generated_facts")
+        grounded_values = grounding_facts.get(category, set())
+        for value in values:
+            if value in grounded_values:
+                continue
+            buckets.setdefault(bucket, []).append(f"{category}:{value}")
+    return {bucket: sorted(values) for bucket, values in sorted(buckets.items())}
 
 
 def _numeric_metric_values(

@@ -456,14 +456,56 @@ main {
   color: var(--text-muted);
 }
 
-.compiler-metadata {
+.generation-settings {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.75rem;
   margin-top: 0.75rem;
 }
 
-.compiler-metadata label {
+.metadata-settings {
+  margin-top: 0.75rem;
+}
+
+.metadata-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.metadata-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.metadata-textarea {
+  min-height: 110px;
+  padding: 0.65rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+  outline: none;
+}
+
+.metadata-textarea:focus {
+  border-color: var(--border-focus);
+}
+
+.metadata-grid input[type="file"] {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.generation-settings label {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
@@ -471,8 +513,8 @@ main {
   font-size: 0.78rem;
 }
 
-.compiler-metadata input,
-.compiler-metadata select {
+.generation-settings input,
+.generation-settings select {
   width: 100%;
   padding: 0.5rem 0.65rem;
   font-family: var(--font-mono);
@@ -484,8 +526,8 @@ main {
   outline: none;
 }
 
-.compiler-metadata input:focus,
-.compiler-metadata select:focus {
+.generation-settings input:focus,
+.generation-settings select:focus {
   border-color: var(--border-focus);
 }
 
@@ -530,6 +572,11 @@ main {
 
 .btn-primary:disabled {
   opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn:disabled {
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
@@ -808,26 +855,6 @@ main {
   margin-bottom: 1rem;
 }
 
-/* ---- Original Source Note ---- */
-
-.original-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
-  padding: 0.6rem 0.9rem;
-  background: var(--green-bg);
-  border: 1px solid var(--green);
-  border-radius: 6px;
-  color: var(--green);
-  font-size: 0.82rem;
-  margin-bottom: 0.8rem;
-  line-height: 1.5;
-}
-
-.original-note strong {
-  color: inherit;
-}
-
 /* ---- Warning ---- */
 
 .warning {
@@ -901,11 +928,18 @@ main {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 0.8rem;
+  gap: 0.75rem;
 }
 
 .panel-header h3 {
   font-size: 0.95rem;
   font-weight: 600;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
 }
 
 /* ---- Code Blocks ---- */
@@ -968,6 +1002,59 @@ pre {
   word-break: break-all;
 }
 
+.diagnostics-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.8rem;
+}
+
+.diagnostic-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.diagnostic-card .label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.2rem;
+}
+
+.fn-map-diagnostics {
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  min-width: 10rem;
+}
+
+.diag-badge {
+  display: inline-block;
+  margin-left: 0.25rem;
+  padding: 0.08rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.diag-badge.truncated {
+  background: var(--yellow-bg);
+  color: var(--yellow);
+  border: 1px solid var(--yellow);
+}
+
+.diag-badge.abi {
+  background: rgba(88, 166, 255, 0.12);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
 /* ---- Utility ---- */
 
 .hidden {
@@ -1017,7 +1104,11 @@ footer em {
     grid-template-columns: 1fr;
   }
 
-  .compiler-metadata {
+  .generation-settings {
+    grid-template-columns: 1fr;
+  }
+
+  .metadata-grid {
     grid-template-columns: 1fr;
   }
 

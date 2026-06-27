@@ -12,10 +12,11 @@
   const btnSample = document.getElementById("btn-sample");
   const btnClear = document.getElementById("btn-clear");
   const apiKeyInput = document.getElementById("api-key-input");
-  const compilerVersionInput = document.getElementById("compiler-version-input");
-  const optimizerEnabledInput = document.getElementById("optimizer-enabled-input");
-  const optimizerRunsInput = document.getElementById("optimizer-runs-input");
   const bytecodeGuidance = document.getElementById("bytecode-guidance");
+  const abiInput = document.getElementById("abi-input");
+  const abiFileInput = document.getElementById("abi-file-input");
+  const metadataInput = document.getElementById("metadata-input");
+  const metadataFileInput = document.getElementById("metadata-file-input");
   const maxNewTokensInput = document.getElementById("max-new-tokens-input");
   const temperatureInput = document.getElementById("temperature-input");
   const doSampleInput = document.getElementById("do-sample-input");
@@ -33,6 +34,7 @@
   const modelWarning = document.getElementById("model-warning");
   const modelWarningText = document.getElementById("model-warning-text");
   const functionMappingContent = document.getElementById("function-mapping-content");
+  const traceDiagnostics = document.getElementById("trace-diagnostics");
   const securityContent = document.getElementById("security-content");
   const btnVulnerabilityScan = document.getElementById("btn-vulnerability-scan");
   const btnClassify = document.getElementById("btn-classify");
@@ -55,51 +57,9 @@
   const readinessContent = document.getElementById("readiness-content");
   const readinessStatusDot = document.getElementById("readiness-status-dot");
 
-  // ---- Sample bytecode (Owner contract compiled with solc 0.8.24, runtime bytecode) ----
+  // ---- Sample runtime bytecode for demo use ----
   const SAMPLE_BYTECODE =
     "0x608060405234801561000f575f80fd5b5060043610610034575f3560e01c8063893d20e814610038578063a6f9dae114610056575b5f80fd5b610040610072565b60405161004d919061014e565b60405180910390f35b610070600480360381019061006b9190610195565b610099565b005b5f805f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff16905090565b8073ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff160361010c57805f806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505b50565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f6101388261010f565b9050919050565b6101488161012e565b82525050565b5f6020820190506101615f83018461013f565b92915050565b5f80fd5b6101748161012e565b811461017e575f80fd5b50565b5f8135905061018f8161016b565b92915050565b5f602082840312156101aa576101a9610167565b5b5f6101b784828501610181565b9150509291505056fea264697066735822122020389b4014c2d8511dc28898fda8ea80a2215a6e55690e4770b83b23ce7e209364736f6c63430008180033";
-
-  // Original Solidity source that was compiled into SAMPLE_BYTECODE
-  const SAMPLE_ORIGINAL_SOLIDITY =
-    "// SPDX-License-Identifier: GPL-3.0\n" +
-    "pragma solidity >=0.7.0 <0.9.0;\n" +
-    "\n" +
-    "/**\n" +
-    " * @title Owner\n" +
-    " * @dev Set & change owner\n" +
-    " */\n" +
-    "contract Owner {\n" +
-    "\n" +
-    "    address private owner;\n" +
-    "\n" +
-    "    /**\n" +
-    "     * @dev Set contract deployer as owner\n" +
-    "     */\n" +
-    "    constructor() {\n" +
-    "        owner = msg.sender;\n" +
-    "    }\n" +
-    "\n" +
-    "    /**\n" +
-    "     * @dev Return owner address\n" +
-    "     * @return address of owner\n" +
-    "     */\n" +
-    "    function getOwner() external view returns (address) {\n" +
-    "        return owner;\n" +
-    "    }\n" +
-    "\n" +
-    "    /**\n" +
-    "     * @dev Change owner\n" +
-    "     * @param newOwner address of new owner\n" +
-    "     */\n" +
-    "    function changeOwner(address newOwner) public {\n" +
-    "        if (msg.sender == newOwner) {\n" +
-    "            owner = newOwner;\n" +
-    "        }\n" +
-    "    }\n" +
-    "}\n";
-
-  // Track whether sample bytecode is loaded
-  var isSampleLoaded = false;
 
   // ---- State tracking ----
   var functionStartTime = 0;
@@ -111,6 +71,7 @@
   var activeDecompileController = null;
   var resultRevealTimer = null;
   var healthInfo = null;
+  var lastDecompileResult = null;
   var maxBytecodeHexLength = 200000;
   var generationDefaults = {
     max_new_tokens: 1024,
@@ -135,6 +96,12 @@
   }
   function hideError() {
     hide(errorBanner);
+  }
+
+  function setDownloadButtonsEnabled(enabled) {
+    document.querySelectorAll(".btn-download").forEach(function (btn) {
+      btn.disabled = !enabled;
+    });
   }
 
   function apiHeaders(baseHeaders) {
@@ -166,14 +133,19 @@
       show(loadingEl);
       hide(resultsSection);
       hideError();
+      setDownloadButtonsEnabled(false);
       btnDecompile.disabled = true;
       btnSample.disabled = true;
       inputEl.readOnly = true;
+      if (abiInput) abiInput.readOnly = true;
+      if (metadataInput) metadataInput.readOnly = true;
     } else {
       hide(loadingEl);
       btnDecompile.disabled = false;
       btnSample.disabled = false;
       inputEl.readOnly = false;
+      if (abiInput) abiInput.readOnly = false;
+      if (metadataInput) metadataInput.readOnly = false;
     }
   }
 
@@ -202,29 +174,6 @@
       activeDecompileRequestId += 1;
     }
     setLoading(false);
-  }
-
-  function updateOriginalTab() {
-    var tabBtn = document.getElementById("tab-btn-original");
-    var tabPanel = document.getElementById("tab-original");
-    var originalOutput = document.getElementById("original-output");
-
-    if (isSampleLoaded) {
-      show(tabBtn);
-      originalOutput.textContent = SAMPLE_ORIGINAL_SOLIDITY;
-    } else {
-      hide(tabBtn);
-      if (tabPanel) {
-        tabPanel.classList.add("hidden");
-        tabPanel.classList.remove("active");
-      }
-      // If original tab was active, switch to solidity tab
-      if (tabBtn && tabBtn.classList.contains("active")) {
-        tabBtn.classList.remove("active");
-        var solTab = document.querySelector('[data-tab="tab-solidity"]');
-        if (solTab) solTab.click();
-      }
-    }
   }
 
   function updateProgress(pct, message) {
@@ -352,6 +301,38 @@
       do_sample: doSampleInput ? doSampleInput.value === "true" : false,
       repetition_penalty: rep
     };
+  }
+
+  function parseOptionalJsonInput(el, label) {
+    if (!el) return null;
+    var raw = el.value.trim();
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      throw new Error(label + " must be valid JSON: " + e.message);
+    }
+  }
+
+  function collectUserMetadata() {
+    var metadata = parseOptionalJsonInput(metadataInput, "Contract metadata");
+    var abi = parseOptionalJsonInput(abiInput, "ABI");
+    return { metadata: metadata, abi: abi };
+  }
+
+  function loadJsonFileIntoTextarea(fileInput, targetInput, label) {
+    if (!fileInput || !targetInput || !fileInput.files || !fileInput.files[0]) return;
+    var file = fileInput.files[0];
+    var reader = new FileReader();
+    reader.onload = function () {
+      targetInput.value = String(reader.result || "");
+      fileInput.value = "";
+    };
+    reader.onerror = function () {
+      showError("Unable to read " + label + " file.");
+      fileInput.value = "";
+    };
+    reader.readAsText(file);
   }
 
   function escapeHtml(text) {
@@ -505,7 +486,7 @@
   function getSourceTooltip(source) {
     switch (source) {
       case "exact_match": return "Resolved via TAC hash lookup (exact match from database)";
-      case "model_inference": return "Generated by Llama 3.2 3B model inference";
+      case "model_inference": return "Generated by Qwen2.5-Coder model inference";
       case "pending_inference": return "Awaiting model inference";
       case "error": return "Decompilation failed";
       default: return "";
@@ -570,6 +551,47 @@
     });
   });
 
+  function safeFilenamePart(value) {
+    return String(value || "decompile")
+      .replace(/[^a-zA-Z0-9_.-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || "decompile";
+  }
+
+  function downloadText(filename, mimeType, text) {
+    var blob = new Blob([text], { type: mimeType });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function handleDownloadArtifact(kind) {
+    if (!lastDecompileResult) return;
+    var base = safeFilenamePart(lastDecompileResult.request_id || "decompile");
+    if (kind === "solidity") {
+      downloadText(base + ".sol", "text/plain;charset=utf-8",
+        lastDecompileResult.solidity || "");
+    } else if (kind === "tac") {
+      downloadText(base + ".tac", "text/plain;charset=utf-8",
+        lastDecompileResult.tac || "");
+    } else if (kind === "json") {
+      downloadText(base + ".json", "application/json;charset=utf-8",
+        JSON.stringify(lastDecompileResult, null, 2));
+    }
+  }
+
+  document.querySelectorAll(".btn-download").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      handleDownloadArtifact(this.getAttribute("data-artifact"));
+    });
+  });
+  setDownloadButtonsEnabled(false);
+
   // ---- Build analysis cards ----
 
   function renderAnalysis(analysis) {
@@ -616,6 +638,19 @@
       html += card("DB Functions", analysis.source_summary.exact_match || 0);
       html += card("LLM Functions", analysis.source_summary.model_inference || 0);
       html += card("Failed Functions", analysis.source_summary.error || 0);
+      html += card("ABI Functions", analysis.source_summary.abi_functions_used || 0);
+      html += card("Validation Failed", analysis.source_summary.validation_failed || 0);
+    }
+    if (analysis.validation) {
+      html += card(
+        "Solidity Validation",
+        (analysis.validation.valid ? "valid" : "invalid") +
+          " (" + (analysis.validation.method || "unknown") + ")",
+        true
+      );
+      if (analysis.validation.scaffold_errors && analysis.validation.scaffold_errors.length) {
+        html += card("Validation Errors", analysis.validation.scaffold_errors.join(", "), true);
+      }
     }
     if (analysis.effective_generation_config) {
       var gen = analysis.effective_generation_config;
@@ -658,6 +693,52 @@
   //  Function Selector Mapping
   // ================================================================== //
 
+  function diagnosticSummary(diag) {
+    if (!diag) return "—";
+    var parts = [];
+    if (diag.tac_tokens_before != null) {
+      parts.push("TAC " + diag.tac_tokens_before + "→" + diag.tac_tokens_after);
+    }
+    if (diag.prompt_tokens != null) parts.push("prompt " + diag.prompt_tokens);
+    if (diag.generated_tokens != null) parts.push("gen " + diag.generated_tokens);
+    if (diag.tac_truncated) parts.push("truncated");
+    return parts.join(", ") || "—";
+  }
+
+  function renderTraceDiagnostics(data) {
+    if (!traceDiagnostics) return;
+    var functionResults = data.function_results || [];
+    var truncated = 0;
+    var generatedTokens = 0;
+    for (var i = 0; i < functionResults.length; i++) {
+      var diag = functionResults[i].diagnostics || {};
+      if (diag.tac_truncated) truncated += 1;
+      if (diag.generated_tokens != null) generatedTokens += Number(diag.generated_tokens) || 0;
+    }
+    var html = "";
+    if (data.trace_path) {
+      html += '<div class="diagnostic-card"><div class="label">Trace path</div><code>' +
+        escapeHtml(data.trace_path) + "</code></div>";
+    }
+    html += '<div class="diagnostic-card"><div class="label">Token diagnostics</div>' +
+      escapeHtml(functionResults.length + " function(s), " + truncated +
+        " truncated, " + generatedTokens + " generated token(s)") + "</div>";
+    if (data.contract_metadata && data.contract_metadata.abi &&
+        data.contract_metadata.abi.provided) {
+      var abi = data.contract_metadata.abi;
+      html += '<div class="diagnostic-card"><div class="label">ABI metadata</div>' +
+        escapeHtml((abi.function_count || 0) + " functions, " +
+          (abi.event_count || 0) + " events, " + (abi.error_count || 0) +
+          " errors from " + (abi.source || "request")) + "</div>";
+    }
+    if (data.validation) {
+      html += '<div class="diagnostic-card"><div class="label">Validation</div>' +
+        escapeHtml((data.validation.valid ? "valid" : "invalid") +
+          " via " + (data.validation.method || "unknown")) + "</div>";
+    }
+    traceDiagnostics.innerHTML = html;
+  }
+
   function renderFunctionMapping(selectorMap, functionResults) {
     var hasSelectors = selectorMap && Object.keys(selectorMap).length > 0;
     var hasResults = functionResults && functionResults.length > 0;
@@ -676,6 +757,7 @@
       "<th>Source</th>" +
       "<th>Status</th>" +
       "<th>Elapsed</th>" +
+      "<th>Diagnostics</th>" +
       "<th>Error</th>" +
       "</tr></thead><tbody>";
 
@@ -695,10 +777,14 @@
 
       var selectorSource =
         best.source === "builtin" ? "Known Standard" :
-        best.source === "4byte" ? "4byte.directory" : (best.source || "Unknown");
+        best.source === "4byte" ? "4byte.directory" :
+        best.source === "abi" ? "User ABI" : (best.source || "Unknown");
       var provenance = result.source || "unknown";
       var status = result.status || "unknown";
       var error = result.error || "";
+      var diag = result.diagnostics || {};
+      var abi = result.abi || (info.abi || null);
+      var validation = result.validation || null;
 
       html += "<tr>";
       html +=
@@ -723,14 +809,22 @@
       }
       html += '<td class="fn-map-source">' +
         escapeHtml(getSourceLabel(provenance) + " / " + selectorSource) + "</td>";
-      html += "<td>" + escapeHtml(status) + "</td>";
+      html += "<td>" + escapeHtml(status) +
+        (validation && !validation.valid ? ' <span class="diag-badge truncated">invalid</span>' : "") +
+        (abi ? ' <span class="diag-badge abi">ABI</span>' : "") + "</td>";
       html += "<td>" + escapeHtml(result.elapsed_s != null ? result.elapsed_s + "s" : "—") + "</td>";
+      html += '<td class="fn-map-diagnostics">' +
+        '<span title="' + escapeHtml(JSON.stringify(diag || {}, null, 2)) + '">' +
+        escapeHtml(diagnosticSummary(diag)) +
+        "</span>" +
+        (diag.tac_truncated ? ' <span class="diag-badge truncated">truncated</span>' : "") +
+        "</td>";
       html += "<td>" + escapeHtml(error || "—") + "</td>";
       html += "</tr>";
 
       if (info.candidates && info.candidates.length > 1) {
         html +=
-          '<tr class="fn-map-alt"><td></td><td colspan="6">' +
+          '<tr class="fn-map-alt"><td></td><td colspan="7">' +
           escapeHtml((info.candidates.length - 1) + " alternate selector candidate(s) available") +
           "</td></tr>";
       }
@@ -933,6 +1027,7 @@
 
     var lookup = data.lookup || {};
     var limits = data.limits || {};
+    var warmup = data.warmup || {};
     var html = '<div class="gpu-card">';
     html += '<div class="gpu-card-title"><span class="gpu-card-name">' +
       escapeHtml(ready ? "Model ready" : "TAC/lookup-only mode") + "</span></div>";
@@ -940,7 +1035,14 @@
     if (data.model_error) {
       html += '<div class="gpu-warning">Load error: ' + escapeHtml(data.model_error) + "</div>";
     }
+    html += "<div>Warmup: " +
+      escapeHtml(warmup.status || (warmup.enabled ? "not started" : "disabled")) + "</div>";
+    if (warmup.error) {
+      html += '<div class="gpu-warning">Warmup error: ' + escapeHtml(warmup.error) + "</div>";
+    }
     html += "<div>Lookup DB: " + escapeHtml(lookup.available ? "available" : "unavailable") + "</div>";
+    html += "<div>Timeout: " + escapeHtml(String(limits.timeout_seconds || "disabled")) +
+      "s (" + escapeHtml(limits.timeout_enforcement || "cooperative") + ")</div>";
     html += "<div>Bytecode limit: " +
       Number(limits.max_bytecode_hex_length || maxBytecodeHexLength).toLocaleString() +
       " hex chars</div>";
@@ -1075,36 +1177,23 @@
       return;
     }
     var generationConfig;
+    var userMetadata;
     try {
       generationConfig = collectGenerationConfig();
+      userMetadata = collectUserMetadata();
     } catch (e) {
       showError(e.message);
       return;
     }
 
     var requestBody = { bytecode: validation.bytecode, generation: generationConfig };
-    var compilerVersion = compilerVersionInput
-      ? compilerVersionInput.value.trim()
-      : "";
-    var optimizerEnabled = optimizerEnabledInput
-      ? optimizerEnabledInput.value
-      : "";
-    var optimizerRuns = optimizerRunsInput
-      ? optimizerRunsInput.value.trim()
-      : "";
-    if (compilerVersion) {
-      requestBody.compiler_version = compilerVersion;
-    }
-    if (optimizerEnabled) {
-      requestBody.optimizer_enabled = optimizerEnabled === "true";
-    }
-    if (optimizerRuns) {
-      requestBody.optimizer_runs = optimizerRuns;
-    }
+    if (userMetadata.abi) requestBody.abi = userMetadata.abi;
+    if (userMetadata.metadata) requestBody.metadata = userMetadata.metadata;
 
     clearResultRevealTimer();
     setLoading(true);
     currentSelectorMap = null;
+    lastDecompileResult = null;
     activeDecompileRequestId += 1;
     var requestId = activeDecompileRequestId;
     activeDecompileController = new AbortController();
@@ -1216,13 +1305,18 @@
 
       case "error":
         finishDecompileRequest(requestId);
-        showError(data.error || "Unknown server error");
+        showError(
+          (data.error || "Unknown server error") +
+            (data.trace_path ? " Trace: " + data.trace_path : "")
+        );
         break;
     }
   }
 
   function handleResult(data, requestId) {
     if (!isCurrentDecompileRequest(requestId)) return;
+    lastDecompileResult = data;
+    setDownloadButtonsEnabled(true);
 
     // Populate results
     tacOutput.textContent = data.tac || "(no TAC output)";
@@ -1239,6 +1333,16 @@
       } else if (data.success === false) {
         warning += (warning ? " " : "") + "Decompilation did not fully succeed.";
       }
+      if (data.validation && !data.validation.valid) {
+        warning +=
+          (warning ? " " : "") +
+          "Generated Solidity failed validation (" +
+          (data.validation.method || "unknown") +
+          ").";
+      }
+      if (data.trace_path) {
+        warning += (warning ? " " : "") + "Trace: " + data.trace_path;
+      }
       modelWarningText.textContent = warning;
       show(modelWarning);
     } else {
@@ -1249,6 +1353,7 @@
     if (data.analysis) {
       renderAnalysis(data.analysis);
     }
+    renderTraceDiagnostics(data);
 
     // Function mapping
     var selMap = data.selector_map || currentSelectorMap;
@@ -1383,40 +1488,49 @@
   btnSample.addEventListener("click", function () {
     abortActiveDecompile();
     inputEl.value = SAMPLE_BYTECODE;
-    if (compilerVersionInput) compilerVersionInput.value = "0.8.24";
-    if (optimizerEnabledInput) optimizerEnabledInput.value = "";
-    if (optimizerRunsInput) optimizerRunsInput.value = "";
-    isSampleLoaded = true;
     updateCharCount();
-    updateOriginalTab();
     inputEl.focus();
   });
 
   btnClear.addEventListener("click", function () {
     abortActiveDecompile();
     inputEl.value = "";
-    if (compilerVersionInput) compilerVersionInput.value = "";
-    if (optimizerEnabledInput) optimizerEnabledInput.value = "";
-    if (optimizerRunsInput) optimizerRunsInput.value = "";
-    isSampleLoaded = false;
+    if (abiInput) abiInput.value = "";
+    if (metadataInput) metadataInput.value = "";
     updateCharCount();
-    updateOriginalTab();
     hide(resultsSection);
     hideError();
+    lastDecompileResult = null;
+    setDownloadButtonsEnabled(false);
     inputEl.focus();
   });
 
-  // Detect if user modifies the input away from sample
+  // Cancel active decompilation if the bytecode changes.
   inputEl.addEventListener("input", function () {
     if (activeDecompileController) {
       abortActiveDecompile();
     }
-
-    if (isSampleLoaded && inputEl.value.trim() !== SAMPLE_BYTECODE) {
-      isSampleLoaded = false;
-      updateOriginalTab();
-    }
   });
+
+  [abiInput, metadataInput].forEach(function (el) {
+    if (!el) return;
+    el.addEventListener("input", function () {
+      if (activeDecompileController) {
+        abortActiveDecompile();
+      }
+    });
+  });
+
+  if (abiFileInput) {
+    abiFileInput.addEventListener("change", function () {
+      loadJsonFileIntoTextarea(abiFileInput, abiInput, "ABI");
+    });
+  }
+  if (metadataFileInput) {
+    metadataFileInput.addEventListener("change", function () {
+      loadJsonFileIntoTextarea(metadataFileInput, metadataInput, "metadata");
+    });
+  }
 
   btnDismissError.addEventListener("click", hideError);
 

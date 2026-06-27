@@ -16,14 +16,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# Issue 1: Compiler version annotation in TAC
+# Issue 1: Bytecode-only TAC excludes source metadata
 # ---------------------------------------------------------------------------
 
-class TestIssue01_CompilerVersionAnnotation:
-    """TAC output should include a compiler version comment when provided."""
 
-    def test_extract_tac_includes_compiler_version(self):
-        """_extract_tac should insert a '// Compiler: solc ...' line."""
+class TestIssue01_BytecodeOnlyTac:
+    """TAC output should not include source-only compiler metadata."""
+
+    def test_extract_tac_omits_compiler_version(self):
+        """_extract_tac should keep bytecode facts and omit compiler metadata."""
         from download_hf_contracts import _extract_tac
 
         func = MagicMock()
@@ -36,9 +37,11 @@ class TestIssue01_CompilerVersionAnnotation:
         analyzer.basic_blocks = {}
 
         tac = _extract_tac(func, analyzer, compiler_version="0.8.20", optimizer_enabled=True)
-        assert "// Compiler: solc 0.8.20 (with optimizer)" in tac
+        assert "// Compiler:" not in tac
+        assert "function selector_a9059cbb:" in tac
+        assert "// Selector: 0xa9059cbb" in tac
 
-    def test_extract_tac_no_optimizer(self):
+    def test_extract_tac_omits_optimizer_metadata(self):
         from download_hf_contracts import _extract_tac
 
         func = MagicMock()
@@ -51,7 +54,9 @@ class TestIssue01_CompilerVersionAnnotation:
         analyzer.basic_blocks = {}
 
         tac = _extract_tac(func, analyzer, compiler_version="0.6.12", optimizer_enabled=False)
-        assert "// Compiler: solc 0.6.12 (no optimizer)" in tac
+        assert "// Compiler:" not in tac
+        assert "optimizer" not in tac.lower()
+        assert "// Selector: 0x12345678" in tac
 
     def test_extract_tac_no_version_omits_line(self):
         from download_hf_contracts import _extract_tac
@@ -68,9 +73,11 @@ class TestIssue01_CompilerVersionAnnotation:
         tac = _extract_tac(func, analyzer, compiler_version="", optimizer_enabled=False)
         assert "// Compiler:" not in tac
 
+
 # ---------------------------------------------------------------------------
 # Issue 2: Storage slot labeling
 # ---------------------------------------------------------------------------
+
 
 class TestIssue02_StorageSlotLabeling:
     """Storage layout resolver should parse Solidity state variables and
@@ -225,9 +232,11 @@ class TestIssue02_StorageSlotLabeling:
         assert "// Storage layout:" in enriched
         assert "// likely: address owner" in enriched
 
+
 # ---------------------------------------------------------------------------
 # Issue 3: Revert/panic code decoding
 # ---------------------------------------------------------------------------
+
 
 class TestIssue03_RevertPanicDecoding:
     """PANIC_CODES and ERROR_SELECTORS should be defined for revert decoding,
@@ -254,16 +263,18 @@ class TestIssue03_RevertPanicDecoding:
         """ABIEnricher should parse custom error definitions from ABI."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "error",
-                "name": "InsufficientBalance",
-                "inputs": [
-                    {"name": "required", "type": "uint256"},
-                    {"name": "available", "type": "uint256"},
-                ],
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "error",
+                    "name": "InsufficientBalance",
+                    "inputs": [
+                        {"name": "required", "type": "uint256"},
+                        {"name": "available", "type": "uint256"},
+                    ],
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         assert len(enricher.errors) == 1
 
@@ -283,6 +294,7 @@ class TestIssue03_RevertPanicDecoding:
     def test_decode_revert_data_method_exists(self):
         """BytecodeAnalyzer should have a _decode_revert_data method."""
         from src.bytecode_analyzer import BytecodeAnalyzer
+
         assert hasattr(BytecodeAnalyzer, "_decode_revert_data")
 
     def test_error_string_revert_decoded_in_tac(self):
@@ -323,7 +335,8 @@ class TestIssue03_RevertPanicDecoding:
 
         instr = TACInstruction(
             operation=TACOperationType.REVERT,
-            operand1="0x00", operand2="0x24",
+            operand1="0x00",
+            operand2="0x24",
             metadata={
                 "original_op": "REVERT",
                 "revert_decoded": {"type": "Error(string)", "message": "Error(string)"},
@@ -338,7 +351,8 @@ class TestIssue03_RevertPanicDecoding:
 
         instr = TACInstruction(
             operation=TACOperationType.REVERT,
-            operand1="temp_1", operand2="temp_2",
+            operand1="temp_1",
+            operand2="temp_2",
             metadata={"original_op": "REVERT"},
         )
         formatted = BytecodeAnalyzer._format_tac_instruction(instr)
@@ -349,14 +363,18 @@ class TestIssue03_RevertPanicDecoding:
         from src.bytecode_analyzer import BytecodeAnalyzer
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([{
-            "type": "error",
-            "name": "InsufficientBalance",
-            "inputs": [
-                {"name": "required", "type": "uint256"},
-                {"name": "available", "type": "uint256"},
-            ],
-        }])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "error",
+                    "name": "InsufficientBalance",
+                    "inputs": [
+                        {"name": "required", "type": "uint256"},
+                        {"name": "available", "type": "uint256"},
+                    ],
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         error = list(enricher.errors.values())[0]
         sel_hex = error.selector.replace("0x", "")
@@ -373,9 +391,11 @@ class TestIssue03_RevertPanicDecoding:
         assert decoded["type"] == "CustomError"
         assert decoded["name"] == "InsufficientBalance"
 
+
 # ---------------------------------------------------------------------------
 # Issue 4: No failed/partial decompilation examples (placeholder)
 # ---------------------------------------------------------------------------
+
 
 class TestIssue04_PartialDecompilationExamples:
     """Partial decompilation examples should be generated for unmatched functions."""
@@ -383,6 +403,7 @@ class TestIssue04_PartialDecompilationExamples:
     def test_generate_partial_pairs_method_exists(self):
         """DatasetBuilder should have _generate_partial_pairs."""
         from src.dataset_pipeline import DatasetBuilder
+
         assert hasattr(DatasetBuilder, "_generate_partial_pairs")
 
     def test_partial_pair_generated_for_unmatched_function(self):
@@ -390,17 +411,25 @@ class TestIssue04_PartialDecompilationExamples:
         from src.dataset_pipeline import DatasetBuilder, FunctionPair
         from src.bytecode_analyzer import Function, BasicBlock, TACInstruction, TACOperationType
 
-        with patch.object(DatasetBuilder, '__init__', lambda self, *a, **k: None):
+        with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
             builder = DatasetBuilder.__new__(DatasetBuilder)
             builder.logger = MagicMock()
 
             block = BasicBlock(
-                id="block_0x0080", instructions=[
-                    TACInstruction(TACOperationType.LOAD, result="t1", operand1="0",
-                                   metadata={"memory_type": "storage"}),
+                id="block_0x0080",
+                instructions=[
+                    TACInstruction(
+                        TACOperationType.LOAD,
+                        result="t1",
+                        operand1="0",
+                        metadata={"memory_type": "storage"},
+                    ),
                 ],
-                predecessors=[], successors=[],
-                start_address=0x80, end_address=0x90, metadata={},
+                predecessors=[],
+                successors=[],
+                start_address=0x80,
+                end_address=0x90,
+                metadata={},
             )
             mock_analyzer = MagicMock()
             mock_analyzer.basic_blocks = {"block_0x0080": block}
@@ -412,8 +441,10 @@ class TestIssue04_PartialDecompilationExamples:
 
             bytecode_funcs = {
                 "function_0xdeadbeef": Function(
-                    name="function_0xdeadbeef", selector="0xdeadbeef",
-                    basic_blocks=[], entry_block="block_0x0080",
+                    name="function_0xdeadbeef",
+                    selector="0xdeadbeef",
+                    basic_blocks=[],
+                    entry_block="block_0x0080",
                 ),
             }
             pairs = builder._generate_partial_pairs("0xtest", bytecode_funcs, [], mock_analyzer)
@@ -427,7 +458,7 @@ class TestIssue04_PartialDecompilationExamples:
         from src.dataset_pipeline import DatasetBuilder
         from src.bytecode_analyzer import Function
 
-        with patch.object(DatasetBuilder, '__init__', lambda self, *a, **k: None):
+        with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
             builder = DatasetBuilder.__new__(DatasetBuilder)
             builder.logger = MagicMock()
 
@@ -435,7 +466,10 @@ class TestIssue04_PartialDecompilationExamples:
                 "f": Function(name="f", selector="0xaabb", basic_blocks=[], entry_block="b"),
             }
             pairs = builder._generate_partial_pairs(
-                "0x", bytecode_funcs, [{"selector": "0xaabb"}], MagicMock(),
+                "0x",
+                bytecode_funcs,
+                [{"selector": "0xaabb"}],
+                MagicMock(),
             )
             assert len(pairs) == 0
 
@@ -451,46 +485,56 @@ class TestIssue04_PartialDecompilationExamples:
         assert "Partial decompilation" in partial
         assert "Control flow" in partial
 
+
 # ---------------------------------------------------------------------------
 # Issue 5: Trivial function filtering
 # ---------------------------------------------------------------------------
+
 
 class TestIssue05_TrivialFunctionFiltering:
     """Expanded trivial patterns and token-count heuristic."""
 
     def test_original_patterns_still_caught(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ return x; }")
         assert is_trivial_function("{ return 42; }")
         assert is_trivial_function("{ }")
 
     def test_return_true_false_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ return true; }")
         assert is_trivial_function("{ return false; }")
 
     def test_simple_setter_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ x = y; }")
 
     def test_emit_only_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ emit Transfer(from, to, amount); }")
 
     def test_return_property_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ return obj.prop; }")
 
     def test_modifier_placeholder_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ _; }")
 
     def test_return_func_call_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         assert is_trivial_function("{ return foo(x); }")
 
     def test_complex_body_not_trivial(self):
         from download_hf_contracts import is_trivial_function
+
         body = """{
             require(balances[msg.sender] >= amount, "Insufficient balance");
             balances[msg.sender] -= amount;
@@ -503,13 +547,16 @@ class TestIssue05_TrivialFunctionFiltering:
     def test_token_count_filter(self):
         """Bodies with fewer than MIN_MEANINGFUL_TOKENS should be trivial."""
         from download_hf_contracts import is_trivial_function, MIN_MEANINGFUL_TOKENS
+
         # Very short but doesn't match regex patterns exactly
         short_body = "{ a = b + c; }"
         assert is_trivial_function(short_body)  # < 15 tokens
 
+
 # ---------------------------------------------------------------------------
 # Issue 6: Missing constructor/receive/fallback handling (placeholder)
 # ---------------------------------------------------------------------------
+
 
 class TestIssue06_SpecialFunctionHandling:
     """BytecodeAnalyzer should detect receive(), fallback(), and internal functions."""
@@ -517,16 +564,19 @@ class TestIssue06_SpecialFunctionHandling:
     def test_detect_receive_function_method_exists(self):
         """BytecodeAnalyzer should have _detect_receive_function."""
         from src.bytecode_analyzer import BytecodeAnalyzer
+
         assert hasattr(BytecodeAnalyzer, "_detect_receive_function")
 
     def test_detect_fallback_function_method_exists(self):
         """BytecodeAnalyzer should have _detect_fallback_function."""
         from src.bytecode_analyzer import BytecodeAnalyzer
+
         assert hasattr(BytecodeAnalyzer, "_detect_fallback_function")
 
     def test_detect_internal_functions_method_exists(self):
         """BytecodeAnalyzer should have _detect_internal_functions."""
         from src.bytecode_analyzer import BytecodeAnalyzer
+
         assert hasattr(BytecodeAnalyzer, "_detect_internal_functions")
 
     def test_receive_detection_with_calldatasize_iszero(self):
@@ -603,20 +653,26 @@ class TestIssue06_SpecialFunctionHandling:
 
         analyzer.basic_blocks = {
             "block_0000": BasicBlock(
-                id="block_0000", instructions=[], predecessors=[],
+                id="block_0000",
+                instructions=[],
+                predecessors=[],
                 successors=["block_0010"],
-                start_address=0, end_address=5,
+                start_address=0,
+                end_address=5,
                 metadata={"raw_instructions": [jump_instr]},
             ),
             "block_0010": BasicBlock(
-                id="block_0010", instructions=[], predecessors=["block_0000"],
-                successors=[], start_address=0x10, end_address=0x15,
+                id="block_0010",
+                instructions=[],
+                predecessors=["block_0000"],
+                successors=[],
+                start_address=0x10,
+                end_address=0x15,
                 metadata={"raw_instructions": [jumpdest_instr, stop_instr]},
             ),
         }
         known = {
-            "f": Function(name="f", selector="0xaabb", basic_blocks=[],
-                          entry_block="block_0000"),
+            "f": Function(name="f", selector="0xaabb", basic_blocks=[], entry_block="block_0000"),
         }
         internal = analyzer._detect_internal_functions(known)
         assert "internal_block_0010" in internal
@@ -625,15 +681,18 @@ class TestIssue06_SpecialFunctionHandling:
     def test_identify_functions_calls_special_detection(self):
         """identify_functions should invoke receive/fallback/internal detection."""
         from src.bytecode_analyzer import BytecodeAnalyzer
+
         bytecode = "0x608060405234801561001057600080fd5b50600436106100365760003560e01c8063893d20e81461003b578063a6f9dae114610059575b600080fd"
         analyzer = BytecodeAnalyzer(bytecode)
         analyzer.analyze_control_flow()
         functions = analyzer.identify_functions()
         assert len(functions) >= 1
 
+
 # ---------------------------------------------------------------------------
 # Issue 7: Shared utility blocks deduplication (placeholder)
 # ---------------------------------------------------------------------------
+
 
 class TestIssue07_SharedBlockDedup:
     """_collect_function_blocks should deduplicate shared blocks across functions."""
@@ -642,6 +701,7 @@ class TestIssue07_SharedBlockDedup:
         """_collect_function_blocks should accept an emitted_blocks parameter."""
         from src.dataset_pipeline import DatasetBuilder
         import inspect
+
         sig = inspect.signature(DatasetBuilder._collect_function_blocks)
         assert "emitted_blocks" in sig.parameters
 
@@ -650,25 +710,38 @@ class TestIssue07_SharedBlockDedup:
         from src.dataset_pipeline import DatasetBuilder
         from src.bytecode_analyzer import BasicBlock, TACInstruction, TACOperationType
 
-        with patch.object(DatasetBuilder, '__init__', lambda self, *a, **k: None):
+        with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
             builder = DatasetBuilder.__new__(DatasetBuilder)
             builder.logger = MagicMock()
 
             shared = BasicBlock(
-                id="block_shared", instructions=[
-                    TACInstruction(TACOperationType.REVERT, operand1="0", operand2="0",
-                                   metadata={"original_op": "REVERT"}),
+                id="block_shared",
+                instructions=[
+                    TACInstruction(
+                        TACOperationType.REVERT,
+                        operand1="0",
+                        operand2="0",
+                        metadata={"original_op": "REVERT"},
+                    ),
                 ],
-                predecessors=[], successors=[],
-                start_address=0x200, end_address=0x210, metadata={},
+                predecessors=[],
+                successors=[],
+                start_address=0x200,
+                end_address=0x210,
+                metadata={},
             )
             entry = BasicBlock(
-                id="block_entry", instructions=[
-                    TACInstruction(TACOperationType.ASSIGN, result="t1", operand1="42",
-                                   metadata={}),
+                id="block_entry",
+                instructions=[
+                    TACInstruction(
+                        TACOperationType.ASSIGN, result="t1", operand1="42", metadata={}
+                    ),
                 ],
-                predecessors=[], successors=["block_shared"],
-                start_address=0x80, end_address=0x90, metadata={},
+                predecessors=[],
+                successors=["block_shared"],
+                start_address=0x80,
+                end_address=0x90,
+                metadata={},
             )
 
             all_blocks = {"block_entry": entry, "block_shared": shared}
@@ -676,23 +749,32 @@ class TestIssue07_SharedBlockDedup:
             # First call: emitted is empty → both blocks collected
             emitted: set = set()
             blocks1 = builder._collect_function_blocks(
-                "block_entry", all_blocks, emitted_blocks=emitted,
+                "block_entry",
+                all_blocks,
+                emitted_blocks=emitted,
             )
             assert "block_entry" in emitted
             assert "block_shared" in emitted
 
             # Second call with same emitted set → shared block skipped
             entry2 = BasicBlock(
-                id="block_entry2", instructions=[
-                    TACInstruction(TACOperationType.ASSIGN, result="t2", operand1="99",
-                                   metadata={}),
+                id="block_entry2",
+                instructions=[
+                    TACInstruction(
+                        TACOperationType.ASSIGN, result="t2", operand1="99", metadata={}
+                    ),
                 ],
-                predecessors=[], successors=["block_shared"],
-                start_address=0xA0, end_address=0xB0, metadata={},
+                predecessors=[],
+                successors=["block_shared"],
+                start_address=0xA0,
+                end_address=0xB0,
+                metadata={},
             )
             all_blocks["block_entry2"] = entry2
             blocks2 = builder._collect_function_blocks(
-                "block_entry2", all_blocks, emitted_blocks=emitted,
+                "block_entry2",
+                all_blocks,
+                emitted_blocks=emitted,
             )
             # block_shared should appear as a reference (shared_ref),
             # not with its original full instructions
@@ -708,18 +790,27 @@ class TestIssue07_SharedBlockDedup:
         from src.dataset_pipeline import DatasetBuilder
         from src.bytecode_analyzer import BasicBlock, TACInstruction, TACOperationType
 
-        with patch.object(DatasetBuilder, '__init__', lambda self, *a, **k: None):
+        with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
             builder = DatasetBuilder.__new__(DatasetBuilder)
             builder.logger = MagicMock()
 
             shared = BasicBlock(
-                id="block_shared", instructions=[], predecessors=[],
-                successors=[], start_address=0x200, end_address=0x210, metadata={},
+                id="block_shared",
+                instructions=[],
+                predecessors=[],
+                successors=[],
+                start_address=0x200,
+                end_address=0x210,
+                metadata={},
             )
             entry = BasicBlock(
-                id="block_entry", instructions=[], predecessors=[],
+                id="block_entry",
+                instructions=[],
+                predecessors=[],
                 successors=["block_shared"],
-                start_address=0x80, end_address=0x90, metadata={},
+                start_address=0x80,
+                end_address=0x90,
+                metadata={},
             )
             all_blocks = {"block_entry": entry, "block_shared": shared}
 
@@ -728,9 +819,11 @@ class TestIssue07_SharedBlockDedup:
             assert "block_entry" in block_ids
             assert "block_shared" in block_ids
 
+
 # ---------------------------------------------------------------------------
 # Issue 8: ABI data usage for type annotations
 # ---------------------------------------------------------------------------
+
 
 class TestIssue08_ABIDataUsage:
     """ABI data should be parsed and used to enrich TAC with type annotations."""
@@ -739,18 +832,20 @@ class TestIssue08_ABIDataUsage:
         """ABIEnricher should parse function entries and compute selectors."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "transfer",
-                "inputs": [
-                    {"name": "to", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "nonpayable",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        {"name": "to", "type": "address"},
+                        {"name": "amount", "type": "uint256"},
+                    ],
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "nonpayable",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         assert enricher.has_data()
 
@@ -766,17 +861,19 @@ class TestIssue08_ABIDataUsage:
         """ABIEnricher should parse event entries and compute topic0."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "event",
-                "name": "Transfer",
-                "inputs": [
-                    {"name": "from", "type": "address", "indexed": True},
-                    {"name": "to", "type": "address", "indexed": True},
-                    {"name": "value", "type": "uint256", "indexed": False},
-                ],
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "event",
+                    "name": "Transfer",
+                    "inputs": [
+                        {"name": "from", "type": "address", "indexed": True},
+                        {"name": "to", "type": "address", "indexed": True},
+                        {"name": "value", "type": "uint256", "indexed": False},
+                    ],
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         expected_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         event = enricher.get_event_by_topic(expected_topic)
@@ -788,24 +885,26 @@ class TestIssue08_ABIDataUsage:
         """ABIEnricher should resolve tuple types from ABI components."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "submitOrder",
-                "inputs": [
-                    {
-                        "name": "order",
-                        "type": "tuple",
-                        "components": [
-                            {"name": "maker", "type": "address"},
-                            {"name": "amount", "type": "uint256"},
-                        ],
-                    }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "submitOrder",
+                    "inputs": [
+                        {
+                            "name": "order",
+                            "type": "tuple",
+                            "components": [
+                                {"name": "maker", "type": "address"},
+                                {"name": "amount", "type": "uint256"},
+                            ],
+                        }
+                    ],
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         func = list(enricher.functions.values())[0]
         assert func.input_types == ["(address,uint256)"]
@@ -814,24 +913,26 @@ class TestIssue08_ABIDataUsage:
         """ABIEnricher should resolve tuple[] types."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "batchTransfer",
-                "inputs": [
-                    {
-                        "name": "transfers",
-                        "type": "tuple[]",
-                        "components": [
-                            {"name": "to", "type": "address"},
-                            {"name": "amount", "type": "uint256"},
-                        ],
-                    }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "batchTransfer",
+                    "inputs": [
+                        {
+                            "name": "transfers",
+                            "type": "tuple[]",
+                            "components": [
+                                {"name": "to", "type": "address"},
+                                {"name": "amount", "type": "uint256"},
+                            ],
+                        }
+                    ],
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         func = list(enricher.functions.values())[0]
         assert func.input_types == ["(address,uint256)[]"]
@@ -840,18 +941,20 @@ class TestIssue08_ABIDataUsage:
         """format_function_header should produce a named function with typed params."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "transfer",
-                "inputs": [
-                    {"name": "to", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "nonpayable",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        {"name": "to", "type": "address"},
+                        {"name": "amount", "type": "uint256"},
+                    ],
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "nonpayable",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         sel = "0xa9059cbb"
         header = enricher.format_function_header(sel)
@@ -861,15 +964,17 @@ class TestIssue08_ABIDataUsage:
         """format_return_annotation should produce a return type comment."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "balanceOf",
-                "inputs": [{"name": "account", "type": "address"}],
-                "outputs": [{"name": "", "type": "uint256"}],
-                "stateMutability": "view",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "balanceOf",
+                    "inputs": [{"name": "account", "type": "address"}],
+                    "outputs": [{"name": "", "type": "uint256"}],
+                    "stateMutability": "view",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         sel = "0x70a08231"
         ret = enricher.format_return_annotation(sel)
@@ -879,18 +984,20 @@ class TestIssue08_ABIDataUsage:
         """format_param_annotations should produce indexed parameter comments."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "transfer",
-                "inputs": [
-                    {"name": "to", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "nonpayable",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        {"name": "to", "type": "address"},
+                        {"name": "amount", "type": "uint256"},
+                    ],
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "nonpayable",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         sel = "0xa9059cbb"
         params = enricher.format_param_annotations(sel)
@@ -902,17 +1009,19 @@ class TestIssue08_ABIDataUsage:
         """format_event_annotation should produce a readable event comment."""
         from src.abi_enrichment import ABIEnricher
 
-        abi_json = json.dumps([
-            {
-                "type": "event",
-                "name": "Transfer",
-                "inputs": [
-                    {"name": "from", "type": "address", "indexed": True},
-                    {"name": "to", "type": "address", "indexed": True},
-                    {"name": "value", "type": "uint256", "indexed": False},
-                ],
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "event",
+                    "name": "Transfer",
+                    "inputs": [
+                        {"name": "from", "type": "address", "indexed": True},
+                        {"name": "to", "type": "address", "indexed": True},
+                        {"name": "value", "type": "uint256", "indexed": False},
+                    ],
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         annotation = enricher.format_event_annotation(topic)
@@ -936,18 +1045,20 @@ class TestIssue08_ABIDataUsage:
         """enrich_tac_with_abi should replace function header with ABI info."""
         from src.abi_enrichment import ABIEnricher, enrich_tac_with_abi
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "transfer",
-                "inputs": [
-                    {"name": "to", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "nonpayable",
-            }
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        {"name": "to", "type": "address"},
+                        {"name": "amount", "type": "uint256"},
+                    ],
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "nonpayable",
+                }
+            ]
+        )
         enricher = ABIEnricher(abi_json)
         sel = "0xa9059cbb"
 
@@ -965,56 +1076,67 @@ class TestIssue08_ABIDataUsage:
         assert "param[0] at 0x04: address to" in enriched
         assert "param[1] at 0x24: uint256 amount" in enriched
 
+
 # ---------------------------------------------------------------------------
 # Issue 9: Fragile selector computation for complex types
 # ---------------------------------------------------------------------------
+
 
 class TestIssue09_SelectorComputation:
     """Balanced-parenthesis-aware parameter parsing for selectors."""
 
     def test_simple_params(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         assert _parse_solidity_param_types("uint256 amount") == ["uint256"]
         assert _parse_solidity_param_types("address to, uint256 amount") == ["address", "uint256"]
 
     def test_empty_params(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         assert _parse_solidity_param_types("") == []
         assert _parse_solidity_param_types("   ") == []
 
     def test_memory_calldata_ignored(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         result = _parse_solidity_param_types("uint256[] memory data, address to")
         assert result == ["uint256[]", "address"]
 
     def test_tuple_type(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         result = _parse_solidity_param_types("(uint256,address) data")
         assert result == ["(uint256,address)"]
 
     def test_tuple_array_type(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         result = _parse_solidity_param_types("(uint256,address)[] data")
         assert result == ["(uint256,address)[]"]
 
     def test_nested_tuple(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         result = _parse_solidity_param_types("(uint256,(address,bool)) data")
         assert result == ["(uint256,(address,bool))"]
 
     def test_fixed_size_array_with_space(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         result = _parse_solidity_param_types("uint256 [3]")
         assert result == ["uint256[3]"]
 
     def test_mixed_tuple_and_regular(self):
         from download_hf_contracts import _parse_solidity_param_types
+
         result = _parse_solidity_param_types("(uint256,address)[] items, bool flag")
         assert result == ["(uint256,address)[]", "bool"]
 
     def test_dataset_pipeline_parser_same_behavior(self):
         """DatasetBuilder._parse_solidity_param_types should behave identically."""
         from src.dataset_pipeline import DatasetBuilder
+
         result = DatasetBuilder._parse_solidity_param_types("(uint256,address)[] items, bool flag")
         assert result == ["(uint256,address)[]", "bool"]
 
@@ -1036,9 +1158,11 @@ class TestIssue09_SelectorComputation:
         canonical = f"foo({','.join(types)})"
         assert canonical == "foo((uint256,address))"
 
+
 # ---------------------------------------------------------------------------
 # Issue 10: Inconsistent Solidity output format (fallback pairs removed)
 # ---------------------------------------------------------------------------
+
 
 class TestIssue10_NoFallbackPairs:
     """Whole-contract fallback pairs should no longer be created."""
@@ -1047,37 +1171,54 @@ class TestIssue10_NoFallbackPairs:
         """When no functions match by selector, no fallback pair should be added."""
         from src.dataset_pipeline import DatasetBuilder
 
-        with patch.object(DatasetBuilder, '__init__', lambda self, *a, **k: None):
+        with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
             builder = DatasetBuilder.__new__(DatasetBuilder)
             builder.parser = MagicMock()
             builder.logger = MagicMock()
 
             # Mock: Solidity parser returns functions but none match
             builder.parser.extract_functions.return_value = [
-                {"name": "foo", "body": "function foo() { return 1; }",
-                 "signature": "function foo()", "visibility": "public",
-                 "is_payable": False, "is_view": False, "contract_name": "Test"}
+                {
+                    "name": "foo",
+                    "body": "function foo() { return 1; }",
+                    "signature": "function foo()",
+                    "visibility": "public",
+                    "is_payable": False,
+                    "is_view": False,
+                    "contract_name": "Test",
+                }
             ]
 
             # bytecode with no matching selectors
             mock_analyzer = MagicMock()
             mock_analyzer.identify_functions.return_value = {}
 
-            with patch.object(builder, '_add_selectors_to_solidity_functions',
-                            return_value=[{"name": "foo", "selector": "0xdeadbeef",
-                                          "body": "...", "signature": "function foo()"}]):
-                with patch.object(builder, '_match_functions_by_selector', return_value=[]):
-                    with patch('src.dataset_pipeline.BytecodeAnalyzer', return_value=mock_analyzer):
+            with patch.object(
+                builder,
+                "_add_selectors_to_solidity_functions",
+                return_value=[
+                    {
+                        "name": "foo",
+                        "selector": "0xdeadbeef",
+                        "body": "...",
+                        "signature": "function foo()",
+                    }
+                ],
+            ):
+                with patch.object(builder, "_match_functions_by_selector", return_value=[]):
+                    with patch("src.dataset_pipeline.BytecodeAnalyzer", return_value=mock_analyzer):
                         pairs = builder._create_function_pairs("0xtest", "source", "0x00")
 
             # No fallback pair should be created
             assert len(pairs) == 0
             # Verify _create_fallback_pair was NOT called
-            assert not hasattr(builder, '_create_fallback_pair_called')
+            assert not hasattr(builder, "_create_fallback_pair_called")
+
 
 # ---------------------------------------------------------------------------
 # Issue 11: Variable name augmentation
 # ---------------------------------------------------------------------------
+
 
 class TestIssue11_VariableNameAugmentation:
     """Variable name augmentation replaces user-defined names with generic ones."""
@@ -1085,11 +1226,13 @@ class TestIssue11_VariableNameAugmentation:
     def test_augment_function_exists(self):
         """augment_variable_names should be importable from model_setup."""
         from src.model_setup import augment_variable_names
+
         assert callable(augment_variable_names)
 
     def test_basic_renaming(self):
         """Declared variables should be renamed to var_N."""
         from src.model_setup import augment_variable_names
+
         code = "uint256 amount = 100;\naddress recipient = msg.sender;\nreturn amount;"
         result = augment_variable_names(code)
         assert "var_1" in result  # amount → var_1
@@ -1100,6 +1243,7 @@ class TestIssue11_VariableNameAugmentation:
     def test_keywords_not_renamed(self):
         """Solidity keywords/types should not be renamed."""
         from src.model_setup import augment_variable_names
+
         code = "uint256 totalCount = 0;\nreturn totalCount;"
         result = augment_variable_names(code)
         assert "uint256" in result
@@ -1110,12 +1254,14 @@ class TestIssue11_VariableNameAugmentation:
     def test_empty_input(self):
         """Empty input should return empty."""
         from src.model_setup import augment_variable_names
+
         assert augment_variable_names("") == ""
         assert augment_variable_names("   ") == "   "
 
     def test_no_declarations_unchanged(self):
         """Code with no variable declarations should pass through."""
         from src.model_setup import augment_variable_names
+
         code = "return msg.sender;"
         result = augment_variable_names(code)
         assert result == code
@@ -1123,6 +1269,7 @@ class TestIssue11_VariableNameAugmentation:
     def test_solidity_reserved_words_preserved(self):
         """Built-in globals like msg, block, sender should not be renamed."""
         from src.model_setup import augment_variable_names
+
         code = "address owner = msg.sender;\nrequire(owner != address(0));"
         result = augment_variable_names(code)
         assert "msg" in result
@@ -1136,8 +1283,7 @@ class TestIssue11_VariableNameAugmentation:
         import tempfile, json
 
         data = [
-            {"input": "tac code", "output": "uint256 amount = 1; return amount;",
-             "metadata": {}}
+            {"input": "tac code", "output": "uint256 amount = 1; return amount;", "metadata": {}}
         ]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
             for d in data:
@@ -1152,50 +1298,60 @@ class TestIssue11_VariableNameAugmentation:
         mock_tokenizer.eos_token_id = 2
 
         # Call with different indices; some should be augmented
-        mock_tokenizer.__call__ = MagicMock(return_value={
-            "input_ids": [1, 2, 3], "attention_mask": [1, 1, 1],
-        })
+        mock_tokenizer.__call__ = MagicMock(
+            return_value={
+                "input_ids": [1, 2, 3],
+                "attention_mask": [1, 1, 1],
+            }
+        )
         ds = SmartContractDataset(path, mock_tokenizer, augment_names=True)
         assert ds.AUGMENT_RATE == 0.3
 
         import os
+
         os.unlink(path)
 
     def test_deterministic_augmentation(self):
         """augment_variable_names with same seed should produce same result."""
         from src.model_setup import augment_variable_names
+
         code = "uint256 amount = 100; address dest = msg.sender;"
         r1 = augment_variable_names(code, seed=42)
         r2 = augment_variable_names(code, seed=42)
         assert r1 == r2
 
+
 # ---------------------------------------------------------------------------
 # Issue 12: Export-time dedup cap reduced
 # ---------------------------------------------------------------------------
+
 
 class TestIssue12_ReducedBodyDupeCap:
     """max_body_dupes default should be 2, not 5."""
 
     def test_default_max_body_dupes_is_2(self):
         """Verify the CLI default for --max-body-dupes is 2."""
-        import argparse
-        # Parse the default from the argparse definition
         import download_hf_contracts
-        # We can't easily inspect argparse defaults without running main,
-        # so we check the source directly
+
         import inspect
+
         source = inspect.getsource(download_hf_contracts.main)
-        # Find the default value in the source
-        match = re.search(r'--max-body-dupes.*?default=(\d+)', source)
+        match = re.search(r"--max-body-dupes.*?default=(\d+)", source, re.DOTALL)
         assert match is not None
         assert int(match.group(1)) == 2
 
     def test_export_respects_max_body_dupes(self):
         """Export with max_body_dupes=2 should limit duplicates."""
         from download_hf_contracts import (
-            init_database, _store_pairs_batch, export_training_data,
-            _md5, hash_normalized_body, hash_normalized_tac, hash_normalized_pair,
+            init_database,
+            _store_pairs_batch,
+            export_training_data,
+            _md5,
+            hash_normalized_body,
+            hash_normalized_tac,
+            hash_normalized_pair,
         )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"
             init_database(db_path)
@@ -1205,21 +1361,23 @@ class TestIssue12_ReducedBodyDupeCap:
             sol = "function test() { return 42; }"
             pairs = []
             for i in range(5):
-                pairs.append({
-                    "contract_address": f"0xaddr{i}",
-                    "function_name": "test",
-                    "tac_representation": tac,
-                    "solidity_code": sol,
-                    "function_signature": "function test()",
-                    "visibility": "public",
-                    "is_payable": False,
-                    "is_view": False,
-                    "metadata": "{}",
-                    "hash": _md5(f"{tac}{sol}{i}"),  # unique hash
-                    "body_hash": hash_normalized_body(sol),
-                    "tac_hash": hash_normalized_tac(tac),
-                    "pair_norm_hash": hash_normalized_pair(tac, sol),
-                })
+                pairs.append(
+                    {
+                        "contract_address": f"0xaddr{i}",
+                        "function_name": "test",
+                        "tac_representation": tac,
+                        "solidity_code": sol,
+                        "function_signature": "function test()",
+                        "visibility": "public",
+                        "is_payable": False,
+                        "is_view": False,
+                        "metadata": "{}",
+                        "hash": _md5(f"{tac}{sol}{i}"),  # unique hash
+                        "body_hash": hash_normalized_body(sol),
+                        "tac_hash": hash_normalized_tac(tac),
+                        "pair_norm_hash": hash_normalized_pair(tac, sol),
+                    }
+                )
 
             # pair_norm_hash is UNIQUE, so only 1 will be inserted
             inserted = _store_pairs_batch(db_path, pairs)
@@ -1231,15 +1389,18 @@ class TestIssue12_ReducedBodyDupeCap:
                 lines = f.readlines()
             assert len(lines) <= 2
 
+
 # ---------------------------------------------------------------------------
 # Combined: Normalization helpers
 # ---------------------------------------------------------------------------
+
 
 class TestNormalizationHelpers:
     """Tests for normalization and hashing functions."""
 
     def test_normalize_solidity_body(self):
         from download_hf_contracts import normalize_solidity_body
+
         # Comment stripping + whitespace collapsing should produce same result
         body1 = "{ return   x; // comment\n}"
         body2 = "{ return x; }"
@@ -1247,59 +1408,76 @@ class TestNormalizationHelpers:
 
     def test_normalize_solidity_body_case_insensitive(self):
         from download_hf_contracts import normalize_solidity_body
+
         body1 = "{ return X; }"
         body2 = "{ return x; }"
         assert normalize_solidity_body(body1) == normalize_solidity_body(body2)
 
     def test_normalize_tac_strips_comments(self):
         from download_hf_contracts import normalize_tac
+
         tac1 = "function f:\n  // Compiler: solc 0.8.20\n  temp_1 = 42"
         tac2 = "function f:\n  temp_1 = 42"
         assert normalize_tac(tac1) == normalize_tac(tac2)
 
     def test_hash_normalized_pair_consistent(self):
         from download_hf_contracts import hash_normalized_pair
+
         h1 = hash_normalized_pair("tac code", "solidity code")
         h2 = hash_normalized_pair("tac code", "solidity code")
         assert h1 == h2
 
     def test_hash_source_code_whitespace_insensitive(self):
         from download_hf_contracts import hash_source_code
+
         src1 = "contract Foo {\n    uint x;\n}"
         src2 = "contract Foo {  uint   x;  }"
         assert hash_source_code(src1) == hash_source_code(src2)
 
+
 # ---------------------------------------------------------------------------
 # Integration-style: Quality filter pipeline
 # ---------------------------------------------------------------------------
+
 
 class TestQualityFilterPipeline:
     """Integration tests for the quality filter pipeline."""
 
     def test_proxy_only_detection(self):
         from download_hf_contracts import is_proxy_only
+
         proxy_body = "{ (bool success, ) = impl.delegatecall(msg.data); require(success); }"
         assert is_proxy_only(proxy_body)
 
     def test_non_proxy_not_detected(self):
         from download_hf_contracts import is_proxy_only
+
         normal = "{ balances[msg.sender] -= amount; balances[to] += amount; }"
         assert not is_proxy_only(normal)
 
     def test_build_pair_rejects_tiny(self):
         from download_hf_contracts import _build_pair
+
         match = {
-            "solidity_function": {"name": "f", "body": "{ }", "signature": "function f()",
-                                  "visibility": "public", "is_payable": False, "is_view": False},
+            "solidity_function": {
+                "name": "f",
+                "body": "{ }",
+                "signature": "function f()",
+                "visibility": "public",
+                "is_payable": False,
+                "is_view": False,
+            },
             "tac": "func:\n  nop",
             "selector": "0x12345678",
         }
         result = _build_pair(match, "0xaddr", "0.8.0", False, 200, "Test")
         assert result is None  # body too short
 
+
 # ---------------------------------------------------------------------------
 # ABI Enrichment: end-to-end TAC annotation
 # ---------------------------------------------------------------------------
+
 
 class TestABIEnrichmentEndToEnd:
     """End-to-end tests for ABI + storage enrichment in TAC generation."""
@@ -1308,27 +1486,29 @@ class TestABIEnrichmentEndToEnd:
         """Test combining ABI and storage enrichment on a TAC string."""
         from src.abi_enrichment import ABIEnricher, StorageLayoutResolver, enrich_tac_with_abi
 
-        abi_json = json.dumps([
-            {
-                "type": "function",
-                "name": "transfer",
-                "inputs": [
-                    {"name": "to", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "outputs": [{"name": "", "type": "bool"}],
-                "stateMutability": "nonpayable",
-            },
-            {
-                "type": "event",
-                "name": "Transfer",
-                "inputs": [
-                    {"name": "from", "type": "address", "indexed": True},
-                    {"name": "to", "type": "address", "indexed": True},
-                    {"name": "value", "type": "uint256", "indexed": False},
-                ],
-            },
-        ])
+        abi_json = json.dumps(
+            [
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        {"name": "to", "type": "address"},
+                        {"name": "amount", "type": "uint256"},
+                    ],
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "nonpayable",
+                },
+                {
+                    "type": "event",
+                    "name": "Transfer",
+                    "inputs": [
+                        {"name": "from", "type": "address", "indexed": True},
+                        {"name": "to", "type": "address", "indexed": True},
+                        {"name": "value", "type": "uint256", "indexed": False},
+                    ],
+                },
+            ]
+        )
         source = """
         contract Token {
             address public owner;
@@ -1377,6 +1557,7 @@ class TestABIEnrichmentEndToEnd:
     def test_enrich_tac_empty_string(self):
         """Empty TAC should return empty."""
         from src.abi_enrichment import enrich_tac_with_abi
+
         assert enrich_tac_with_abi("", "0x12345678") == ""
 
 
@@ -1396,9 +1577,7 @@ class TestGitHubIssue27_ABITypeCanonicalSelectors:
         from download_hf_contracts import _parse_solidity_param_types
         from src.dataset_pipeline import DatasetBuilder
 
-        assert _parse_solidity_param_types("(uint,int[])[] data") == [
-            "(uint256,int256[])[]"
-        ]
+        assert _parse_solidity_param_types("(uint,int[])[] data") == ["(uint256,int256[])[]"]
 
         with patch.object(DatasetBuilder, "__init__", lambda self, *a, **k: None):
             builder = DatasetBuilder.__new__(DatasetBuilder)
@@ -1426,21 +1605,23 @@ class TestGitHubIssue29_BodyDuplicateExportCap:
         pairs = []
         for idx in range(3):
             tac = f"function same:\n  block_{idx}:\n    temp = {idx}"
-            pairs.append({
-                "contract_address": f"0x{idx}",
-                "function_name": "same",
-                "tac_representation": tac,
-                "solidity_code": sol,
-                "function_signature": "function same()",
-                "visibility": "public",
-                "is_payable": False,
-                "is_view": False,
-                "metadata": "{}",
-                "hash": _md5(tac + sol),
-                "body_hash": hash_normalized_body(sol),
-                "tac_hash": hash_normalized_tac(tac),
-                "pair_norm_hash": hash_normalized_pair(tac, sol),
-            })
+            pairs.append(
+                {
+                    "contract_address": f"0x{idx}",
+                    "function_name": "same",
+                    "tac_representation": tac,
+                    "solidity_code": sol,
+                    "function_signature": "function same()",
+                    "visibility": "public",
+                    "is_payable": False,
+                    "is_view": False,
+                    "metadata": "{}",
+                    "hash": _md5(tac + sol),
+                    "body_hash": hash_normalized_body(sol),
+                    "tac_hash": hash_normalized_tac(tac),
+                    "pair_norm_hash": hash_normalized_pair(tac, sol),
+                }
+            )
 
         assert _store_pairs_batch(db_path, pairs) == 3
         output = tmp_path / "body-cap.jsonl"
@@ -1529,15 +1710,9 @@ class TestGitHubIssue34_DatasetBuilderSemanticSchema:
 
         builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
         conn = sqlite3.connect(builder.db_path)
-        contract_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(contracts)").fetchall()
-        }
-        pair_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(function_pairs)").fetchall()
-        }
-        indexes = {
-            row[1] for row in conn.execute("PRAGMA index_list(function_pairs)").fetchall()
-        }
+        contract_cols = {row[1] for row in conn.execute("PRAGMA table_info(contracts)").fetchall()}
+        pair_cols = {row[1] for row in conn.execute("PRAGMA table_info(function_pairs)").fetchall()}
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(function_pairs)").fetchall()}
         conn.close()
 
         assert "source_hash" in contract_cols
@@ -1644,10 +1819,13 @@ class TestGitHubIssue36_MultiFilePragmaIntersection:
     def test_no_intersection_returns_no_versions(self):
         from src.local_compiler import compatible_versions_for_pragmas
 
-        assert compatible_versions_for_pragmas(
-            ["^0.7.0", "^0.8.0"],
-            candidate_versions=["0.8.20", "0.7.6"],
-        ) == []
+        assert (
+            compatible_versions_for_pragmas(
+                ["^0.7.0", "^0.8.0"],
+                candidate_versions=["0.8.20", "0.7.6"],
+            )
+            == []
+        )
 
 
 class TestGitHubIssue44_Web3HexNormalization:
@@ -1662,11 +1840,17 @@ class TestGitHubIssue44_Web3HexNormalization:
     def test_abi_error_selector_has_single_prefix(self):
         from src.abi_enrichment import ABIEnricher
 
-        enricher = ABIEnricher(json.dumps([{
-            "type": "error",
-            "name": "InsufficientBalance",
-            "inputs": [{"name": "required", "type": "uint"}],
-        }]))
+        enricher = ABIEnricher(
+            json.dumps(
+                [
+                    {
+                        "type": "error",
+                        "name": "InsufficientBalance",
+                        "inputs": [{"name": "required", "type": "uint"}],
+                    }
+                ]
+            )
+        )
         selector = list(enricher.errors)[0]
         assert selector.startswith("0x")
         assert not selector.startswith("0x0x")

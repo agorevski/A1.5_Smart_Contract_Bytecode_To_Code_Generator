@@ -24,7 +24,7 @@ EVM Bytecode → BytecodeAnalyzer → TAC → Fine-tuned LLM → Solidity
 
 ### Stage 2: TAC → Solidity (`src/model_setup.py`)
 
-- **Base model**: Llama 3.2 3B with LoRA fine-tuning
+- **Base model**: Qwen2.5-Coder-7B-Instruct with LoRA fine-tuning
 - **Input**: TAC with control flow annotations
 - **Output**: Human-readable Solidity function
 

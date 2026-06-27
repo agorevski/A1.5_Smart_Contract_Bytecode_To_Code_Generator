@@ -1,5 +1,5 @@
 """
-Llama 3.2 3B Model Setup with LoRA Configuration
+Model setup with LoRA configuration
 
 This module implements the model architecture and training setup as described in the paper,
 including Low-Rank Adaptation (LoRA) fine-tuning with rank 16 targeting specific layers.
@@ -113,19 +113,30 @@ def augment_variable_names(solidity_code: str, seed: Optional[int] = None) -> st
 
 @dataclass
 class ModelConfig:
-    """Configuration for the Llama 3.2 3B model setup."""
+    """Configuration for the base model and optional LoRA adapter setup."""
 
-    model_name: str = "meta-llama/Llama-3.2-3B"
+    model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
     max_sequence_length: int = 2048  # Practical training length; paper max is 20000
+    use_lora: bool = True
     lora_rank: int = 16  # As specified in paper
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    target_modules: List[str] = None
-    use_quantization: bool = True
+    target_modules: Optional[Union[List[str], str]] = None
+    use_quantization: bool = False
     load_in_4bit: bool = True
-    include_compiler_metadata: bool = True
+    precision: str = "auto"
+    dataloader_num_workers: Optional[int] = None
+    dataloader_pin_memory: Optional[bool] = None
+    dataloader_persistent_workers: Optional[bool] = None
+    dataloader_prefetch_factor: Optional[int] = None
+    include_bytecode_metadata: bool = True
+    include_compiler_metadata: bool = False  # Deprecated; ignored for prompt safety.
 
     def __post_init__(self):
+        self.include_compiler_metadata = False
+        self.precision = str(self.precision or "auto").lower()
+        if self.precision not in {"auto", "bf16", "fp16", "fp32"}:
+            raise ValueError("precision must be one of: auto, bf16, fp16, fp32")
         if self.target_modules is None:
             # Target query, key, value, and projection layers as mentioned in paper
             self.target_modules = [
@@ -143,13 +154,19 @@ class ModelConfig:
         return {
             "model_name": self.model_name,
             "max_sequence_length": self.max_sequence_length,
+            "use_lora": self.use_lora,
             "lora_rank": self.lora_rank,
             "lora_alpha": self.lora_alpha,
             "lora_dropout": self.lora_dropout,
             "target_modules": self.target_modules,
             "use_quantization": self.use_quantization,
             "load_in_4bit": self.load_in_4bit,
-            "include_compiler_metadata": self.include_compiler_metadata,
+            "precision": self.precision,
+            "dataloader_num_workers": self.dataloader_num_workers,
+            "dataloader_pin_memory": self.dataloader_pin_memory,
+            "dataloader_persistent_workers": self.dataloader_persistent_workers,
+            "dataloader_prefetch_factor": self.dataloader_prefetch_factor,
+            "include_bytecode_metadata": self.include_bytecode_metadata,
         }
 
     @classmethod
@@ -158,12 +175,19 @@ class ModelConfig:
         known_keys = {
             "model_name",
             "max_sequence_length",
+            "use_lora",
             "lora_rank",
             "lora_alpha",
             "lora_dropout",
             "target_modules",
             "use_quantization",
             "load_in_4bit",
+            "precision",
+            "dataloader_num_workers",
+            "dataloader_pin_memory",
+            "dataloader_persistent_workers",
+            "dataloader_prefetch_factor",
+            "include_bytecode_metadata",
             "include_compiler_metadata",
         }
         filtered = {k: v for k, v in d.items() if k in known_keys}
@@ -266,83 +290,294 @@ def _metadata_bool(value) -> Optional[bool]:
     return None
 
 
-def _format_solc_version(version: str) -> str:
-    """Normalize compiler version metadata for prompt display."""
-    version = version.strip()
-    lower = version.lower()
-    if lower.startswith("solc "):
-        return version
-    if version.startswith("v") and len(version) > 1 and version[1].isdigit():
-        version = version[1:]
-    return f"solc {version}"
+_SELECTOR_RE = re.compile(r"\b0x[0-9a-fA-F]{8}\b")
+_FUNCTION_HEADER_RE = re.compile(
+    r"^(\s*)function\s+([A-Za-z_$][A-Za-z0-9_$]*|function_0x[0-9A-Fa-f]{8})"
+    r"(?:\s*\([^)]*\))?\s*:\s*$"
+)
+_BLOCK_LABEL_RE = re.compile(r"^\s*block_[A-Za-z0-9_]+:\s*$")
+_ORACLE_TAC_COMMENT_RE = re.compile(
+    r"^\s*//\s*(?:"
+    r"Compiler|Returns?|Parameters?|Inputs?|param\[[^\]]+\]|"
+    r"Visibility|Payable|View/Pure|View|Pure|"
+    r"State mutability|Mutability|"
+    r"Function\s+signature|Signature|Contract(?:\s+name)?|Compiled contract|"
+    r"Optimizer|EVM(?:\s+version)?|ABI|Source|Inheritance|Modifiers?|Base contracts?"
+    r")(?:\s|:|$)",
+    re.IGNORECASE,
+)
+_STORAGE_LAYOUT_START_RE = re.compile(r"^\s*//\s*Storage\s+layout\s*:?", re.IGNORECASE)
+_STORAGE_LAYOUT_DETAIL_RE = re.compile(
+    r"^\s*//\s*(?:slot\b|\[[^\]]*slot|storage\s+slot\b|\d+\s*:)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_selector(value: Any) -> Optional[str]:
+    """Return a normalized 4-byte selector if one is present."""
+    if value is None:
+        return None
+    if isinstance(value, int) and 0 <= value <= 0xFFFFFFFF:
+        return f"0x{value:08x}"
+    match = _SELECTOR_RE.search(str(value))
+    return match.group(0).lower() if match else None
+
+
+def _metadata_containers(metadata: Optional[Dict]) -> List[Dict[str, Any]]:
+    """Return top-level and known nested bytecode-analysis metadata containers."""
+    if not isinstance(metadata, dict):
+        return []
+    containers: List[Dict[str, Any]] = [metadata]
+    for key in (
+        "bytecode_analysis",
+        "bytecode_metadata",
+        "tac_metadata",
+        "analysis",
+        "statistics",
+        "stats",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    return containers
+
+
+def _metadata_lookup(metadata: Optional[Dict], *keys: str) -> Any:
+    for container in _metadata_containers(metadata):
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _metadata_nonnegative_int(metadata: Optional[Dict], *keys: str) -> Optional[int]:
+    value = _metadata_lookup(metadata, *keys)
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return number if number >= 0 else None
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return None
+    number = int(match.group(0))
+    return number if number >= 0 else None
+
+
+def extract_bytecode_selector(
+    metadata: Optional[Dict] = None,
+    tac_input: Optional[str] = None,
+) -> Optional[str]:
+    """Extract a bytecode selector without using source-derived signatures."""
+    if tac_input:
+        for line in str(tac_input).splitlines():
+            if "selector" not in line.lower() and "function_0x" not in line.lower():
+                continue
+            selector = _normalize_selector(line)
+            if selector:
+                return selector
+
+    value = _metadata_lookup(
+        metadata,
+        "selector",
+        "function_selector",
+        "method_id",
+        "4byte_selector",
+        "selector_hex",
+    )
+    return _normalize_selector(value)
+
+
+def sanitize_tac_for_prompt(
+    tac_input: str,
+    metadata: Optional[Dict] = None,
+) -> str:
+    """Remove source/oracle annotations while keeping bytecode-derived TAC."""
+    selector = extract_bytecode_selector(metadata, tac_input)
+    safe_function_name = f"function_{selector}" if selector else "function_unknown"
+    sanitized: List[str] = []
+    in_storage_layout = False
+
+    for line in str(tac_input or "").splitlines():
+        stripped = line.strip()
+
+        if in_storage_layout:
+            if not stripped or _STORAGE_LAYOUT_DETAIL_RE.match(line):
+                continue
+            in_storage_layout = False
+
+        if _STORAGE_LAYOUT_START_RE.match(line):
+            in_storage_layout = True
+            continue
+
+        if _ORACLE_TAC_COMMENT_RE.match(line):
+            continue
+
+        header_match = _FUNCTION_HEADER_RE.match(line)
+        if header_match:
+            line = f"{header_match.group(1)}function {safe_function_name}:"
+
+        sanitized.append(line.rstrip())
+
+    return "\n".join(sanitized).strip()
+
+
+def _tac_stats(tac_text: str) -> Dict[str, int]:
+    """Compute deterministic, bytecode-only prompt statistics from TAC text."""
+    stats = {
+        "tac_blocks": 0,
+        "tac_ops": 0,
+        "branches": 0,
+        "storage_reads": 0,
+        "storage_writes": 0,
+        "external_calls": 0,
+        "logs": 0,
+        "reverts": 0,
+    }
+
+    for line in str(tac_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        lower = stripped.lower()
+        if _BLOCK_LABEL_RE.match(stripped):
+            stats["tac_blocks"] += 1
+            continue
+        if stripped.startswith("function ") and stripped.endswith(":"):
+            continue
+
+        stats["tac_ops"] += 1
+        if re.search(r"\bif\b.*\bgoto\b|\bgoto\b|\bjumpi?\b", lower):
+            stats["branches"] += 1
+        storage_write = bool(
+            re.match(r"storage\s*\[[^\]]+\]\s*=", lower) or re.search(r"\bsstore\b", lower)
+        )
+        if storage_write:
+            stats["storage_writes"] += 1
+        if "storage[" in lower or re.search(r"\bsload\b", lower):
+            if not storage_write:
+                stats["storage_reads"] += 1
+        if re.search(r"\b(delegatecall|staticcall|callcode)\b", lower) or re.search(
+            r"\bcall\s*\(", lower
+        ):
+            stats["external_calls"] += 1
+        if re.search(r"\blog[0-4]\b|\bemit\b", lower):
+            stats["logs"] += 1
+        if re.search(r"\brevert\b|\binvalid\b", lower):
+            stats["reverts"] += 1
+
+    return stats
+
+
+def _format_count_part(label: str, value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    return f"{label}={value}"
 
 
 def format_prompt_metadata(
     metadata: Optional[Dict],
-    include_compiler_metadata: bool = True,
+    include_bytecode_metadata: bool = True,
+    include_compiler_metadata: bool = False,
+    tac_input: Optional[str] = None,
 ) -> str:
-    """Format function/compiler metadata as a compact prompt header line."""
-    if not metadata:
+    """Format compact bytecode-derived metadata for prompt context.
+
+    ``include_compiler_metadata`` is accepted for backward compatibility but is
+    intentionally ignored; compiler/source metadata must never enter prompts.
+    """
+    if not include_bytecode_metadata:
         return ""
 
+    selector = extract_bytecode_selector(metadata, tac_input)
+    has_tac = bool(str(tac_input or "").strip())
+    stats = _tac_stats(tac_input or "") if has_tac else {}
     metadata_parts = []
-    if metadata.get("function_name"):
-        metadata_parts.append(f"Function: {metadata['function_name']}")
-    if metadata.get("visibility"):
-        metadata_parts.append(f"Visibility: {metadata['visibility']}")
-    if metadata.get("is_payable"):
-        metadata_parts.append("Payable: true")
-    if metadata.get("is_view"):
-        metadata_parts.append("View/Pure: true")
+    if selector:
+        metadata_parts.append(f"selector={selector}")
 
-    if include_compiler_metadata:
-        compiler_version = (
-            _metadata_text(metadata.get("compiler_version"))
-            or _metadata_text(metadata.get("solc_version"))
-            or _metadata_text(metadata.get("solidity_compiler_version"))
+    tac_blocks = (stats.get("tac_blocks", 0) if has_tac else 0) or _metadata_nonnegative_int(
+        metadata,
+        "tac_basic_block_count",
+        "tac_block_count",
+        "basic_block_count",
+        "num_basic_blocks",
+    )
+    tac_ops = (stats.get("tac_ops", 0) if has_tac else 0) or _metadata_nonnegative_int(
+        metadata,
+        "tac_instruction_count",
+        "tac_op_count",
+        "tac_ops",
+        "instruction_count",
+        "num_instructions",
+    )
+    tac_stat_parts = (
+        (
+            ("branches", stats.get("branches", 0)),
+            ("storage_reads", stats.get("storage_reads", 0)),
+            ("storage_writes", stats.get("storage_writes", 0)),
+            ("external_calls", stats.get("external_calls", 0)),
+            ("logs", stats.get("logs", 0)),
+            ("reverts", stats.get("reverts", 0)),
         )
-        if compiler_version:
-            metadata_parts.append(
-                f"Solidity compiler: {_format_solc_version(compiler_version)}"
-            )
+        if has_tac
+        else ()
+    )
 
-        optimizer_enabled = None
-        optimizer_seen = False
-        for key in ("optimizer_enabled", "optimization_enabled", "optimizer"):
-            if key in metadata:
-                optimizer_seen = True
-                optimizer_enabled = _metadata_bool(metadata.get(key))
-                break
-        if optimizer_seen:
-            if optimizer_enabled is True:
-                optimizer = "Optimizer: enabled"
-                optimizer_runs = None
-                for runs_key in ("optimizer_runs", "optimization_runs"):
-                    optimizer_runs = _metadata_text(metadata.get(runs_key))
-                    if optimizer_runs:
-                        break
-                if optimizer_runs:
-                    optimizer += f" ({optimizer_runs} runs)"
-                metadata_parts.append(optimizer)
-            elif optimizer_enabled is False:
-                metadata_parts.append("Optimizer: disabled")
+    for label, value in (
+        ("tac_blocks", tac_blocks),
+        ("tac_ops", tac_ops),
+        *tac_stat_parts,
+        (
+            "bytecode_len",
+            _metadata_nonnegative_int(
+                metadata,
+                "bytecode_length",
+                "runtime_bytecode_length",
+                "bytecode_size",
+                "runtime_bytecode_size",
+            ),
+        ),
+        (
+            "bytecode_instructions",
+            _metadata_nonnegative_int(
+                metadata,
+                "bytecode_instruction_count",
+                "evm_instruction_count",
+                "num_instructions",
+            ),
+        ),
+        (
+            "functions",
+            _metadata_nonnegative_int(
+                metadata,
+                "bytecode_function_count",
+                "function_count",
+                "num_functions",
+            ),
+        ),
+    ):
+        part = _format_count_part(label, value)
+        if part:
+            metadata_parts.append(part)
 
-        evm_version = _metadata_text(metadata.get("evm_version"))
-        if evm_version:
-            metadata_parts.append(f"EVM version: {evm_version}")
-
-    return ", ".join(metadata_parts)
+    return f"Bytecode metadata: {', '.join(metadata_parts)}" if metadata_parts else ""
 
 
 def build_training_prompt_for_length(
     item: Dict[str, Any],
-    include_compiler_metadata: bool = True,
+    include_bytecode_metadata: bool = True,
+    include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
 ) -> str:
     """Build the exact training prompt text used for sequence-length detection."""
     dataset = SmartContractDataset.__new__(SmartContractDataset)
     dataset.template_format = template_format
-    dataset.include_compiler_metadata = include_compiler_metadata
+    dataset.include_bytecode_metadata = include_bytecode_metadata
+    dataset.include_compiler_metadata = False
     return dataset._format_prompt(
         item.get("input", ""),
         item.get("output", ""),
@@ -488,7 +723,8 @@ def detect_max_sequence_length(
     min_length: int = 128,
     max_length: int = 4096,
     default_length: int = 512,
-    include_compiler_metadata: bool = True,
+    include_bytecode_metadata: bool = True,
+    include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
 ) -> int:
     """Detect max sequence length from actual tokenizer counts, rounded to pow2."""
@@ -501,7 +737,7 @@ def detect_max_sequence_length(
             item = json.loads(line)
             prompt = build_training_prompt_for_length(
                 item,
-                include_compiler_metadata=include_compiler_metadata,
+                include_bytecode_metadata=include_bytecode_metadata,
                 template_format=template_format,
             )
             lengths.append(len(_tokenize_to_ids(tokenizer, prompt)))
@@ -527,11 +763,27 @@ def _cuda_supports_bf16() -> bool:
 
 def resolve_training_precision(
     deepspeed_config: Optional[str] = None,
+    precision: str = "auto",
 ) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
     """Resolve Trainer/DeepSpeed precision from CUDA capability."""
     has_cuda = torch.cuda.is_available()
-    use_bf16 = bool(has_cuda and _cuda_supports_bf16())
-    use_fp16 = bool(has_cuda and not use_bf16)
+    precision = str(precision or "auto").lower()
+    if precision not in {"auto", "bf16", "fp16", "fp32"}:
+        raise ValueError("precision must be one of: auto, bf16, fp16, fp32")
+    if precision == "bf16":
+        use_bf16 = bool(has_cuda)
+        use_fp16 = False
+    elif precision == "fp16":
+        use_bf16 = False
+        use_fp16 = bool(has_cuda)
+    elif precision == "fp32":
+        use_bf16 = False
+        use_fp16 = False
+    else:
+        use_bf16 = bool(has_cuda and _cuda_supports_bf16())
+        use_fp16 = bool(has_cuda and not use_bf16)
+    if precision in {"bf16", "fp16"} and not has_cuda:
+        logger.warning("Requested %s precision without CUDA; falling back to fp32.", precision)
     adjusted_ds_config = None
 
     if deepspeed_config:
@@ -546,13 +798,22 @@ def resolve_training_precision(
             adjusted_ds_config.setdefault("bf16", {})["enabled"] = use_bf16
             adjusted_ds_config.setdefault("fp16", {})["enabled"] = use_fp16
             if use_bf16:
-                logger.info("DeepSpeed precision resolved to BF16 (GPU supports sm_80+)")
+                logger.info("DeepSpeed precision resolved to BF16")
             elif use_fp16:
-                logger.info("DeepSpeed precision resolved to FP16 (BF16 unsupported)")
+                logger.info("DeepSpeed precision resolved to FP16")
             else:
-                logger.info("DeepSpeed mixed precision disabled (CUDA unavailable)")
+                logger.info("DeepSpeed mixed precision disabled (FP32)")
 
     return use_bf16, use_fp16, adjusted_ds_config
+
+
+def _distributed_world_size() -> int:
+    raw_world_size = os.environ.get("WORLD_SIZE")
+    try:
+        return max(1, int(raw_world_size)) if raw_world_size else 1
+    except ValueError:
+        logger.warning("Ignoring invalid WORLD_SIZE value: %s", raw_world_size)
+        return 1
 
 
 class SmartContractDataset(Dataset):
@@ -570,10 +831,9 @@ class SmartContractDataset(Dataset):
         max_length: int = 2048,
         template_format: str = "alpaca",
         augment_names: bool = False,
-        include_compiler_metadata: bool = True,
-        tokenization_cache: Optional[
-            Union[TokenizationCacheConfig, str, Path, bool]
-        ] = None,
+        include_bytecode_metadata: bool = True,
+        include_compiler_metadata: bool = False,
+        tokenization_cache: Optional[Union[TokenizationCacheConfig, str, Path, bool]] = None,
     ):
         """Initialize the dataset with training data.
 
@@ -583,8 +843,10 @@ class SmartContractDataset(Dataset):
             max_length: Maximum sequence length for tokenization.
             template_format: Prompt template format ('alpaca' or 'simple').
             augment_names: Whether to deterministically augment target variable names.
-            include_compiler_metadata: Whether compiler settings in metadata are
+            include_bytecode_metadata: Whether bytecode/TAC-derived metadata is
                 included in the prompt header.
+            include_compiler_metadata: Deprecated no-op; compiler metadata is
+                never included in prompts.
             tokenization_cache: Optional cache config/path. Disabled by default
                 to preserve existing lazy tokenization behavior.
         """
@@ -592,16 +854,15 @@ class SmartContractDataset(Dataset):
         self.max_length = max_length
         self.template_format = template_format
         self.augment_names = augment_names
-        self.include_compiler_metadata = include_compiler_metadata
+        self.include_bytecode_metadata = include_bytecode_metadata
+        self.include_compiler_metadata = False
         self.AUGMENT_RATE = 0.3
         self.data = self._load_data(data_path)
         self._tokenized_cache: Optional[List[Dict[str, List[Any]]]] = None
 
         cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
         if cache_config.enabled:
-            self._tokenized_cache = self._load_or_build_tokenization_cache(
-                data_path, cache_config
-            )
+            self._tokenized_cache = self._load_or_build_tokenization_cache(data_path, cache_config)
 
     def _load_data(self, data_path: str) -> List[Dict]:
         """Load dataset from JSONL file."""
@@ -620,7 +881,7 @@ class SmartContractDataset(Dataset):
             "dataset_fingerprint": _sha256_file(data_path),
             "tokenizer": tokenizer_cache_identity(self.tokenizer),
             "template_format": self.template_format,
-            "include_compiler_metadata": bool(self.include_compiler_metadata),
+            "include_bytecode_metadata": bool(self.include_bytecode_metadata),
             "augment_names": bool(self.augment_names),
             "max_length": int(self.max_length),
             "num_examples": len(self.data),
@@ -645,14 +906,10 @@ class SmartContractDataset(Dataset):
 
         cache_dir.mkdir(parents=True, exist_ok=True)
         expected_metadata = self._cache_metadata(data_path)
-        cache_path, metadata_path = self._cache_paths(
-            data_path, cache_dir, expected_metadata
-        )
+        cache_path, metadata_path = self._cache_paths(data_path, cache_dir, expected_metadata)
 
         if not cache_config.overwrite:
-            cached = self._read_tokenization_cache(
-                cache_path, metadata_path, expected_metadata
-            )
+            cached = self._read_tokenization_cache(cache_path, metadata_path, expected_metadata)
             if cached is not None:
                 logger.info("Loaded tokenized dataset cache from %s", cache_path)
                 return cached
@@ -730,26 +987,24 @@ class SmartContractDataset(Dataset):
                 except OSError:
                     pass
 
-    def _format_prompt(
-        self, tac_input: str, solidity_output: str, metadata: Dict
-    ) -> str:
+    def _format_prompt(self, tac_input: str, solidity_output: str, metadata: Dict) -> str:
         """Format the training example using the template described in the paper."""
-        prefix, target, suffix = self._format_prompt_parts(
-            tac_input, solidity_output, metadata
-        )
+        prefix, target, suffix = self._format_prompt_parts(tac_input, solidity_output, metadata)
         return f"{prefix}{target}{suffix}"
 
     def _format_prompt_components(
         self, tac_input: str, solidity_output: str, metadata: Dict
     ) -> Tuple[str, str, str, str, str]:
         """Format an example as header, TAC, footer, target, and suffix."""
+        tac_text = sanitize_tac_for_prompt(tac_input, metadata)
         if self.template_format == "alpaca":
             instruction = "Convert the following Three-Address Code (TAC) representation to readable Solidity code."
 
             metadata_str = ""
             metadata_line = format_prompt_metadata(
                 metadata,
-                include_compiler_metadata=self.include_compiler_metadata,
+                include_bytecode_metadata=getattr(self, "include_bytecode_metadata", True),
+                tac_input=tac_text,
             )
             if metadata_line:
                 metadata_str = f"{metadata_line}\n\n"
@@ -759,7 +1014,6 @@ class SmartContractDataset(Dataset):
 
 ### Input:
 {metadata_str}"""
-            tac_text = tac_input.strip()
             prefix_after_tac = """
 
 ### Response:
@@ -770,7 +1024,8 @@ class SmartContractDataset(Dataset):
         elif self.template_format == "simple":
             metadata_line = format_prompt_metadata(
                 metadata,
-                include_compiler_metadata=self.include_compiler_metadata,
+                include_bytecode_metadata=getattr(self, "include_bytecode_metadata", True),
+                tac_input=tac_text,
             )
             metadata_str = ""
             if metadata_line:
@@ -781,7 +1036,6 @@ class SmartContractDataset(Dataset):
 """
             prefix_before_tac = f"""{metadata_str}[TAC]
 """
-            tac_text = tac_input.strip()
             prefix_after_tac = """
 [/TAC]
 
@@ -895,9 +1149,9 @@ class MemoryLoggingCallback(TrainerCallback):
 
             if torch.cuda.is_available():
                 device = torch.cuda.current_device()
-                allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
-                reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                max_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                allocated_mb = torch.cuda.memory_allocated(device) / (1024**2)
+                reserved_mb = torch.cuda.memory_reserved(device) / (1024**2)
+                max_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
                 message += (
                     f", cuda_allocated={allocated_mb:.1f} MiB"
                     f", cuda_reserved={reserved_mb:.1f} MiB"
@@ -959,9 +1213,7 @@ class TrainingInstrumentationCallback(TrainerCallback):
             "step": step,
             "elapsed_seconds": elapsed,
             "steps_per_second": step / elapsed,
-            "estimated_samples_per_second": (
-                step * self._examples_per_step(args) / elapsed
-            ),
+            "estimated_samples_per_second": (step * self._examples_per_step(args) / elapsed),
             "input_tokens_per_second": (
                 float(tokens_seen) / elapsed if tokens_seen is not None else None
             ),
@@ -994,8 +1246,10 @@ class TrainingInstrumentationCallback(TrainerCallback):
 
     def _start_profiler(self) -> None:
         try:
-            trace_dir = Path(self.config.profiler_trace_dir) if self.config.profiler_trace_dir else (
-                self.output_dir / "profiler_trace"
+            trace_dir = (
+                Path(self.config.profiler_trace_dir)
+                if self.config.profiler_trace_dir
+                else (self.output_dir / "profiler_trace")
             )
             trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1058,12 +1312,8 @@ class TrainingInstrumentationCallback(TrainerCallback):
             "input_tokens_per_second": (
                 float(tokens_seen) / elapsed if tokens_seen is not None else None
             ),
-            "per_device_train_batch_size": getattr(
-                args, "per_device_train_batch_size", None
-            ),
-            "gradient_accumulation_steps": getattr(
-                args, "gradient_accumulation_steps", None
-            ),
+            "per_device_train_batch_size": getattr(args, "per_device_train_batch_size", None),
+            "gradient_accumulation_steps": getattr(args, "gradient_accumulation_steps", None),
             "world_size": self._world_size(args),
             "train_dataset_size": self.train_dataset_size,
             "max_steps": getattr(state, "max_steps", None),
@@ -1087,7 +1337,7 @@ class TrainingInstrumentationCallback(TrainerCallback):
 
 class SmartContractModelTrainer:
     """
-    Main trainer class for fine-tuning Llama 3.2 3B on smart contract decompilation.
+    Main trainer class for fine-tuning a causal LM on smart contract decompilation.
     """
 
     def __init__(self, config: ModelConfig, output_dir: str = "models"):
@@ -1119,12 +1369,16 @@ class SmartContractModelTrainer:
 
     def setup_model(
         self, force_reload: bool = False, use_deepspeed: bool = False
-    ) -> Tuple[AutoTokenizer, PeftModel]:
-        """Set up the Llama 3.2 3B model with LoRA configuration."""
+    ) -> Tuple[AutoTokenizer, nn.Module]:
+        """Set up the base model, applying LoRA when enabled."""
         if self.tokenizer is not None and self.peft_model is not None and not force_reload:
             return self.tokenizer, self.peft_model
 
-        logger.info("Setting up model with LoRA...")
+        logger.info(
+            "Setting up %s%s...",
+            self.config.model_name,
+            " with LoRA" if self.config.use_lora else " for full fine-tuning",
+        )
 
         # Enable TF32 for matmuls on Ampere+ GPUs (~2x faster than FP32 precision)
         if torch.cuda.is_available():
@@ -1147,13 +1401,21 @@ class SmartContractModelTrainer:
 
         # Determine dtype and device based on GPU availability
         has_cuda = torch.cuda.is_available()
-        if has_cuda:
+        precision = self.config.precision
+        if precision == "bf16" and has_cuda:
+            compute_dtype = torch.bfloat16
+        elif precision == "fp16" and has_cuda:
+            compute_dtype = torch.float16
+        elif precision == "fp32" or not has_cuda:
+            compute_dtype = torch.float32
+        elif has_cuda:
             gpu_cap = torch.cuda.get_device_capability()
             use_bf16 = gpu_cap[0] >= 8  # Ampere+ supports bf16 natively
             compute_dtype = torch.bfloat16 if use_bf16 else torch.float16
         else:
             compute_dtype = torch.float32
         model_dtype = compute_dtype
+        logger.info("Model load precision resolved to %s (%s)", precision, model_dtype)
 
         # Configure quantization
         quantization_config = None
@@ -1181,6 +1443,7 @@ class SmartContractModelTrainer:
         if has_cuda:
             try:
                 import flash_attn  # noqa: F401
+
                 attn_impl = "flash_attention_2"
             except ImportError:
                 attn_impl = "sdpa"  # PyTorch 2.x built-in efficient attention
@@ -1209,38 +1472,58 @@ class SmartContractModelTrainer:
 
         if self.config.use_quantization:
             self.model = prepare_model_for_kbit_training(
-                self.model, use_gradient_checkpointing=True,
+                self.model,
+                use_gradient_checkpointing=True,
                 gradient_checkpointing_kwargs={"use_reentrant": False},
             )
 
-        # Auto-detect target modules for LoRA if defaults don't exist in model
-        target_modules = self.config.target_modules
-        model_module_names = [name for name, _ in self.model.named_modules()]
-        module_name_str = " ".join(model_module_names)
-        # Check if any target module is present
-        valid_targets = [t for t in target_modules if t in module_name_str]
-        if not valid_targets:
-            # Fall back to auto-detecting linear layers
-            logger.info("Default target modules not found; using auto-detection for LoRA targets")
-            target_modules = "all-linear"
+        if self.config.use_lora:
+            # Auto-detect target modules for LoRA if defaults don't exist in model
+            target_modules = self.config.target_modules
+            if isinstance(target_modules, str):
+                valid_targets = [target_modules]
+            else:
+                model_module_names = [name for name, _ in self.model.named_modules()]
+                module_name_str = " ".join(model_module_names)
+                # Check if any target module is present
+                valid_targets = [t for t in target_modules if t in module_name_str]
+            if not valid_targets:
+                # Fall back to auto-detecting linear layers
+                logger.info(
+                    "Default target modules not found; using auto-detection for LoRA targets"
+                )
+                target_modules = "all-linear"
 
-        # Configure LoRA
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=self.config.lora_rank,
-            lora_alpha=self.config.lora_alpha,
-            lora_dropout=self.config.lora_dropout,
-            target_modules=target_modules if target_modules != self.config.target_modules else self.config.target_modules,
-            bias="none",
-        )
+            # Configure LoRA
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=self.config.lora_rank,
+                lora_alpha=self.config.lora_alpha,
+                lora_dropout=self.config.lora_dropout,
+                target_modules=(
+                    target_modules
+                    if target_modules != self.config.target_modules
+                    else self.config.target_modules
+                ),
+                bias="none",
+            )
 
-        self.peft_model = get_peft_model(self.model, lora_config)
+            self.peft_model = get_peft_model(self.model, lora_config)
+        else:
+            if self.config.use_quantization:
+                raise ValueError(
+                    "Full fine-tuning is not supported with 4-bit quantization. "
+                    "Disable quantization or keep LoRA enabled."
+                )
+            self.peft_model = self.model
 
         # Resize embeddings if needed
         if len(self.tokenizer) > self.peft_model.config.vocab_size:
             self.peft_model.resize_token_embeddings(len(self.tokenizer))
 
-        self.peft_model.print_trainable_parameters()
+        print_trainable = getattr(self.peft_model, "print_trainable_parameters", None)
+        if callable(print_trainable):
+            print_trainable()
 
         logger.info("Model setup completed successfully")
         return self.tokenizer, self.peft_model
@@ -1261,17 +1544,27 @@ class SmartContractModelTrainer:
         do_eval: bool = True,
         train_dataset_size: int = 0,
         deepspeed_config: Optional[str] = None,
+        precision: str = "auto",
+        train_eval_strategy: str = "auto",
+        train_eval_steps: Optional[int] = None,
+        dataloader_num_workers: Optional[int] = None,
+        dataloader_pin_memory: Optional[bool] = None,
+        dataloader_persistent_workers: Optional[bool] = None,
+        dataloader_prefetch_factor: Optional[int] = None,
     ) -> TrainingArguments:
         """Create training arguments based on the paper's optimization strategy.
-        
+
         Automatically adapts configuration for small datasets to ensure
         training completes successfully.
         """
+        world_size = _distributed_world_size()
+
         # Auto-adjust for small datasets
-        effective_batch = batch_size * gradient_accumulation_steps
+        effective_batch = batch_size * gradient_accumulation_steps * world_size
         if train_dataset_size > 0 and train_dataset_size < effective_batch:
             # Reduce gradient_accumulation_steps so at least 1 optimizer step runs
-            gradient_accumulation_steps = max(1, train_dataset_size // batch_size)
+            per_step_batch = max(1, batch_size * world_size)
+            gradient_accumulation_steps = max(1, train_dataset_size // per_step_batch)
             if gradient_accumulation_steps == 0:
                 gradient_accumulation_steps = 1
             logger.info(
@@ -1280,7 +1573,8 @@ class SmartContractModelTrainer:
             )
 
         # Scale warmup proportionally for small datasets
-        steps_per_epoch = max(1, train_dataset_size // (batch_size * gradient_accumulation_steps))
+        effective_batch = batch_size * gradient_accumulation_steps * world_size
+        steps_per_epoch = max(1, math.ceil(train_dataset_size / max(1, effective_batch)))
         total_steps = max_steps if max_steps and max_steps > 0 else steps_per_epoch * num_epochs
         if warmup_steps > total_steps // 2:
             warmup_steps = max(0, total_steps // 5)
@@ -1288,20 +1582,47 @@ class SmartContractModelTrainer:
 
         # For small datasets, use epoch-based saving/eval instead of step-based
         is_small = train_dataset_size > 0 and train_dataset_size < 200
+        train_eval_strategy = str(train_eval_strategy or "auto").lower()
+        if train_eval_strategy not in {"auto", "steps", "epoch", "no"}:
+            raise ValueError("train_eval_strategy must be one of: auto, steps, epoch, no")
+        effective_eval_strategy = "epoch" if is_small else "steps"
+        if train_eval_strategy != "auto":
+            effective_eval_strategy = train_eval_strategy
+        if effective_eval_strategy == "no":
+            do_eval = False
+
         save_strategy = "epoch" if is_small else "steps"
+        if do_eval and effective_eval_strategy in {"steps", "epoch"}:
+            save_strategy = effective_eval_strategy
         logging_steps_final = max(1, min(logging_steps, total_steps)) if is_small else logging_steps
 
         # Determine mixed-precision strategy
         has_cuda = torch.cuda.is_available()
         use_bf16, use_fp16, adjusted_deepspeed_config = resolve_training_precision(
-            deepspeed_config
+            deepspeed_config,
+            precision=precision,
         )
+        if dataloader_num_workers is None:
+            dataloader_num_workers = 0 if is_small or not has_cuda else 4
+        dataloader_num_workers = max(0, int(dataloader_num_workers))
+        if dataloader_pin_memory is None:
+            dataloader_pin_memory = bool(has_cuda)
+        if dataloader_persistent_workers is None:
+            dataloader_persistent_workers = bool(
+                has_cuda and dataloader_num_workers > 0 and not is_small
+            )
+        else:
+            dataloader_persistent_workers = bool(
+                dataloader_persistent_workers and dataloader_num_workers > 0
+            )
+        if dataloader_num_workers == 0:
+            dataloader_persistent_workers = False
+        if dataloader_prefetch_factor is None:
+            dataloader_prefetch_factor = 2 if dataloader_num_workers > 0 else None
 
         training_arg_params = inspect.signature(TrainingArguments.__init__).parameters
         eval_strategy_arg = (
-            "eval_strategy"
-            if "eval_strategy" in training_arg_params
-            else "evaluation_strategy"
+            "eval_strategy" if "eval_strategy" in training_arg_params else "evaluation_strategy"
         )
 
         args = {
@@ -1318,9 +1639,9 @@ class SmartContractModelTrainer:
             "lr_scheduler_type": "cosine_with_restarts",
             "logging_steps": logging_steps_final,
             "save_strategy": save_strategy,
-            "dataloader_pin_memory": True,
-            "dataloader_num_workers": 4,
-            "dataloader_persistent_workers": True,
+            "dataloader_pin_memory": bool(dataloader_pin_memory),
+            "dataloader_num_workers": dataloader_num_workers,
+            "dataloader_persistent_workers": dataloader_persistent_workers,
             "remove_unused_columns": False,
             "push_to_hub": False,
             "report_to": "none",
@@ -1338,6 +1659,12 @@ class SmartContractModelTrainer:
             args["max_steps"] = max_steps
         if "group_by_length" in training_arg_params:
             args["group_by_length"] = True
+        if (
+            dataloader_prefetch_factor is not None
+            and dataloader_num_workers > 0
+            and "dataloader_prefetch_factor" in training_arg_params
+        ):
+            args["dataloader_prefetch_factor"] = int(dataloader_prefetch_factor)
 
         # For DDP with quantized models, disable unused parameter detection
         if self.config.use_quantization and has_cuda:
@@ -1352,16 +1679,24 @@ class SmartContractModelTrainer:
             args["save_steps"] = save_steps
 
         if do_eval:
-            if is_small:
-                args[eval_strategy_arg] = "epoch"
-            else:
-                args["eval_steps"] = eval_steps
-                args[eval_strategy_arg] = "steps"
+            if effective_eval_strategy == "steps":
+                args["eval_steps"] = train_eval_steps or eval_steps
+            args[eval_strategy_arg] = effective_eval_strategy
             args["load_best_model_at_end"] = True
             args["metric_for_best_model"] = "eval_loss"
             args["greater_is_better"] = False
         else:
             args[eval_strategy_arg] = "no"
+
+        logger.info(
+            "Effective DataLoader settings: workers=%s pin_memory=%s persistent_workers=%s "
+            "prefetch_factor=%s",
+            dataloader_num_workers,
+            bool(dataloader_pin_memory),
+            dataloader_persistent_workers,
+            dataloader_prefetch_factor,
+        )
+        logger.info("Effective train-time eval strategy: %s", args[eval_strategy_arg])
 
         return TrainingArguments(**args)
 
@@ -1377,46 +1712,60 @@ class SmartContractModelTrainer:
         deepspeed_config: Optional[str] = None,
         enable_memory_monitoring: bool = False,
         max_steps: int = -1,
-        tokenization_cache: Optional[
-            Union[TokenizationCacheConfig, str, Path, bool]
-        ] = None,
+        tokenization_cache: Optional[Union[TokenizationCacheConfig, str, Path, bool]] = None,
         instrumentation_config: Optional[
             Union[TrainingInstrumentationConfig, Dict[str, Any], bool]
         ] = None,
+        train_eval_strategy: str = "auto",
+        train_eval_steps: Optional[int] = None,
+        train_eval_max_samples: Optional[int] = None,
+        dataloader_num_workers: Optional[int] = None,
+        dataloader_pin_memory: Optional[bool] = None,
+        dataloader_persistent_workers: Optional[bool] = None,
+        dataloader_prefetch_factor: Optional[int] = None,
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
-        tokenizer, peft_model = self.setup_model(
-            use_deepspeed=deepspeed_config is not None
-        )
-        tokenization_cache_config = TokenizationCacheConfig.from_value(
-            tokenization_cache
-        )
-        instrumentation = TrainingInstrumentationConfig.from_value(
-            instrumentation_config
-        )
+        tokenizer, peft_model = self.setup_model(use_deepspeed=deepspeed_config is not None)
+        tokenization_cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
+        instrumentation = TrainingInstrumentationConfig.from_value(instrumentation_config)
 
         logger.info("Loading training dataset...")
         train_dataset = SmartContractDataset(
             train_dataset_path,
             tokenizer,
             max_length=self.config.max_sequence_length,
-            include_compiler_metadata=self.config.include_compiler_metadata,
+            include_bytecode_metadata=self.config.include_bytecode_metadata,
             tokenization_cache=tokenization_cache_config,
         )
 
         eval_dataset = None
-        if eval_dataset_path and Path(eval_dataset_path).exists():
+        eval_strategy_requested = str(train_eval_strategy or "auto").lower()
+        if (
+            eval_strategy_requested != "no"
+            and eval_dataset_path
+            and Path(eval_dataset_path).exists()
+        ):
             logger.info("Loading evaluation dataset...")
             eval_dataset = SmartContractDataset(
                 eval_dataset_path,
                 tokenizer,
                 max_length=self.config.max_sequence_length,
-                include_compiler_metadata=self.config.include_compiler_metadata,
+                include_bytecode_metadata=self.config.include_bytecode_metadata,
                 tokenization_cache=tokenization_cache_config,
             )
             if len(eval_dataset) == 0:
                 logger.warning("Evaluation dataset is empty; disabling evaluation")
                 eval_dataset = None
+            elif train_eval_max_samples is not None and len(eval_dataset) > train_eval_max_samples:
+                eval_dataset.data = eval_dataset.data[:train_eval_max_samples]
+                if eval_dataset._tokenized_cache is not None:
+                    eval_dataset._tokenized_cache = eval_dataset._tokenized_cache[
+                        :train_eval_max_samples
+                    ]
+                logger.info(
+                    "Capped train-time evaluation dataset to %d examples",
+                    train_eval_max_samples,
+                )
 
         do_eval = eval_dataset is not None
 
@@ -1461,6 +1810,29 @@ class SmartContractModelTrainer:
             train_dataset_size=len(train_dataset),
             deepspeed_config=deepspeed_config,
             max_steps=max_steps,
+            precision=self.config.precision,
+            train_eval_strategy=train_eval_strategy,
+            train_eval_steps=train_eval_steps,
+            dataloader_num_workers=(
+                dataloader_num_workers
+                if dataloader_num_workers is not None
+                else self.config.dataloader_num_workers
+            ),
+            dataloader_pin_memory=(
+                dataloader_pin_memory
+                if dataloader_pin_memory is not None
+                else self.config.dataloader_pin_memory
+            ),
+            dataloader_persistent_workers=(
+                dataloader_persistent_workers
+                if dataloader_persistent_workers is not None
+                else self.config.dataloader_persistent_workers
+            ),
+            dataloader_prefetch_factor=(
+                dataloader_prefetch_factor
+                if dataloader_prefetch_factor is not None
+                else self.config.dataloader_prefetch_factor
+            ),
         )
 
         callbacks = []
@@ -1535,7 +1907,7 @@ class SmartContractModelTrainer:
 
         logger.info(f"Model saved to {save_path}")
 
-    def load_model(self, path: str, for_inference: bool = True) -> Tuple[AutoTokenizer, PeftModel]:
+    def load_model(self, path: str, for_inference: bool = True) -> Tuple[AutoTokenizer, nn.Module]:
         """Load a previously trained model.
 
         When *for_inference* is ``True`` (default) several GPU-specific
@@ -1568,9 +1940,7 @@ class SmartContractModelTrainer:
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(str(load_path), token=hf_token)
         except Exception:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.config.model_name, token=hf_token
-            )
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name, token=hf_token)
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -1609,6 +1979,7 @@ class SmartContractModelTrainer:
         if has_cuda and for_inference:
             try:
                 import flash_attn  # noqa: F401
+
                 attn_impl = "flash_attention_2"
                 logger.info("Flash Attention 2 available — enabling")
             except ImportError:
@@ -1668,13 +2039,18 @@ class SmartContractModelTrainer:
         dtype_name = str(compute_dtype).split(".")[-1]
         logger.info(
             "Model loaded from %s (device: %s, dtype: %s, attn: %s)",
-            load_path, device, dtype_name, attn_impl or "eager",
+            load_path,
+            device,
+            dtype_name,
+            attn_impl or "eager",
         )
         return self.tokenizer, self.peft_model
 
 
 class SmartContractDecompiler:
     """High-level interface for using the trained model for decompilation."""
+
+    TAC_TRUNCATION_MARKER = "  // ... truncated (TAC too large for context window)"
 
     def __init__(self, model_path: str):
         self.trainer = SmartContractModelTrainer(ModelConfig())
@@ -1690,7 +2066,11 @@ class SmartContractDecompiler:
         """Return the number of tokens in *text*."""
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
-    def _truncate_tac(self, tac_text: str, max_tokens: int) -> str:
+    def _truncate_tac_with_diagnostics(
+        self,
+        tac_text: str,
+        max_tokens: int,
+    ) -> Tuple[str, Dict[str, Any]]:
         """Truncate *tac_text* to fit within *max_tokens*.
 
         Strategy (applied in order until the text fits):
@@ -1698,20 +2078,36 @@ class SmartContractDecompiler:
           2. Remove dead-code blocks
           3. Hard-truncate remaining lines with a marker
         """
+        max_tokens = max(1, int(max_tokens or 1))
+        before_tokens = self._count_tokens(tac_text)
+
+        def diagnostics(
+            text: str,
+            *,
+            truncated: bool,
+            strategy: str,
+            marker: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            return {
+                "tac_tokens_before": before_tokens,
+                "tac_tokens_after": self._count_tokens(text),
+                "tac_token_budget": max_tokens,
+                "tac_truncated": bool(truncated),
+                "strategy": strategy,
+                "marker": marker,
+            }
+
         # Fast path — already fits
-        if self._count_tokens(tac_text) <= max_tokens:
-            return tac_text
+        if before_tokens <= max_tokens:
+            return tac_text, diagnostics(tac_text, truncated=False, strategy="none")
 
         lines = tac_text.splitlines()
 
         # Pass 1: remove pure-comment lines (keep block headers like "block_00a2:")
-        stripped = [
-            ln for ln in lines
-            if not ln.strip().startswith("//")
-        ]
+        stripped = [ln for ln in lines if not ln.strip().startswith("//")]
         candidate = "\n".join(stripped)
         if self._count_tokens(candidate) <= max_tokens:
-            return candidate
+            return candidate, diagnostics(candidate, truncated=True, strategy="strip_comments")
 
         # Pass 2: remove dead-code blocks (block header + its indented body)
         filtered: List[str] = []
@@ -1727,7 +2123,7 @@ class SmartContractDecompiler:
                 filtered.append(ln)
         candidate = "\n".join(filtered)
         if self._count_tokens(candidate) <= max_tokens:
-            return candidate
+            return candidate, diagnostics(candidate, truncated=True, strategy="drop_dead_code")
 
         # Pass 3: hard-truncate line-by-line
         kept: List[str] = []
@@ -1738,8 +2134,18 @@ class SmartContractDecompiler:
                 break
             kept.append(ln)
             running += ln_tokens
-        kept.append("  // ... truncated (TAC too large for context window)")
-        return "\n".join(kept)
+        kept.append(self.TAC_TRUNCATION_MARKER)
+        candidate = "\n".join(kept)
+        return candidate, diagnostics(
+            candidate,
+            truncated=True,
+            strategy="hard_truncate",
+            marker=self.TAC_TRUNCATION_MARKER.strip(),
+        )
+
+    def _truncate_tac(self, tac_text: str, max_tokens: int) -> str:
+        truncated, _diagnostics = self._truncate_tac_with_diagnostics(tac_text, max_tokens)
+        return truncated
 
     def _context_window(self) -> int:
         return max(1, int(getattr(self.config, "max_sequence_length", 2048) or 2048))
@@ -1748,13 +2154,18 @@ class SmartContractDecompiler:
         generation_budget = max(0, int(max_new_tokens or 0))
         return max(1, self._context_window() - generation_budget)
 
-    def _prompt_parts(self, metadata: Optional[Dict] = None) -> Tuple[str, str]:
+    def _prompt_parts(
+        self,
+        metadata: Optional[Dict] = None,
+        tac_input: Optional[str] = None,
+    ) -> Tuple[str, str]:
         instruction = "Convert the following Three-Address Code (TAC) representation to readable Solidity code."
 
         metadata_str = ""
         metadata_line = format_prompt_metadata(
             metadata,
-            include_compiler_metadata=self.config.include_compiler_metadata,
+            include_bytecode_metadata=getattr(self.config, "include_bytecode_metadata", True),
+            tac_input=tac_input,
         )
         if metadata_line:
             metadata_str = f"{metadata_line}\n\n"
@@ -1773,9 +2184,10 @@ class SmartContractDecompiler:
     def _tac_token_budget(
         self,
         metadata: Optional[Dict] = None,
+        tac_input: Optional[str] = None,
         max_new_tokens: int = 1024,
     ) -> int:
-        before_tac, after_tac = self._prompt_parts(metadata)
+        before_tac, after_tac = self._prompt_parts(metadata, tac_input=tac_input)
         prompt_budget = self._prompt_token_budget(max_new_tokens)
         overhead = self._count_tokens(f"{before_tac}{after_tac}")
         return max(1, prompt_budget - overhead)
@@ -1791,11 +2203,44 @@ class SmartContractDecompiler:
         max_new_tokens: int = 1024,
     ) -> str:
         """Build a decompilation prompt from TAC + optional metadata."""
-        before_tac, after_tac = self._prompt_parts(metadata)
-        budget = self._tac_token_budget(metadata, max_new_tokens=max_new_tokens)
-        safe_tac = self._truncate_tac(tac_input, budget)
+        sanitized_tac = sanitize_tac_for_prompt(tac_input, metadata)
+        before_tac, after_tac = self._prompt_parts(metadata, tac_input=sanitized_tac)
+        budget = self._tac_token_budget(
+            metadata,
+            tac_input=sanitized_tac,
+            max_new_tokens=max_new_tokens,
+        )
+        safe_tac = self._truncate_tac(sanitized_tac, budget)
 
         return f"{before_tac}{safe_tac.strip()}{after_tac}"
+
+    def prompt_diagnostics(
+        self,
+        tac_input: str,
+        metadata: Optional[Dict] = None,
+        max_new_tokens: int = 1024,
+        generated_text: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return token-budget and TAC truncation diagnostics for an eval prompt."""
+        sanitized_tac = sanitize_tac_for_prompt(tac_input, metadata)
+        before_tac, after_tac = self._prompt_parts(metadata, tac_input=sanitized_tac)
+        tac_budget = self._tac_token_budget(
+            metadata,
+            tac_input=sanitized_tac,
+            max_new_tokens=max_new_tokens,
+        )
+        safe_tac, diagnostics = self._truncate_tac_with_diagnostics(sanitized_tac, tac_budget)
+        prompt = f"{before_tac}{safe_tac.strip()}{after_tac}"
+        prompt_diagnostics: Dict[str, Any] = {
+            "context_window": self._context_window(),
+            "prompt_budget": self._prompt_token_budget(max_new_tokens),
+            "max_new_tokens": max(0, int(max_new_tokens or 0)),
+            "prompt_tokens": self._count_tokens(prompt),
+            **diagnostics,
+        }
+        if generated_text is not None:
+            prompt_diagnostics["generated_tokens"] = self._count_tokens(generated_text)
+        return prompt_diagnostics
 
     def decompile_tac_to_solidity(
         self,
@@ -1879,8 +2324,7 @@ class SmartContractDecompiler:
         ).to(self.model.device)
 
         prompt_lengths = [
-            (inputs["attention_mask"][i] == 1).sum().item()
-            for i in range(len(prompts))
+            (inputs["attention_mask"][i] == 1).sum().item() for i in range(len(prompts))
         ]
 
         with torch.no_grad():
@@ -1928,13 +2372,16 @@ class SmartContractDecompiler:
             bytecode: Hex-encoded EVM bytecode (with or without ``0x`` prefix).
             max_new_tokens: Maximum tokens to generate per function.
             temperature: Sampling temperature.
-            metadata: Optional contract-level prompt metadata applied to each
-                function.
-            compiler_version: Optional Solidity compiler version used to create
-                the bytecode, for example ``"0.8.20"``.
-            optimizer_enabled: Optional optimizer setting used at compile time.
-            optimizer_runs: Optional optimizer run count used at compile time.
-            evm_version: Optional EVM version target used at compile time.
+            metadata: Optional contract-level bytecode-analysis metadata applied
+                to each function.
+            compiler_version: Deprecated no-op; compiler metadata is never
+                included in prompts.
+            optimizer_enabled: Deprecated no-op; optimizer metadata is never
+                included in prompts.
+            optimizer_runs: Deprecated no-op; optimizer metadata is never
+                included in prompts.
+            evm_version: Deprecated no-op; EVM-version metadata is never
+                included in prompts.
 
         Returns:
             A dict with keys:
@@ -1946,17 +2393,10 @@ class SmartContractDecompiler:
         from src.bytecode_analyzer import BytecodeAnalyzer
 
         import time
+
         t0 = time.time()
 
         contract_metadata = dict(metadata or {})
-        if compiler_version is not None:
-            contract_metadata["compiler_version"] = compiler_version
-        if optimizer_enabled is not None:
-            contract_metadata["optimizer_enabled"] = optimizer_enabled
-        if optimizer_runs is not None:
-            contract_metadata["optimizer_runs"] = optimizer_runs
-        if evm_version is not None:
-            contract_metadata["evm_version"] = evm_version
 
         analyzer = BytecodeAnalyzer(bytecode)
         func_tac_map = analyzer.generate_per_function_tac()
@@ -1966,10 +2406,19 @@ class SmartContractDecompiler:
         num_instructions = len(analyzer.instructions)
         num_blocks = len(analyzer.basic_blocks)
         num_functions = len(analyzer.functions)
+        contract_metadata.update(
+            {
+                "bytecode_instruction_count": num_instructions,
+                "basic_block_count": num_blocks,
+                "function_count": num_functions,
+            }
+        )
 
         logger.info(
             "Contract analysis: %d instructions, %d blocks, %d functions",
-            num_instructions, num_blocks, num_functions,
+            num_instructions,
+            num_blocks,
+            num_functions,
         )
 
         # Decompile each function independently
@@ -1981,12 +2430,9 @@ class SmartContractDecompiler:
             func_meta = dict(contract_metadata)
             func_obj = analyzer.functions.get(fname)
             if func_obj:
-                func_meta.update({
-                    "function_name": func_obj.name,
-                    "visibility": func_obj.visibility,
-                    "is_payable": func_obj.is_payable,
-                    "is_view": func_obj.is_view,
-                })
+                selector = getattr(func_obj, "selector", None)
+                if selector:
+                    func_meta["selector"] = selector
 
             try:
                 sol = self.decompile_tac_to_solidity(
@@ -1996,8 +2442,12 @@ class SmartContractDecompiler:
                     temperature=temperature,
                 )
                 function_solidity[fname] = sol
-                logger.info("Decompiled %s (%d TAC tokens → %d output chars)",
-                                 fname, self._count_tokens(tac_str), len(sol))
+                logger.info(
+                    "Decompiled %s (%d TAC tokens → %d output chars)",
+                    fname,
+                    self._count_tokens(tac_str),
+                    len(sol),
+                )
             except Exception as e:
                 logger.error("Failed to decompile %s: %s", fname, e)
                 function_errors[fname] = str(e)
@@ -2019,16 +2469,6 @@ class SmartContractDecompiler:
                 "tac_generation_time_s": round(tac_time, 3),
                 "solidity_generation_time_s": round(gen_time, 3),
                 "function_errors": function_errors,
-                "compiler_metadata": {
-                    key: contract_metadata[key]
-                    for key in (
-                        "compiler_version",
-                        "optimizer_enabled",
-                        "optimizer_runs",
-                        "evm_version",
-                    )
-                    if key in contract_metadata
-                },
             },
         }
 
@@ -2124,11 +2564,13 @@ class DPODatasetBuilder:
                 rejected = DPODatasetBuilder._degrade_output(chosen)
 
             if prompt and chosen and rejected and chosen != rejected:
-                pairs.append({
-                    "prompt": prompt,
-                    "chosen": chosen,
-                    "rejected": rejected,
-                })
+                pairs.append(
+                    {
+                        "prompt": prompt,
+                        "chosen": chosen,
+                        "rejected": rejected,
+                    }
+                )
 
         return pairs
 

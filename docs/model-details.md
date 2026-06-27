@@ -2,16 +2,13 @@
 
 ## Base Model
 
-**Llama 3.2 3B** (`meta-llama/Llama-3.2-3B`)
+**Qwen2.5-Coder-7B-Instruct** (`Qwen/Qwen2.5-Coder-7B-Instruct`)
 
 | Property | Value |
 |----------|-------|
-| Parameters | 3.21B |
-| Layers | 32 transformer blocks |
-| Hidden size | 3,072 |
-| Attention heads | 24 |
-| Context window | 20,000 tokens |
-| Vocabulary | 128,256 tokens |
+| Parameters | 7.6B |
+| Context window | 128K tokens |
+| Primary role | Code-specialized instruction model for TAC-to-Solidity generation |
 
 ## LoRA Fine-Tuning
 
@@ -20,14 +17,16 @@
 | Rank (r) | 16 |
 | Alpha (α) | 32 |
 | Dropout | 0.1 |
-| Target modules | All linear layers |
-| Trainable params | ~30M (0.9% of base) |
+| Target modules | q/k/v/o and MLP gate/up/down projections |
+| Trainable params | ~40M with the default Qwen 7B target modules |
 
 LoRA decomposes weight updates as: $W' = W + \frac{BA}{\alpha}$ where $B \in \mathbb{R}^{r \times d}$, $A \in \mathbb{R}^{d \times r}$.
 
 ## Quantization
 
-The code defaults to 4-bit NF4 loading via `bitsandbytes` (`use_quantization=True`, `load_in_4bit=True`). This keeps the base model small enough for LoRA fine-tuning on a single CUDA GPU while preserving the normal Hugging Face/PEFT training flow.
+Training defaults to full-precision LoRA (`use_quantization=False`) to avoid quantization-related quality changes on the 4-GPU default path. Use `--quantization` to enable 4-bit NF4 loading via `bitsandbytes` when VRAM is constrained, or `--no-quantization` to make the choice explicit in manifests.
+
+Precision is controlled with `--precision {auto,bf16,fp16,fp32}`. `auto` selects BF16 on Ampere+ CUDA devices, FP16 on older CUDA devices, and FP32 on CPU.
 
 8-bit loading is not currently exposed as a separate training mode; update `ModelConfig` before documenting or relying on 8-bit quantization.
 
@@ -36,12 +35,15 @@ The code defaults to 4-bit NF4 loading via `bitsandbytes` (`use_quantization=Tru
 | Parameter | Value |
 |-----------|-------|
 | Batch size | 4 per device |
-| Gradient accumulation | 4 steps |
+| Gradient accumulation | Auto from target global batch |
 | Effective batch size | 16 |
 | Learning rate | 2e-4 (cosine schedule) |
 | Optimizer | AdamW |
 | Epochs | 3 |
 | Max sequence length | 2,048 tokens |
+| GPUs | 4 by default via automatic `torchrun` relaunch |
+| Tokenization cache | Enabled by default for repeat runs |
+| Trainer validation | `--train-eval-strategy auto` (`steps` for large splits, `epoch` for small splits) |
 
 ## Inference
 
@@ -66,4 +68,5 @@ The code defaults to 4-bit NF4 loading via `bitsandbytes` (`use_quantization=Tru
 | Operation | Min VRAM |
 |-----------|----------|
 | Inference (4-bit) | 4 GB |
+| Training (full LoRA) | 24 GB+ recommended |
 | Training (4-bit + LoRA) | 16 GB |

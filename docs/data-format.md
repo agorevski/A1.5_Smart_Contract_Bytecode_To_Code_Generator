@@ -22,11 +22,22 @@ Each line in the training JSONL file:
 }
 ```
 
-Required fields are non-empty string `input` and `output`. `metadata` is optional
-but must be an object when present. `train.py` validates JSON parse errors,
-missing/empty fields, metadata type, and tokenizer-aware target/context length
-before training or eval-only runs. Use `--skip-data-preflight` only for legacy
-smoke tests.
+Schema version 1 rows include `metadata.schema_version: 1`. Required fields are
+non-empty string `input` and `output`; `metadata` is optional only for explicit
+legacy compatibility and must be an object when present. Decontamination-critical
+metadata values are validated by the shared schema helpers in
+`src.dataset_pipeline`:
+
+- `contract_address`: 20-byte `0x`-prefixed hex address
+- `selector` / `function_selector`: 4-byte `0x`-prefixed hex selector
+- `source_hash`, `source_code_hash`, `body_hash`, `input_hash`, `output_hash`:
+  32- or 64-byte hex digests
+- `optimizer_enabled`, `is_payable`, `is_view`: booleans
+- `compiler_version`: normalized Solidity semver such as `0.8.20`
+
+`train.py` validates JSON parse errors, missing/empty fields, metadata type, and
+tokenizer-aware target/context length before training or eval-only runs. Use
+`--skip-data-preflight` only for legacy smoke tests.
 
 Recommended decontamination metadata keys, when available:
 
@@ -133,4 +144,23 @@ Each manifest includes:
 - row counts, typed status/drop counts, duplicate stats, and timing;
 - compile failure summaries with top status/error groups and sample contract addresses.
 
-Export manifests also include `validation.body_duplicate_cap`, which recomputes normalized target bodies from the emitted JSONL and records whether the duplicate cap passed.
+Download manifests include Parquet streaming throughput and bounded
+`parquet_batch_size` so large HuggingFace files are ingested without full
+DataFrame materialization. Export manifests include
+`validation.body_duplicate_cap`, `validation.token_length_filter`, and
+`training_row_schema_version`. Rows exceeding the configured export
+`--max-seq-length` are omitted from the main JSONL and written to
+`<output>.rejects.jsonl` with source row, contract/function metadata, token
+lengths, and reject reasons.
+
+The Etherscan `DatasetBuilder` path writes
+`smart_contract_dataset.jsonl.manifest.json` next to its export. That manifest
+includes the input address-list hash/count when available, typed
+`generation_diagnostics`, `dataset_filter_drops`, output artifact hashes, row
+counts, and the training row schema version.
+
+Partial decompilation placeholders (`metadata.partial == true`,
+`Partial decompilation`, `TODO: Full logic not reconstructed`, or
+`unknown_<selector>` targets) are excluded from the default supervised dataset.
+Call `DatasetBuilder.export_dataset(..., include_partial=True)` only when you
+want a separate `smart_contract_dataset.partial.jsonl` quarantine artifact.

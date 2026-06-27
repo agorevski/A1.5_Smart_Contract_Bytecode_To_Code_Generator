@@ -2,7 +2,7 @@
 Smart Contract Bytecode Decompiler — Flask Web Application
 
 Provides a web UI for decompiling EVM bytecode into TAC and Solidity
-using the trained Llama 3.2 3B model.
+using the trained Qwen2.5-Coder model.
 """
 
 import sys
@@ -12,6 +12,7 @@ import time
 import traceback
 import ipaddress
 import threading
+import queue
 import hmac
 import hashlib
 import re
@@ -27,7 +28,7 @@ from flask import Flask, render_template, request, jsonify, Response, stream_wit
 from flask_cors import CORS
 
 from src.bytecode_analyzer import BytecodeAnalyzer
-from src.model_setup import SmartContractDecompiler, ModelConfig
+from src.model_setup import SmartContractDecompiler
 from src.selector_resolver import get_resolver
 from src.tac_lookup import TACLookup
 
@@ -48,19 +49,11 @@ class MockDecompiler:
     def decompile_tac_to_solidity(self, tac_input: str, metadata: dict = None, **kwargs) -> str:
         time.sleep(self._SIMULATED_DELAY)
         meta = metadata or {}
-        name = meta.get("function_name", "mockFunc")
-        vis = meta.get("visibility", "public")
-        modifiers = []
-        if meta.get("is_payable"):
-            modifiers.append("payable")
-        if meta.get("is_view"):
-            modifiers.append("view")
-        mod_str = " ".join(modifiers)
-        if mod_str:
-            mod_str = " " + mod_str
+        selector = str(meta.get("selector") or "").removeprefix("0x")
+        name = f"function_{selector}" if selector else "mockFunc"
         tac_lines = len(tac_input.splitlines())
         return (
-            f"function {name}() {vis}{mod_str} {{\n"
+            f"function {name}() public {{\n"
             f"    // [MOCK] Simulated decompilation output\n"
             f"    // TAC input: {tac_lines} lines, {len(tac_input)} chars\n"
             f'    revert("mock");\n'
@@ -134,6 +127,9 @@ ENABLE_REMOTE_SELECTOR_LOOKUP = _parse_bool_env("WEB_ENABLE_REMOTE_SELECTOR_LOOK
 MAX_DECOMPILE_FUNCTIONS = _parse_int_env("WEB_MAX_DECOMPILE_FUNCTIONS", 128, 1)
 DECOMPILE_TIMEOUT_SECONDS = _parse_float_env("WEB_DECOMPILE_TIMEOUT_SECONDS", 900.0, 0.0)
 MAX_NEW_TOKENS_LIMIT = _parse_int_env("WEB_MAX_NEW_TOKENS", 4096, 1)
+MAX_ABI_JSON_CHARS = _parse_int_env("WEB_MAX_ABI_JSON_CHARS", 200000, 1)
+MAX_CONTRACT_METADATA_JSON_CHARS = _parse_int_env("WEB_MAX_CONTRACT_METADATA_JSON_CHARS", 200000, 1)
+MAX_ABI_ENTRIES = _parse_int_env("WEB_MAX_ABI_ENTRIES", 512, 1)
 DEFAULT_GENERATION_CONFIG = {
     "max_new_tokens": _parse_int_env("WEB_DEFAULT_MAX_NEW_TOKENS", 1024, 1),
     "temperature": _parse_float_env("WEB_DEFAULT_TEMPERATURE", 0.1, 0.0),
@@ -151,6 +147,9 @@ INFERENCE_TRACE_DIR = os.path.abspath(
         os.path.join(PROJECT_ROOT, "results", "inference_traces"),
     )
 )
+MODEL_WARMUP_ENABLED = _parse_bool_env("WEB_MODEL_WARMUP_ENABLED", False)
+MODEL_WARMUP_TIMEOUT_SECONDS = _parse_float_env("WEB_MODEL_WARMUP_TIMEOUT_SECONDS", 30.0, 0.0)
+MODEL_WARMUP_MAX_NEW_TOKENS = _parse_int_env("WEB_MODEL_WARMUP_MAX_NEW_TOKENS", 8, 1)
 DECOMPILE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_DECOMPILES)
 
 # ---------------------------------------------------------------------------
@@ -175,10 +174,49 @@ tac_lookup: TACLookup = None  # type: ignore[assignment]
 mock_mode: bool = False
 active_model_path: str | None = None
 model_load_error: str | None = None
+model_warmup_state: dict = {
+    "enabled": MODEL_WARMUP_ENABLED,
+    "status": "disabled" if not MODEL_WARMUP_ENABLED else "not_started",
+    "duration_s": None,
+    "error": None,
+    "max_new_tokens": MODEL_WARMUP_MAX_NEW_TOKENS,
+    "timeout_seconds": MODEL_WARMUP_TIMEOUT_SECONDS,
+}
 
 
 class DecompileRequestError(Exception):
     """Raised for request-scoped decompilation failures after SSE starts."""
+
+
+def _run_with_timeout(operation, timeout_seconds: float | None, description: str):
+    """Run blocking work with a request-level hard timeout."""
+    if timeout_seconds is None:
+        return operation()
+    if timeout_seconds <= 0:
+        raise DecompileRequestError(
+            f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds before {description}."
+        )
+
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            result_queue.put((True, operation()))
+        except BaseException as exc:  # pragma: no cover - defensive handoff
+            result_queue.put((False, exc))
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise DecompileRequestError(
+            f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds during {description}."
+        )
+
+    ok, payload = result_queue.get_nowait()
+    if ok:
+        return payload
+    raise payload
 
 
 def _error_response(message: str, status_code: int, **extra):
@@ -279,36 +317,6 @@ def _parse_optional_bool(value):
     return None
 
 
-def _compiler_metadata_from_request(data: dict | None) -> dict:
-    """Extract optional compiler metadata supplied with an inference request."""
-    if not isinstance(data, dict):
-        return {}
-
-    metadata = {}
-    supplied_metadata = data.get("metadata")
-    if isinstance(supplied_metadata, dict):
-        metadata.update(supplied_metadata)
-
-    for key in ("compiler_version", "solc_version", "evm_version"):
-        value = data.get(key)
-        if isinstance(value, str):
-            value = value.strip()
-        if value not in (None, ""):
-            metadata[key] = value
-
-    optimizer_enabled = _parse_optional_bool(data.get("optimizer_enabled"))
-    if optimizer_enabled is not None:
-        metadata["optimizer_enabled"] = optimizer_enabled
-
-    optimizer_runs = data.get("optimizer_runs")
-    if isinstance(optimizer_runs, str):
-        optimizer_runs = optimizer_runs.strip()
-    if optimizer_runs not in (None, ""):
-        metadata["optimizer_runs"] = optimizer_runs
-
-    return metadata
-
-
 def _generation_config_from_request(data: dict | None, request_id: str):
     """Validate and merge optional generation controls from a request body."""
     config = dict(DEFAULT_GENERATION_CONFIG)
@@ -394,6 +402,301 @@ def _generation_config_from_request(data: dict | None, request_id: str):
     return config, None
 
 
+def _json_char_size(value) -> int:
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(_json.dumps(value, separators=(",", ":"), default=str))
+    except TypeError:
+        return len(str(value))
+
+
+def _coerce_json_value(value, label: str, max_chars: int, request_id: str):
+    if value is None or value == "":
+        return None, None
+    if isinstance(value, str):
+        if len(value) > max_chars:
+            return None, _error_response(
+                f"'{label}' is too large; maximum is {max_chars} characters.",
+                413,
+                request_id=request_id,
+            )
+        try:
+            return _json.loads(value), None
+        except _json.JSONDecodeError as exc:
+            return None, _error_response(
+                f"'{label}' must be valid JSON: {exc.msg}.",
+                400,
+                request_id=request_id,
+            )
+    if isinstance(value, (dict, list)):
+        if _json_char_size(value) > max_chars:
+            return None, _error_response(
+                f"'{label}' is too large; maximum is {max_chars} JSON characters.",
+                413,
+                request_id=request_id,
+            )
+        return value, None
+    return None, _error_response(
+        f"'{label}' must be a JSON object, array, or JSON-encoded string.",
+        400,
+        request_id=request_id,
+    )
+
+
+def _canonical_abi_type(param: dict) -> str:
+    typ = str(param.get("type") or "").strip()
+    if typ.startswith("tuple"):
+        components = param.get("components") if isinstance(param.get("components"), list) else []
+        inner = ",".join(
+            _canonical_abi_type(component)
+            for component in components
+            if isinstance(component, dict)
+        )
+        suffix = typ[5:] if len(typ) > 5 else ""
+        return f"({inner}){suffix}"
+    return typ
+
+
+def _abi_signature(entry: dict) -> str | None:
+    name = str(entry.get("name") or "").strip()
+    if not name:
+        return None
+    inputs = entry.get("inputs") if isinstance(entry.get("inputs"), list) else []
+    types = [
+        _canonical_abi_type(param)
+        for param in inputs
+        if isinstance(param, dict) and _canonical_abi_type(param)
+    ]
+    return f"{name}({','.join(types)})"
+
+
+def _keccak_hex(text: str) -> str | None:
+    try:
+        from eth_utils import keccak
+
+        return "0x" + keccak(text=text).hex()
+    except Exception:
+        try:
+            return "0x" + hashlib.sha3_256(text.encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+
+
+def _normalise_abi_params(params) -> list[dict]:
+    if not isinstance(params, list):
+        return []
+    normalised = []
+    for param in params:
+        if not isinstance(param, dict):
+            continue
+        item = {
+            "name": str(param.get("name") or ""),
+            "type": _canonical_abi_type(param),
+            "indexed": bool(param.get("indexed", False)) if "indexed" in param else None,
+        }
+        normalised.append({k: v for k, v in item.items() if v not in (None, "")})
+    return normalised
+
+
+def _abi_entry_fact(entry: dict) -> dict | None:
+    entry_type = str(entry.get("type") or "function").strip() or "function"
+    if entry_type not in {"function", "event", "error", "constructor", "fallback", "receive"}:
+        return None
+
+    fact = {
+        "type": entry_type,
+        "name": str(entry.get("name") or entry_type).strip(),
+        "inputs": _normalise_abi_params(entry.get("inputs")),
+        "outputs": _normalise_abi_params(entry.get("outputs")),
+    }
+    signature = _abi_signature(entry)
+    if signature:
+        fact["signature"] = signature
+        digest = _keccak_hex(signature)
+        if digest:
+            if entry_type in {"function", "error"}:
+                fact["selector"] = digest[:10]
+            else:
+                fact["topic0"] = digest
+
+    mutability = entry.get("stateMutability") or entry.get("state_mutability")
+    if mutability:
+        fact["state_mutability"] = str(mutability)
+    elif entry_type == "function":
+        if entry.get("payable"):
+            fact["state_mutability"] = "payable"
+        elif entry.get("constant"):
+            fact["state_mutability"] = "view"
+        else:
+            fact["state_mutability"] = "nonpayable"
+
+    return {k: v for k, v in fact.items() if v not in (None, "", [], {})}
+
+
+def _build_abi_summary(abi_value, request_id: str):
+    if abi_value is None:
+        return None, None
+
+    if isinstance(abi_value, dict) and "abi" in abi_value:
+        abi_value = abi_value.get("abi")
+    elif isinstance(abi_value, dict) and "type" in abi_value:
+        abi_value = [abi_value]
+
+    if not isinstance(abi_value, list):
+        return None, _error_response(
+            "'abi' must be a JSON ABI array or an object containing an 'abi' array.",
+            400,
+            request_id=request_id,
+        )
+    if len(abi_value) > MAX_ABI_ENTRIES:
+        return None, _error_response(
+            f"'abi' contains {len(abi_value)} entries; maximum is {MAX_ABI_ENTRIES}.",
+            413,
+            request_id=request_id,
+        )
+
+    functions = []
+    events = []
+    errors = []
+    for entry in abi_value:
+        if not isinstance(entry, dict):
+            return None, _error_response(
+                "'abi' entries must be JSON objects.",
+                400,
+                request_id=request_id,
+            )
+        fact = _abi_entry_fact(entry)
+        if not fact:
+            continue
+        if fact["type"] == "function":
+            functions.append(fact)
+        elif fact["type"] == "event":
+            events.append(fact)
+        elif fact["type"] == "error":
+            errors.append(fact)
+
+    return {
+        "provided": True,
+        "entry_count": len(abi_value),
+        "function_count": len(functions),
+        "event_count": len(events),
+        "error_count": len(errors),
+        "functions": functions,
+        "events": events,
+        "errors": errors,
+        "function_selectors": {
+            fact["selector"].lower(): fact for fact in functions if fact.get("selector")
+        },
+    }, None
+
+
+def _contract_metadata_from_request(data: dict | None, request_id: str):
+    if not isinstance(data, dict):
+        return {}, None
+
+    metadata_value = {}
+    if "metadata" in data and data.get("metadata") not in (None, ""):
+        parsed, error = _coerce_json_value(
+            data.get("metadata"),
+            "metadata",
+            MAX_CONTRACT_METADATA_JSON_CHARS,
+            request_id,
+        )
+        if error:
+            return None, error
+        if not isinstance(parsed, dict):
+            return None, _error_response(
+                "'metadata' must be a JSON object.",
+                400,
+                request_id=request_id,
+            )
+        metadata_value = parsed
+
+    abi_source = None
+    abi_raw = None
+    if "abi" in data and data.get("abi") not in (None, ""):
+        abi_raw = data.get("abi")
+        abi_source = "request.abi"
+    elif isinstance(metadata_value, dict) and metadata_value.get("abi") not in (None, ""):
+        abi_raw = metadata_value.get("abi")
+        abi_source = "request.metadata.abi"
+
+    abi_summary = None
+    if abi_raw is not None:
+        parsed_abi, error = _coerce_json_value(abi_raw, "abi", MAX_ABI_JSON_CHARS, request_id)
+        if error:
+            return None, error
+        abi_summary, error = _build_abi_summary(parsed_abi, request_id)
+        if error:
+            return None, error
+        if abi_summary:
+            abi_summary["source"] = abi_source
+
+    safe_metadata = {
+        key: value
+        for key, value in metadata_value.items()
+        if key != "abi" and isinstance(key, str) and len(key) <= 80
+    }
+    return {
+        "metadata": safe_metadata,
+        "abi": abi_summary,
+    }, None
+
+
+def _extract_selector_from_function(fname: str, func_obj=None) -> str | None:
+    selector = getattr(func_obj, "selector", None) if func_obj is not None else None
+    if selector:
+        match = re.search(r"0x?[0-9a-fA-F]{8}", str(selector))
+        if match:
+            text = match.group(0).lower()
+            return text if text.startswith("0x") else f"0x{text}"
+    match = re.search(r"(?:0x)?([0-9a-fA-F]{8})", str(fname or ""))
+    if match:
+        return f"0x{match.group(1).lower()}"
+    return None
+
+
+def _abi_fact_for_function(
+    fname: str,
+    analyzer: BytecodeAnalyzer | None,
+    contract_metadata: dict | None,
+):
+    abi_summary = (
+        (contract_metadata or {}).get("abi") if isinstance(contract_metadata, dict) else None
+    )
+    if not isinstance(abi_summary, dict):
+        return None
+    func_obj = getattr(analyzer, "functions", {}).get(fname) if analyzer is not None else None
+    selector = _extract_selector_from_function(fname, func_obj)
+    if selector:
+        fact = abi_summary.get("function_selectors", {}).get(selector.lower())
+        if fact:
+            return fact
+    for fact in abi_summary.get("functions", []):
+        if fact.get("name") and str(fact.get("name")) == str(fname):
+            return fact
+    return None
+
+
+def _selector_result_from_abi(fact: dict) -> dict:
+    selector = fact.get("selector")
+    signature = fact.get("signature") or fact.get("name") or "abi_function"
+    best = {
+        "selector": selector,
+        "signature": signature,
+        "confidence": 100.0,
+        "source": "abi",
+        "state_mutability": fact.get("state_mutability"),
+    }
+    return {
+        "selector": selector,
+        "best_match": best,
+        "candidates": [best],
+        "abi": fact,
+    }
+
+
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -416,6 +719,8 @@ def _lookup_stats() -> dict:
     if available:
         try:
             stats = tac_lookup.stats()
+        except DecompileRequestError:
+            raise
         except Exception as e:
             stats = {"error": str(e)}
     return {
@@ -426,16 +731,19 @@ def _lookup_stats() -> dict:
 
 
 def _health_payload() -> dict:
+    warmup_status = dict(model_warmup_state)
+    ready = decompiler is not None and warmup_status.get("status") not in {"running", "failed"}
     return {
         "status": "ok",
         "liveness": "ok",
-        "ready": decompiler is not None,
-        "inference_ready": decompiler is not None,
+        "ready": ready,
+        "inference_ready": ready,
         "model_loaded": decompiler is not None,
         "mock_mode": mock_mode,
         "model_path": active_model_path,
         "model_error": model_load_error,
         "model_config": model_config_dict,
+        "warmup": warmup_status,
         "lookup": _lookup_stats(),
         "limits": {
             "max_bytecode_hex_length": MAX_BYTECODE_HEX_LENGTH,
@@ -443,7 +751,11 @@ def _health_payload() -> dict:
             "max_concurrent_decompiles": MAX_CONCURRENT_DECOMPILES,
             "max_functions": MAX_DECOMPILE_FUNCTIONS,
             "timeout_seconds": DECOMPILE_TIMEOUT_SECONDS,
+            "timeout_enforcement": "daemon_thread",
             "max_new_tokens": MAX_NEW_TOKENS_LIMIT,
+            "max_abi_json_chars": MAX_ABI_JSON_CHARS,
+            "max_contract_metadata_json_chars": MAX_CONTRACT_METADATA_JSON_CHARS,
+            "max_abi_entries": MAX_ABI_ENTRIES,
             "max_content_length_bytes": app.config.get("MAX_CONTENT_LENGTH"),
         },
         "generation_defaults": dict(DEFAULT_GENERATION_CONFIG),
@@ -457,8 +769,8 @@ def _health_payload() -> dict:
 def _new_inference_trace(
     request_id: str,
     bytecode: str,
-    request_metadata: dict,
     generation_config: dict,
+    contract_metadata: dict | None = None,
 ) -> dict:
     hex_body = bytecode[2:] if bytecode.startswith("0x") else bytecode
     trace = {
@@ -470,7 +782,6 @@ def _new_inference_trace(
             "hex_length": len(hex_body),
             "byte_length": len(hex_body) // 2,
         },
-        "compiler_metadata": request_metadata,
         "generation_config": generation_config,
         "model": {
             "loaded": decompiler is not None,
@@ -480,6 +791,7 @@ def _new_inference_trace(
             "load_error": model_load_error,
         },
         "lookup": _lookup_stats(),
+        "contract_metadata": contract_metadata or {},
         "analysis": {},
         "selector_map": {},
         "functions": {},
@@ -489,6 +801,64 @@ def _new_inference_trace(
         trace["bytecode"]["sample_prefix"] = bytecode[:128]
         trace["bytecode"]["sample_suffix"] = bytecode[-128:]
     return trace
+
+
+def _safe_function_metadata(
+    bytecode: str,
+    analyzer: BytecodeAnalyzer,
+    fname: str,
+    tac_text: str,
+    contract_metadata: dict | None = None,
+) -> dict:
+    """Build model metadata only from bytecode/analyzer-derived facts."""
+    hex_body = bytecode[2:] if bytecode.startswith("0x") else bytecode
+    metadata = {
+        "selector": None,
+        "bytecode_hex_length": len(hex_body),
+        "bytecode_byte_length": len(hex_body) // 2,
+        "instruction_count": len(analyzer.instructions),
+        "basic_block_count": len(analyzer.basic_blocks),
+        "function_count": len(analyzer.functions),
+        "tac_line_count": len(tac_text.splitlines()),
+        "tac_char_count": len(tac_text),
+    }
+
+    func_obj = analyzer.functions.get(fname)
+    selector = getattr(func_obj, "selector", None)
+    if selector:
+        metadata["selector"] = selector
+
+    abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
+    if abi_fact:
+        metadata.update(
+            {
+                "selector": abi_fact.get("selector") or metadata.get("selector"),
+                "abi_source": "user",
+                "abi_name": abi_fact.get("name"),
+                "abi_signature": abi_fact.get("signature"),
+                "abi_state_mutability": abi_fact.get("state_mutability"),
+                "abi_inputs": [p.get("type") for p in abi_fact.get("inputs", [])],
+                "abi_outputs": [p.get("type") for p in abi_fact.get("outputs", [])],
+            }
+        )
+
+    blocks = []
+    if func_obj is not None and hasattr(analyzer, "_blocks_for_function"):
+        try:
+            blocks = analyzer._blocks_for_function(func_obj, fallback_to_all=False)
+        except Exception:
+            blocks = []
+    if not blocks and func_obj is not None:
+        blocks = list(getattr(func_obj, "basic_blocks", None) or [])
+
+    if blocks:
+        metadata["function_basic_block_count"] = len(blocks)
+        metadata["function_instruction_count"] = sum(
+            len(block.metadata.get("raw_instructions") or block.instructions or [])
+            for block in blocks
+        )
+
+    return {key: value for key, value in metadata.items() if value is not None}
 
 
 def _trace_event(trace: dict | None, stage: str, **data) -> None:
@@ -590,8 +960,13 @@ def _prompt_diagnostics(
 def _selector_summary(selector_map: dict, fname: str) -> dict:
     info = selector_map.get(fname, {}) if isinstance(selector_map, dict) else {}
     best = info.get("best_match") if isinstance(info, dict) else None
+    selector = None
+    if isinstance(info, dict):
+        selector = info.get("selector")
+    if isinstance(best, dict) and best.get("selector"):
+        selector = best.get("selector")
     return {
-        "selector": best.get("selector") if isinstance(best, dict) else None,
+        "selector": selector,
         "signature": best.get("signature") if isinstance(best, dict) else None,
         "confidence": best.get("confidence") if isinstance(best, dict) else None,
         "selector_source": best.get("source") if isinstance(best, dict) else None,
@@ -605,25 +980,40 @@ def _build_function_results(
     function_latencies: dict,
     selector_map: dict,
     prompt_diagnostics: dict,
+    analyzer: BytecodeAnalyzer | None = None,
+    contract_metadata: dict | None = None,
+    validation_by_function: dict | None = None,
 ) -> list[dict]:
     results = []
     for fname in func_names:
         source = function_sources.get(fname, "unknown")
         error = function_errors.get(fname)
+        validation = (validation_by_function or {}).get(fname)
+        status = "error" if error else "ok"
+        if status == "ok" and validation and not validation.get("valid"):
+            status = "validation_failed"
         item = {
             "name": fname,
-            "status": "error" if error else "ok",
+            "status": status,
             "source": source,
             "error": error,
             "elapsed_s": function_latencies.get(fname),
             "diagnostics": prompt_diagnostics.get(fname),
+            "validation": validation,
         }
         item.update(_selector_summary(selector_map, fname))
+        abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
+        if abi_fact:
+            item["abi"] = abi_fact
         results.append(item)
     return results
 
 
-def _source_summary(function_sources: dict, function_errors: dict) -> dict:
+def _source_summary(
+    function_sources: dict,
+    function_errors: dict,
+    function_results: list[dict] | None = None,
+) -> dict:
     summary = {"exact_match": 0, "model_inference": 0, "error": 0, "unknown": 0}
     for fname, source in function_sources.items():
         if fname in function_errors:
@@ -632,7 +1022,34 @@ def _source_summary(function_sources: dict, function_errors: dict) -> dict:
             summary[source] += 1
         else:
             summary["unknown"] += 1
+    if function_results is not None:
+        summary["abi_functions_used"] = sum(1 for item in function_results if item.get("abi"))
+        summary["validation_failed"] = sum(
+            1
+            for item in function_results
+            if item.get("validation") and not item["validation"].get("valid")
+        )
     return summary
+
+
+def _validate_solidity_output(source_code: str, metadata: dict | None = None) -> dict:
+    try:
+        from src.training_pipeline import validate_generated_solidity
+
+        return validate_generated_solidity(source_code, metadata or {}).to_dict()
+    except Exception as exc:  # pragma: no cover - dependency/runtime defensive
+        return {
+            "valid": False,
+            "method": "validation_error",
+            "scaffold_valid": False,
+            "scaffold_errors": [],
+            "compiler_checked": False,
+            "compiler_version": None,
+            "compiler_errors": [],
+            "ast_checked": False,
+            "ast_valid": None,
+            "error": str(exc),
+        }
 
 
 def _is_model_artifact(path: str) -> bool:
@@ -662,6 +1079,79 @@ def resolve_model_path(model_path: str | None = None) -> str:
     return DEFAULT_MODEL_PATH
 
 
+def _reset_warmup_state(enabled: bool | None = None) -> None:
+    model_warmup_state.clear()
+    effective_enabled = MODEL_WARMUP_ENABLED if enabled is None else enabled
+    model_warmup_state.update(
+        {
+            "enabled": effective_enabled,
+            "status": "disabled" if not effective_enabled else "not_started",
+            "duration_s": None,
+            "error": None,
+            "max_new_tokens": MODEL_WARMUP_MAX_NEW_TOKENS,
+            "timeout_seconds": MODEL_WARMUP_TIMEOUT_SECONDS,
+        }
+    )
+
+
+def _run_warmup_with_timeout(operation, timeout_seconds: float | None):
+    if not timeout_seconds or timeout_seconds <= 0:
+        return operation()
+
+    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            result_queue.put((True, operation()))
+        except BaseException as exc:  # pragma: no cover - defensive handoff
+            result_queue.put((False, exc))
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise TimeoutError(f"warmup exceeded {timeout_seconds:g} seconds")
+    ok, payload = result_queue.get_nowait()
+    if ok:
+        return payload
+    raise payload
+
+
+def _warm_model() -> None:
+    if not MODEL_WARMUP_ENABLED:
+        _reset_warmup_state(False)
+        return
+    _reset_warmup_state(True)
+    if decompiler is None:
+        model_warmup_state.update({"status": "skipped", "error": "model not loaded"})
+        return
+
+    model_warmup_state["status"] = "running"
+    start = time.time()
+    try:
+        warmup_tac = "function function_0x00000000:\nblock_0:\n  RETURN 0"
+        _run_warmup_with_timeout(
+            lambda: decompiler.decompile_tac_to_solidity(
+                warmup_tac,
+                metadata={"selector": "0x00000000", "warmup": True},
+                max_new_tokens=MODEL_WARMUP_MAX_NEW_TOKENS,
+                temperature=0.0,
+                do_sample=False,
+                repetition_penalty=1.0,
+            ),
+            MODEL_WARMUP_TIMEOUT_SECONDS,
+        )
+        model_warmup_state.update(
+            {"status": "complete", "duration_s": round(time.time() - start, 3), "error": None}
+        )
+        logger.info("Model warmup complete in %.2f seconds", model_warmup_state["duration_s"])
+    except Exception as exc:
+        model_warmup_state.update(
+            {"status": "failed", "duration_s": round(time.time() - start, 3), "error": str(exc)}
+        )
+        logger.warning("Model warmup failed: %s", exc)
+
+
 def load_model(use_mock: bool = False, model_path: str | None = None):
     """Load the trained model and TAC lookup database into memory.
 
@@ -676,6 +1166,7 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
     active_model_path = None
     model_load_error = None
     model_config_dict = {}
+    _reset_warmup_state()
     start = time.time()
 
     # Load TAC lookup database (fast exact-match cache)
@@ -712,6 +1203,7 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
         active_model_path = "mock://MockDecompiler"
         elapsed = time.time() - start
         logger.info("Mock model ready in %.1f seconds", elapsed)
+        _warm_model()
         return
 
     resolved_model_path = resolve_model_path(model_path)
@@ -732,11 +1224,13 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
         model_config_dict["model_path"] = resolved_model_path
         elapsed = time.time() - start
         logger.info("Model loaded successfully in %.1f seconds", elapsed)
+        _warm_model()
     except Exception as e:
         logger.error("Failed to load model: %s", e)
         logger.error(traceback.format_exc())
         decompiler = None  # type: ignore[assignment]
         model_load_error = str(e)
+        _warm_model()
 
 
 # ---------------------------------------------------------------------------
@@ -929,12 +1423,12 @@ def api_decompile():
     """
     Decompile EVM bytecode using per-function pipeline with SSE streaming.
 
-    Expects JSON: { "bytecode": "0x..." }. Optional compiler metadata can be
-    provided as top-level fields or inside ``metadata``:
-    ``compiler_version``, ``optimizer_enabled``, ``optimizer_runs``,
-    ``evm_version``. Optional generation controls can be supplied in a
-    ``generation`` object: ``max_new_tokens``, ``temperature``, ``do_sample``,
-    and ``repetition_penalty``.
+    Expects JSON: { "bytecode": "0x..." }. Optional ``abi`` and ``metadata``
+    objects are validated and carried into selector provenance/traces. Optional
+    generation controls can be supplied in a ``generation`` object:
+    ``max_new_tokens``, ``temperature``, ``do_sample``, and
+    ``repetition_penalty``. Legacy compiler/source metadata fields are ignored
+    for bytecode-only prompt safety.
     Returns a Server-Sent Events stream with progress updates followed
     by the final result.
 
@@ -952,10 +1446,12 @@ def api_decompile():
     bytecode, validation_error = _normalize_bytecode_from_request(data, request_id=request_id)
     if validation_error:
         return validation_error
-    request_metadata = _compiler_metadata_from_request(data)
     generation_config, generation_error = _generation_config_from_request(data, request_id)
     if generation_error:
         return generation_error
+    contract_metadata, metadata_error = _contract_metadata_from_request(data, request_id)
+    if metadata_error:
+        return metadata_error
 
     if not DECOMPILE_SEMAPHORE.acquire(blocking=False):
         return _error_response(
@@ -969,7 +1465,7 @@ def api_decompile():
         )
 
     request_started_at = time.time()
-    trace = _new_inference_trace(request_id, bytecode, request_metadata, generation_config)
+    trace = _new_inference_trace(request_id, bytecode, generation_config, contract_metadata)
     trace_written_path: str | None = None
 
     def _sse(event: str, data: dict) -> str:
@@ -986,6 +1482,15 @@ def api_decompile():
             raise DecompileRequestError(
                 f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds."
             )
+
+    def _timeout_remaining() -> float | None:
+        if not DECOMPILE_TIMEOUT_SECONDS:
+            return None
+        return max(0.0, DECOMPILE_TIMEOUT_SECONDS - (time.time() - request_started_at))
+
+    def _blocking_call(operation, description: str):
+        _check_timeout()
+        return _run_with_timeout(operation, _timeout_remaining(), description)
 
     def _finish_trace(status: str, error: str | None = None) -> str | None:
         nonlocal trace_written_path
@@ -1028,8 +1533,11 @@ def api_decompile():
             )
 
             t0 = time.time()
-            analyzer = BytecodeAnalyzer(bytecode)
-            func_tac_map = analyzer.generate_per_function_tac()
+            analyzer = _blocking_call(lambda: BytecodeAnalyzer(bytecode), "bytecode analyzer setup")
+            func_tac_map = _blocking_call(
+                lambda: analyzer.generate_per_function_tac(),
+                "per-function TAC generation",
+            )
             tac_time = time.time() - t0
 
             num_instructions = len(analyzer.instructions)
@@ -1053,8 +1561,15 @@ def api_decompile():
 
             # ---- Resolve function selectors ----
             resolver = get_resolver(use_remote=ENABLE_REMOTE_SELECTOR_LOOKUP)
-            selector_results = resolver.resolve_function_names(func_names)
+            selector_results = _blocking_call(
+                lambda: resolver.resolve_function_names(func_names),
+                "selector resolution",
+            )
             selector_map = {fname: res.to_dict() for fname, res in selector_results.items()}
+            for fname in func_names:
+                abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
+                if abi_fact:
+                    selector_map[fname] = _selector_result_from_abi(abi_fact)
             trace["selector_map"] = selector_map
 
             yield _sse(
@@ -1196,8 +1711,11 @@ def api_decompile():
                     function_sources[fname] = "error"
                     function_errors[fname] = "Model not loaded"
                     function_latencies[fname] = 0.0
+                    func_metadata = _safe_function_metadata(
+                        bytecode, analyzer, fname, func_tac_map[fname], contract_metadata
+                    )
                     prompt_diagnostics[fname] = _prompt_diagnostics(
-                        None, func_tac_map[fname], request_metadata, generation_config
+                        None, func_tac_map[fname], func_metadata, generation_config
                     )
                     trace["functions"].setdefault(fname, {}).update(
                         {
@@ -1217,8 +1735,12 @@ def api_decompile():
                         function_latencies,
                         selector_map,
                         prompt_diagnostics,
+                        analyzer,
+                        contract_metadata,
                     )
-                    source_summary = _source_summary(function_sources, function_errors)
+                    source_summary = _source_summary(
+                        function_sources, function_errors, function_results
+                    )
                     analysis = {
                         "num_instructions": num_instructions,
                         "num_basic_blocks": num_blocks,
@@ -1234,7 +1756,6 @@ def api_decompile():
                         "source_summary": source_summary,
                         "model_config": model_config_dict,
                         "model_path": active_model_path,
-                        "compiler_metadata": request_metadata,
                         "effective_generation_config": generation_config,
                     }
                     trace["analysis"].update(analysis)
@@ -1264,6 +1785,7 @@ def api_decompile():
                             "analysis": analysis,
                             "effective_generation_config": generation_config,
                             "model_path": active_model_path,
+                            "contract_metadata": contract_metadata,
                             "trace_path": _relative_project_path(trace_path),
                             "model_error": "Model not loaded. Check server logs for details.",
                         },
@@ -1289,18 +1811,11 @@ def api_decompile():
                 tac_list = []
                 meta_list = []
                 for fname in unresolved_fnames:
-                    tac_list.append(func_tac_map[fname])
-                    func_obj = analyzer.functions.get(fname)
-                    func_meta = dict(request_metadata)
-                    if func_obj:
-                        func_meta.update(
-                            {
-                                "function_name": func_obj.name,
-                                "visibility": func_obj.visibility,
-                                "is_payable": func_obj.is_payable,
-                                "is_view": func_obj.is_view,
-                            }
-                        )
+                    tac_text = func_tac_map[fname]
+                    tac_list.append(tac_text)
+                    func_meta = _safe_function_metadata(
+                        bytecode, analyzer, fname, tac_text, contract_metadata
+                    )
                     meta_list.append(func_meta)
 
                 # Use batched inference when multiple unresolved functions
@@ -1352,11 +1867,14 @@ def api_decompile():
 
                         try:
                             batch_t0 = time.time()
-                            results = decompiler.decompile_batch(
-                                batch_tac,
-                                metadatas=batch_meta,
-                                max_new_tokens=generation_config["max_new_tokens"],
-                                repetition_penalty=generation_config["repetition_penalty"],
+                            results = _blocking_call(
+                                lambda: decompiler.decompile_batch(
+                                    batch_tac,
+                                    metadatas=batch_meta,
+                                    max_new_tokens=generation_config["max_new_tokens"],
+                                    repetition_penalty=generation_config["repetition_penalty"],
+                                ),
+                                f"batch model inference for {len(batch_fnames)} functions",
                             )
                             batch_latency = time.time() - batch_t0
                             for j, fname in enumerate(batch_fnames):
@@ -1386,13 +1904,18 @@ def api_decompile():
                             for j, fname in enumerate(batch_fnames):
                                 try:
                                     single_t0 = time.time()
-                                    sol = decompiler.decompile_tac_to_solidity(
-                                        batch_tac[j],
-                                        metadata=batch_meta[j],
-                                        max_new_tokens=generation_config["max_new_tokens"],
-                                        temperature=generation_config["temperature"],
-                                        do_sample=generation_config["do_sample"],
-                                        repetition_penalty=generation_config["repetition_penalty"],
+                                    sol = _blocking_call(
+                                        lambda j=j: decompiler.decompile_tac_to_solidity(
+                                            batch_tac[j],
+                                            metadata=batch_meta[j],
+                                            max_new_tokens=generation_config["max_new_tokens"],
+                                            temperature=generation_config["temperature"],
+                                            do_sample=generation_config["do_sample"],
+                                            repetition_penalty=generation_config[
+                                                "repetition_penalty"
+                                            ],
+                                        ),
+                                        f"model inference for {fname}",
                                     )
                                     latency = time.time() - single_t0
                                     function_solidity[fname] = sol
@@ -1412,6 +1935,8 @@ def api_decompile():
                                             "diagnostics": prompt_diagnostics[fname],
                                         }
                                     )
+                                except DecompileRequestError:
+                                    raise
                                 except Exception as e2:
                                     function_errors[fname] = str(e2)
                                     function_solidity[fname] = f"// Decompilation failed: {e2}"
@@ -1469,13 +1994,16 @@ def api_decompile():
 
                         try:
                             single_t0 = time.time()
-                            sol = decompiler.decompile_tac_to_solidity(
-                                tac_list[idx],
-                                metadata=meta_list[idx],
-                                max_new_tokens=generation_config["max_new_tokens"],
-                                temperature=generation_config["temperature"],
-                                do_sample=generation_config["do_sample"],
-                                repetition_penalty=generation_config["repetition_penalty"],
+                            sol = _blocking_call(
+                                lambda idx=idx: decompiler.decompile_tac_to_solidity(
+                                    tac_list[idx],
+                                    metadata=meta_list[idx],
+                                    max_new_tokens=generation_config["max_new_tokens"],
+                                    temperature=generation_config["temperature"],
+                                    do_sample=generation_config["do_sample"],
+                                    repetition_penalty=generation_config["repetition_penalty"],
+                                ),
+                                f"model inference for {fname}",
                             )
                             latency = time.time() - single_t0
                             function_solidity[fname] = sol
@@ -1495,6 +2023,8 @@ def api_decompile():
                                     "diagnostics": prompt_diagnostics[fname],
                                 }
                             )
+                        except DecompileRequestError:
+                            raise
                         except Exception as e:
                             logger.error("[%s] Failed to decompile %s: %s", request_id, fname, e)
                             function_errors[fname] = str(e)
@@ -1567,6 +2097,27 @@ def api_decompile():
                 )
 
             combined_tac = "\n\n".join(func_tac_map.values())
+            function_validation = {
+                fname: _validate_solidity_output(
+                    source,
+                    _safe_function_metadata(
+                        bytecode,
+                        analyzer,
+                        fname,
+                        func_tac_map.get(fname, ""),
+                        contract_metadata,
+                    ),
+                )
+                for fname, source in ordered_function_solidity.items()
+            }
+            validation = _validate_solidity_output(
+                assembled,
+                {
+                    "request_id": request_id,
+                    "contract_metadata": contract_metadata,
+                    "function_count": len(ordered_function_solidity),
+                },
+            )
             function_results = _build_function_results(
                 func_names,
                 function_sources,
@@ -1574,11 +2125,19 @@ def api_decompile():
                 function_latencies,
                 selector_map,
                 prompt_diagnostics,
+                analyzer,
+                contract_metadata,
+                function_validation,
             )
-            source_summary = _source_summary(function_sources, function_errors)
+            source_summary = _source_summary(function_sources, function_errors, function_results)
             failure_count = len(function_errors)
-            success = failure_count == 0 and not (decompiler is None and unresolved_fnames)
-            partial_success = failure_count > 0 and any(
+            validation_failed = not bool(validation.get("valid"))
+            success = (
+                failure_count == 0
+                and not validation_failed
+                and not (decompiler is None and unresolved_fnames)
+            )
+            partial_success = (failure_count > 0 or validation_failed) and any(
                 source != "error" for source in function_sources.values()
             )
 
@@ -1596,17 +2155,27 @@ def api_decompile():
                 "function_results": function_results,
                 "source_summary": source_summary,
                 "failure_count": failure_count,
+                "validation": validation,
+                "function_validation": function_validation,
                 "model_config": model_config_dict,
                 "model_path": active_model_path,
-                "compiler_metadata": request_metadata,
                 "effective_generation_config": generation_config,
+                "contract_metadata": contract_metadata,
             }
             trace["analysis"].update(analysis)
             for item in function_results:
                 trace["functions"].setdefault(item["name"], {}).update(item)
             trace_path = _finish_trace(
                 "success" if success else "partial" if partial_success else "failed",
-                None if success or partial_success else "All functions failed",
+                (
+                    None
+                    if success or partial_success
+                    else (
+                        "Solidity validation failed"
+                        if validation_failed
+                        else "All functions failed"
+                    )
+                ),
             )
 
             yield _sse(
@@ -1625,6 +2194,9 @@ def api_decompile():
                     "analysis": analysis,
                     "effective_generation_config": generation_config,
                     "model_path": active_model_path,
+                    "contract_metadata": contract_metadata,
+                    "validation": validation,
+                    "function_validation": function_validation,
                     "trace_path": _relative_project_path(trace_path),
                     "model_error": (
                         "Model not loaded. Some functions could not be decompiled."
@@ -1825,8 +2397,23 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, default=5000, help="Port number")
     parser.add_argument("--debug", action="store_true", help="Flask debug mode")
+    warmup_group = parser.add_mutually_exclusive_group()
+    warmup_group.add_argument(
+        "--warmup",
+        action="store_true",
+        help="Run bounded model warmup after loading (also WEB_MODEL_WARMUP_ENABLED=true).",
+    )
+    warmup_group.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Disable startup model warmup even if WEB_MODEL_WARMUP_ENABLED=true.",
+    )
     args = parser.parse_args()
     if args.remote_selector_lookup:
         ENABLE_REMOTE_SELECTOR_LOOKUP = True
+    if args.warmup:
+        MODEL_WARMUP_ENABLED = True
+    elif args.no_warmup:
+        MODEL_WARMUP_ENABLED = False
     load_model(use_mock=args.mockmodel, model_path=args.model_path)
     app.run(host=args.host, port=args.port, debug=args.debug)

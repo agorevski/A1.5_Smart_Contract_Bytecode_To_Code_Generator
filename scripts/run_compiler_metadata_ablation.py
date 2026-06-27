@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Run a control-vs-ablation study for compiler metadata prompts.
+"""Historical oracle-only compiler-metadata prompt study.
 
-The control run includes Solidity compiler/optimizer metadata in prompts. The
-ablation run trains with the same data and hyperparameters, but removes compiler
-metadata from prompts via ``ModelConfig.include_compiler_metadata=False``.
+Current production prompt code is bytecode-only: it sanitizes legacy TAC inputs
+and ignores ``ModelConfig.include_compiler_metadata``. This script is retained
+for reproducibility of the old study setup, but it no longer injects true
+compiler/optimizer metadata into prompts.
+
+Production inference only has bytecode (for example, Etherscan Contract >
+Bytecode), so those true compiler/optimizer values are unavailable. Use this
+script for retrospective/oracle research notes only; do not use it to justify
+production prompt inputs or expect the current variants to differ by compiler
+metadata.
 """
 
 from __future__ import annotations
@@ -82,8 +89,7 @@ def _prepare_datasets(args: argparse.Namespace, run_dir: Path, max_steps: int) -
         rows = [
             row
             for row in rows
-            if isinstance(row.get("metadata"), dict)
-            and row["metadata"].get("compiler_version")
+            if isinstance(row.get("metadata"), dict) and row["metadata"].get("compiler_version")
         ]
     if args.max_input_chars > 0:
         rows = [row for row in rows if len(row.get("input", "")) <= args.max_input_chars]
@@ -100,9 +106,7 @@ def _prepare_datasets(args: argparse.Namespace, run_dir: Path, max_steps: int) -
 
     required = train_samples + args.eval_samples
     if len(rows) < required:
-        raise ValueError(
-            f"Need at least {required} valid rows for this study, found {len(rows)}"
-        )
+        raise ValueError(f"Need at least {required} valid rows for this study, found {len(rows)}")
 
     prepared_dir = run_dir / "prepared_data"
     train_path = prepared_dir / "train.jsonl"
@@ -178,6 +182,33 @@ def _variant_command(
     return command
 
 
+def _variant_names(args: argparse.Namespace) -> List[str]:
+    variants = [variant.strip() for variant in args.variants.split(",") if variant.strip()]
+    for variant in variants:
+        if variant not in {"control", "ablation"}:
+            raise ValueError(f"Unknown variant: {variant}")
+    if not variants:
+        raise ValueError("At least one variant is required.")
+    return variants
+
+
+def _parse_gpu_devices(value: str) -> List[str]:
+    return [device.strip() for device in value.split(",") if device.strip()]
+
+
+def _device_assignments(args: argparse.Namespace, variants: List[str]) -> Dict[str, str]:
+    devices = _parse_gpu_devices(args.cuda_visible_devices)
+    if not devices:
+        raise ValueError("--cuda-visible-devices must name at least one GPU/device.")
+    if args.parallel and len(devices) < len(variants):
+        raise ValueError(
+            f"Parallel mode needs at least {len(variants)} CUDA device(s); got {devices}"
+        )
+    if args.parallel:
+        return {variant: devices[index] for index, variant in enumerate(variants)}
+    return {variant: ",".join(devices) for variant in variants}
+
+
 def _run_orchestrator(args: argparse.Namespace) -> None:
     max_steps = _compute_max_steps(args)
     run_dir = Path(args.output_dir)
@@ -185,6 +216,8 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
         run_dir = Path("results") / "ablation" / f"compiler_metadata_{_timestamp()}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    variants = _variant_names(args)
+    device_assignments = _device_assignments(args, variants)
     manifest = _prepare_datasets(args, run_dir, max_steps)
 
     summary = {
@@ -195,6 +228,8 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
         "seconds_per_step_estimate": args.seconds_per_step_estimate,
         "train_samples": manifest["train_samples"],
         "eval_samples": manifest["eval_samples"],
+        "parallel": args.parallel,
+        "device_assignments": device_assignments,
         "variants": {},
     }
 
@@ -213,30 +248,125 @@ def _run_orchestrator(args: argparse.Namespace) -> None:
         logger.info("Dry run requested; not launching training.")
         return
 
-    env = os.environ.copy()
-    if args.cuda_visible_devices:
-        env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
-
-    for variant in args.variants.split(","):
-        variant = variant.strip()
-        if variant not in {"control", "ablation"}:
-            raise ValueError(f"Unknown variant: {variant}")
-
-        command = _variant_command(args, run_dir, variant, max_steps, manifest)
-        logger.info("Starting %s variant", variant)
-        started = time.time()
-        subprocess.run(command, cwd=str(REPO_ROOT), env=env, check=True)
-        elapsed = time.time() - started
-
-        variant_summary_path = run_dir / variant / "summary.json"
-        variant_summary = json.loads(variant_summary_path.read_text(encoding="utf-8"))
-        variant_summary["orchestrator_elapsed_seconds"] = elapsed
-        summary["variants"][variant] = variant_summary
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if args.parallel:
+        _run_variants_parallel(
+            args, run_dir, max_steps, manifest, variants, device_assignments, summary
+        )
+    else:
+        _run_variants_serial(
+            args, run_dir, max_steps, manifest, variants, device_assignments, summary
+        )
 
     summary["comparison"] = _compare_variants(summary["variants"])
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     logger.info("Ablation summary written to %s", summary_path)
+
+
+def _run_variants_serial(
+    args: argparse.Namespace,
+    run_dir: Path,
+    max_steps: int,
+    manifest: Dict[str, Any],
+    variants: List[str],
+    device_assignments: Dict[str, str],
+    summary: Dict[str, Any],
+) -> None:
+    summary_path = run_dir / "ablation_summary.json"
+    for variant in variants:
+        command = _variant_command(args, run_dir, variant, max_steps, manifest)
+        variant_dir = run_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = device_assignments[variant]
+        subprocess_log_path = variant_dir / "subprocess.log"
+        logger.info(
+            "Starting %s variant on CUDA_VISIBLE_DEVICES=%s",
+            variant,
+            device_assignments[variant],
+        )
+        started = time.time()
+        with subprocess_log_path.open("w", encoding="utf-8") as subprocess_log:
+            subprocess.run(
+                command,
+                cwd=str(REPO_ROOT),
+                env=env,
+                stdout=subprocess_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+        elapsed = time.time() - started
+
+        variant_summary_path = variant_dir / "summary.json"
+        variant_summary = json.loads(variant_summary_path.read_text(encoding="utf-8"))
+        variant_summary["orchestrator_elapsed_seconds"] = elapsed
+        variant_summary["cuda_visible_devices"] = device_assignments[variant]
+        summary["variants"][variant] = variant_summary
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def _run_variants_parallel(
+    args: argparse.Namespace,
+    run_dir: Path,
+    max_steps: int,
+    manifest: Dict[str, Any],
+    variants: List[str],
+    device_assignments: Dict[str, str],
+    summary: Dict[str, Any],
+) -> None:
+    summary_path = run_dir / "ablation_summary.json"
+    processes: Dict[str, Dict[str, Any]] = {}
+
+    for variant in variants:
+        command = _variant_command(args, run_dir, variant, max_steps, manifest)
+        variant_dir = run_dir / variant
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = device_assignments[variant]
+        subprocess_log = (variant_dir / "subprocess.log").open("w", encoding="utf-8")
+        logger.info(
+            "Starting %s variant on CUDA_VISIBLE_DEVICES=%s",
+            variant,
+            device_assignments[variant],
+        )
+        processes[variant] = {
+            "process": subprocess.Popen(
+                command,
+                cwd=str(REPO_ROOT),
+                env=env,
+                stdout=subprocess_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            ),
+            "log": subprocess_log,
+            "started": time.time(),
+            "variant_dir": variant_dir,
+        }
+
+    failures: List[str] = []
+    for variant, info in processes.items():
+        process = info["process"]
+        return_code = process.wait()
+        info["log"].close()
+        elapsed = time.time() - info["started"]
+        if return_code != 0:
+            failures.append(
+                f"{variant} exited with {return_code}; see {info['variant_dir'] / 'subprocess.log'}"
+            )
+            continue
+
+        variant_summary_path = info["variant_dir"] / "summary.json"
+        variant_summary = json.loads(variant_summary_path.read_text(encoding="utf-8"))
+        variant_summary["orchestrator_elapsed_seconds"] = elapsed
+        variant_summary["cuda_visible_devices"] = device_assignments[variant]
+        summary["variants"][variant] = variant_summary
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        logger.info("%s variant completed in %.1f seconds", variant, elapsed)
+
+    if failures:
+        summary["failures"] = failures
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        raise RuntimeError("; ".join(failures))
 
 
 def _compare_variants(variants: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -368,7 +498,7 @@ def _run_worker(args: argparse.Namespace) -> None:
 
     from src.model_setup import ModelConfig, SmartContractModelTrainer
 
-    include_compiler_metadata = args.worker_variant == "control"
+    requested_compiler_metadata = args.worker_variant == "control"
     config = ModelConfig(
         model_name=args.model_name,
         max_sequence_length=args.max_seq_length,
@@ -376,13 +506,14 @@ def _run_worker(args: argparse.Namespace) -> None:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         use_quantization=args.use_quantization,
-        include_compiler_metadata=include_compiler_metadata,
+        include_compiler_metadata=requested_compiler_metadata,
     )
 
     logger.info(
-        "Variant=%s include_compiler_metadata=%s max_steps=%d",
+        "Variant=%s requested_compiler_metadata=%s effective_compiler_metadata=%s max_steps=%d",
         args.worker_variant,
-        include_compiler_metadata,
+        requested_compiler_metadata,
+        config.include_compiler_metadata,
         args.max_steps,
     )
     trainer = SmartContractModelTrainer(config, output_dir=str(variant_dir / "models"))
@@ -415,7 +546,8 @@ def _run_worker(args: argparse.Namespace) -> None:
 
     summary = {
         "variant": args.worker_variant,
-        "include_compiler_metadata": include_compiler_metadata,
+        "requested_compiler_metadata": requested_compiler_metadata,
+        "effective_compiler_metadata": config.include_compiler_metadata,
         "model_path": model_path,
         "max_steps": args.max_steps,
         "train_seconds": train_seconds,
@@ -430,7 +562,11 @@ def _run_worker(args: argparse.Namespace) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a compiler-metadata control-vs-ablation training study."
+        description=(
+            "Historical oracle-only compiler-metadata study. Current prompt "
+            "code ignores compiler metadata, so variants do not differ by "
+            "compiler/optimizer prompt inputs."
+        )
     )
     parser.add_argument("--dataset", default="data/hf_training_dataset.jsonl")
     parser.add_argument("--output-dir", default="auto")
@@ -446,10 +582,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seconds-per-step-estimate",
         type=float,
-        default=8.0,
+        default=9.5,
         help=(
             "Used to derive max steps when --max-steps is omitted. "
-            "Default yields 150 steps for a ~20 minute Qwen 7B run."
+            "Default yields 126 steps for a ~20 minute Qwen 7B run."
         ),
     )
     parser.add_argument("--max-steps", type=int, default=-1)
@@ -477,8 +613,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exclude very large Solidity outputs from the bounded study sample.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cuda-visible-devices", default="0")
+    parser.add_argument(
+        "--cuda-visible-devices",
+        default="0",
+        help=(
+            "Comma-separated CUDA devices. In --parallel mode, each variant is "
+            "pinned to one listed device."
+        ),
+    )
     parser.add_argument("--variants", default="control,ablation")
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Run variants concurrently, pinned to separate CUDA devices.",
+    )
     parser.add_argument("--use-quantization", action="store_true")
     parser.add_argument(
         "--allow-missing-compiler-metadata",

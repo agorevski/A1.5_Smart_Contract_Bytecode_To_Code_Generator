@@ -24,7 +24,7 @@ Generated data, models, and results are gitignored. A clean clone will not inclu
 |------|------|-----------------|
 | Verify the pipeline quickly | Existing JSONL or small generated set | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
 | Train a baseline with current data | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
-| Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
+| Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` or `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
 | Build more data first | Hugging Face verified contracts | `uv run python download_hf_contracts.py --limit 1000 --max-compiler-versions 3` |
 | Reproduce paper-scale intent | Large generated dataset | Scale `download_hf_contracts.py` until pair counts approach the target, then train/evaluate |
 
@@ -90,10 +90,11 @@ print({"rows": rows, "bad_json": bad_json, "missing_input_or_output": missing_io
 PY
 ```
 
-A valid training row looks like:
+A production-aligned training row keeps prompt inputs bytecode-derived. If a
+selector database supplies a name/signature guess, mark it inferred:
 
 ```json
-{"input": "<TAC representation>", "output": "<Solidity code>", "metadata": {"function_name": "transfer"}}
+{"input": "<TAC/CFG from bytecode>", "output": "<Solidity code>", "metadata": {"function_selector": "0xa9059cbb", "signature_guess": "transfer(address,uint256)", "signature_guess_inferred": true}}
 ```
 
 Use `demo_dataset.jsonl` only for smoke tests. Three examples are not enough for meaningful fine-tuning.
@@ -102,7 +103,7 @@ real pairs fail fast unless `--allow-demo-fallback` is set.
 
 ## 3. Generate or refresh training data
 
-The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles them with compatible `solc` versions, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests.
+The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles them with compatible `solc` versions, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests. For production prompt design, treat compiler version and optimizer fields/comments in generated data as oracle-only and exclude or sanitize them before training.
 
 ```bash
 # Quick data-generation test
@@ -209,9 +210,20 @@ This re-splits the source JSONL into `data/train_dataset.jsonl`,
 splitter preserves leakage-connected groups (source hash, contract address,
 contract+selector/signature, exact input hash, exact output hash), validates no
 overlap across train/val/test, and reports holdout coverage by compiler version,
-optimizer, visibility, source, length bucket, and function family. Compiler
-version and optimizer metadata are included in prompts by default when dataset
-rows contain them; use `--no-compiler-metadata` only for an ablation run.
+optimizer, visibility, source, length bucket, and function family. Production
+inference only has Etherscan **Contract > Bytecode**, so training prompts
+always ignore true compiler/optimizer metadata and sanitize legacy TAC inputs:
+
+```bash
+uv run python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl
+```
+
+`--no-compiler-metadata` is retained as a deprecated no-op for old scripts.
+If an older JSONL embeds `// Compiler:` or source/ABI annotations inside the
+TAC `input`, the training prompt builder strips those lines before tokenization;
+new exports also sanitize TAC prompt inputs.
 
 Before training or eval-only, `train.py` validates JSONL schema and tokenizer
 lengths. By default it uses a cached tokenizer when available and falls back to
@@ -227,85 +239,90 @@ final metrics, and evaluation result references. Throughput telemetry is enabled
 by default and writes `models/training_throughput.json` plus
 `models/training_throughput.csv`; disable it with `--no-throughput-metrics`.
 
-### Compiler metadata ablation study
+The default training recipe is `Qwen/Qwen2.5-Coder-7B-Instruct` with LoRA on 4
+GPUs. When multiple CUDA devices are visible, `train.py` automatically relaunches
+itself with `torchrun --nproc_per_node=4` unless `--num-gpus 1` or
+`--no-auto-torchrun` is provided. Gradient accumulation is auto-computed from
+`--global-batch-size` (default 16), so scaling to 4 GPUs keeps the effective
+batch comparable to the single-GPU recipe instead of silently quadrupling it.
 
-Use an ablation study to measure whether compiler metadata improves generated
-Solidity quality. The control run includes compiler/optimizer metadata in the
-prompt; the ablation run uses the same dataset, model, LoRA config, sequence
-length, learning rate, seed, and step budget, but removes that metadata.
+### Production bytecode-only prompt metadata
 
-The reusable script below prepares one deterministic train/eval sample and then
-runs the two variants in separate Python processes so GPU memory is released
-between runs:
+Production inference starts from Etherscan **Contract > Bytecode** only. Do not
+design prompts around true `compiler_version`, `solc_version`,
+`optimizer_enabled`, `optimizer_runs`, or `evm_version`; those are verified-source
+oracle fields, not bytecode-only inputs.
+
+Safe high-value prompt inputs are derived from the bytecode or from selector
+databases:
+
+- TAC/CFG text, function selector, and selector/signature guesses marked
+  inferred with their source.
+- Basic block and branch counts.
+- TAC/opcode counts.
+- Storage read/write counts.
+- External call counts.
+- Event/log and revert counts.
+- Bytecode length, instruction count, and function count.
+
+For inference, omit compiler flags and inspect the bytecode-derived TAC/analysis:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-uv run python scripts/run_compiler_metadata_ablation.py \
-  --dataset data/hf_training_dataset.jsonl \
-  --model-name Qwen/Qwen2.5-Coder-7B-Instruct \
-  --target-train-minutes 20 \
-  --seconds-per-step-estimate 8.0 \
-  --max-seq-length 4096 \
-  --batch-size 1 \
-  --gradient-accumulation-steps 4 \
-  --lora-rank 32 \
-  --lora-alpha 64 \
-  --eval-samples 8
+uv run python scripts/decompile.py \
+  --model-path models/final_model \
+  --bytecode 0x60806040... \
+  --format json
+
+uv run python scripts/decompile.py --format tac --bytecode 0x60806040...
 ```
 
-With the default estimate, the script caps each training run at **150 optimizer
-steps**, which is roughly 20 minutes per run on the local RTX 8000/Qwen 7B fp16
-setup after observing ~8 seconds/step on 4096-token samples. The script also
-filters extreme long-tail examples by default (`--max-input-chars 12000`,
-`--max-output-chars 4000`) so a few huge functions do not dominate runtime.
-Override `--max-steps` if you want an exact step count, or adjust
-`--seconds-per-step-estimate` after a calibration run. Results are written under
-`results/ablation/compiler_metadata_<timestamp>/` with per-variant
-`summary.json` files and an aggregate `ablation_summary.json`.
+Use `--no-bytecode-metadata` only if you want to disable the compact
+bytecode/TAC-derived count line; TAC/CFG remains the core model input and TAC
+sanitization still runs. Legacy inference flags such as `--compiler-version`,
+`--optimizer-enabled`, `--optimizer-runs`, and `--evm-version` are deprecated
+no-ops and are ignored.
 
-Interpret the study directionally unless you repeat it with multiple seeds.
-Compare `edit_similarity_mean`, `edit_distance_mean`,
-`replication_precision_mean`, `replication_recall_mean`, and
-`replication_f1_mean`. If the control consistently beats the ablation, keep
-compiler metadata in production prompts.
+### Oracle-only compiler metadata study
+
+`scripts/run_compiler_metadata_ablation.py` is deprecated for production prompt
+design. Current prompt code ignores true compiler/optimizer values and sanitizes
+legacy TAC inputs, so the script is retained only as a historical research
+artifact and no longer creates a real compiler-metadata control. Do not use the
+old oracle result to justify compiler metadata in production prompts.
 
 ### Recommended <=8B code model: Qwen2.5-Coder-7B-Instruct
 
-For a stronger code-specialized base model that still fits comfortably on the available RTX 8000 GPUs, use `Qwen/Qwen2.5-Coder-7B-Instruct`. A local full-fp16 LoRA smoke run completed successfully on this repository with a tiny TAC/Solidity subset, batch size 1, one epoch, and `max_seq_length=1024`.
+`Qwen/Qwen2.5-Coder-7B-Instruct` is now the default base model. A local full-fp16
+LoRA smoke run completed successfully on this repository with a tiny TAC/Solidity
+subset, batch size 1, one epoch, and `max_seq_length=1024`.
 
-The current CLI has no explicit `--no-quantization` flag; full fp16 requires calling the Python API and setting `use_quantization=False`:
+Full-precision LoRA is the default to avoid quantization-related quality changes.
+Use `--quantization` only when VRAM pressure requires 4-bit NF4 loading:
 
-```python
-from train import setup_logging, split_dataset, train_model
+```bash
+uv run python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --num-gpus 4 \
+  --global-batch-size 16
 
-setup_logging("train_qwen.log")
-train_path, val_path, _ = split_dataset(
-    "data/hf_training_dataset.jsonl",
-    "data",
-)
-
-model_path = train_model(
-    train_path=train_path,
-    val_path=val_path,
-    output_dir="models",
-    batch_size=1,
-    learning_rate=2e-4,
-    num_epochs=1,
-    max_seq_length=1024,
-    model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
-    use_quantization=False,
-)
-print(model_path)
+uv run python train.py \
+  --skip-collection \
+  --dataset data/hf_training_dataset.jsonl \
+  --num-gpus 4 \
+  --quantization
 ```
 
-For longer runs on this hardware, start with batch size 1-2, sequence length 2048-4096, and compare against the Llama 3.2 3B baseline using the same train/validation/test split.
+For longer runs on this hardware, start with batch size 1-2, sequence length
+2048-4096, and compare against the Llama 3.2 3B paper baseline using the same
+train/validation/test split.
 
 ### Multi-GPU with torchrun
 
 ```bash
 NGPUS=4 \
 DATASET=./data/hf_training_dataset.jsonl \
-MODEL=meta-llama/Llama-3.2-3B \
+MODEL=Qwen/Qwen2.5-Coder-7B-Instruct \
 EPOCHS=3 \
 LR=2e-4 \
 ./run_train_torchrun.sh
@@ -328,7 +345,7 @@ uv sync --extra deepspeed
 NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_deepspeed.sh
 ```
 
-For Llama 3.2 3B + LoRA, torchrun DDP is usually simpler and faster. Use DeepSpeed primarily for larger models or when ZeRO sharding is needed.
+For Qwen2.5-Coder-7B + LoRA, torchrun DDP is usually simpler and faster. Use DeepSpeed primarily for larger models or when ZeRO sharding is needed.
 
 ### Resume from a checkpoint
 
@@ -450,34 +467,35 @@ decompiler = SmartContractDecompiler("models/final_model")
 solidity = decompiler.decompile_tac_to_solidity(
     tac_input="function transfer(address to, uint256 amount):\n  // ... TAC ...",
     metadata={
-        "compiler_version": "0.8.20",
-        "optimizer_enabled": True,
-        "optimizer_runs": 200,
+        "function_name": "transfer",
+        "signature_guess_inferred": True,
+        "signature_guess_source": "selector_database",
     },
     max_new_tokens=1024,
 )
 print(solidity)
 ```
 
-Passing compiler metadata is recommended when you know it. Solidity language
-semantics and bytecode shape vary by compiler version and optimizer settings,
-so the training and inference prompts include `compiler_version`,
-`optimizer_enabled`, `optimizer_runs`, and `evm_version` when present.
+Only pass prompt metadata that is available from bytecode analysis or selector
+databases. Treat function names/signatures as guesses unless they came from a
+verified selector mapping, and do not pass true compiler/optimizer settings for
+production bytecode-only inference.
 
 ### CLI: bytecode to TAC or Solidity
 
 Use `scripts/decompile.py` for shell, CI, and batch inference. JSON output is
 machine-readable and includes generated Solidity, TAC, analysis timings,
-function errors, compiler metadata, generation controls, and model config:
+function errors, Solidity validation diagnostics, request metadata, generation
+controls, and model config. If `--model-path` is omitted, the CLI uses the same
+model resolution order as the web app: `WEB_MODEL_PATH`, `models/final_model/`,
+then the newest `models/final_model*/` artifact containing `model_config.json`:
 
 ```bash
 uv run python scripts/decompile.py \
-  --model-path models/final_model \
   --bytecode 0x60806040... \
-  --compiler-version 0.8.20 \
-  --optimizer-enabled true \
-  --optimizer-runs 200 \
   --max-new-tokens 1024 \
+  --timeout-seconds 900 \
+  --max-functions 128 \
   --format json
 ```
 
@@ -495,9 +513,6 @@ from src.model_setup import SmartContractDecompiler
 decompiler = SmartContractDecompiler("models/final_model")
 result = decompiler.decompile_contract(
     "0x60806040...",
-    compiler_version="0.8.20",
-    optimizer_enabled=True,
-    optimizer_runs=200,
 )
 
 print(result["solidity"])
@@ -514,11 +529,14 @@ from src.model_setup import SmartContractDecompiler
 decompiler = SmartContractDecompiler("models/final_model_378")
 ```
 
-The web app first checks `WEB_MODEL_PATH`, then `models/final_model/`, then auto-discovers the newest `models/final_model*/` directory containing `model_config.json`. You can also pass a path explicitly:
+The web app and CLI first check `WEB_MODEL_PATH`, then `models/final_model/`,
+then auto-discover the newest `models/final_model*/` directory containing
+`model_config.json`. You can also pass a path explicitly:
 
 ```bash
 WEB_MODEL_PATH=models/final_model_378 uv run python web/app.py
 uv run python web/app.py --model-path models/final_model_378
+uv run python scripts/decompile.py --model-path models/final_model_378 --bytecode 0x...
 ```
 
 ### Web app
@@ -530,24 +548,36 @@ uv run python web/app.py
 Open `http://localhost:5000`. If no model artifact can be resolved, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
 The readiness panel calls `/api/health` before a job and shows whether the
 model is loaded, which model path/config is effective, lookup DB availability,
-request limits, and default generation controls. The browser validates bytecode
-format/size before upload and provides an explicit cancel button for long jobs.
+warmup status, request limits, hard-timeout mode, and default generation
+controls. The browser validates bytecode/ABI/metadata format before upload,
+provides an explicit cancel button for long jobs, and exposes `.sol`, `.tac`,
+and structured JSON downloads after results arrive.
 
 The `/api/decompile` endpoint streams SSE progress and a final result. Each
 request includes a `request_id`; when `WEB_INFERENCE_TRACE_ENABLED=true`
 (default), a JSON trace is written under `results/inference_traces/` with
-bytecode hashes, per-function lookup/model provenance, token/truncation
-diagnostics, generation settings, timings, and errors. Raw bytecode/TAC samples
-are omitted unless `WEB_INFERENCE_TRACE_INCLUDE_SAMPLES=true`.
+bytecode hashes, per-function lookup/model/ABI provenance, token/truncation
+diagnostics, validation results, generation settings, timings, and errors. Raw
+bytecode/TAC samples are omitted unless `WEB_INFERENCE_TRACE_INCLUDE_SAMPLES=true`.
 
 ```bash
 curl -N http://127.0.0.1:5000/api/decompile \
   -H 'Content-Type: application/json' \
   -d '{
     "bytecode": "0x60806040...",
-    "compiler_version": "0.8.20",
-    "optimizer_enabled": true,
-    "optimizer_runs": 200,
+    "abi": [
+      {
+        "type": "function",
+        "name": "transfer",
+        "inputs": [
+          {"name": "to", "type": "address"},
+          {"name": "amount", "type": "uint256"}
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable"
+      }
+    ],
+    "metadata": {"contractName": "Token"},
     "generation": {
       "max_new_tokens": 512,
       "temperature": 0.1,
@@ -556,6 +586,48 @@ curl -N http://127.0.0.1:5000/api/decompile \
     }
   }'
 ```
+
+`/api/decompile` accepts ABI either as top-level `abi` or as
+`metadata.abi`. ABI JSON may be an array or an artifact object containing an
+`abi` array. ABI-derived function signatures override selector provenance as
+`source="abi"` and are included in per-function metadata, traces, and JSON
+exports. The final result includes `validation`, `function_validation`,
+`trace_path`, `function_results[*].diagnostics`, `contract_metadata`,
+`source_summary`, and `effective_generation_config`.
+
+Supported web inference configuration is environment/CLI driven; web requests do
+not read `src/settings.yaml`.
+
+| Knob | Default | Notes |
+|------|---------|-------|
+| `WEB_MODEL_PATH` / `--model-path` | auto | Model path precedence before `models/final_model/` and newest `models/final_model*/` |
+| `WEB_HOST` / `--host` | `127.0.0.1` | Bind address |
+| `--port` | `5000` | Flask port |
+| `--debug` | off | Flask debug mode |
+| `WEB_API_KEY` | unset | Required for non-loopback/protected access when set |
+| `WEB_CORS_ORIGINS` | loopback origins | Comma-separated origins or `*` |
+| `WEB_MAX_BYTECODE_HEX_LENGTH` | `200000` | Request bytecode hex limit |
+| `WEB_MAX_CONCURRENT_DECOMPILES` | `1` | Bounded semaphore capacity |
+| `WEB_MAX_DECOMPILE_FUNCTIONS` | `128` | Function work cap |
+| `WEB_DECOMPILE_TIMEOUT_SECONDS` | `900` | Hard daemon-thread timeout around analyzer/model calls; `0` disables |
+| `WEB_MAX_NEW_TOKENS` | `4096` | Maximum request generation cap |
+| `WEB_DEFAULT_MAX_NEW_TOKENS` | `1024` | UI/API default generation cap |
+| `WEB_DEFAULT_TEMPERATURE` | `0.1` | UI/API default |
+| `WEB_DEFAULT_DO_SAMPLE` | `false` | UI/API default |
+| `WEB_DEFAULT_REPETITION_PENALTY` | `1.15` | UI/API default |
+| `WEB_ENABLE_REMOTE_SELECTOR_LOOKUP` / `--remote-selector-lookup` | `false` | Enables 4byte.directory lookups |
+| `WEB_INFERENCE_TRACE_ENABLED` | `true` | Writes trace JSON |
+| `WEB_INFERENCE_TRACE_INCLUDE_SAMPLES` | `false` | Include raw samples in traces |
+| `WEB_INFERENCE_TRACE_DIR` | `results/inference_traces/` | Trace output directory |
+| `WEB_MAX_ABI_JSON_CHARS` | `200000` | ABI JSON size limit |
+| `WEB_MAX_CONTRACT_METADATA_JSON_CHARS` | `200000` | Metadata JSON size limit |
+| `WEB_MAX_ABI_ENTRIES` | `512` | ABI entry count limit |
+| `WEB_MODEL_WARMUP_ENABLED` / `--warmup` / `--no-warmup` | `false` | Optional startup warmup |
+| `WEB_MODEL_WARMUP_TIMEOUT_SECONDS` | `30` | Warmup deadline |
+| `WEB_MODEL_WARMUP_MAX_NEW_TOKENS` | `8` | Warmup generation cap |
+
+`/api/health` reports these as `limits`, `generation_defaults`, `tracing`,
+`warmup`, `model_path`, `model_loaded`, `inference_ready`, and `lookup`.
 
 The UI also exposes the security-analysis APIs using the same bytecode/API-key
 inputs:

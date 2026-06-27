@@ -2,6 +2,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,9 +78,7 @@ def test_collect_dataset_passes_configurable_max_workers_when_supported(tmp_path
         def __init__(self, _api_key, output_dir):
             pass
 
-        def collect_and_compile_contracts(
-            self, addresses, max_workers=3, max_compiler_configs=2
-        ):
+        def collect_and_compile_contracts(self, addresses, max_workers=3, max_compiler_configs=2):
             captured["addresses"] = addresses
             captured["max_workers"] = max_workers
             captured["max_compiler_configs"] = max_compiler_configs
@@ -131,9 +130,7 @@ def test_collect_dataset_fails_fast_without_explicit_demo_fallback(tmp_path, mon
         train.collect_dataset("api-key", "addresses.txt", output_dir=str(tmp_path))
 
 
-def test_collect_dataset_demo_fallback_requires_flag_and_writes_manifest(
-    tmp_path, monkeypatch
-):
+def test_collect_dataset_demo_fallback_requires_flag_and_writes_manifest(tmp_path, monkeypatch):
     import src.dataset_pipeline as dataset_pipeline
 
     class FakeBuilder:
@@ -295,23 +292,29 @@ def test_jsonl_preflight_reports_schema_and_token_length_errors(tmp_path):
     dataset_path.write_text(
         "\n".join(
             [
-                json.dumps({"input": "ok", "output": "ok", "metadata": {}}),
+                json.dumps({"input": "ok", "output": "ok", "metadata": {"schema_version": 1}}),
                 "{not valid json}",
-                json.dumps({"output": "missing input", "metadata": {}}),
+                json.dumps({"output": "missing input", "metadata": {"schema_version": 1}}),
                 json.dumps({"input": "has bad metadata", "output": "ok", "metadata": []}),
-                json.dumps({"input": "has empty output", "output": "   ", "metadata": {}}),
+                json.dumps(
+                    {
+                        "input": "has empty output",
+                        "output": "   ",
+                        "metadata": {"schema_version": 1},
+                    }
+                ),
                 json.dumps(
                     {
                         "input": " ".join(["context"] * 40),
                         "output": "ok",
-                        "metadata": {},
+                        "metadata": {"schema_version": 1},
                     }
                 ),
                 json.dumps(
                     {
                         "input": "ok",
                         "output": " ".join(["target"] * 40),
-                        "metadata": {},
+                        "metadata": {"schema_version": 1},
                     }
                 ),
             ]
@@ -335,10 +338,89 @@ def test_jsonl_preflight_reports_schema_and_token_length_errors(tmp_path):
     assert report["error_counts"]["target_overlength"] == 1
 
 
+def test_jsonl_preflight_rejects_malformed_versioned_metadata(tmp_path):
+    dataset_path = tmp_path / "bad_metadata.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [
+            {
+                "input": "tac",
+                "output": "sol",
+                "metadata": {
+                    "schema_version": 1,
+                    "contract_address": "0xnot-an-address",
+                    "selector": "0x123",
+                    "source_hash": "not-hex",
+                    "optimizer_enabled": "true",
+                    "compiler_version": "solc-nightly",
+                    "optimizer_runs": True,
+                },
+            }
+        ],
+    )
+
+    report = train.validate_jsonl_schema_and_lengths(
+        dataset_path,
+        tokenizer=TinyTokenizer(),
+        max_seq_length=64,
+    )
+
+    assert report["status"] == "failed"
+    assert report["metadata_schema"]["allow_legacy"] is False
+    assert report["error_counts"]["contract_address_format"] == 1
+    assert report["error_counts"]["selector_format"] == 1
+    assert report["error_counts"]["hash_format"] == 1
+    assert report["error_counts"]["boolean_type_error"] == 1
+    assert report["error_counts"]["compiler_version_format"] == 1
+    assert report["error_counts"]["optimizer_runs_type_error"] == 1
+
+
+def test_jsonl_preflight_legacy_schema_requires_explicit_compatibility(tmp_path):
+    dataset_path = tmp_path / "legacy.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [
+            {
+                "input": "tac",
+                "output": "sol",
+                "metadata": {
+                    "contract_address": "0x0000000000000000000000000000000000000001",
+                    "selector": "0x12345678",
+                    "optimizer_enabled": True,
+                    "compiler_version": "0.8.20",
+                },
+            }
+        ],
+    )
+
+    strict = train.validate_jsonl_schema_and_lengths(
+        dataset_path,
+        tokenizer=TinyTokenizer(),
+        max_seq_length=64,
+    )
+    legacy = train.validate_jsonl_schema_and_lengths(
+        dataset_path,
+        tokenizer=TinyTokenizer(),
+        max_seq_length=64,
+        allow_legacy_metadata_schema=True,
+    )
+
+    assert strict["status"] == "failed"
+    assert strict["error_counts"]["schema_version_missing"] == 1
+    assert legacy["status"] == "passed"
+    assert legacy["metadata_schema"]["allow_legacy"] is True
+
+
 @dataclass
 class FakeMetrics:
     semantic_similarity: float = 1.0
     normalized_edit_distance: float = 0.0
+    replication_precision: float = 1.0
+    replication_recall: float = 1.0
+    replication_f1: float = 1.0
+    solidity_valid: bool = True
+    solidity_compiler_checked: bool = True
+    solidity_ast_valid: bool = True
 
 
 class FakeEvaluator:
@@ -497,24 +579,286 @@ def test_evaluate_model_records_failed_rows_and_traceable_details(tmp_path, monk
     assert summary["worst_samples"]["failed"][0]["dataset_index"] == 1
 
 
+def test_evaluate_model_persists_prompt_truncation_diagnostics(tmp_path, monkeypatch):
+    class DiagnosticDecompiler:
+        def __init__(self, model_path):
+            self.model_path = model_path
+
+        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+            return "generated solidity"
+
+        def prompt_diagnostics(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            generated_text=None,
+        ):
+            return {
+                "context_window": 32,
+                "prompt_budget": 16,
+                "max_new_tokens": max_new_tokens,
+                "tac_token_budget": 8,
+                "tac_tokens_before": len(str(tac).split()),
+                "tac_tokens_after": 6,
+                "prompt_tokens": 14,
+                "generated_tokens": (
+                    len(str(generated_text).split()) if generated_text is not None else None
+                ),
+                "tac_truncated": True,
+                "strategy": "hard_truncate",
+                "marker": "// ... truncated",
+            }
+
+    _patch_evaluation_dependencies(monkeypatch, DiagnosticDecompiler)
+    dataset_path = tmp_path / "test.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [
+            {
+                "input": " ".join(f"OP_{i}" for i in range(50)),
+                "output": "sol",
+                "metadata": {"schema_version": 1},
+            }
+        ],
+    )
+
+    summary = train.evaluate_model(
+        "fake-model",
+        str(dataset_path),
+        results_dir=str(tmp_path / "results"),
+        latest_results_path=str(tmp_path / "latest.txt"),
+    )
+    payload = json.loads(Path(summary["results_path"]).read_text())
+    detail = payload["details"][0]
+
+    assert detail["prompt_diagnostics"]["tac_truncated"] is True
+    assert detail["prompt_diagnostics"]["strategy"] == "hard_truncate"
+    assert detail["prompt_diagnostics"]["generated_tokens"] == 2
+    assert summary["prompt_truncation_count"] == 1
+    assert summary["prompt_truncation_rate"] == 1.0
+    assert summary["prompt_diagnostics"]["tac_tokens_before"]["max"] == 50
+    assert (
+        summary["worst_samples"]["truncated_low_quality"][0]["prompt_diagnostics"]["tac_truncated"]
+        is True
+    )
+
+
+def test_evaluate_model_uses_seeded_limit_and_full_aggregation(tmp_path, monkeypatch):
+    class FakeDecompiler:
+        def __init__(self, model_path):
+            self.model_path = model_path
+
+        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+            return f"sol:{tac}"
+
+    _patch_evaluation_dependencies(monkeypatch, FakeDecompiler)
+    dataset_path = tmp_path / "test.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [
+            {
+                "input": f"tac{i}",
+                "output": f"sol{i}",
+                "metadata": {
+                    "compiler_version": "0.8.20" if i % 2 else "0.8.19",
+                    "optimizer_enabled": bool(i % 2),
+                },
+            }
+            for i in range(20)
+        ],
+    )
+
+    summary_a = train.evaluate_model(
+        "fake-model",
+        str(dataset_path),
+        results_dir=str(tmp_path / "results-a"),
+        latest_results_path=str(tmp_path / "latest-a.txt"),
+        eval_limit=5,
+        eval_seed=123,
+    )
+    summary_b = train.evaluate_model(
+        "fake-model",
+        str(dataset_path),
+        results_dir=str(tmp_path / "results-b"),
+        latest_results_path=str(tmp_path / "latest-b.txt"),
+        eval_limit=5,
+        eval_seed=123,
+    )
+    summary_c = train.evaluate_model(
+        "fake-model",
+        str(dataset_path),
+        results_dir=str(tmp_path / "results-c"),
+        latest_results_path=str(tmp_path / "latest-c.txt"),
+        eval_limit=5,
+        eval_seed=124,
+    )
+
+    assert summary_a["eval_sampling_strategy"] == "seeded_sample"
+    assert summary_a["eval_sample_indices"] == summary_b["eval_sample_indices"]
+    assert summary_a["eval_sample_indices"] != summary_c["eval_sample_indices"]
+    assert summary_a["solidity_valid_mean"] == 1.0
+    assert summary_a["solidity_compiler_checked_mean"] == 1.0
+    assert summary_a["solidity_ast_valid_mean"] == 1.0
+    assert "semantic_similarity_mean" in summary_a["confidence_intervals"]
+    assert "metadata_segments" in summary_a
+    payload = json.loads(Path(summary_a["results_path"]).read_text())
+    assert payload["summary"]["eval_seed"] == 123
+    assert [row["dataset_index"] for row in payload["details"]] == summary_a["eval_sample_indices"]
+
+
+def test_evaluate_model_baseline_comparison_and_quality_gate(tmp_path, monkeypatch):
+    class FakeDecompiler:
+        def __init__(self, model_path):
+            self.model_path = model_path
+
+        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+            return f"sol:{tac}"
+
+    _patch_evaluation_dependencies(monkeypatch, FakeDecompiler)
+    dataset_path = tmp_path / "test.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [{"input": "tac", "output": "sol", "metadata": {"compiler_version": "0.8.20"}}],
+    )
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "semantic_similarity_mean": 0.5,
+                    "edit_distance_mean": 0.5,
+                    "failure_rate": 0.0,
+                }
+            }
+        )
+    )
+
+    summary = train.evaluate_model(
+        "fake-model",
+        str(dataset_path),
+        results_dir=str(tmp_path / "results"),
+        latest_results_path=str(tmp_path / "latest.txt"),
+        baseline_results_path=str(baseline_path),
+        quality_gate_config={
+            "enabled": True,
+            "thresholds": {
+                "semantic_similarity_mean": {"op": ">=", "value": 1.1, "required": True},
+                "failure_rate": {"op": "<=", "value": 0.0, "required": True},
+            },
+            "max_baseline_regressions": 0,
+        },
+    )
+
+    comparison = summary["baseline_comparison"]["comparisons"]
+    assert comparison["semantic_similarity_mean"]["status"] == "improved"
+    assert comparison["edit_distance_mean"]["status"] == "improved"
+    assert summary["quality_gate"]["status"] == "failed"
+    assert summary["quality_gate"]["failures"][0]["metric"] == "semantic_similarity_mean"
+
+
 def test_resolve_resume_checkpoint_auto_selects_latest_numeric_checkpoint(tmp_path):
     output_dir = tmp_path / "models"
     (output_dir / "checkpoint-3").mkdir(parents=True)
     (output_dir / "checkpoint-12").mkdir()
+    (output_dir / "checkpoints" / "checkpoint-20").mkdir(parents=True)
     (output_dir / "not-a-checkpoint").mkdir()
     (output_dir / "checkpoint-3" / "trainer_state.json").write_text("{}")
     (output_dir / "checkpoint-12" / "trainer_state.json").write_text("{}")
+    (output_dir / "checkpoints" / "checkpoint-20" / "trainer_state.json").write_text("{}")
 
     assert train.resolve_resume_checkpoint("auto", str(output_dir)) == str(
-        output_dir / "checkpoint-12"
+        output_dir / "checkpoints" / "checkpoint-20"
     )
-    assert train.resolve_resume_checkpoint("checkpoint-custom", str(output_dir)) == "checkpoint-custom"
+    assert train.resolve_resume_checkpoint.last_result["searched_roots"] == [
+        str(output_dir),
+        str(output_dir / "checkpoints"),
+    ]
+    assert (
+        train.resolve_resume_checkpoint("checkpoint-custom", str(output_dir)) == "checkpoint-custom"
+    )
     assert train.resolve_resume_checkpoint("auto", str(tmp_path / "empty")) is None
 
 
-def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(
-    tmp_path, monkeypatch
-):
+def test_training_config_file_keys_flatten_to_cli_destinations():
+    flattened = train._flatten_cli_config(
+        {
+            "model": {
+                "name": "Qwen/Qwen2.5-Coder-7B-Instruct",
+                "max_sequence_length": 4096,
+                "quantization": True,
+                "lora": {
+                    "enabled": True,
+                    "rank": 8,
+                    "alpha": 16,
+                    "dropout": 0.05,
+                    "target_modules": ["q_proj", "v_proj"],
+                },
+            },
+            "training": {
+                "epochs": 2,
+                "batch_size": 2,
+                "global_batch_size": 16,
+                "gpu_count": 4,
+                "learning_rate": 1e-4,
+            },
+            "dataset": {
+                "path": "data/hf_training_dataset.jsonl",
+                "skip_collection": True,
+            },
+            "evaluation": {
+                "batch_size": 4,
+            },
+        }
+    )
+
+    assert flattened["model_name"] == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert flattened["max_seq_length"] == 4096
+    assert flattened["use_quantization"] is True
+    assert flattened["use_lora"] is True
+    assert flattened["lora_rank"] == 8
+    assert flattened["lora_alpha"] == 16
+    assert flattened["lora_dropout"] == 0.05
+    assert flattened["lora_target_modules"] == ["q_proj", "v_proj"]
+    assert flattened["epochs"] == 2
+    assert flattened["batch_size"] == 2
+    assert flattened["global_batch_size"] == 16
+    assert flattened["num_gpus"] == 4
+    assert flattened["lr"] == 1e-4
+    assert flattened["dataset"] == "data/hf_training_dataset.jsonl"
+    assert flattened["skip_collection"] is True
+    assert flattened["eval_batch_size"] == 4
+
+
+def test_auto_torchrun_relaunch_uses_default_four_gpus(monkeypatch):
+    calls = {}
+
+    def fake_execv(executable, args):
+        calls["executable"] = executable
+        calls["args"] = args
+        raise SystemExit("execv called")
+
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(train, "_cuda_device_count", lambda: 8)
+    monkeypatch.setattr(train.os, "execv", fake_execv)
+    monkeypatch.setattr(sys, "argv", ["train.py", "--skip-collection"])
+
+    with pytest.raises(SystemExit, match="execv called"):
+        train._maybe_relaunch_with_torchrun(
+            SimpleNamespace(
+                dataset_only=False,
+                no_auto_torchrun=False,
+                num_gpus=train.DEFAULT_NUM_GPUS,
+            )
+        )
+
+    assert calls["executable"] == sys.executable
+    assert "--nproc_per_node=4" in calls["args"]
+    assert calls["args"][-2:] == ["train.py", "--skip-collection"]
+
+
+def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(tmp_path, monkeypatch):
     rows = [
         {
             "input": f"tac {i}",
@@ -571,6 +915,15 @@ def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(
             "--resume",
             "auto",
             "--skip-eval",
+            "--skip-data-preflight",
+            "--no-auto-torchrun",
+            "--precision",
+            "fp16",
+            "--no-quantization",
+            "--train-eval-strategy",
+            "no",
+            "--dataloader-num-workers",
+            "0",
             "--run-manifest",
             str(manifest_path),
             "--epochs",
@@ -584,11 +937,173 @@ def test_main_persists_run_manifest_with_resume_dataset_and_training_refs(
 
     manifest = json.loads(manifest_path.read_text())
     assert captured_train_kwargs["resume_from"] == str(checkpoint)
+    assert captured_train_kwargs["precision"] == "fp16"
+    assert captured_train_kwargs["use_quantization"] is False
+    assert captured_train_kwargs["train_eval_strategy"] == "no"
+    assert captured_train_kwargs["dataloader_num_workers"] == 0
     assert manifest["status"] == "completed"
     assert manifest["training"]["config"]["resume"] == "auto"
     assert manifest["training"]["config"]["resume_from_checkpoint"] == str(checkpoint)
+    assert manifest["training"]["config"]["precision"] == "fp16"
+    assert manifest["training"]["config"]["resume_resolution"]["searched_roots"] == [
+        str(output_dir),
+        str(output_dir / "checkpoints"),
+    ]
+    assert manifest["training"]["config"]["dataloader"]["num_workers"] == 0
     assert manifest["datasets"]["source"]["row_count"] == len(rows)
     assert manifest["datasets"]["splits"]["train"]["sha256"]
     assert manifest["training"]["final_metrics"]["train_loss"] == 0.25
     assert manifest["training"]["log_history_references"][0]["log_history_count"] == 1
     assert manifest["evaluation"] == {"skipped": True}
+
+
+def test_split_dataset_reuses_matching_manifest_without_resplitting(tmp_path, monkeypatch):
+    rows = [
+        {
+            "input": f"tac {i}",
+            "output": f"function f{i}() public {{}}",
+            "metadata": {"contract_address": f"0x{i}", "function_signature": f"f{i}()"},
+        }
+        for i in range(12)
+    ]
+    dataset_path = tmp_path / "dataset.jsonl"
+    split_dir = tmp_path / "splits"
+    _write_jsonl(dataset_path, rows)
+
+    first = train.split_dataset(
+        str(dataset_path),
+        str(split_dir),
+        train_ratio=0.6,
+        val_ratio=0.2,
+        seed=99,
+        reuse_existing=True,
+    )
+    assert train.split_dataset.last_status["reused"] is False
+
+    def fail_if_resplit(*_args, **_kwargs):
+        raise AssertionError("split cache miss unexpectedly regenerated splits")
+
+    monkeypatch.setattr(train, "_stratified_component_split", fail_if_resplit)
+    second = train.split_dataset(
+        str(dataset_path),
+        str(split_dir),
+        train_ratio=0.6,
+        val_ratio=0.2,
+        seed=99,
+        reuse_existing=True,
+    )
+
+    assert second == first
+    assert train.split_dataset.last_status["reused"] is True
+
+
+def test_split_quality_gate_fails_oversized_component_by_default(tmp_path):
+    rows = [
+        {
+            "input": f"shared tac {i}",
+            "output": "function shared() public { return; }",
+            "metadata": {"contract_address": f"0xshared{i}", "function_signature": "shared()"},
+        }
+        for i in range(110)
+    ]
+    rows.extend(
+        {
+            "input": f"unique tac {i}",
+            "output": f"function unique{i}() public {{ return; }}",
+            "metadata": {"contract_address": f"0xunique{i}", "function_signature": f"u{i}()"},
+        }
+        for i in range(10)
+    )
+    dataset_path = tmp_path / "degenerate.jsonl"
+    _write_jsonl(dataset_path, rows)
+
+    with pytest.raises(ValueError, match="Split quality validation failed"):
+        train.split_dataset(str(dataset_path), str(tmp_path / "blocked"))
+
+    train.split_dataset(
+        str(dataset_path),
+        str(tmp_path / "allowed"),
+        allow_degenerate_splits=True,
+    )
+    manifest = json.loads((tmp_path / "allowed" / "split_manifest.json").read_text())
+    assert manifest["split_quality"]["status"] == "passed"
+    assert manifest["split_quality"]["largest_component_rows"] == 110
+
+
+def test_preflight_tokenizer_failure_fails_closed_and_override_is_explicit(tmp_path, monkeypatch):
+    import types
+
+    dataset_path = tmp_path / "dataset.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [{"input": "tac", "output": "sol", "metadata": {"schema_version": 1}}],
+    )
+
+    class FailingAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*_args, **_kwargs):
+            raise OSError("missing tokenizer")
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = FailingAutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    failed = train.run_data_preflight(
+        {"train": str(dataset_path)},
+        tokenizer_source="missing-model",
+        max_seq_length=32,
+    )
+    assert failed["status"] == "failed"
+    assert failed["error"] == "tokenizer_unavailable"
+    assert failed["tokenizer"]["mode"] == "unavailable"
+
+    allowed = train.run_data_preflight(
+        {"train": str(dataset_path)},
+        tokenizer_source="missing-model",
+        max_seq_length=32,
+        allow_whitespace_fallback=True,
+    )
+    assert allowed["status"] == "passed"
+    assert allowed["tokenizer"]["mode"] == "whitespace_fallback"
+    assert allowed["tokenizer"]["fallback_allowed"] is True
+
+
+def test_eval_only_autodetected_test_dataset_requires_split_manifest(tmp_path):
+    test_path = tmp_path / "test_dataset.jsonl"
+    _write_jsonl(test_path, [{"input": "tac", "output": "sol", "metadata": {}}])
+
+    with pytest.raises(ValueError, match="not verified"):
+        train.verify_autodetected_test_dataset(test_path, tmp_path / "split_manifest.json")
+
+    info = train.verify_autodetected_test_dataset(
+        test_path,
+        tmp_path / "split_manifest.json",
+        allow_unverified=True,
+    )
+    assert info["status"] == "unverified_allowed"
+    assert "split_manifest_missing" in info["problems"]
+
+
+def test_main_finalizes_manifest_for_early_eval_only_failure(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "failed.manifest.json"
+    monkeypatch.setattr(train, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--eval-only",
+            "--model-path",
+            str(tmp_path / "missing-model"),
+            "--run-manifest",
+            str(manifest_path),
+            "--no-auto-torchrun",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        train.main()
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["error"]["message"].startswith("Model path does not exist")

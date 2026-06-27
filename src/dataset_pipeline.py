@@ -4,6 +4,10 @@ Dataset Collection and Preprocessing Pipeline
 This module implements the data collection, processing, and filtering pipeline
 to create high-quality training examples for the smart contract decompilation model,
 as described in the paper (238,446 TAC-to-Solidity function pairs).
+
+JSONL exports may retain source/compiler metadata for analysis, filtering, and
+manifests, but prompt ``input`` text is bytecode-only TAC. Do not add verified
+source/ABI signatures, compiler settings, or source storage layouts to inputs.
 """
 
 import json
@@ -12,7 +16,11 @@ import os
 import hashlib
 import logging
 import traceback
-from typing import Dict, List, Optional, Tuple
+import time
+import threading
+from collections import Counter
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
@@ -38,6 +46,7 @@ from .abi_enrichment import canonicalize_abi_type, normalize_hex
 import yaml
 
 logger = logging.getLogger(__name__)
+TRAINING_ROW_SCHEMA_VERSION = 1
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -59,6 +68,109 @@ def normalize_tac(tac: str) -> str:
     return _collapse_whitespace(text).lower()
 
 
+_FUNCTION_HEADER_RE = re.compile(r"^(\s*)function\s+.+:\s*$")
+_SELECTOR_COMMENT_RE = re.compile(
+    r"//\s*(?:function\s+)?selector:\s*(0x[0-9a-fA-F]{8})",
+    re.IGNORECASE,
+)
+_SOURCE_ONLY_COMMENT_RE = re.compile(
+    r"^\s*//\s*(?:Compiler:|Returns:|param\[\d+\]\s+at\s+0x[0-9a-fA-F]+:|event:)",
+    re.IGNORECASE,
+)
+_STORAGE_LAYOUT_HEADER_RE = re.compile(r"^\s*//\s*Storage layout:\s*$", re.IGNORECASE)
+_STORAGE_LAYOUT_ROW_RE = re.compile(r"^\s*//\s*slot\s+\d+:", re.IGNORECASE)
+_SOURCE_STORAGE_ANNOTATION_RE = re.compile(r"\s+//\s*likely:\s+.*$", re.IGNORECASE)
+
+
+def _selector_safe_name(selector: Optional[str]) -> Optional[str]:
+    """Return a selector-based TAC function name, or ``None`` without a selector."""
+    if not selector:
+        return None
+    selector_text = str(selector).strip().lower()
+    if selector_text.startswith("0x"):
+        selector_text = selector_text[2:]
+    selector_text = re.sub(r"[^0-9a-f]", "", selector_text)
+    if len(selector_text) != 8:
+        return None
+    return f"selector_{selector_text}"
+
+
+def _safe_tac_function_name(bytecode_function) -> str:
+    """Name TAC headers from bytecode-visible facts, preferring selectors."""
+    selector_name = _selector_safe_name(getattr(bytecode_function, "selector", None))
+    if selector_name:
+        return selector_name
+
+    raw_name = str(getattr(bytecode_function, "name", "") or "").strip()
+    if raw_name in {"fallback", "fallback_function", "receive"}:
+        return re.sub(r"[^A-Za-z0-9_]", "_", raw_name).strip("_") or "bytecode_function"
+
+    if raw_name.startswith("internal_"):
+        return re.sub(r"[^A-Za-z0-9_]", "_", raw_name).strip("_") or "bytecode_function"
+
+    entry_block = str(getattr(bytecode_function, "entry_block", "") or "").strip()
+    if entry_block:
+        safe_entry = re.sub(r"[^A-Za-z0-9_]", "_", entry_block).strip("_")
+        if safe_entry:
+            return f"bytecode_{safe_entry}"
+
+    return "bytecode_function"
+
+
+def _selector_near_header(lines: List[str], header_index: int) -> Optional[str]:
+    """Find the selector comment associated with a TAC function header."""
+    for following in lines[header_index + 1 :]:
+        if _FUNCTION_HEADER_RE.match(following):
+            break
+        match = _SELECTOR_COMMENT_RE.search(following)
+        if match:
+            return match.group(1)
+        if following and not following.strip().startswith("//") and not following.startswith(" "):
+            break
+    return None
+
+
+def sanitize_tac_prompt_input(tac: str) -> str:
+    """Remove source/compiler-only annotations from TAC prompt text.
+
+    Metadata can still carry compiler, ABI, source signature, and source storage
+    facts for offline analysis. The TAC input itself must stay limited to facts
+    available from runtime bytecode at inference time.
+    """
+    if tac is None:
+        return ""
+    if not isinstance(tac, str):
+        tac = str(tac)
+    if not tac:
+        return tac
+
+    lines = tac.splitlines()
+
+    sanitized: List[str] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if _SOURCE_ONLY_COMMENT_RE.match(stripped):
+            continue
+        if _STORAGE_LAYOUT_HEADER_RE.match(stripped) or _STORAGE_LAYOUT_ROW_RE.match(stripped):
+            continue
+
+        header_match = _FUNCTION_HEADER_RE.match(line)
+        if header_match:
+            selector = _selector_near_header(lines, idx)
+            selector_name = _selector_safe_name(selector)
+            if selector_name:
+                sanitized.append(f"{header_match.group(1)}function {selector_name}:")
+            elif "(" in line or ")" in line:
+                sanitized.append(f"{header_match.group(1)}function bytecode_function:")
+            else:
+                sanitized.append(line)
+            continue
+
+        sanitized.append(_SOURCE_STORAGE_ANNOTATION_RE.sub("", line))
+
+    return "\n".join(sanitized)
+
+
 def _md5(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
@@ -77,6 +189,276 @@ def hash_normalized_tac(tac: str) -> str:
 
 def hash_normalized_pair(tac: str, body: str) -> str:
     return _md5(normalize_tac(tac) + "|" + normalize_solidity_body(body))
+
+
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_SELECTOR_RE = re.compile(r"^0x[0-9a-fA-F]{8}$")
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}([0-9a-fA-F]{32})?$")
+_COMPILER_VERSION_RE = re.compile(r"^v?\d+\.\d+\.\d+(?:[+-].*)?$")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _make_dataset_run_id(prefix: str = "etherscan") -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{prefix}-{stamp}-{os.getpid()}"
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Counter):
+        return dict(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _jsonl_count(path: Path) -> Optional[int]:
+    path = Path(path)
+    if not path.exists() or path.suffix != ".jsonl":
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
+
+
+def _file_artifact(path: Path, *, jsonl: bool = False) -> Dict[str, Any]:
+    path = Path(path)
+    artifact: Dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if path.exists() and path.is_file():
+        artifact.update(
+            {
+                "bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+        if jsonl:
+            artifact["row_count"] = _jsonl_count(path)
+    return artifact
+
+
+def _hash_address_list(addresses: List[str]) -> str:
+    normalized = "\n".join(str(addr).strip().lower() for addr in addresses if str(addr).strip())
+    return hashlib.sha256((normalized + "\n").encode()).hexdigest()
+
+
+def _bounded_error(error: Any, limit: int = 500) -> str:
+    text = str(error or "").strip()
+    return text[:limit]
+
+
+def parse_metadata_object(metadata: Any) -> Dict[str, Any]:
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    if isinstance(metadata, str) and metadata.strip():
+        try:
+            parsed = json.loads(metadata)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def normalize_training_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return metadata with the current row-schema marker attached."""
+    normalized = dict(metadata or {})
+    normalized.setdefault("schema_version", TRAINING_ROW_SCHEMA_VERSION)
+    return normalized
+
+
+def validate_training_metadata_schema(
+    metadata: Any,
+    *,
+    allow_legacy: bool = False,
+) -> Dict[str, Any]:
+    """Validate decontamination-critical metadata fields when present.
+
+    ``allow_legacy`` accepts rows that omit ``schema_version`` while still
+    validating any critical fields they do provide.
+    """
+    errors: List[Dict[str, str]] = []
+    if not isinstance(metadata, dict):
+        return {
+            "status": "failed",
+            "schema_version": TRAINING_ROW_SCHEMA_VERSION,
+            "errors": [
+                {
+                    "field": "metadata",
+                    "code": "metadata_type_error",
+                    "message": "metadata must be an object",
+                }
+            ],
+        }
+
+    version = metadata.get("schema_version")
+    if version is None:
+        if not allow_legacy:
+            errors.append(
+                {
+                    "field": "metadata.schema_version",
+                    "code": "schema_version_missing",
+                    "message": "metadata.schema_version is required for schema v1 rows",
+                }
+            )
+    elif version != TRAINING_ROW_SCHEMA_VERSION:
+        errors.append(
+            {
+                "field": "metadata.schema_version",
+                "code": "schema_version_unsupported",
+                "message": f"unsupported metadata schema version {version!r}",
+            }
+        )
+
+    address = metadata.get("contract_address")
+    if address not in (None, "") and not (isinstance(address, str) and _ADDRESS_RE.match(address)):
+        errors.append(
+            {
+                "field": "metadata.contract_address",
+                "code": "contract_address_format",
+                "message": "contract_address must be a 20-byte 0x-prefixed hex string",
+            }
+        )
+
+    selector = metadata.get("selector", metadata.get("function_selector"))
+    if selector not in (None, "") and not (
+        isinstance(selector, str) and _SELECTOR_RE.match(selector)
+    ):
+        errors.append(
+            {
+                "field": "metadata.selector",
+                "code": "selector_format",
+                "message": "selector must be a 4-byte 0x-prefixed hex string",
+            }
+        )
+
+    for key in ("source_hash", "source_code_hash", "body_hash", "input_hash", "output_hash"):
+        value = metadata.get(key)
+        if value not in (None, "") and not (isinstance(value, str) and _HASH_RE.match(value)):
+            errors.append(
+                {
+                    "field": f"metadata.{key}",
+                    "code": "hash_format",
+                    "message": f"{key} must be a 32- or 64-byte lowercase/uppercase hex digest",
+                }
+            )
+
+    for key in ("optimizer_enabled", "is_payable", "is_view"):
+        value = metadata.get(key)
+        if value not in (None, "") and not isinstance(value, bool):
+            errors.append(
+                {
+                    "field": f"metadata.{key}",
+                    "code": "boolean_type_error",
+                    "message": f"{key} must be a boolean when present",
+                }
+            )
+
+    compiler_version = metadata.get("compiler_version")
+    if compiler_version not in (None, "") and not (
+        isinstance(compiler_version, str) and _COMPILER_VERSION_RE.match(compiler_version)
+    ):
+        errors.append(
+            {
+                "field": "metadata.compiler_version",
+                "code": "compiler_version_format",
+                "message": "compiler_version must look like a Solidity semver string",
+            }
+        )
+
+    optimizer_runs = metadata.get("optimizer_runs")
+    if optimizer_runs not in (None, "") and not (
+        isinstance(optimizer_runs, int)
+        and not isinstance(optimizer_runs, bool)
+        and optimizer_runs >= 0
+    ):
+        errors.append(
+            {
+                "field": "metadata.optimizer_runs",
+                "code": "optimizer_runs_type_error",
+                "message": "optimizer_runs must be a non-negative integer when present",
+            }
+        )
+
+    return {
+        "status": "failed" if errors else "passed",
+        "schema_version": TRAINING_ROW_SCHEMA_VERSION,
+        "errors": errors,
+    }
+
+
+def validate_training_record_schema(
+    record: Any,
+    *,
+    allow_legacy: bool = False,
+) -> Dict[str, Any]:
+    """Validate the top-level training JSONL row and versioned metadata schema."""
+    errors: List[Dict[str, str]] = []
+    if not isinstance(record, dict):
+        return {
+            "status": "failed",
+            "schema_version": TRAINING_ROW_SCHEMA_VERSION,
+            "errors": [
+                {
+                    "field": "$",
+                    "code": "row_type_error",
+                    "message": "row must be an object",
+                }
+            ],
+        }
+
+    for field_name in ("input", "output"):
+        value = record.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(
+                {
+                    "field": field_name,
+                    "code": f"{field_name}_required_string",
+                    "message": f"{field_name} must be a non-empty string",
+                }
+            )
+
+    metadata = record.get("metadata", {})
+    metadata_result = validate_training_metadata_schema(metadata, allow_legacy=allow_legacy)
+    errors.extend(metadata_result["errors"])
+    return {
+        "status": "failed" if errors else "passed",
+        "schema_version": TRAINING_ROW_SCHEMA_VERSION,
+        "errors": errors,
+    }
+
+
+def is_partial_training_pair(
+    metadata: Any = None,
+    solidity_code: str = "",
+    function_name: str = "",
+) -> bool:
+    """Return true for partial/placeholder decompilation examples."""
+    parsed_metadata = parse_metadata_object(metadata)
+    if parsed_metadata.get("partial") is True:
+        return True
+    target = str(solidity_code or "")
+    if "Partial decompilation" in target:
+        return True
+    if "TODO: Full logic not reconstructed" in target:
+        return True
+    if re.search(r"\bfunction\s+unknown_[0-9A-Za-z_]*\s*\(", target):
+        return True
+    return str(function_name or "").startswith("unknown_")
 
 
 def _extract_function_signature_parts(signature: str) -> Optional[Tuple[str, str]]:
@@ -132,19 +514,50 @@ class FunctionPair:
     metadata: Optional[Dict] = field(default=None)
 
 
+@dataclass
+class _CollectionAddressResult:
+    """Worker result for one collect/compile address; persisted by caller."""
+
+    address: str
+    contract_data: Optional[ContractData] = None
+    pairs: List[FunctionPair] = field(default_factory=list)
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    status_update: Optional[Dict[str, Any]] = None
+
+
 class EtherscanAPI:
     """Interface for collecting verified contracts from Etherscan."""
 
-    def __init__(self, api_key: str, base_url: str = "https://api.etherscan.io/v2/api"):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://api.etherscan.io/v2/api",
+        min_request_interval: float = 0.2,
+    ):
         """Initialize the Etherscan API client.
 
         Args:
             api_key: Etherscan API key for authentication.
             base_url: Base URL for Etherscan API. Defaults to v2 API.
+            min_request_interval: Minimum spacing between Etherscan requests.
         """
         self.api_key = api_key
         self.base_url = base_url
         self.session = requests.Session()
+        self.min_request_interval = max(0.0, float(min_request_interval or 0.0))
+        self._request_lock = threading.Lock()
+        self._last_request_at = 0.0
+
+    def _get(self, params: Dict[str, Any], timeout: int = 30) -> requests.Response:
+        """Issue a thread-safe, rate-limited GET against Etherscan."""
+        with self._request_lock:
+            elapsed = time.monotonic() - self._last_request_at
+            delay = self.min_request_interval - elapsed
+            if delay > 0:
+                time.sleep(delay)
+            response = self.session.get(self.base_url, params=params, timeout=timeout)
+            self._last_request_at = time.monotonic()
+            return response
 
     def get_contract_source(self, address: str) -> Optional[ContractData]:
         """Get verified contract source code from Etherscan.
@@ -164,7 +577,7 @@ class EtherscanAPI:
                 "apikey": self.api_key,
             }
 
-            response = self.session.get(self.base_url, params=params, timeout=30)
+            response = self._get(params, timeout=30)
             response.raise_for_status()
             data = response.json()
 
@@ -185,9 +598,7 @@ class EtherscanAPI:
                 "apikey": self.api_key,
             }
 
-            bytecode_response = self.session.get(
-                self.base_url, params=bytecode_params, timeout=30
-            )
+            bytecode_response = self._get(bytecode_params, timeout=30)
             bytecode_data = bytecode_response.json()
 
             if bytecode_data.get("result") == "0x":
@@ -199,9 +610,7 @@ class EtherscanAPI:
                 bytecode=bytecode_data.get("result", ""),
                 compiler_version=result.get("CompilerVersion", ""),
                 optimization_enabled=result.get("OptimizationUsed") == "1",
-                optimization_runs=(
-                    int(result.get("Runs", "0")) if result.get("Runs") else 0
-                ),
+                optimization_runs=(int(result.get("Runs", "0")) if result.get("Runs") else 0),
                 abi=result.get("ABI"),
             )
 
@@ -262,9 +671,7 @@ class SolidityParser:
                 if contract_name and contract["name"] != contract_name:
                     continue
 
-                contract_functions = self._extract_functions_from_contract(
-                    contract["body"]
-                )
+                contract_functions = self._extract_functions_from_contract(contract["body"])
 
                 for func in contract_functions:
                     func["contract_name"] = contract["name"]
@@ -309,17 +716,13 @@ class SolidityParser:
 
                         if "sources" in source_json:
                             combined_source = ""
-                            for file_path, file_data in source_json[
-                                "sources"
-                            ].items():
+                            for file_path, file_data in source_json["sources"].items():
                                 if "content" in file_data:
                                     combined_source += f"// File: {file_path}\n"
                                     combined_source += file_data["content"] + "\n\n"
                             source_code = combined_source
                     except (json.JSONDecodeError, IndexError):
-                        logger.warning(
-                            "Failed to parse JSON-encoded source code"
-                        )
+                        logger.warning("Failed to parse JSON-encoded source code")
 
         return source_code
 
@@ -335,9 +738,7 @@ class SolidityParser:
         contracts: List[Dict] = []
 
         contract_starts = []
-        for match in re.finditer(
-            r"\b(contract|interface|library)\s+(\w+)", source_code
-        ):
+        for match in re.finditer(r"\b(contract|interface|library)\s+(\w+)", source_code):
             contract_starts.append(
                 {"type": match.group(1), "name": match.group(2), "start": match.end()}
             )
@@ -360,9 +761,7 @@ class SolidityParser:
                         "body": source_code[body_start:body_end],
                     }
                 )
-                logger.debug(
-                    f"Extracted {contract_info['type']} {contract_info['name']}"
-                )
+                logger.debug(f"Extracted {contract_info['type']} {contract_info['name']}")
 
         return contracts
 
@@ -412,12 +811,8 @@ class SolidityParser:
 
                 if is_abstract:
                     if semicolon_pos != -1:
-                        full_function = contract_body[
-                            func_info["start"] : semicolon_pos + 1
-                        ]
-                        self._add_function_to_list(
-                            functions, func_info["name"], full_function, ""
-                        )
+                        full_function = contract_body[func_info["start"] : semicolon_pos + 1]
+                        self._add_function_to_list(functions, func_info["name"], full_function, "")
                     continue
 
                 # Concrete function with a body.
@@ -431,9 +826,7 @@ class SolidityParser:
                     )
 
             except Exception as e:
-                logger.warning(
-                    f"Failed to extract function {func_info['name']}: {e}"
-                )
+                logger.warning(f"Failed to extract function {func_info['name']}: {e}")
                 continue
 
         return functions
@@ -622,6 +1015,10 @@ class DatasetBuilder:
         self.logger = logging.getLogger(__name__)
 
         self.db_path = self.output_dir / "contracts.db"
+        self.run_id = _make_dataset_run_id()
+        self._collection_input_summary: Dict[str, Any] = {}
+        self._last_collection_summary: Dict[str, Any] = {}
+        self._last_filter_drop_counts: Dict[str, int] = {}
         self._init_database()
 
     def _init_database(self) -> None:
@@ -643,6 +1040,10 @@ class DatasetBuilder:
                 optimization_runs INTEGER,
                 source_hash TEXT,
                 processed BOOLEAN DEFAULT FALSE,
+                compile_status TEXT DEFAULT 'pending',
+                attempt_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                processed_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
@@ -671,10 +1072,46 @@ class DatasetBuilder:
         """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generation_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                stage TEXT,
+                contract_address TEXT,
+                compiler_version TEXT,
+                optimizer_enabled BOOLEAN,
+                optimization_runs INTEGER,
+                contract_name TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_filter_drops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                rule TEXT NOT NULL,
+                rows_dropped INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+
         self._add_columns(
             cursor,
             "contracts",
-            [("source_hash", "TEXT")],
+            [
+                ("source_hash", "TEXT"),
+                ("compile_status", "TEXT DEFAULT 'pending'"),
+                ("attempt_count", "INTEGER DEFAULT 0"),
+                ("last_error", "TEXT"),
+                ("processed_at", "TIMESTAMP"),
+            ],
         )
         self._add_columns(
             cursor,
@@ -686,20 +1123,29 @@ class DatasetBuilder:
             ],
         )
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dataset_source_hash "
-            "ON contracts(source_hash)"
+            "CREATE INDEX IF NOT EXISTS idx_dataset_source_hash " "ON contracts(source_hash)"
         )
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dataset_body_hash "
-            "ON function_pairs(body_hash)"
+            "CREATE INDEX IF NOT EXISTS idx_dataset_body_hash " "ON function_pairs(body_hash)"
         )
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_dataset_tac_hash "
-            "ON function_pairs(tac_hash)"
+            "CREATE INDEX IF NOT EXISTS idx_dataset_tac_hash " "ON function_pairs(tac_hash)"
         )
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_pair_norm_hash "
             "ON function_pairs(pair_norm_hash)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_generation_diagnostics_run "
+            "ON generation_diagnostics(run_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_generation_diagnostics_status "
+            "ON generation_diagnostics(status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_filter_drops_run "
+            "ON dataset_filter_drops(run_id)"
         )
 
         conn.commit()
@@ -713,13 +1159,154 @@ class DatasetBuilder:
             except sqlite3.OperationalError:
                 pass
 
+    def _record_generation_diagnostic(
+        self,
+        *,
+        stage: str,
+        contract_address: str,
+        status: str,
+        error: Any = "",
+        compiler_version: Optional[str] = None,
+        optimizer_enabled: Optional[bool] = None,
+        optimization_runs: Optional[int] = None,
+        contract_name: Optional[str] = None,
+    ) -> None:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO generation_diagnostics
+                (run_id, stage, contract_address, compiler_version, optimizer_enabled,
+                 optimization_runs, contract_name, status, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.run_id,
+                stage,
+                contract_address,
+                compiler_version,
+                optimizer_enabled,
+                optimization_runs,
+                contract_name,
+                status,
+                _bounded_error(error),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def _update_contract_status(
+        self,
+        address: str,
+        status: str,
+        *,
+        processed: bool,
+        last_error: str = "",
+    ) -> None:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE contracts
+            SET processed = ?,
+                compile_status = ?,
+                attempt_count = COALESCE(attempt_count, 0) + 1,
+                last_error = ?,
+                processed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE processed_at END
+            WHERE address = ?
+            """,
+            (processed, status, last_error or None, processed, address),
+        )
+        conn.commit()
+        conn.close()
+
+    def _persist_filter_drops(self, drop_counts: Dict[str, int]) -> None:
+        values = [
+            (self.run_id, rule, int(count))
+            for rule, count in sorted(drop_counts.items())
+            if int(count) > 0
+        ]
+        if not values:
+            return
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.executemany(
+            """
+            INSERT INTO dataset_filter_drops (run_id, rule, rows_dropped)
+            VALUES (?, ?, ?)
+            """,
+            values,
+        )
+        conn.commit()
+        conn.close()
+
+    def _diagnostic_summary(self, limit: int = 10) -> Dict[str, Any]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        total = cursor.execute(
+            "SELECT COUNT(*) FROM generation_diagnostics WHERE run_id = ?",
+            (self.run_id,),
+        ).fetchone()[0]
+        status_rows = cursor.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM generation_diagnostics
+            WHERE run_id = ?
+            GROUP BY status
+            ORDER BY status
+            """,
+            (self.run_id,),
+        ).fetchall()
+        top_rows = cursor.execute(
+            """
+            SELECT stage, status, COALESCE(error, ''), COUNT(*), GROUP_CONCAT(contract_address)
+            FROM generation_diagnostics
+            WHERE run_id = ?
+            GROUP BY stage, status, COALESCE(error, '')
+            ORDER BY COUNT(*) DESC, stage, status
+            LIMIT ?
+            """,
+            (self.run_id, limit),
+        ).fetchall()
+        conn.close()
+        return {
+            "run_id": self.run_id,
+            "total_diagnostics": total,
+            "status_counts": {status: count for status, count in status_rows},
+            "top_errors": [
+                {
+                    "stage": stage,
+                    "status": status,
+                    "error": error,
+                    "count": count,
+                    "sample_contract_addresses": [
+                        addr for addr in (addresses or "").split(",") if addr
+                    ][:5],
+                }
+                for stage, status, error, count, addresses in top_rows
+            ],
+        }
+
+    def _filter_drop_summary(self) -> Dict[str, int]:
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            """
+            SELECT rule, SUM(rows_dropped)
+            FROM dataset_filter_drops
+            WHERE run_id = ?
+            GROUP BY rule
+            ORDER BY rule
+            """,
+            (self.run_id,),
+        ).fetchall()
+        conn.close()
+        return {rule: int(count or 0) for rule, count in rows}
+
     # ------------------------------------------------------------------ #
     #  Contract Collection
     # ------------------------------------------------------------------ #
 
-    def collect_contracts(
-        self, contract_addresses: List[str], max_workers: int = 10
-    ) -> int:
+    def collect_contracts(self, contract_addresses: List[str], max_workers: int = 10) -> int:
         """Collect contract data from Etherscan in parallel.
 
         Args:
@@ -751,9 +1338,7 @@ class DatasetBuilder:
                 except Exception as e:
                     logger.error(f"Failed to process contract {address}: {e}")
 
-        logger.info(
-            f"Collected {collected} contracts out of {len(contract_addresses)} addresses"
-        )
+        logger.info(f"Collected {collected} contracts out of {len(contract_addresses)} addresses")
         return collected
 
     def _store_contract(self, contract_data: ContractData) -> None:
@@ -767,10 +1352,17 @@ class DatasetBuilder:
 
         cursor.execute(
             """
-            INSERT OR REPLACE INTO contracts
+            INSERT INTO contracts
             (address, source_code, bytecode, compiler_version,
              optimization_enabled, optimization_runs, source_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(address) DO UPDATE SET
+                source_code = excluded.source_code,
+                bytecode = excluded.bytecode,
+                compiler_version = excluded.compiler_version,
+                optimization_enabled = excluded.optimization_enabled,
+                optimization_runs = excluded.optimization_runs,
+                source_hash = excluded.source_hash
         """,
             (
                 contract_data.address,
@@ -790,144 +1382,391 @@ class DatasetBuilder:
     #  Compile-and-collect pipeline
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _coerce_max_workers(max_workers: Optional[int]) -> int:
+        try:
+            return max(1, int(max_workers or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _make_generation_diagnostic(
+        *,
+        stage: str,
+        contract_address: str,
+        status: str,
+        error: Any = "",
+        compiler_version: Optional[str] = None,
+        optimizer_enabled: Optional[bool] = None,
+        optimization_runs: Optional[int] = None,
+        contract_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "stage": stage,
+            "contract_address": contract_address,
+            "status": status,
+            "error": error,
+            "compiler_version": compiler_version,
+            "optimizer_enabled": optimizer_enabled,
+            "optimization_runs": optimization_runs,
+            "contract_name": contract_name,
+        }
+
+    def _collect_compile_address(
+        self,
+        addr: str,
+        max_compiler_configs: int,
+        compiler_install_lock: threading.Lock,
+    ) -> _CollectionAddressResult:
+        """Fetch, compile, and analyze one address without SQLite writes."""
+        result = _CollectionAddressResult(address=addr)
+        address_failures: List[Tuple[str, str]] = []
+
+        def add_diagnostic(**kwargs: Any) -> None:
+            result.diagnostics.append(self._make_generation_diagnostic(**kwargs))
+
+        try:
+            contract_data = self.etherscan.get_contract_source(addr)
+            if contract_data is None:
+                logger.warning(f"Skipping {addr}: not verified or unavailable")
+                add_diagnostic(
+                    stage="fetch",
+                    contract_address=addr,
+                    status="not_verified_or_unavailable",
+                    error="Etherscan returned no verified source",
+                )
+                return result
+
+            result.contract_data = contract_data
+            stored_address = contract_data.address or addr
+            raw_source = contract_data.source_code
+            original_version = contract_data.compiler_version
+            original_opt = contract_data.optimization_enabled
+            original_runs = contract_data.optimization_runs
+
+            source_files = parse_etherscan_source(raw_source)
+            if not source_files:
+                logger.warning(f"Skipping {addr}: empty source")
+                error = "parse_etherscan_source returned no files"
+                add_diagnostic(
+                    stage="parse_source",
+                    contract_address=addr,
+                    status="empty_source",
+                    error=error,
+                )
+                result.status_update = {
+                    "address": stored_address,
+                    "status": "empty_source",
+                    "processed": False,
+                    "last_error": error,
+                }
+                return result
+
+            combined_source = "\n\n".join(source_files.values())
+            pragmas = parse_pragma(combined_source)
+            pragma_constraints = pragmas or [">=0.4.0"]
+
+            configs = select_compilation_configs(
+                pragma_constraints,
+                original_version=original_version,
+                original_optimizer=original_opt,
+                original_runs=original_runs,
+                max_configs=max_compiler_configs,
+            )
+
+            if not configs:
+                logger.warning(f"Skipping {addr}: no compatible compiler found")
+                error = "no compatible compiler found"
+                add_diagnostic(
+                    stage="select_compiler",
+                    contract_address=addr,
+                    status="no_compiler_config",
+                    error=error,
+                )
+                result.status_update = {
+                    "address": stored_address,
+                    "status": "no_compiler_config",
+                    "processed": False,
+                    "last_error": error,
+                }
+                return result
+
+            solidity_functions = SolidityParser().extract_functions(combined_source)
+            if not solidity_functions:
+                logger.warning(f"Skipping {addr}: no functions extracted from source")
+                error = "SolidityParser extracted no functions"
+                add_diagnostic(
+                    stage="parse_functions",
+                    contract_address=addr,
+                    status="no_functions_extracted",
+                    error=error,
+                )
+                result.status_update = {
+                    "address": stored_address,
+                    "status": "no_functions_extracted",
+                    "processed": False,
+                    "last_error": error,
+                }
+                return result
+
+            solidity_with_selectors = self._add_selectors_to_solidity_functions(solidity_functions)
+
+            for cfg in configs:
+                ver = cfg["version"]
+                opt = cfg["optimizer_enabled"]
+                runs = cfg["optimizer_runs"]
+
+                logger.info(
+                    f"  Compiling {addr} with solc {ver} "
+                    f"(opt={'on' if opt else 'off'}, runs={runs})"
+                )
+
+                # py-solc-x installs into a shared cache; guard installation while
+                # allowing already-installed compiler execution to proceed in workers.
+                with compiler_install_lock:
+                    solc_available = install_solc_version(ver)
+                if not solc_available:
+                    error = f"Could not install solc {ver}"
+                    logger.warning(f"  Compilation failed for {addr}: {error}")
+                    address_failures.append(("compile_failed", error))
+                    add_diagnostic(
+                        stage="compile",
+                        contract_address=addr,
+                        compiler_version=ver,
+                        optimizer_enabled=opt,
+                        optimization_runs=runs,
+                        status="compile_failed",
+                        error=error,
+                    )
+                    continue
+
+                if len(source_files) > 1:
+                    comp = compile_multi_file(source_files, ver, opt, runs)
+                else:
+                    first_source = next(iter(source_files.values()))
+                    comp = compile_source(first_source, ver, opt, runs)
+
+                if not comp.success:
+                    logger.warning(
+                        f"  Compilation failed for {addr} with solc {ver}: "
+                        + "; ".join(comp.errors[:2])
+                    )
+                    error = "; ".join(comp.errors[:2]) if comp.errors else "compilation failed"
+                    address_failures.append(("compile_failed", error))
+                    add_diagnostic(
+                        stage="compile",
+                        contract_address=addr,
+                        compiler_version=ver,
+                        optimizer_enabled=opt,
+                        optimization_runs=runs,
+                        status="compile_failed",
+                        error=error,
+                    )
+                    continue
+
+                for cname, compiled in comp.contracts.items():
+                    bytecode_hex = "0x" + compiled.runtime_bytecode
+                    try:
+                        analyzer = BytecodeAnalyzer(bytecode_hex)
+                        analyzer.analyze_control_flow()
+                        bytecode_functions = analyzer.identify_functions()
+                    except Exception as e:
+                        logger.warning(f"  TAC analysis failed for {cname}: {e}")
+                        address_failures.append(("analysis_failed", str(e)))
+                        add_diagnostic(
+                            stage="tac_analysis",
+                            contract_address=addr,
+                            compiler_version=ver,
+                            optimizer_enabled=opt,
+                            optimization_runs=runs,
+                            contract_name=cname,
+                            status="analysis_failed",
+                            error=e,
+                        )
+                        continue
+
+                    contract_sol_funcs = [
+                        f for f in solidity_with_selectors if f.get("contract_name", "") == cname
+                    ] or solidity_with_selectors
+
+                    matched = self._match_functions_by_selector(
+                        contract_sol_funcs, bytecode_functions, analyzer
+                    )
+                    if not matched:
+                        address_failures.append(("no_selector_matches", cname))
+                        add_diagnostic(
+                            stage="match",
+                            contract_address=addr,
+                            compiler_version=ver,
+                            optimizer_enabled=opt,
+                            optimization_runs=runs,
+                            contract_name=cname,
+                            status="no_selector_matches",
+                            error="no Solidity selector matched bytecode functions",
+                        )
+
+                    contract_name_start_pairs = len(result.pairs)
+                    for m in matched:
+                        pair = self._build_training_pair(m, stored_address)
+                        if pair:
+                            pair.metadata = pair.metadata or {}
+                            pair.metadata["compiler_version"] = ver
+                            pair.metadata["optimizer_enabled"] = opt
+                            pair.metadata["optimizer_runs"] = runs
+                            pair.metadata["compiled_contract"] = cname
+                            result.pairs.append(pair)
+                    if len(result.pairs) > contract_name_start_pairs:
+                        add_diagnostic(
+                            stage="compile",
+                            contract_address=addr,
+                            compiler_version=ver,
+                            optimizer_enabled=opt,
+                            optimization_runs=runs,
+                            contract_name=cname,
+                            status="processed",
+                            error="",
+                        )
+
+                logger.info(f"  {addr} solc {ver}: contributed pairs = {len(result.pairs)}")
+
+            if result.pairs:
+                result.status_update = {
+                    "address": stored_address,
+                    "status": "processed",
+                    "processed": True,
+                }
+            elif address_failures:
+                status, error = address_failures[0]
+                result.status_update = {
+                    "address": stored_address,
+                    "status": status,
+                    "processed": False,
+                    "last_error": error,
+                }
+            else:
+                error = "compile jobs produced no training pairs"
+                add_diagnostic(
+                    stage="match",
+                    contract_address=addr,
+                    status="no_pairs",
+                    error=error,
+                )
+                result.status_update = {
+                    "address": stored_address,
+                    "status": "no_pairs",
+                    "processed": False,
+                    "last_error": error,
+                }
+
+        except Exception as e:
+            logger.error(f"Failed to process {addr}: {e}")
+            logger.debug(traceback.format_exc())
+            add_diagnostic(
+                stage="pipeline",
+                contract_address=addr,
+                status="pipeline_exception",
+                error=e,
+            )
+
+        return result
+
     def collect_and_compile_contracts(
         self,
         contract_addresses: List[str],
         max_compiler_configs: int = 2,
+        max_workers: int = 1,
     ) -> int:
-        """Download source from Etherscan and compile locally with multiple solc versions.
+        """Download source from Etherscan and compile locally with bounded workers.
 
-        This avoids fetching runtime bytecode from a live node.  Instead it:
-
-        1. Downloads verified source + compiler metadata from Etherscan.
-        2. Parses the pragma to find compatible compiler versions.
-        3. Compiles locally with up to *max_compiler_configs* settings.
-        4. Creates TAC→Solidity training pairs for each compilation.
-
-        Args:
-            contract_addresses: List of contract addresses.
-            max_compiler_configs: Max compilations per contract for augmentation.
-
-        Returns:
-            Total number of function pairs created.
+        Network fetches, compilation, and TAC analysis run in a bounded worker pool.
+        SQLite writes are serialized in the caller thread after each worker returns.
         """
+        self.run_id = _make_dataset_run_id()
+        started_at = _utc_now_iso()
+        start_time = time.perf_counter()
+        requested_workers = self._coerce_max_workers(max_workers)
+        effective_workers = min(requested_workers, len(contract_addresses)) or 1
+        self._collection_input_summary = {
+            "address_count": len(contract_addresses),
+            "address_list_sha256": _hash_address_list(contract_addresses),
+        }
         total_pairs = 0
 
-        for addr in tqdm(contract_addresses, desc="Contracts"):
-            try:
-                contract_data = self.etherscan.get_contract_source(addr)
-                if contract_data is None:
-                    logger.warning(
-                        f"Skipping {addr}: not verified or unavailable"
-                    )
-                    continue
+        logger.info(
+            "Collect/compile preprocessing starting: addresses=%s, "
+            "max_workers=%s, max_compiler_configs=%s",
+            len(contract_addresses),
+            effective_workers,
+            max_compiler_configs,
+        )
 
-                raw_source = contract_data.source_code
-                original_version = contract_data.compiler_version
-                original_opt = contract_data.optimization_enabled
-                original_runs = contract_data.optimization_runs
+        compiler_install_lock = threading.Lock()
 
-                source_files = parse_etherscan_source(raw_source)
-                if not source_files:
-                    logger.warning(f"Skipping {addr}: empty source")
-                    continue
+        def persist_result(result: _CollectionAddressResult) -> None:
+            nonlocal total_pairs
+            if result.contract_data is not None:
+                self._store_contract(result.contract_data)
+            for diagnostic in result.diagnostics:
+                self._record_generation_diagnostic(**diagnostic)
+            for pair in result.pairs:
+                self._store_function_pair(pair)
+                total_pairs += 1
+            if result.status_update:
+                self._update_contract_status(**result.status_update)
 
-                combined_source = "\n\n".join(source_files.values())
-                pragmas = parse_pragma(combined_source)
-                pragma_constraints = pragmas or [">=0.4.0"]
-
-                configs = select_compilation_configs(
-                    pragma_constraints,
-                    original_version=original_version,
-                    original_optimizer=original_opt,
-                    original_runs=original_runs,
-                    max_configs=max_compiler_configs,
-                )
-
-                if not configs:
-                    logger.warning(
-                        f"Skipping {addr}: no compatible compiler found"
-                    )
-                    continue
-
-                solidity_functions = self.parser.extract_functions(combined_source)
-                if not solidity_functions:
-                    logger.warning(
-                        f"Skipping {addr}: no functions extracted from source"
-                    )
-                    continue
-
-                solidity_with_selectors = self._add_selectors_to_solidity_functions(
-                    solidity_functions
-                )
-
-                for cfg in configs:
-                    ver = cfg["version"]
-                    opt = cfg["optimizer_enabled"]
-                    runs = cfg["optimizer_runs"]
-
-                    logger.info(
-                        f"  Compiling {addr} with solc {ver} "
-                        f"(opt={'on' if opt else 'off'}, runs={runs})"
-                    )
-
-                    if len(source_files) > 1:
-                        comp = compile_multi_file(source_files, ver, opt, runs)
-                    else:
-                        first_source = next(iter(source_files.values()))
-                        comp = compile_source(first_source, ver, opt, runs)
-
-                    if not comp.success:
-                        logger.warning(
-                            f"  Compilation failed for {addr} with solc {ver}: "
-                            + "; ".join(comp.errors[:2])
-                        )
-                        continue
-
-                    for cname, compiled in comp.contracts.items():
-                        bytecode_hex = "0x" + compiled.runtime_bytecode
-                        try:
-                            analyzer = BytecodeAnalyzer(bytecode_hex)
-                            analyzer.analyze_control_flow()
-                            bytecode_functions = analyzer.identify_functions()
-                        except Exception as e:
-                            logger.warning(
-                                f"  TAC analysis failed for {cname}: {e}"
-                            )
-                            continue
-
-                        contract_sol_funcs = [
-                            f
-                            for f in solidity_with_selectors
-                            if f.get("contract_name", "") == cname
-                        ] or solidity_with_selectors
-
-                        matched = self._match_functions_by_selector(
-                            contract_sol_funcs, bytecode_functions, analyzer
+        if contract_addresses:
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                future_to_address = {
+                    executor.submit(
+                        self._collect_compile_address,
+                        addr,
+                        max_compiler_configs,
+                        compiler_install_lock,
+                    ): addr
+                    for addr in contract_addresses
+                }
+                for future in tqdm(
+                    as_completed(future_to_address),
+                    total=len(future_to_address),
+                    desc="Contracts",
+                ):
+                    addr = future_to_address[future]
+                    try:
+                        persist_result(future.result())
+                    except Exception as e:
+                        logger.error(f"Failed to process {addr}: {e}")
+                        logger.debug(traceback.format_exc())
+                        self._record_generation_diagnostic(
+                            stage="pipeline",
+                            contract_address=addr,
+                            status="pipeline_exception",
+                            error=e,
                         )
 
-                        for m in matched:
-                            pair = self._build_training_pair(m, addr)
-                            if pair:
-                                pair.metadata = pair.metadata or {}
-                                pair.metadata["compiler_version"] = ver
-                                pair.metadata["optimizer_enabled"] = opt
-                                pair.metadata["optimizer_runs"] = runs
-                                pair.metadata["compiled_contract"] = cname
-                                self._store_function_pair(pair)
-                                total_pairs += 1
-
-                    logger.info(
-                        f"  {addr} solc {ver}: contributed pairs so far = {total_pairs}"
-                    )
-
-                self._store_contract(contract_data)
-
-            except Exception as e:
-                logger.error(f"Failed to process {addr}: {e}")
-                logger.debug(traceback.format_exc())
-
+        duration_seconds = time.perf_counter() - start_time
+        contract_throughput = (
+            len(contract_addresses) / duration_seconds if duration_seconds > 0 else 0.0
+        )
+        pair_throughput = total_pairs / duration_seconds if duration_seconds > 0 else 0.0
         logger.info(f"Total function pairs created: {total_pairs}")
+        logger.info(
+            "Preprocessing throughput: %.2f contracts/sec, %.2f pairs/sec " "(max_workers=%s)",
+            contract_throughput,
+            pair_throughput,
+            effective_workers,
+        )
+        self._last_collection_summary = {
+            "run_id": self.run_id,
+            "started_at": started_at,
+            "duration_seconds": round(duration_seconds, 3),
+            "max_workers": effective_workers,
+            "requested_max_workers": requested_workers,
+            "throughput_contracts_per_second": round(contract_throughput, 3),
+            "throughput_pairs_per_second": round(pair_throughput, 3),
+            "addresses": self._collection_input_summary,
+            "total_pairs": total_pairs,
+            "diagnostics": self._diagnostic_summary(),
+        }
         return total_pairs
 
     # ------------------------------------------------------------------ #
@@ -1010,9 +1849,7 @@ class DatasetBuilder:
                 logger.warning(f"No Solidity functions found for {address}")
                 return pairs
 
-            solidity_with_selectors = self._add_selectors_to_solidity_functions(
-                solidity_functions
-            )
+            solidity_with_selectors = self._add_selectors_to_solidity_functions(solidity_functions)
 
             matched_pairs = self._match_functions_by_selector(
                 solidity_with_selectors, bytecode_functions, analyzer
@@ -1037,7 +1874,10 @@ class DatasetBuilder:
             # functions that have no Solidity match.  This teaches the model
             # to express uncertainty rather than hallucinate.
             partial = self._generate_partial_pairs(
-                address, bytecode_functions, matched_pairs, analyzer,
+                address,
+                bytecode_functions,
+                matched_pairs,
+                analyzer,
             )
             pairs.extend(partial)
 
@@ -1098,7 +1938,8 @@ class DatasetBuilder:
 
             # Gather structural hints from the TAC / blocks
             blocks = self._collect_function_blocks(
-                func.entry_block, analyzer.basic_blocks,
+                func.entry_block,
+                analyzer.basic_blocks,
             )
             n_blocks = len(blocks)
             has_storage = any(
@@ -1107,8 +1948,7 @@ class DatasetBuilder:
                 for instr in b.instructions
             )
             has_call = any(
-                getattr(instr, "operation", None)
-                and instr.operation.value == "call"
+                getattr(instr, "operation", None) and instr.operation.value == "call"
                 for b in blocks
                 for instr in b.instructions
             )
@@ -1122,28 +1962,32 @@ class DatasetBuilder:
             if has_call:
                 hints.append("// Contains external call(s)")
 
-            solidity_partial = "\n".join([
-                *hints,
-                f"function unknown_{sel_label.replace('0x', '')}(/* params unknown */) public {{",
-                "    // TODO: Full logic not reconstructed",
-                "}",
-            ])
+            solidity_partial = "\n".join(
+                [
+                    *hints,
+                    f"function unknown_{sel_label.replace('0x', '')}(/* params unknown */) public {{",
+                    "    // TODO: Full logic not reconstructed",
+                    "}",
+                ]
+            )
 
-            pairs.append(FunctionPair(
-                function_name=fname,
-                tac_representation=tac,
-                solidity_code=solidity_partial,
-                function_signature=f"function unknown_{sel_label.replace('0x', '')}()",
-                visibility="public",
-                is_payable=False,
-                is_view=False,
-                contract_address=address,
-                metadata={
-                    "partial": True,
-                    "selector": func.selector,
-                    "block_count": n_blocks,
-                },
-            ))
+            pairs.append(
+                FunctionPair(
+                    function_name=fname,
+                    tac_representation=tac,
+                    solidity_code=solidity_partial,
+                    function_signature=f"function unknown_{sel_label.replace('0x', '')}()",
+                    visibility="public",
+                    is_payable=False,
+                    is_view=False,
+                    contract_address=address,
+                    metadata={
+                        "partial": True,
+                        "selector": func.selector,
+                        "block_count": n_blocks,
+                    },
+                )
+            )
 
         return pairs
 
@@ -1166,51 +2010,49 @@ class DatasetBuilder:
         depth = 0
         current: List[str] = []
         for ch in params_str:
-            if ch == '(':
+            if ch == "(":
                 depth += 1
                 current.append(ch)
-            elif ch == ')':
+            elif ch == ")":
                 depth -= 1
                 current.append(ch)
-            elif ch == ',' and depth == 0:
-                params.append(''.join(current).strip())
+            elif ch == "," and depth == 0:
+                params.append("".join(current).strip())
                 current = []
             else:
                 current.append(ch)
         if current:
-            params.append(''.join(current).strip())
+            params.append("".join(current).strip())
 
         types: List[str] = []
         for param in params:
             param = param.strip()
             if not param:
                 continue
-            if param.startswith('('):
+            if param.startswith("("):
                 d = 0
                 end = 0
                 for i, c in enumerate(param):
-                    if c == '(':
+                    if c == "(":
                         d += 1
-                    elif c == ')':
+                    elif c == ")":
                         d -= 1
                         if d == 0:
                             end = i + 1
                             break
-                while end < len(param) and param[end] in '[]0123456789':
+                while end < len(param) and param[end] in "[]0123456789":
                     end += 1
                 types.append(canonicalize_abi_type(param[:end]))
             else:
                 parts = param.split()
                 type_token = parts[0]
-                if len(parts) > 1 and parts[1].startswith('['):
+                if len(parts) > 1 and parts[1].startswith("["):
                     type_token += parts[1]
                 types.append(canonicalize_abi_type(type_token))
 
         return types
 
-    def _add_selectors_to_solidity_functions(
-        self, functions: List[Dict]
-    ) -> List[Dict]:
+    def _add_selectors_to_solidity_functions(self, functions: List[Dict]) -> List[Dict]:
         """Calculate function selectors for Solidity functions.
 
         Uses balanced-parenthesis-aware parameter parsing (Issue 9) to
@@ -1242,13 +2084,9 @@ class DatasetBuilder:
                 selector_hash = Web3.keccak(text=canonical)[:4]
                 func["selector"] = normalize_hex(selector_hash)
 
-                logger.debug(
-                    f"Calculated selector {func['selector']} for {canonical}"
-                )
+                logger.debug(f"Calculated selector {func['selector']} for {canonical}")
             except Exception as e:
-                logger.warning(
-                    f"Failed to calculate selector for {func['name']}: {e}"
-                )
+                logger.warning(f"Failed to calculate selector for {func['name']}: {e}")
                 func["selector"] = None
 
         return functions
@@ -1272,12 +2110,8 @@ class DatasetBuilder:
         matches: List[Dict] = []
         self._ensure_analyzer_tac_integrated(analyzer)
 
-        solidity_by_selector = {
-            f["selector"]: f for f in solidity_functions if f.get("selector")
-        }
-        bytecode_by_selector = {
-            f.selector: f for f in bytecode_functions.values() if f.selector
-        }
+        solidity_by_selector = {f["selector"]: f for f in solidity_functions if f.get("selector")}
+        bytecode_by_selector = {f.selector: f for f in bytecode_functions.values() if f.selector}
 
         for selector, sol_func in solidity_by_selector.items():
             if selector in bytecode_by_selector:
@@ -1291,13 +2125,9 @@ class DatasetBuilder:
                         "selector": selector,
                     }
                 )
-                logger.debug(
-                    f"Matched function {sol_func['name']} with selector {selector}"
-                )
+                logger.debug(f"Matched function {sol_func['name']} with selector {selector}")
             else:
-                logger.debug(
-                    f"No bytecode match for {sol_func['name']} (selector: {selector})"
-                )
+                logger.debug(f"No bytecode match for {sol_func['name']} (selector: {selector})")
 
         return matches
 
@@ -1322,23 +2152,22 @@ class DatasetBuilder:
         if callable(converter):
             converter()
 
-    def _extract_tac_for_function(
-        self, bytecode_function, analyzer: BytecodeAnalyzer
-    ) -> str:
-        """Extract TAC representation for a specific function.
+    def _extract_tac_for_function(self, bytecode_function, analyzer: BytecodeAnalyzer) -> str:
+        """Extract bytecode-only TAC representation for a specific function.
 
         Args:
             bytecode_function: Function object from BytecodeAnalyzer.
             analyzer: BytecodeAnalyzer instance with analyzed blocks.
 
         Returns:
-            Formatted TAC string for the function.
+            Formatted TAC string for the function. Headers use selector-safe
+            bytecode names and exclude source/compiler-only annotations.
         """
         tac_lines: List[str] = []
 
         try:
             self._ensure_analyzer_tac_integrated(analyzer)
-            func_name = bytecode_function.name
+            func_name = _safe_tac_function_name(bytecode_function)
             tac_lines.append(f"function {func_name}:")
 
             if bytecode_function.selector:
@@ -1347,15 +2176,10 @@ class DatasetBuilder:
             tac_lines.append(f"  // Entry block: {bytecode_function.entry_block}")
 
             function_blocks = (
-                bytecode_function.basic_blocks
-                if bytecode_function.basic_blocks
-                else []
+                bytecode_function.basic_blocks if bytecode_function.basic_blocks else []
             )
 
-            if (
-                not function_blocks
-                and bytecode_function.entry_block in analyzer.basic_blocks
-            ):
+            if not function_blocks and bytecode_function.entry_block in analyzer.basic_blocks:
                 function_blocks = self._collect_function_blocks(
                     bytecode_function.entry_block, analyzer.basic_blocks
                 )
@@ -1364,13 +2188,9 @@ class DatasetBuilder:
                 tac_lines.append(f"  {block.id}:")
 
                 if block.predecessors:
-                    tac_lines.append(
-                        f"    // Predecessors: {', '.join(block.predecessors)}"
-                    )
+                    tac_lines.append(f"    // Predecessors: {', '.join(block.predecessors)}")
                 if block.successors:
-                    tac_lines.append(
-                        f"    // Successors: {', '.join(block.successors)}"
-                    )
+                    tac_lines.append(f"    // Successors: {', '.join(block.successors)}")
 
                 for instr in block.instructions:
                     formatted = analyzer._format_tac_instruction(instr)
@@ -1424,13 +2244,16 @@ class DatasetBuilder:
             if block_id in emitted_blocks:
                 # Issue 7: emit a lightweight reference instead of the full block
                 from .bytecode_analyzer import BasicBlock as BB, TACInstruction, TACOperationType
+
                 ref_block = BB(
                     id=block.id,
                     instructions=[
                         TACInstruction(
                             operation=TACOperationType.NOP,
-                            metadata={"shared_ref": True,
-                                      "comment": f"(see shared block {block_id})"},
+                            metadata={
+                                "shared_ref": True,
+                                "comment": f"(see shared block {block_id})",
+                            },
                         )
                     ],
                     predecessors=block.predecessors,
@@ -1454,9 +2277,7 @@ class DatasetBuilder:
     #  Training pair construction
     # ------------------------------------------------------------------ #
 
-    def _build_training_pair(
-        self, match: Dict, address: str
-    ) -> Optional[FunctionPair]:
+    def _build_training_pair(self, match: Dict, address: str) -> Optional[FunctionPair]:
         """Build a training pair from a matched function.
 
         Args:
@@ -1467,7 +2288,7 @@ class DatasetBuilder:
             FunctionPair object or ``None`` if the function is too small.
         """
         sol_func = match["solidity_function"]
-        tac = match["tac"]
+        tac = sanitize_tac_prompt_input(match["tac"])
 
         if len(sol_func["body"].strip()) < 10:
             return None
@@ -1508,7 +2329,7 @@ class DatasetBuilder:
             FunctionPair for entire contract, or ``None`` on error.
         """
         try:
-            tac = analyzer.generate_tac_representation()
+            tac = sanitize_tac_prompt_input(analyzer.generate_tac_representation())
             cleaned_source = self.parser._clean_source_code(source_code)
 
             return FunctionPair(
@@ -1533,14 +2354,18 @@ class DatasetBuilder:
     def _store_function_pair(self, pair: FunctionPair) -> None:
         """Store function pair in database. Duplicates are skipped via hash.
 
+        TAC prompt text is sanitized before storage so compiler/source-only
+        metadata remains only in the JSON metadata object.
+
         Args:
             pair: FunctionPair object to store.
         """
-        content = f"{pair.tac_representation}{pair.solidity_code}"
+        tac_representation = sanitize_tac_prompt_input(pair.tac_representation)
+        content = f"{tac_representation}{pair.solidity_code}"
         hash_value = hashlib.md5(content.encode()).hexdigest()
         body_hash = hash_normalized_body(pair.solidity_code)
-        tac_hash = hash_normalized_tac(pair.tac_representation)
-        pair_norm_hash = hash_normalized_pair(pair.tac_representation, pair.solidity_code)
+        tac_hash = hash_normalized_tac(tac_representation)
+        pair_norm_hash = hash_normalized_pair(tac_representation, pair.solidity_code)
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -1557,7 +2382,7 @@ class DatasetBuilder:
                 (
                     pair.contract_address,
                     pair.function_name,
-                    pair.tac_representation,
+                    tac_representation,
                     pair.solidity_code,
                     pair.function_signature,
                     pair.visibility,
@@ -1581,7 +2406,10 @@ class DatasetBuilder:
     # ------------------------------------------------------------------ #
 
     def filter_and_clean_dataset(
-        self, min_length: int = 50, max_length: int = 20000
+        self,
+        min_length: int = 50,
+        max_length: int = 20000,
+        include_partial: bool = False,
     ) -> int:
         """Filter and clean the dataset according to paper specifications.
 
@@ -1596,15 +2424,38 @@ class DatasetBuilder:
         Args:
             min_length: Minimum Solidity function length in characters.
             max_length: Maximum TAC representation length in characters.
+            include_partial: Keep partial/placeholder examples in the DB for a
+                separate opt-in export. Defaults to ``False`` for supervised
+                TAC→Solidity training data.
 
         Returns:
             Number of function pairs after filtering.
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        drop_counts: Counter = Counter()
+
+        def delete_rule(rule: str, sql: str, params: tuple = ()) -> None:
+            cursor.execute(sql, params)
+            drop_counts[rule] += max(int(cursor.rowcount or 0), 0)
+
+        if not include_partial:
+            delete_rule(
+                "partial_placeholder",
+                """
+                DELETE FROM function_pairs
+                WHERE COALESCE(metadata, '') LIKE '%"partial": true%'
+                   OR COALESCE(metadata, '') LIKE '%"partial":true%'
+                   OR solidity_code LIKE '%Partial decompilation%'
+                   OR solidity_code LIKE '%TODO: Full logic not reconstructed%'
+                   OR solidity_code LIKE '%function unknown_%'
+                   OR function_name LIKE 'unknown_%'
+                """,
+            )
 
         # Step 1: Remove extremely short functions
-        cursor.execute(
+        delete_rule(
+            "min_solidity_length",
             """
             DELETE FROM function_pairs
             WHERE LENGTH(solidity_code) < ?
@@ -1613,7 +2464,8 @@ class DatasetBuilder:
         )
 
         # Step 2: Apply max TAC length filter
-        cursor.execute(
+        delete_rule(
+            "max_tac_length",
             """
             DELETE FROM function_pairs
             WHERE LENGTH(tac_representation) > ?
@@ -1622,7 +2474,8 @@ class DatasetBuilder:
         )
 
         # Step 3: Remove duplicates based on signature and substantial content
-        cursor.execute(
+        delete_rule(
+            "duplicate_signature_body",
             """
             DELETE FROM function_pairs
             WHERE id NOT IN (
@@ -1630,24 +2483,26 @@ class DatasetBuilder:
                 FROM function_pairs
                 GROUP BY function_signature, SUBSTR(solidity_code, 1, 300)
             )
-        """
+        """,
         )
 
         # Step 4: Additional filtering based on content quality
-        cursor.execute(
+        delete_rule(
+            "test_function_name",
             """
             DELETE FROM function_pairs
             WHERE function_name LIKE '%test%' OR function_name LIKE '%Test%'
-        """
+        """,
         )
 
         # Step 5: Filter out functions with overly simple patterns that may not contribute much to learning
-        cursor.execute(
+        delete_rule(
+            "overly_simple_pattern",
             """
             DELETE FROM function_pairs
             WHERE (LENGTH(solidity_code) - LENGTH(REPLACE(solidity_code, 'return', ''))) < 2
             AND (LENGTH(solidity_code) - LENGTH(REPLACE(solidity_code, ';', ''))) < 5
-        """
+        """,
         )
 
         conn.commit()
@@ -1657,14 +2512,33 @@ class DatasetBuilder:
 
         conn.close()
 
-        logger.info(f"Dataset filtered to {final_count} function pairs")
+        self._last_filter_drop_counts = dict(drop_counts)
+        self._persist_filter_drops(self._last_filter_drop_counts)
+
+        logger.info(
+            "Dataset filtered to %s function pairs; drops=%s",
+            final_count,
+            dict(drop_counts),
+        )
         return final_count
 
-    def export_dataset(self, output_format: str = "jsonl") -> str:
+    def export_dataset(
+        self,
+        output_format: str = "jsonl",
+        *,
+        include_partial: bool = False,
+        write_manifest: bool = True,
+    ) -> str:
         """Export the dataset in the specified format.
+
+        JSONL records keep source/compiler facts in ``metadata`` for analysis,
+        but the ``input`` field is sanitized bytecode-only TAC.
 
         Args:
             output_format: Export format (``'jsonl'``, ``'csv'``, or ``'parquet'``).
+            include_partial: Also write partial placeholders to a separate
+                ``smart_contract_dataset.partial.jsonl`` file.
+            write_manifest: Write an export manifest next to the main artifact.
 
         Returns:
             Path to exported file.
@@ -1697,48 +2571,129 @@ class DatasetBuilder:
                      id
         """
         df = pd.read_sql_query(query, conn)
+        db_counts = {}
+        for table in (
+            "contracts",
+            "function_pairs",
+            "generation_diagnostics",
+            "dataset_filter_drops",
+        ):
+            try:
+                db_counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            except sqlite3.OperationalError:
+                db_counts[table] = 0
         conn.close()
+        if "tac_representation" in df.columns:
+            df["tac_representation"] = df["tac_representation"].map(sanitize_tac_prompt_input)
 
         filename = f"smart_contract_dataset.{output_format}"
         filepath = self.output_dir / filename
+        partial_filepath = self.output_dir / "smart_contract_dataset.partial.jsonl"
+
+        partial_mask = []
+        for _, row in df.iterrows():
+            partial_mask.append(
+                is_partial_training_pair(
+                    row.get("metadata"),
+                    row.get("solidity_code", ""),
+                    row.get("function_name", ""),
+                )
+            )
+        if partial_mask:
+            main_df = df[[not flag for flag in partial_mask]].copy()
+            partial_df = df[partial_mask].copy()
+        else:
+            main_df = df.copy()
+            partial_df = df.iloc[0:0].copy()
+
+        def row_to_record(row: Any) -> Dict[str, Any]:
+            stored_metadata = parse_metadata_object(row.get("metadata"))
+            if row.get("metadata") and not stored_metadata:
+                logger.warning(
+                    "Skipping invalid metadata JSON for %s",
+                    row["function_name"],
+                )
+            metadata = normalize_training_metadata(
+                {
+                    **stored_metadata,
+                    "function_name": row["function_name"],
+                    "function_signature": row["function_signature"],
+                    "visibility": row["visibility"],
+                    "is_payable": bool(row["is_payable"]),
+                    "is_view": bool(row["is_view"]),
+                    "contract_address": row["contract_address"],
+                }
+            )
+            return {
+                "input": row["tac_representation"],
+                "output": row["solidity_code"],
+                "metadata": metadata,
+            }
 
         if output_format == "jsonl":
-            with open(filepath, "w") as f:
-                for _, row in df.iterrows():
-                    stored_metadata = {}
-                    raw_metadata = row.get("metadata")
-                    if isinstance(raw_metadata, str) and raw_metadata.strip():
-                        try:
-                            parsed_metadata = json.loads(raw_metadata)
-                            if isinstance(parsed_metadata, dict):
-                                stored_metadata = parsed_metadata
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                "Skipping invalid metadata JSON for %s",
-                                row["function_name"],
-                            )
-
-                    metadata = {
-                        **stored_metadata,
-                        "function_name": row["function_name"],
-                        "function_signature": row["function_signature"],
-                        "visibility": row["visibility"],
-                        "is_payable": bool(row["is_payable"]),
-                        "is_view": bool(row["is_view"]),
-                        "contract_address": row["contract_address"],
-                    }
-                    record = {
-                        "input": row["tac_representation"],
-                        "output": row["solidity_code"],
-                        "metadata": metadata,
-                    }
+            with open(filepath, "w", encoding="utf-8") as f:
+                for _, row in main_df.iterrows():
+                    record = row_to_record(row)
                     f.write(json.dumps(record, sort_keys=True) + "\n")
 
+            if include_partial:
+                with open(partial_filepath, "w", encoding="utf-8") as f:
+                    for _, row in partial_df.iterrows():
+                        record = row_to_record(row)
+                        record["metadata"]["partial_split"] = "partial_placeholders"
+                        f.write(json.dumps(record, sort_keys=True) + "\n")
+
         elif output_format == "csv":
-            df.to_csv(filepath, index=False)
+            main_df.to_csv(filepath, index=False)
 
         elif output_format == "parquet":
-            df.to_parquet(filepath, index=False)
+            main_df.to_parquet(filepath, index=False)
+        else:
+            raise ValueError(f"Unsupported output_format: {output_format}")
+
+        if write_manifest:
+            filter_drops = self._filter_drop_summary()
+            partial_drop_count = int(len(partial_df))
+            drop_counts = {
+                **filter_drops,
+                "partial_placeholder_export_excluded": partial_drop_count,
+            }
+            manifest = {
+                "manifest_kind": "etherscan_dataset_export",
+                "manifest_schema_version": 1,
+                "training_row_schema_version": TRAINING_ROW_SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "generated_at": _utc_now_iso(),
+                "database": str(self.db_path),
+                "inputs": self._collection_input_summary,
+                "parameters": {
+                    "output_format": output_format,
+                    "include_partial": include_partial,
+                },
+                "artifacts": {
+                    "dataset": _file_artifact(filepath, jsonl=output_format == "jsonl"),
+                    "database": _file_artifact(self.db_path),
+                },
+                "row_counts": {
+                    **db_counts,
+                    "rows_after_pair_dedup": int(len(df)),
+                    "rows_exported": int(len(main_df)),
+                    "partial_rows_quarantined": partial_drop_count,
+                },
+                "drop_counts": drop_counts,
+                "failure_diagnostics": self._diagnostic_summary(),
+                "filter_drops": filter_drops,
+                "collection": self._last_collection_summary,
+            }
+            if include_partial:
+                manifest["artifacts"]["partial_dataset"] = _file_artifact(
+                    partial_filepath,
+                    jsonl=True,
+                )
+            manifest_path = Path(f"{filepath}.manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(_json_safe(manifest), f, indent=2, sort_keys=True)
+                f.write("\n")
 
         logger.info(f"Dataset exported to {filepath}")
         return str(filepath)
@@ -1820,9 +2775,7 @@ def main() -> None:
             api_key = settings.get("ETHERSCAN_API_KEY", api_key)
 
     if not api_key:
-        logger.error(
-            "Please set ETHERSCAN_API_KEY environment variable or add it to settings.yaml"
-        )
+        logger.error("Please set ETHERSCAN_API_KEY environment variable or add it to settings.yaml")
         return
 
     builder = DatasetBuilder(api_key)

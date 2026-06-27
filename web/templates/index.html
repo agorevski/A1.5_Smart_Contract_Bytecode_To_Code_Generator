@@ -10,7 +10,7 @@
   <header>
     <div class="header-content">
       <h1>🔍 Smart Contract Bytecode Decompiler</h1>
-      <p class="subtitle">EVM Bytecode → TAC → Solidity &nbsp;|&nbsp; Powered by fine-tuned Llama 3.2 3B</p>
+      <p class="subtitle">EVM Bytecode → TAC → Solidity &nbsp;|&nbsp; Powered by fine-tuned Qwen2.5-Coder</p>
     </div>
   </header>
 
@@ -65,38 +65,38 @@
       <div id="bytecode-guidance" class="input-help">
         Hex bytecode may include whitespace and an optional 0x prefix. Limit: checking…
       </div>
-      <div class="compiler-metadata">
-        <label>
-          Solidity compiler
-          <input
-            id="compiler-version-input"
-            type="text"
-            placeholder="optional, e.g. 0.8.20"
-            autocomplete="off"
-          />
-        </label>
-        <label>
-          Optimizer
-          <select id="optimizer-enabled-input">
-            <option value="">Unknown</option>
-            <option value="true">Enabled</option>
-            <option value="false">Disabled</option>
-          </select>
-        </label>
-        <label>
-          Optimizer runs
-          <input
-            id="optimizer-runs-input"
-            type="number"
-            min="0"
-            step="1"
-            placeholder="optional"
-          />
-        </label>
-      </div>
+      <details class="advanced-settings metadata-settings">
+        <summary>Optional ABI and contract metadata</summary>
+        <div class="metadata-grid">
+          <label>
+            Verified ABI JSON
+            <textarea
+              id="abi-input"
+              class="metadata-textarea"
+              placeholder='Paste ABI array or artifact object with an "abi" field'
+              spellcheck="false"
+            ></textarea>
+            <input id="abi-file-input" type="file" accept="application/json,.json" />
+          </label>
+          <label>
+            Contract metadata JSON
+            <textarea
+              id="metadata-input"
+              class="metadata-textarea"
+              placeholder='Optional object, for example {"contractName":"Token","chainId":1}'
+              spellcheck="false"
+            ></textarea>
+            <input id="metadata-file-input" type="file" accept="application/json,.json" />
+          </label>
+        </div>
+        <p class="input-help">
+          ABI function signatures are used for selector provenance and prompt metadata.
+          Metadata is recorded in the trace/export but compiler settings are not trusted as bytecode facts.
+        </p>
+      </details>
       <details class="advanced-settings">
         <summary>Advanced generation settings</summary>
-        <div class="compiler-metadata">
+        <div class="generation-settings">
           <label>
             Max new tokens
             <input id="max-new-tokens-input" type="number" min="1" step="1" />
@@ -168,7 +168,6 @@
     <!-- Results Section -->
     <section id="results-section" class="results-section hidden">
       <div class="tabs">
-        <button id="tab-btn-original" class="tab hidden" data-tab="tab-original">📄 Original Solidity</button>
         <button class="tab active" data-tab="tab-solidity">Generated Solidity</button>
         <button class="tab" data-tab="tab-functions">🔗 Function Mapping</button>
         <button class="tab" data-tab="tab-tac">TAC Output</button>
@@ -177,24 +176,14 @@
       </div>
 
       <div class="tab-panels">
-        <!-- Original Solidity Tab (only visible when sample is loaded) -->
-        <div id="tab-original" class="tab-panel hidden">
-          <div class="panel-header">
-            <h3>Original Solidity Source</h3>
-            <button class="btn btn-small btn-copy" data-target="original-output">📋 Copy</button>
-          </div>
-          <div class="original-note">
-            This is the verified source code that was compiled into the sample bytecode.
-            Compare it with the <strong>Generated Solidity</strong> tab to evaluate decompilation quality.
-          </div>
-          <pre><code id="original-output" class="code-block solidity"></code></pre>
-        </div>
-
         <!-- Solidity Tab -->
         <div id="tab-solidity" class="tab-panel active">
           <div class="panel-header">
             <h3>Reconstructed Solidity Code</h3>
-            <button class="btn btn-small btn-copy" data-target="solidity-output">📋 Copy</button>
+            <div class="panel-actions">
+              <button class="btn btn-small btn-download" data-artifact="solidity" disabled>⬇ .sol</button>
+              <button class="btn btn-small btn-copy" data-target="solidity-output">📋 Copy</button>
+            </div>
           </div>
           <div id="model-warning" class="warning hidden">
             <span>⚠️</span> <span id="model-warning-text"></span>
@@ -211,6 +200,7 @@
             Each function selector (4-byte hash) is resolved to its likely human-readable name.
             Confidence indicates how certain the mapping is.
           </p>
+          <div id="trace-diagnostics" class="diagnostics-panel"></div>
           <div id="function-mapping-content" class="function-mapping-table-wrap">
             <p class="text-muted">No function data yet. Run a decompilation first.</p>
           </div>
@@ -220,7 +210,10 @@
         <div id="tab-tac" class="tab-panel hidden">
           <div class="panel-header">
             <h3>Three-Address Code (TAC)</h3>
-            <button class="btn btn-small btn-copy" data-target="tac-output">📋 Copy</button>
+            <div class="panel-actions">
+              <button class="btn btn-small btn-download" data-artifact="tac" disabled>⬇ TAC</button>
+              <button class="btn btn-small btn-copy" data-target="tac-output">📋 Copy</button>
+            </div>
           </div>
           <pre><code id="tac-output" class="code-block tac"></code></pre>
         </div>
@@ -229,6 +222,7 @@
         <div id="tab-analysis" class="tab-panel hidden">
           <div class="panel-header">
             <h3>Analysis Details</h3>
+            <button class="btn btn-small btn-download" data-artifact="json" disabled>⬇ JSON export</button>
           </div>
           <div id="analysis-content" class="analysis-grid"></div>
         </div>

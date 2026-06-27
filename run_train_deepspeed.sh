@@ -5,9 +5,9 @@
 # Uses DeepSpeed as a DDP backend with:
 #   • Capability-aware mixed precision (BF16 on Ampere+, FP16 otherwise)
 #   • Efficient gradient accumulation handling
-#   • Compatible with 4-bit quantization + LoRA
+#   • Compatible with Qwen2.5-Coder LoRA, with optional 4-bit quantization
 #
-# For this model size (3B params, 24M trainable LoRA params),
+# For the default Qwen2.5-Coder-7B LoRA setup,
 # ZeRO stage 0 (no sharding) matches torchrun DDP performance.
 # Set BATCH_SIZE=8+ and ZeRO stage 1/2 in ds_config.json for
 # larger models or when GPU memory is constrained.
@@ -53,7 +53,7 @@ echo "  Max seq length:       ${MAX_SEQ_LEN}"
 echo "  Dataset:              ${DATASET}"
 echo "  Model:                ${MODEL}"
 echo "  DeepSpeed config:     ${DS_CONFIG}"
-echo "  Precision:            ${PRECISION_MODE}"
+echo "  Precision:            ${PRECISION} (${PRECISION_MODE})"
 echo ""
 
 uv run --extra deepspeed deepspeed \
@@ -66,5 +66,6 @@ uv run --extra deepspeed deepspeed \
     --lr "${LR}" \
     --max-seq-length "${MAX_SEQ_LEN}" \
     --model-name "${MODEL}" \
+    --precision "${PRECISION}" \
     --deepspeed "${DS_CONFIG}" \
     --skip-eval

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def protected_api_state(monkeypatch):
     original_testing = web_app.app.config.get("TESTING", False)
     monkeypatch.setattr(web_app, "WEB_API_KEY", None)
+    web_app._reset_warmup_state(False)
     monkeypatch.setattr(
         web_app,
         "_get_gpu_stats",
@@ -22,6 +23,7 @@ def protected_api_state(monkeypatch):
     )
     web_app.app.config["TESTING"] = True
     yield
+    web_app._reset_warmup_state(False)
     web_app.app.config["TESTING"] = original_testing
 
 
@@ -103,7 +105,9 @@ def test_health_surfaces_readiness_config_and_limits(client, monkeypatch):
     assert data["ready"] is False
     assert data["model_path"] == "models/missing"
     assert data["model_error"] == "not found"
+    assert data["warmup"]["status"] == "disabled"
     assert data["limits"]["max_bytecode_hex_length"] == web_app.MAX_BYTECODE_HEX_LENGTH
+    assert data["limits"]["timeout_enforcement"] == "daemon_thread"
     assert data["generation_defaults"]["max_new_tokens"] >= 1
 
 
@@ -118,8 +122,14 @@ def test_ui_exposes_readiness_generation_cancel_and_security_controls(client):
     assert 'id="btn-vulnerability-scan"' in html
     assert 'id="btn-classify"' in html
     assert 'id="btn-audit-report"' in html
+    assert 'id="abi-input"' in html
+    assert 'id="metadata-input"' in html
+    assert 'class="btn btn-small btn-download"' in html
+    assert 'id="trace-diagnostics"' in html
     assert 'fetch("/api/health", { headers: apiHeaders() })' in app_js
     assert 'runSecurityEndpoint("vulnerability scan", "/api/vulnerability-scan")' in app_js
+    assert "handleDownloadArtifact" in app_js
+    assert "renderTraceDiagnostics" in app_js
 
 
 def _parse_sse_events(text):
@@ -146,16 +156,17 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
             self.instructions = [object(), object()]
             self.basic_blocks = {"b0": object()}
             self.functions = {
-                "func_abcdef01": SimpleNamespace(
-                    name="func_abcdef01",
+                "func_a9059cbb": SimpleNamespace(
+                    name="func_a9059cbb",
                     visibility="public",
                     is_payable=False,
                     is_view=True,
+                    selector="0xa9059cbb",
                 )
             }
 
         def generate_per_function_tac(self):
-            return {"func_abcdef01": "func_abcdef01:\n  v0 = CALLVALUE\n  RETURN v0"}
+            return {"func_a9059cbb": "func_a9059cbb:\n  v0 = CALLVALUE\n  RETURN v0"}
 
     class FakeDecompiler:
         def __init__(self):
@@ -175,10 +186,10 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
 
         def decompile_tac_to_solidity(self, tac, metadata=None, **kwargs):
             self.calls.append({"tac": tac, "metadata": metadata, "kwargs": kwargs})
-            return "function func_abcdef01() public view returns (uint256) { return 0; }"
+            return "function transfer(address to, uint256 amount) public { }"
 
         def _assemble_contract(self, functions, analyzer):
-            return "contract DecompiledContract {\\n" + "\\n".join(functions.values()) + "\\n}"
+            return "contract DecompiledContract {\n" + "\n".join(functions.values()) + "\n}"
 
     class FakeResolver:
         def resolve_function_names(self, fnames):
@@ -186,8 +197,8 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
                 fname: SimpleNamespace(
                     to_dict=lambda fname=fname: {
                         "best_match": {
-                            "selector": "0xabcdef01",
-                            "signature": "func()",
+                            "selector": "0xa9059cbb",
+                            "signature": "transfer(address,uint256)",
                             "confidence": 95,
                             "source": "builtin",
                         },
@@ -199,6 +210,13 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
 
     fake_decompiler = FakeDecompiler()
     monkeypatch.setattr(web_app, "BytecodeAnalyzer", FakeAnalyzer)
+    monkeypatch.setattr(
+        web_app,
+        "_keccak_hex",
+        lambda text: (
+            "0xa9059cbb" + ("0" * 56) if text == "transfer(address,uint256)" else "0x" + ("0" * 64)
+        ),
+    )
     monkeypatch.setattr(web_app, "get_resolver", lambda use_remote=False: FakeResolver())
     monkeypatch.setattr(web_app, "decompiler", fake_decompiler)
     monkeypatch.setattr(web_app, "model_config_dict", {"model_name": "fake"})
@@ -212,6 +230,21 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
         "/api/decompile",
         json={
             "bytecode": "0x6000",
+            "abi": [
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        {"name": "to", "type": "address"},
+                        {"name": "amount", "type": "uint256"},
+                    ],
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                },
+                {"type": "event", "name": "Transfer", "inputs": []},
+                {"type": "error", "name": "InsufficientBalance", "inputs": []},
+            ],
+            "metadata": {"contractName": "Token"},
             "generation": {
                 "max_new_tokens": 64,
                 "temperature": 0.2,
@@ -231,13 +264,19 @@ def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypa
     assert result["effective_generation_config"]["max_new_tokens"] == 64
     assert fake_decompiler.calls[0]["kwargs"]["max_new_tokens"] == 64
     assert fake_decompiler.calls[0]["kwargs"]["temperature"] == 0.2
+    assert fake_decompiler.calls[0]["metadata"]["abi_signature"] == "transfer(address,uint256)"
     assert result["function_results"][0]["source"] == "model_inference"
+    assert result["function_results"][0]["selector_source"] == "abi"
+    assert result["function_results"][0]["abi"]["name"] == "transfer"
     assert result["function_results"][0]["diagnostics"]["tac_truncated"] is True
+    assert result["validation"]["valid"] is True
+    assert result["contract_metadata"]["abi"]["event_count"] == 1
     trace_path = ROOT / result["trace_path"]
     assert trace_path.exists()
     trace = json.loads(trace_path.read_text())
     assert trace["request_id"] == result["request_id"]
-    assert trace["functions"]["func_abcdef01"]["diagnostics"]["generated_tokens"] > 0
+    assert trace["functions"]["func_a9059cbb"]["diagnostics"]["generated_tokens"] > 0
+    assert trace["analysis"]["validation"]["valid"] is True
 
     shutil.rmtree(trace_dir, ignore_errors=True)
 
@@ -251,6 +290,90 @@ def test_decompile_rejects_invalid_generation_controls(client):
 
     assert response.status_code == 400
     assert "max_new_tokens" in response.get_json()["error"]
+
+
+def test_decompile_rejects_invalid_abi_json(client):
+    response = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000", "abi": "{not json"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    assert response.status_code == 400
+    assert "abi" in response.get_json()["error"]
+
+
+def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
+    class FakeAnalyzer:
+        def __init__(self, bytecode):
+            self.instructions = [object()]
+            self.basic_blocks = {"b0": object()}
+            self.functions = {
+                "func_00000000": SimpleNamespace(name="func_00000000", selector="0x00000000")
+            }
+
+        def generate_per_function_tac(self):
+            return {"func_00000000": "func_00000000:\n  RETURN 0"}
+
+    class SlowDecompiler:
+        def decompile_tac_to_solidity(self, *args, **kwargs):
+            import time
+
+            time.sleep(0.5)
+            return "function late() public {}"
+
+    class FakeResolver:
+        def resolve_function_names(self, fnames):
+            return {
+                fname: SimpleNamespace(
+                    to_dict=lambda: {
+                        "best_match": None,
+                        "candidates": [],
+                        "selector": "0x00000000",
+                    }
+                )
+                for fname in fnames
+            }
+
+    monkeypatch.setattr(web_app, "BytecodeAnalyzer", FakeAnalyzer)
+    monkeypatch.setattr(web_app, "get_resolver", lambda use_remote=False: FakeResolver())
+    monkeypatch.setattr(web_app, "decompiler", SlowDecompiler())
+    monkeypatch.setattr(web_app, "DECOMPILE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(web_app, "tac_lookup", None)
+
+    response = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x6000"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    events = _parse_sse_events(response.get_data(as_text=True))
+
+    assert any(event == "error" and "timed out" in data["error"] for event, data in events)
+    assert web_app.DECOMPILE_SEMAPHORE.acquire(blocking=False)
+    web_app.DECOMPILE_SEMAPHORE.release()
+
+
+def test_model_warmup_state_is_reported(monkeypatch):
+    class FakeDecompiler:
+        def __init__(self):
+            self.calls = 0
+
+        def decompile_tac_to_solidity(self, *args, **kwargs):
+            self.calls += 1
+            return "function warm() public {}"
+
+    fake = FakeDecompiler()
+    monkeypatch.setattr(web_app, "decompiler", fake)
+    monkeypatch.setattr(web_app, "MODEL_WARMUP_ENABLED", True)
+    monkeypatch.setattr(web_app, "MODEL_WARMUP_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(web_app, "MODEL_WARMUP_MAX_NEW_TOKENS", 2)
+
+    web_app._warm_model()
+    health = web_app._health_payload()
+
+    assert fake.calls == 1
+    assert health["warmup"]["status"] == "complete"
+    assert health["inference_ready"] is True
 
 
 def test_decompile_oversized_bytecode_returns_413(client, monkeypatch):

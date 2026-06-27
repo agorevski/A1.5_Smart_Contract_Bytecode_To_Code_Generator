@@ -13,7 +13,7 @@ import math
 import re
 import time
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 import hashlib
 import random
 from statistics import NormalDist
@@ -36,9 +36,20 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # Our modules
 from .bytecode_analyzer import BytecodeAnalyzer
-from .dataset_pipeline import DatasetBuilder
 from .model_setup import SmartContractModelTrainer, ModelConfig, SmartContractDecompiler
-from .replication_metrics import aggregate_replication_scores, evaluate_replication
+from .replication_metrics import (
+    aggregate_replication_scores,
+    evaluate_replication,
+    extract_solidity_facts,
+)
+
+try:
+    from .dataset_pipeline import DatasetBuilder
+except Exception as exc:  # pragma: no cover - surfaced when pipeline collection is used
+    DatasetBuilder = None
+    _DATASET_BUILDER_IMPORT_ERROR = exc
+else:
+    _DATASET_BUILDER_IMPORT_ERROR = None
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +169,123 @@ DEFAULT_METADATA_SEGMENT_FIELDS = (
     "optimizer_runs",
     "language_version",
     "contract_kind",
+    "bytecode_length_bucket",
+    "opcode_group",
+    "control_flow",
+)
+
+DEFAULT_EVALUATION_BENCHMARK_DIR = Path("test_data/evaluation")
+
+_BYTECODE_METADATA_KEYS = (
+    "runtime_bytecode",
+    "deployed_bytecode",
+    "bytecode",
+    "creation_bytecode",
+    "init_bytecode",
+)
+
+_EVM_OPCODE_NAMES: Dict[int, str] = {
+    0x00: "STOP",
+    0x01: "ADD",
+    0x02: "MUL",
+    0x03: "SUB",
+    0x04: "DIV",
+    0x05: "SDIV",
+    0x06: "MOD",
+    0x07: "SMOD",
+    0x08: "ADDMOD",
+    0x09: "MULMOD",
+    0x0A: "EXP",
+    0x0B: "SIGNEXTEND",
+    0x10: "LT",
+    0x11: "GT",
+    0x12: "SLT",
+    0x13: "SGT",
+    0x14: "EQ",
+    0x15: "ISZERO",
+    0x16: "AND",
+    0x17: "OR",
+    0x18: "XOR",
+    0x19: "NOT",
+    0x1A: "BYTE",
+    0x1B: "SHL",
+    0x1C: "SHR",
+    0x1D: "SAR",
+    0x20: "SHA3",
+    0x30: "ADDRESS",
+    0x31: "BALANCE",
+    0x32: "ORIGIN",
+    0x33: "CALLER",
+    0x34: "CALLVALUE",
+    0x35: "CALLDATALOAD",
+    0x36: "CALLDATASIZE",
+    0x37: "CALLDATACOPY",
+    0x38: "CODESIZE",
+    0x39: "CODECOPY",
+    0x3A: "GASPRICE",
+    0x3B: "EXTCODESIZE",
+    0x3C: "EXTCODECOPY",
+    0x3D: "RETURNDATASIZE",
+    0x3E: "RETURNDATACOPY",
+    0x3F: "EXTCODEHASH",
+    0x40: "BLOCKHASH",
+    0x41: "COINBASE",
+    0x42: "TIMESTAMP",
+    0x43: "NUMBER",
+    0x44: "PREVRANDAO",
+    0x45: "GASLIMIT",
+    0x46: "CHAINID",
+    0x47: "SELFBALANCE",
+    0x48: "BASEFEE",
+    0x49: "BLOBHASH",
+    0x4A: "BLOBBASEFEE",
+    0x50: "POP",
+    0x51: "MLOAD",
+    0x52: "MSTORE",
+    0x53: "MSTORE8",
+    0x54: "SLOAD",
+    0x55: "SSTORE",
+    0x56: "JUMP",
+    0x57: "JUMPI",
+    0x58: "PC",
+    0x59: "MSIZE",
+    0x5A: "GAS",
+    0x5B: "JUMPDEST",
+    0x5F: "PUSH0",
+    0xA0: "LOG0",
+    0xA1: "LOG1",
+    0xA2: "LOG2",
+    0xA3: "LOG3",
+    0xA4: "LOG4",
+    0xF0: "CREATE",
+    0xF1: "CALL",
+    0xF2: "CALLCODE",
+    0xF3: "RETURN",
+    0xF4: "DELEGATECALL",
+    0xF5: "CREATE2",
+    0xFA: "STATICCALL",
+    0xFD: "REVERT",
+    0xFE: "INVALID",
+    0xFF: "SELFDESTRUCT",
+}
+for _opcode in range(0x60, 0x80):
+    _EVM_OPCODE_NAMES[_opcode] = f"PUSH{_opcode - 0x5F}"
+for _opcode in range(0x80, 0x90):
+    _EVM_OPCODE_NAMES[_opcode] = f"DUP{_opcode - 0x7F}"
+for _opcode in range(0x90, 0xA0):
+    _EVM_OPCODE_NAMES[_opcode] = f"SWAP{_opcode - 0x8F}"
+
+_OPCODE_GROUP_RULES = (
+    ("create", {"CREATE", "CREATE2"}),
+    ("create2", {"CREATE2"}),
+    ("delegatecall", {"DELEGATECALL"}),
+    ("external_call", {"CALL", "CALLCODE", "STATICCALL"}),
+    ("selfdestruct", {"SELFDESTRUCT"}),
+    ("push0", {"PUSH0"}),
+    ("storage", {"SLOAD", "SSTORE"}),
+    ("event_log", {"LOG0", "LOG1", "LOG2", "LOG3", "LOG4"}),
+    ("control_flow", {"JUMP", "JUMPI", "JUMPDEST"}),
+    ("revert", {"REVERT", "INVALID"}),
 )
 
 DEFAULT_BASELINE_METRIC_DIRECTIONS = {
@@ -179,6 +307,12 @@ DEFAULT_BASELINE_METRIC_DIRECTIONS = {
     "replication_f1_micro": "higher",
     "solidity_valid_mean": "higher",
     "solidity_ast_valid_mean": "higher",
+    "bytecode_semantic_score_mean": "higher",
+    "bytecode_semantic_checked_mean": "higher",
+    "bytecode_deployable_mean": "higher",
+    "bytecode_runtime_match_mean": "higher",
+    "replication_hallucination_rate": "lower",
+    "replication_groundedness_score_mean": "higher",
 }
 
 
@@ -195,6 +329,10 @@ class SolidityValidityResult:
     compiler_errors: List[str] = field(default_factory=list)
     ast_checked: bool = False
     ast_valid: Optional[bool] = None
+    bytecode_checked: bool = False
+    deployable: Optional[bool] = None
+    compiled_creation_bytecode: Optional[str] = None
+    compiled_runtime_bytecode: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -207,6 +345,40 @@ class SolidityValidityResult:
             "compiler_errors": list(self.compiler_errors),
             "ast_checked": self.ast_checked,
             "ast_valid": self.ast_valid,
+            "bytecode_checked": self.bytecode_checked,
+            "deployable": self.deployable,
+            "compiled_creation_bytecode_hash": _bytecode_hash(self.compiled_creation_bytecode),
+            "compiled_runtime_bytecode_hash": _bytecode_hash(self.compiled_runtime_bytecode),
+        }
+
+
+@dataclass(frozen=True)
+class BytecodeSemanticResult:
+    """Bytecode-grounded semantic/deployability checks for one generated output."""
+
+    checked: bool
+    score: float
+    deployability_checked: bool
+    deployable: bool
+    runtime_bytecode_checked: bool
+    runtime_bytecode_match: Optional[bool]
+    opcode_groups: List[str] = field(default_factory=list)
+    control_flow_buckets: List[str] = field(default_factory=list)
+    mismatch_buckets: Dict[str, List[str]] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "checked": self.checked,
+            "score": self.score,
+            "deployability_checked": self.deployability_checked,
+            "deployable": self.deployable,
+            "runtime_bytecode_checked": self.runtime_bytecode_checked,
+            "runtime_bytecode_match": self.runtime_bytecode_match,
+            "opcode_groups": list(self.opcode_groups),
+            "control_flow_buckets": list(self.control_flow_buckets),
+            "mismatch_buckets": {
+                bucket: list(values) for bucket, values in sorted(self.mismatch_buckets.items())
+            },
         }
 
 
@@ -254,6 +426,411 @@ def levenshtein_distance(left: str, right: str) -> int:
     return previous[-1]
 
 
+def evaluate_bytecode_semantics(
+    reference_code: str,
+    candidate_code: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+    *,
+    solidity_validity: Optional[SolidityValidityResult] = None,
+    replication: Optional[Any] = None,
+) -> BytecodeSemanticResult:
+    """Evaluate generated Solidity against bytecode-grounded semantic signals.
+
+    The check is deterministic without solc: it uses bytecode/TAC opcode evidence
+    from metadata plus structured Solidity facts. When local solc compilation is
+    available, compiled runtime bytecode is compared to expected runtime bytecode.
+    """
+    metadata = metadata or {}
+    if solidity_validity is None:
+        solidity_validity = validate_generated_solidity(candidate_code, metadata)
+    if replication is None:
+        replication = evaluate_replication(reference_code, candidate_code)
+
+    reference_facts = extract_solidity_facts(reference_code)
+    candidate_facts = extract_solidity_facts(candidate_code)
+    opcode_slices = extract_opcode_control_flow_slices({"metadata": metadata})
+    mismatch_buckets: Dict[str, List[str]] = defaultdict(list)
+
+    _add_fact_mismatches(
+        mismatch_buckets,
+        "selector_mismatch",
+        reference_facts,
+        candidate_facts,
+        ("abi", "visibility", "mutability", "modifier"),
+    )
+    _add_fact_mismatches(
+        mismatch_buckets, "event_mismatch", reference_facts, candidate_facts, ("event",)
+    )
+    _add_fact_mismatches(
+        mismatch_buckets,
+        "storage_write_mismatch",
+        reference_facts,
+        candidate_facts,
+        ("state_write",),
+    )
+    _add_fact_mismatches(
+        mismatch_buckets, "call_mismatch", reference_facts, candidate_facts, ("call", "member_call")
+    )
+    _add_fact_mismatches(
+        mismatch_buckets, "guard_mismatch", reference_facts, candidate_facts, ("guard",)
+    )
+    _add_fact_mismatches(
+        mismatch_buckets, "return_mismatch", reference_facts, candidate_facts, ("return",)
+    )
+    _add_fact_mismatches(
+        mismatch_buckets,
+        "control_flow_mismatch",
+        reference_facts,
+        candidate_facts,
+        ("control_flow",),
+    )
+
+    opcode_groups = set(opcode_slices["opcode_groups"])
+    if "storage" in opcode_groups and not candidate_facts.get("state_write"):
+        mismatch_buckets["storage_write_mismatch"].append("bytecode_has_storage_access")
+    if "event_log" in opcode_groups and not candidate_facts.get("event"):
+        mismatch_buckets["event_mismatch"].append("bytecode_has_log_opcode")
+    if "revert" in opcode_groups and not candidate_facts.get("guard"):
+        mismatch_buckets["guard_mismatch"].append("bytecode_has_revert_path")
+    if "delegatecall" in opcode_groups and not _candidate_mentions(candidate_code, "delegatecall"):
+        mismatch_buckets["call_mismatch"].append("bytecode_has_delegatecall")
+    if "create2" in opcode_groups and not _candidate_mentions(candidate_code, "create2"):
+        mismatch_buckets["call_mismatch"].append("bytecode_has_create2")
+
+    if not solidity_validity.valid:
+        reasons = solidity_validity.compiler_errors or solidity_validity.scaffold_errors
+        mismatch_buckets["deployability_failure"].extend(reasons or ["not_deployable"])
+
+    expected_runtime = _first_bytecode_value(metadata, ("runtime_bytecode", "deployed_bytecode"))
+    compiled_runtime = (
+        _first_bytecode_value(
+            metadata,
+            (
+                "candidate_runtime_bytecode",
+                "generated_runtime_bytecode",
+                "compiled_runtime_bytecode",
+            ),
+        )
+        or solidity_validity.compiled_runtime_bytecode
+    )
+    runtime_checked = bool(expected_runtime and compiled_runtime)
+    runtime_match: Optional[bool] = None
+    if runtime_checked:
+        runtime_match = normalize_evm_bytecode(expected_runtime) == normalize_evm_bytecode(
+            compiled_runtime
+        )
+        if not runtime_match:
+            mismatch_buckets["runtime_bytecode_mismatch"].append("normalized_runtime_differs")
+
+    for failure in _differential_call_failures(metadata):
+        mismatch_buckets["differential_call_failure"].append(failure)
+
+    reference_count = sum(len(values) for values in reference_facts.values())
+    candidate_count = sum(len(values) for values in candidate_facts.values())
+    common_count = sum(
+        len(reference_facts.get(category, set()) & candidate_facts.get(category, set()))
+        for category in set(reference_facts) | set(candidate_facts)
+    )
+    denominator = max(reference_count + candidate_count - common_count, 1)
+    score = common_count / denominator
+    if runtime_match is False:
+        score = min(score, 0.5)
+    if not solidity_validity.valid:
+        score = min(score, 0.25)
+    if mismatch_buckets:
+        score = min(score, 1.0 - min(0.9, 0.1 * len(mismatch_buckets)))
+
+    has_bytecode_evidence = bool(
+        opcode_slices["opcode_groups"] or expected_runtime or compiled_runtime
+    )
+    checked = bool(
+        has_bytecode_evidence
+        or solidity_validity.compiler_checked
+        or solidity_validity.bytecode_checked
+        or reference_facts
+    )
+    deployable = (
+        bool(solidity_validity.deployable)
+        if solidity_validity.deployable is not None
+        else bool(solidity_validity.valid)
+    )
+
+    return BytecodeSemanticResult(
+        checked=checked,
+        score=max(0.0, min(1.0, score)),
+        deployability_checked=bool(
+            solidity_validity.compiler_checked or solidity_validity.bytecode_checked
+        ),
+        deployable=deployable,
+        runtime_bytecode_checked=runtime_checked,
+        runtime_bytecode_match=runtime_match,
+        opcode_groups=opcode_slices["opcode_groups"],
+        control_flow_buckets=opcode_slices["control_flow"],
+        mismatch_buckets={key: sorted(set(values)) for key, values in mismatch_buckets.items()},
+    )
+
+
+def normalize_evm_bytecode(bytecode: Optional[str]) -> str:
+    """Normalize EVM bytecode for deterministic comparisons."""
+    if not bytecode:
+        return ""
+    text = str(bytecode).strip().lower()
+    if text.startswith("0x"):
+        text = text[2:]
+    text = re.sub(r"[^0-9a-f]", "", text)
+    for marker in (
+        "a165627a7a7230",
+        "a2646970667358",
+        "a265627a7a7231",
+        "a264697066735822",
+    ):
+        index = text.find(marker)
+        if index > 0:
+            text = text[:index]
+            break
+    return text
+
+
+def extract_evm_opcodes(bytecode_or_opcode_text: Any) -> List[str]:
+    """Extract opcode names from bytecode hex, opcode lists, or TAC-like text."""
+    if isinstance(bytecode_or_opcode_text, Sequence) and not isinstance(
+        bytecode_or_opcode_text, (str, bytes)
+    ):
+        return [_normalize_opcode_name(value) for value in bytecode_or_opcode_text if value]
+
+    text = str(bytecode_or_opcode_text or "").strip()
+    if not text:
+        return []
+    hex_candidate = text[2:] if text.lower().startswith("0x") else text
+    hex_candidate = re.sub(r"\s+", "", hex_candidate)
+    normalized_hex = normalize_evm_bytecode(text)
+    if normalized_hex and len(normalized_hex) >= 2 and re.fullmatch(r"[0-9a-fA-F]+", hex_candidate):
+        return _disassemble_evm_bytecode(normalized_hex)
+
+    opcode_names = set(_EVM_OPCODE_NAMES.values())
+    return [
+        _normalize_opcode_name(match.group(0))
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9_]*\b", text)
+        if _normalize_opcode_name(match.group(0)) in opcode_names
+    ]
+
+
+def extract_opcode_control_flow_slices(result: Mapping[str, Any]) -> Dict[str, List[str]]:
+    """Return opcode-group and control-flow coverage buckets for one result row."""
+    opcodes = _extract_result_opcodes(result)
+    metadata = _metadata_from_result(result)
+    opcode_groups = _opcode_groups_from_opcodes(opcodes)
+    control_flow = _control_flow_buckets_from_opcodes(opcodes, metadata)
+    return {"opcode_groups": opcode_groups, "control_flow": control_flow}
+
+
+def compute_opcode_control_flow_coverage(results: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Compute aggregate opcode/control-flow coverage counts for evaluation rows."""
+    rows = list(results)
+    opcode_group_counts: Dict[str, int] = defaultdict(int)
+    control_flow_counts: Dict[str, int] = defaultdict(int)
+    examples_with_opcode_groups = 0
+    examples_with_control_flow = 0
+
+    for result in rows:
+        slices = extract_opcode_control_flow_slices(result)
+        if slices["opcode_groups"]:
+            examples_with_opcode_groups += 1
+            for group in slices["opcode_groups"]:
+                opcode_group_counts[group] += 1
+        if slices["control_flow"]:
+            examples_with_control_flow += 1
+            for bucket in slices["control_flow"]:
+                control_flow_counts[bucket] += 1
+
+    return {
+        "total_examples": len(rows),
+        "examples_with_opcode_groups": examples_with_opcode_groups,
+        "examples_without_opcode_groups": len(rows) - examples_with_opcode_groups,
+        "opcode_groups": dict(sorted(opcode_group_counts.items())),
+        "examples_with_control_flow": examples_with_control_flow,
+        "examples_without_control_flow": len(rows) - examples_with_control_flow,
+        "control_flow": dict(sorted(control_flow_counts.items())),
+    }
+
+
+def _dataset_rows_as_results(rows: Iterable[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    return [
+        {
+            "input": row.get("input", ""),
+            "metadata": row.get("metadata", {}) if isinstance(row.get("metadata"), Mapping) else {},
+        }
+        for row in rows
+    ]
+
+
+def _bytecode_hash(bytecode: Optional[str]) -> Optional[str]:
+    normalized = normalize_evm_bytecode(bytecode)
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("ascii")).hexdigest()
+
+
+def _add_fact_mismatches(
+    mismatch_buckets: Dict[str, List[str]],
+    bucket: str,
+    reference_facts: Mapping[str, set],
+    candidate_facts: Mapping[str, set],
+    categories: Sequence[str],
+) -> None:
+    for category in categories:
+        reference_values = reference_facts.get(category, set())
+        candidate_values = candidate_facts.get(category, set())
+        missing = sorted(reference_values - candidate_values)
+        extra = sorted(candidate_values - reference_values)
+        for value in missing:
+            mismatch_buckets[bucket].append(f"missing:{category}:{value}")
+        for value in extra:
+            mismatch_buckets[bucket].append(f"extra:{category}:{value}")
+
+
+def _candidate_mentions(candidate_code: str, token: str) -> bool:
+    return token.lower() in (candidate_code or "").lower()
+
+
+def _first_bytecode_value(
+    metadata: Mapping[str, Any],
+    keys: Sequence[str] = _BYTECODE_METADATA_KEYS,
+) -> Optional[str]:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and normalize_evm_bytecode(value):
+            return value
+        if isinstance(value, Mapping):
+            obj = value.get("object") or value.get("bytecode")
+            if isinstance(obj, str) and normalize_evm_bytecode(obj):
+                return obj
+
+    for nested_key in ("evm", "metadata", "compiler_output", "bytecode_metadata"):
+        nested = metadata.get(nested_key)
+        if not isinstance(nested, Mapping):
+            continue
+        direct = _first_bytecode_value(nested, keys)
+        if direct:
+            return direct
+        bytecode = nested.get("bytecode")
+        if isinstance(bytecode, Mapping):
+            obj = bytecode.get("object")
+            if isinstance(obj, str) and normalize_evm_bytecode(obj):
+                return obj
+        deployed = nested.get("deployedBytecode") or nested.get("deployed_bytecode")
+        if isinstance(deployed, Mapping):
+            obj = deployed.get("object")
+            if isinstance(obj, str) and normalize_evm_bytecode(obj):
+                return obj
+    return None
+
+
+def _differential_call_failures(metadata: Mapping[str, Any]) -> List[str]:
+    calls = metadata.get("differential_calls") or metadata.get("differential_tests")
+    if not isinstance(calls, Sequence) or isinstance(calls, (str, bytes)):
+        return []
+    failures: List[str] = []
+    for index, call in enumerate(calls):
+        if not isinstance(call, Mapping):
+            continue
+        expected = call.get("expected") if "expected" in call else call.get("reference")
+        actual = call.get("actual") if "actual" in call else call.get("generated")
+        status = call.get("status")
+        if status in {"failed", "mismatch"} or (
+            expected is not None and actual is not None and expected != actual
+        ):
+            selector = call.get("selector") or call.get("signature") or f"call_{index}"
+            failures.append(f"{selector}:expected={expected!r}:actual={actual!r}")
+    return failures
+
+
+def _normalize_opcode_name(value: Any) -> str:
+    text = str(value).strip().upper()
+    text = text.replace("SELFDESTRUCT", "SELFDESTRUCT")
+    return text
+
+
+def _disassemble_evm_bytecode(hex_code: str) -> List[str]:
+    opcodes: List[str] = []
+    index = 0
+    while index + 2 <= len(hex_code):
+        try:
+            opcode = int(hex_code[index : index + 2], 16)
+        except ValueError:
+            break
+        name = _EVM_OPCODE_NAMES.get(opcode, f"UNKNOWN_{opcode:02X}")
+        opcodes.append(name)
+        index += 2
+        if name.startswith("PUSH") and name[4:].isdigit():
+            index += int(name[4:]) * 2
+    return opcodes
+
+
+def _extract_result_opcodes(result: Mapping[str, Any]) -> List[str]:
+    metadata = _metadata_from_result(result)
+    candidates: List[Any] = []
+
+    for key in ("opcodes", "opcode_sequence", "opcode_trace"):
+        value = metadata.get(key)
+        if value:
+            candidates.append(value)
+
+    bytecode = _first_bytecode_value(metadata)
+    if bytecode:
+        candidates.append(bytecode)
+
+    for key in ("input", "tac", "bytecode", "runtime_bytecode"):
+        value = result.get(key) or metadata.get(key)
+        if value:
+            candidates.append(value)
+
+    for candidate in candidates:
+        opcodes = extract_evm_opcodes(candidate)
+        if opcodes:
+            return opcodes
+    return []
+
+
+def _opcode_groups_from_opcodes(opcodes: Sequence[str]) -> List[str]:
+    opcode_set = {_normalize_opcode_name(opcode) for opcode in opcodes}
+    groups = [group for group, group_opcodes in _OPCODE_GROUP_RULES if opcode_set & group_opcodes]
+    return sorted(set(groups))
+
+
+def _control_flow_buckets_from_opcodes(
+    opcodes: Sequence[str],
+    metadata: Mapping[str, Any],
+) -> List[str]:
+    opcode_names = [_normalize_opcode_name(opcode) for opcode in opcodes]
+    buckets: set[str] = set()
+    jumpi_count = opcode_names.count("JUMPI")
+    jumpdest_count = opcode_names.count("JUMPDEST")
+
+    if jumpi_count >= 3:
+        buckets.update({"branching", "deep_branching"})
+    elif jumpi_count > 0:
+        buckets.add("branching")
+    elif opcode_names:
+        buckets.add("straight_line")
+
+    if jumpdest_count >= 3:
+        buckets.add("multi_block")
+    if "REVERT" in opcode_names or "INVALID" in opcode_names:
+        buckets.add("revert_path")
+
+    kind = str(
+        metadata.get("function_kind")
+        or metadata.get("contract_kind")
+        or metadata.get("entrypoint")
+        or ""
+    ).lower()
+    if "fallback" in kind or "receive" in kind:
+        buckets.add("fallback_receive")
+
+    return sorted(buckets)
+
+
 def validate_generated_solidity(
     source_code: str,
     metadata: Optional[Mapping[str, Any]] = None,
@@ -273,6 +850,8 @@ def validate_generated_solidity(
             compiler_errors = compiler_result.get("compiler_errors", [])
             ast_valid = compiler_result.get("ast_valid")
             compiler_valid = not compiler_errors and bool(ast_valid)
+            bytecode_checked = "bytecode_generated" in compiler_result
+            deployable = compiler_valid and bool(compiler_result.get("bytecode_generated"))
             return SolidityValidityResult(
                 valid=compiler_valid,
                 method="compiler_ast",
@@ -283,6 +862,10 @@ def validate_generated_solidity(
                 compiler_errors=compiler_errors,
                 ast_checked=True,
                 ast_valid=bool(ast_valid),
+                bytecode_checked=bytecode_checked,
+                deployable=deployable,
+                compiled_creation_bytecode=compiler_result.get("creation_bytecode"),
+                compiled_runtime_bytecode=compiler_result.get("runtime_bytecode"),
             )
 
     return SolidityValidityResult(
@@ -290,6 +873,7 @@ def validate_generated_solidity(
         method="scaffold",
         scaffold_valid=scaffold_valid,
         scaffold_errors=scaffold_errors,
+        deployable=scaffold_valid,
     )
 
 
@@ -379,12 +963,15 @@ def compute_metadata_segment_metrics(
         unknown_count = 0
 
         for result in result_rows:
-            value = _metadata_segment_value(result, field_name)
-            value_key = "unknown" if value in (None, "") else str(value)
-            if value_key == "unknown":
+            value_keys = [str(value) for value in _metadata_segment_values(result, field_name)]
+            if not value_keys:
                 unknown_count += 1
-            counts[value_key] += 1
-            groups[value_key].append(result)
+                counts["unknown"] += 1
+                groups["unknown"].append(result)
+                continue
+            for value_key in sorted(set(value_keys)):
+                counts[value_key] += 1
+                groups[value_key].append(result)
 
         coverage[field_name] = {
             "total": total,
@@ -410,7 +997,70 @@ def compute_metadata_segment_metrics(
         "total_examples": total,
         "coverage": coverage,
         "segments": segments,
+        "opcode_control_flow_coverage": compute_opcode_control_flow_coverage(result_rows),
     }
+
+
+def load_curated_evaluation_benchmarks(
+    benchmark_dir: str | Path = DEFAULT_EVALUATION_BENCHMARK_DIR,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Load checked-in golden/robustness benchmark JSONL suites."""
+    root = Path(benchmark_dir)
+    suites: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    if not root.exists():
+        return {}
+
+    for path in sorted(root.glob("*.jsonl")):
+        with open(path, "r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError(f"{path}:{line_number} benchmark row is not an object")
+                suite = str(
+                    row.get("suite")
+                    or row.get("benchmark_suite")
+                    or row.get("metadata", {}).get("benchmark_suite")
+                    or path.stem.replace("_suite", "")
+                )
+                row.setdefault("suite", suite)
+                metadata = row.setdefault("metadata", {})
+                if isinstance(metadata, dict):
+                    metadata.setdefault("benchmark_suite", suite)
+                    metadata.setdefault("benchmark_case_id", row.get("case_id"))
+                suites[suite].append(row)
+    return dict(sorted(suites.items()))
+
+
+def compute_benchmark_suite_metrics(results: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Summarize deterministic golden/robustness/broad-holdout slices separately."""
+    groups: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for result in results:
+        metadata = _metadata_from_result(result)
+        suite = (
+            result.get("suite")
+            or result.get("benchmark_suite")
+            or metadata.get("benchmark_suite")
+            or metadata.get("suite")
+            or "broad_holdout"
+        )
+        groups[str(suite)].append(result)
+
+    summaries: Dict[str, Any] = {}
+    for suite, group in sorted(groups.items()):
+        metric_rows = [_metrics_from_result(result) for result in group]
+        suite_summary: Dict[str, Any] = {
+            "count": len(group),
+            "metrics": summarize_numeric_metrics(metric_rows),
+            "opcode_control_flow_coverage": compute_opcode_control_flow_coverage(group),
+        }
+        replication_summary = aggregate_replication_scores(metric_rows)
+        if replication_summary:
+            suite_summary["replication_metrics"] = replication_summary
+        summaries[suite] = suite_summary
+    return summaries
 
 
 def compare_evaluation_to_baseline(
@@ -603,7 +1253,7 @@ def _try_local_solc_ast_validation(
             "outputSelection": {
                 "*": {
                     "": ["ast"],
-                    "*": ["abi"],
+                    "*": ["abi", "evm.bytecode.object", "evm.deployedBytecode.object"],
                 }
             }
         },
@@ -632,11 +1282,37 @@ def _try_local_solc_ast_validation(
         if error.get("severity") == "error"
     ]
     ast = output.get("sources", {}).get("Evaluation.sol", {}).get("ast")
+    creation_bytecode, runtime_bytecode = _compiled_contract_bytecodes(output)
     return {
         "compiler_version": compiler_version,
         "compiler_errors": compiler_errors,
         "ast_valid": isinstance(ast, Mapping) and ast.get("nodeType") == "SourceUnit",
+        "creation_bytecode": creation_bytecode,
+        "runtime_bytecode": runtime_bytecode,
+        "bytecode_generated": bool(normalize_evm_bytecode(creation_bytecode)),
     }
+
+
+def _compiled_contract_bytecodes(output: Mapping[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    contracts = output.get("contracts", {})
+    if not isinstance(contracts, Mapping):
+        return None, None
+    for source_contracts in contracts.values():
+        if not isinstance(source_contracts, Mapping):
+            continue
+        for contract in source_contracts.values():
+            if not isinstance(contract, Mapping):
+                continue
+            evm = contract.get("evm")
+            if not isinstance(evm, Mapping):
+                continue
+            bytecode = evm.get("bytecode")
+            deployed = evm.get("deployedBytecode")
+            creation = bytecode.get("object") if isinstance(bytecode, Mapping) else None
+            runtime = deployed.get("object") if isinstance(deployed, Mapping) else None
+            if normalize_evm_bytecode(creation) or normalize_evm_bytecode(runtime):
+                return creation, runtime
+    return None, None
 
 
 def _select_installed_solc_version(
@@ -723,6 +1399,46 @@ def _metadata_segment_value(result: Mapping[str, Any], field_name: str) -> Any:
     return None
 
 
+def _metadata_segment_values(result: Mapping[str, Any], field_name: str) -> List[Any]:
+    if field_name in {"opcode_group", "opcode_groups"}:
+        return extract_opcode_control_flow_slices(result)["opcode_groups"]
+    if field_name == "control_flow":
+        return extract_opcode_control_flow_slices(result)["control_flow"]
+    if field_name in {"bytecode_length_bucket", "length_bucket"}:
+        bucket = _bytecode_length_bucket(result)
+        return [bucket] if bucket else []
+
+    value = _metadata_segment_value(result, field_name)
+    if value in (None, ""):
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [item for item in value if item not in (None, "")]
+    return [value]
+
+
+def _bytecode_length_bucket(result: Mapping[str, Any]) -> Optional[str]:
+    metadata = _metadata_from_result(result)
+    bytecode = _first_bytecode_value(metadata)
+    if not bytecode:
+        bytecode = result.get("bytecode") or result.get("input")
+    normalized = normalize_evm_bytecode(bytecode if isinstance(bytecode, str) else None)
+    if normalized:
+        length = len(normalized) // 2
+    else:
+        text = result.get("input") or metadata.get("tac") or metadata.get("source")
+        if not text:
+            return None
+        length = len(str(text).split())
+
+    if length < 64:
+        return "tiny"
+    if length < 256:
+        return "short"
+    if length < 1024:
+        return "medium"
+    return "long"
+
+
 def _metadata_from_result(result: Mapping[str, Any]) -> Mapping[str, Any]:
     metadata = result.get("metadata")
     if isinstance(metadata, Mapping):
@@ -770,6 +1486,14 @@ def _flatten_replication_metrics(replication_metrics: Mapping[str, Any]) -> Dict
             value = micro.get(source_key)
             if isinstance(value, (int, float)) and not math.isnan(float(value)):
                 flattened[target_key] = float(value)
+    for source_key, target_key in {
+        "hallucination_total": "replication_hallucination_total",
+        "hallucination_rate": "replication_hallucination_rate",
+        "groundedness_score_mean": "replication_groundedness_score_mean",
+    }.items():
+        value = replication_metrics.get(source_key)
+        if isinstance(value, (int, float)) and not math.isnan(float(value)):
+            flattened[target_key] = float(value)
     return flattened
 
 
@@ -784,6 +1508,73 @@ def _metric_direction(metric: str, directions: Mapping[str, str]) -> Optional[st
     if lowered.endswith("_mean") or lowered.startswith("pct_") or lowered.endswith("_micro"):
         return "higher"
     return None
+
+
+def _numeric_percentile_summary(values: Sequence[float]) -> Dict[str, Any]:
+    cleaned = [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float)) and not math.isnan(float(value))
+    ]
+    if not cleaned:
+        return {}
+    return {
+        "count": len(cleaned),
+        "mean": float(np.mean(cleaned)),
+        "min": float(np.min(cleaned)),
+        "max": float(np.max(cleaned)),
+        "percentiles": {
+            "50th": float(np.percentile(cleaned, 50)),
+            "90th": float(np.percentile(cleaned, 90)),
+            "95th": float(np.percentile(cleaned, 95)),
+            "99th": float(np.percentile(cleaned, 99)),
+        },
+    }
+
+
+def aggregate_prompt_diagnostics(results: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Aggregate per-detail prompt budget and TAC truncation diagnostics."""
+    diagnostics = [
+        result.get("prompt_diagnostics")
+        for result in results
+        if isinstance(result, Mapping) and isinstance(result.get("prompt_diagnostics"), Mapping)
+    ]
+    if not diagnostics:
+        return {}
+
+    total = len(diagnostics)
+    truncated_count = sum(1 for item in diagnostics if item.get("tac_truncated") is True)
+    strategy_counts = Counter(str(item.get("strategy") or "unknown") for item in diagnostics)
+    marker_counts = Counter(
+        str(item.get("marker")) for item in diagnostics if item.get("marker") not in (None, "")
+    )
+
+    summary: Dict[str, Any] = {
+        "num_details": total,
+        "truncated_count": truncated_count,
+        "truncated_rate": float(truncated_count / total) if total else 0.0,
+        "strategy_counts": dict(sorted(strategy_counts.items())),
+        "marker_counts": dict(sorted(marker_counts.items())),
+    }
+    for key in (
+        "context_window",
+        "prompt_budget",
+        "max_new_tokens",
+        "tac_token_budget",
+        "tac_tokens_before",
+        "tac_tokens_after",
+        "prompt_tokens",
+        "generated_tokens",
+    ):
+        values = [
+            item.get(key)
+            for item in diagnostics
+            if isinstance(item.get(key), (int, float)) and not math.isnan(float(item.get(key)))
+        ]
+        metric_summary = _numeric_percentile_summary(values)
+        if metric_summary:
+            summary[key] = metric_summary
+    return summary
 
 
 @dataclass
@@ -804,6 +1595,11 @@ class EvaluationMetrics:
     solidity_valid: bool = False
     solidity_compiler_checked: bool = False
     solidity_ast_valid: bool = False
+    bytecode_semantic_score: float = 0.0
+    bytecode_semantic_checked: bool = False
+    bytecode_deployable: bool = False
+    bytecode_runtime_checked: bool = False
+    bytecode_runtime_match: bool = False
     metadata: Dict[str, Any] = None
 
 
@@ -821,6 +1617,21 @@ class TrainingConfig:
     max_sequence_length: int = 20000
     train_test_split: float = 0.85
     validation_split: float = 0.1
+    split_seed: int = 42
+    validate_split_leakage: bool = True
+    min_holdout_stratum_count: int = 0
+    min_split_target_ratio: float = 0.5
+    max_component_target_ratio: float = 1.0
+    allow_degenerate_splits: bool = False
+    reuse_splits: bool = False
+    force_resplit: bool = False
+    run_data_preflight: bool = True
+    allow_legacy_metadata_schema: bool = False
+    preflight_tokenizer_source: Optional[str] = None
+    preflight_tokenizer_download: bool = False
+    allow_whitespace_preflight_fallback: bool = False
+    preflight_cache_dir: Optional[str] = None
+    overwrite_preflight_cache: bool = False
 
     # Model training
     model_config: ModelConfig = None
@@ -1205,6 +2016,11 @@ class SmartContractEvaluator:
                 solidity_valid=False,
                 solidity_compiler_checked=False,
                 solidity_ast_valid=False,
+                bytecode_semantic_score=0.0,
+                bytecode_semantic_checked=False,
+                bytecode_deployable=False,
+                bytecode_runtime_checked=False,
+                bytecode_runtime_match=False,
                 metadata={
                     "original_metadata": {},
                     "decompiled_metadata": {},
@@ -1238,6 +2054,13 @@ class SmartContractEvaluator:
             original_metadata = self.extract_function_metadata(original)
             decompiled_metadata = self.extract_function_metadata(decompiled)
             solidity_validity = validate_generated_solidity(decompiled, metadata)
+            bytecode_semantics = evaluate_bytecode_semantics(
+                original,
+                decompiled,
+                metadata,
+                solidity_validity=solidity_validity,
+                replication=replication,
+            )
 
             function_signature_match = original_metadata.get(
                 "has_function_keyword"
@@ -1264,6 +2087,11 @@ class SmartContractEvaluator:
                 solidity_valid=solidity_validity.valid,
                 solidity_compiler_checked=solidity_validity.compiler_checked,
                 solidity_ast_valid=bool(solidity_validity.ast_valid),
+                bytecode_semantic_score=bytecode_semantics.score,
+                bytecode_semantic_checked=bytecode_semantics.checked,
+                bytecode_deployable=bytecode_semantics.deployable,
+                bytecode_runtime_checked=bytecode_semantics.runtime_bytecode_checked,
+                bytecode_runtime_match=bool(bytecode_semantics.runtime_bytecode_match),
                 metadata={
                     "original_metadata": original_metadata,
                     "decompiled_metadata": decompiled_metadata,
@@ -1271,6 +2099,7 @@ class SmartContractEvaluator:
                     "enhanced_structural_preservation": enhanced_structural_preservation,
                     "replication": replication.to_dict(),
                     "solidity_validity": solidity_validity.to_dict(),
+                    "bytecode_semantics": bytecode_semantics.to_dict(),
                     "evaluation_time": evaluation_time,
                 },
             )
@@ -1294,6 +2123,11 @@ class SmartContractEvaluator:
                 solidity_valid=False,
                 solidity_compiler_checked=False,
                 solidity_ast_valid=False,
+                bytecode_semantic_score=0.0,
+                bytecode_semantic_checked=False,
+                bytecode_deployable=False,
+                bytecode_runtime_checked=False,
+                bytecode_runtime_match=False,
                 metadata={
                     "original_metadata": {},
                     "decompiled_metadata": {},
@@ -1328,6 +2162,10 @@ class SmartContractTrainingPipeline:
             Path(dir_path).mkdir(exist_ok=True)
 
         # Initialize components
+        if DatasetBuilder is None:
+            raise RuntimeError(
+                "DatasetBuilder could not be imported"
+            ) from _DATASET_BUILDER_IMPORT_ERROR
         self.dataset_builder = DatasetBuilder(config.etherscan_api_key, output_dir=config.data_dir)
 
         self.model_trainer = SmartContractModelTrainer(
@@ -1400,7 +2238,7 @@ class SmartContractTrainingPipeline:
         return train_path, val_path, test_path
 
     def _split_dataset(self, dataset_path: str) -> Tuple[str, str, str]:
-        """Split dataset into train, validation, and test sets.
+        """Split dataset using the same leakage and preflight gates as train.py.
 
         Args:
             dataset_path: Path to the complete JSONL dataset file.
@@ -1409,44 +2247,60 @@ class SmartContractTrainingPipeline:
             Tuple containing paths to (train_dataset, validation_dataset,
             test_dataset) JSONL files.
         """
-        # Load data
-        data = []
-        with open(dataset_path, "r") as f:
-            for line in f:
-                data.append(json.loads(line.strip()))
+        import importlib
 
-        test_ratio = 1.0 - self.config.train_test_split - self.config.validation_split
-        if self.config.train_test_split <= 0 or self.config.validation_split < 0 or test_ratio < 0:
-            raise ValueError(
-                "train_test_split and validation_split must leave a non-negative test split"
-            )
-
-        train_data, val_data, test_data = grouped_dataset_split(
-            data,
-            self.config.train_test_split,
-            self.config.validation_split,
-            seed=42,
-        )
-
-        # Save splits
+        train_cli = importlib.import_module("train")
         data_dir = Path(self.config.data_dir)
+        split_manifest_path = data_dir / "split_manifest.json"
 
-        train_path = data_dir / "train_dataset.jsonl"
-        val_path = data_dir / "val_dataset.jsonl"
-        test_path = data_dir / "test_dataset.jsonl"
-
-        for data_split, path in [
-            (train_data, train_path),
-            (val_data, val_path),
-            (test_data, test_path),
-        ]:
-            with open(path, "w") as f:
-                for item in data_split:
-                    f.write(json.dumps(item) + "\n")
-
-        logger.info(
-            f"Dataset split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test"
+        train_path, val_path, test_path = train_cli.split_dataset(
+            dataset_path,
+            str(data_dir),
+            train_ratio=self.config.train_test_split,
+            val_ratio=self.config.validation_split,
+            seed=self.config.split_seed,
+            manifest_path=split_manifest_path,
+            validate_leakage=self.config.validate_split_leakage,
+            min_holdout_stratum_count=self.config.min_holdout_stratum_count,
+            reuse_existing=self.config.reuse_splits,
+            force_resplit=self.config.force_resplit,
+            min_split_target_ratio=self.config.min_split_target_ratio,
+            max_component_target_ratio=self.config.max_component_target_ratio,
+            allow_degenerate_splits=self.config.allow_degenerate_splits,
         )
+        self.last_split_manifest_path = str(split_manifest_path)
+
+        tokenizer_source = self.config.preflight_tokenizer_source or getattr(
+            self.config.model_config, "model_name", None
+        )
+        preflight_cache_dir = self.config.preflight_cache_dir or str(data_dir / "preflight_cache")
+        preflight_report = train_cli.run_data_preflight(
+            {"train": train_path, "val": val_path, "test": test_path},
+            tokenizer_source=tokenizer_source,
+            max_seq_length=getattr(
+                self.config.model_config,
+                "max_sequence_length",
+                self.config.max_sequence_length,
+            ),
+            include_bytecode_metadata=getattr(
+                self.config.model_config,
+                "include_bytecode_metadata",
+                True,
+            ),
+            skip=not self.config.run_data_preflight,
+            allow_tokenizer_download=self.config.preflight_tokenizer_download,
+            allow_whitespace_fallback=self.config.allow_whitespace_preflight_fallback,
+            cache_dir=preflight_cache_dir,
+            overwrite_cache=self.config.overwrite_preflight_cache,
+            allow_legacy_metadata_schema=self.config.allow_legacy_metadata_schema,
+        )
+        self.last_preflight_report = preflight_report
+        if preflight_report.get("status") == "failed":
+            formatter = getattr(train_cli, "_format_preflight_failure", None)
+            detail = formatter(preflight_report) if formatter else "data preflight failed"
+            raise ValueError(f"data preflight failed: {detail}")
+
+        logger.info("Dataset split: %s train, %s val, %s test", train_path, val_path, test_path)
 
         return str(train_path), str(val_path), str(test_path)
 
@@ -1516,6 +2370,30 @@ class SmartContractTrainingPipeline:
         # Initialize decompiler
         decompiler = SmartContractDecompiler(model_path)
 
+        def prompt_diagnostics(
+            item: Mapping[str, Any], generated_text: Optional[str] = None
+        ) -> Dict[str, Any]:
+            diagnostics_fn = getattr(decompiler, "prompt_diagnostics", None)
+            if not callable(diagnostics_fn):
+                return {}
+            try:
+                kwargs = {
+                    "metadata": item.get("metadata", {}),
+                    "max_new_tokens": 1024,
+                }
+                if generated_text is not None:
+                    kwargs["generated_text"] = generated_text
+                diagnostics = diagnostics_fn(item.get("input", ""), **kwargs)
+            except TypeError:
+                diagnostics = diagnostics_fn(
+                    item.get("input", ""),
+                    metadata=item.get("metadata", {}),
+                    max_new_tokens=1024,
+                )
+            except Exception:
+                return {}
+            return diagnostics if isinstance(diagnostics, dict) else {}
+
         # Evaluate each function
         results = []
 
@@ -1535,6 +2413,8 @@ class SmartContractTrainingPipeline:
                     {
                         "original": item["output"],
                         "decompiled": decompiled,
+                        "input": item.get("input", ""),
+                        "prompt_diagnostics": prompt_diagnostics(item, decompiled),
                         "metrics": asdict(metrics),
                         "metadata": item.get("metadata", {}),
                     }
@@ -1547,6 +2427,8 @@ class SmartContractTrainingPipeline:
                     {
                         "original": item.get("output", ""),
                         "decompiled": "",
+                        "input": item.get("input", ""),
+                        "prompt_diagnostics": prompt_diagnostics(item),
                         "metrics": {
                             "semantic_similarity": 0.0,
                             "normalized_edit_distance": 1.0,
@@ -1562,6 +2444,11 @@ class SmartContractTrainingPipeline:
                             "solidity_valid": False,
                             "solidity_compiler_checked": False,
                             "solidity_ast_valid": False,
+                            "bytecode_semantic_score": 0.0,
+                            "bytecode_semantic_checked": False,
+                            "bytecode_deployable": False,
+                            "bytecode_runtime_checked": False,
+                            "bytecode_runtime_match": False,
                             "metadata": {"error": str(e), "traceback": traceback.format_exc()},
                         },
                         "metadata": item.get("metadata", {}),
@@ -1671,6 +2558,10 @@ class SmartContractTrainingPipeline:
             stats["replication_metrics"] = replication_stats
 
         stats["metadata_segments"] = compute_metadata_segment_metrics(results)
+        stats["benchmark_suites"] = compute_benchmark_suite_metrics(results)
+        prompt_diagnostics = aggregate_prompt_diagnostics(results)
+        if prompt_diagnostics:
+            stats["prompt_diagnostics"] = prompt_diagnostics
 
         if baseline_summary:
             stats["baseline_comparison"] = compare_evaluation_to_baseline(stats, baseline_summary)

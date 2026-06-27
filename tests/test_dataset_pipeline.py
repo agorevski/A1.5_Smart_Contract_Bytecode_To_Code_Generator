@@ -5,10 +5,13 @@ Covers: SolidityParser, EtherscanAPI, DatasetBuilder, ContractData, FunctionPair
 """
 
 import json
+import inspect
 import os
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +28,7 @@ from src.dataset_pipeline import (
 # ====================================================================== #
 #  Fixtures
 # ====================================================================== #
+
 
 @pytest.fixture
 def parser():
@@ -47,6 +51,7 @@ def builder(tmp_output_dir):
 # ====================================================================== #
 #  Dataclass construction tests
 # ====================================================================== #
+
 
 class TestContractData:
     def test_required_fields(self):
@@ -95,15 +100,25 @@ class TestFunctionPair:
     def test_metadata_independent_instances(self):
         """Each instance should have its own metadata."""
         fp1 = FunctionPair(
-            function_name="a", tac_representation="", solidity_code="",
-            function_signature="", visibility="", is_payable=False,
-            is_view=False, contract_address="",
+            function_name="a",
+            tac_representation="",
+            solidity_code="",
+            function_signature="",
+            visibility="",
+            is_payable=False,
+            is_view=False,
+            contract_address="",
             metadata={"key": "val1"},
         )
         fp2 = FunctionPair(
-            function_name="b", tac_representation="", solidity_code="",
-            function_signature="", visibility="", is_payable=False,
-            is_view=False, contract_address="",
+            function_name="b",
+            tac_representation="",
+            solidity_code="",
+            function_signature="",
+            visibility="",
+            is_payable=False,
+            is_view=False,
+            contract_address="",
             metadata={"key": "val2"},
         )
         assert fp1.metadata != fp2.metadata
@@ -112,6 +127,7 @@ class TestFunctionPair:
 # ====================================================================== #
 #  EtherscanAPI tests
 # ====================================================================== #
+
 
 class TestEtherscanAPI:
     def test_constructor(self):
@@ -133,6 +149,7 @@ class TestEtherscanAPI:
 #  SolidityParser tests
 # ====================================================================== #
 
+
 class TestCleanSourceCode:
     def test_plain_solidity_passthrough(self, parser):
         src = "pragma solidity ^0.8.0;\ncontract A {}"
@@ -144,23 +161,27 @@ class TestCleanSourceCode:
         assert "pragma solidity" in result
 
     def test_json_multi_file(self, parser):
-        payload = json.dumps({
-            "sources": {
-                "A.sol": {"content": "contract A {}"},
-                "B.sol": {"content": "contract B {}"},
+        payload = json.dumps(
+            {
+                "sources": {
+                    "A.sol": {"content": "contract A {}"},
+                    "B.sol": {"content": "contract B {}"},
+                }
             }
-        })
+        )
         result = parser._clean_source_code(payload)
         assert "contract A" in result
         assert "contract B" in result
         assert "// File: A.sol" in result
 
     def test_double_brace_format(self, parser):
-        inner = json.dumps({
-            "sources": {
-                "Token.sol": {"content": "contract Token {}"},
+        inner = json.dumps(
+            {
+                "sources": {
+                    "Token.sol": {"content": "contract Token {}"},
+                }
             }
-        })
+        )
         double_brace = "{" + inner + "}"
         result = parser._clean_source_code(double_brace)
         assert "contract Token" in result
@@ -311,7 +332,7 @@ class TestExtractVisibility:
 
     def test_visibility_in_body_ignored_no_sig_visibility(self, parser):
         """If signature has no visibility keyword but body mentions 'internal'."""
-        code = 'function foo() { require(msg.sender == internal_var); }'
+        code = "function foo() { require(msg.sender == internal_var); }"
         # No visibility keyword before {, so should default to public.
         assert parser._extract_visibility(code) == "public"
 
@@ -361,7 +382,9 @@ class TestExtractFunctions:
         assert funcs[0]["is_view"] is True
 
     def test_pure_counts_as_view(self, parser):
-        src = "contract C { function add(uint a, uint b) public pure returns (uint) { return a+b; } }"
+        src = (
+            "contract C { function add(uint a, uint b) public pure returns (uint) { return a+b; } }"
+        )
         funcs = parser.extract_functions(src)
         assert funcs[0]["is_view"] is True
 
@@ -383,6 +406,7 @@ class TestExtractFunctions:
 #  DatasetBuilder tests
 # ====================================================================== #
 
+
 class TestDatasetBuilderInit:
     def test_database_created(self, builder, tmp_output_dir):
         db_path = Path(tmp_output_dir) / "contracts.db"
@@ -392,9 +416,7 @@ class TestDatasetBuilderInit:
         db_path = Path(tmp_output_dir) / "contracts.db"
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        )
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         tables = {row[0] for row in cursor.fetchall()}
         conn.close()
         assert "contracts" in tables
@@ -425,12 +447,20 @@ class TestStoreContract:
 
     def test_replace_on_duplicate(self, builder, tmp_output_dir):
         cd1 = ContractData(
-            address="0x1", source_code="v1", bytecode="0x",
-            compiler_version="", optimization_enabled=False, optimization_runs=0,
+            address="0x1",
+            source_code="v1",
+            bytecode="0x",
+            compiler_version="",
+            optimization_enabled=False,
+            optimization_runs=0,
         )
         cd2 = ContractData(
-            address="0x1", source_code="v2", bytecode="0x",
-            compiler_version="", optimization_enabled=False, optimization_runs=0,
+            address="0x1",
+            source_code="v2",
+            bytecode="0x",
+            compiler_version="",
+            optimization_enabled=False,
+            optimization_runs=0,
         )
         builder._store_contract(cd1)
         builder._store_contract(cd2)
@@ -488,6 +518,113 @@ class TestStoreFunctionPair:
         conn.close()
 
 
+class TestCollectAndCompileContracts:
+    def test_signature_accepts_max_workers(self):
+        signature = inspect.signature(DatasetBuilder.collect_and_compile_contracts)
+        assert "max_workers" in signature.parameters
+
+    def test_honors_bounded_max_workers(self, builder, tmp_output_dir, monkeypatch):
+        import src.dataset_pipeline as dataset_pipeline
+
+        addresses = [f"0x{i:040x}" for i in range(1, 5)]
+        source = (
+            "pragma solidity ^0.8.0; "
+            "contract Test { function foo() public returns (uint256) { return 1; } }"
+        )
+        active_fetches = 0
+        peak_fetches = 0
+        worker_threads = set()
+        fetch_lock = threading.Lock()
+        two_active = threading.Event()
+
+        def fake_get_contract_source(address):
+            nonlocal active_fetches, peak_fetches
+            with fetch_lock:
+                active_fetches += 1
+                peak_fetches = max(peak_fetches, active_fetches)
+                worker_threads.add(threading.current_thread().name)
+                if active_fetches == 2:
+                    two_active.set()
+            two_active.wait(0.5)
+            with fetch_lock:
+                active_fetches -= 1
+            return ContractData(
+                address=address,
+                source_code=source,
+                bytecode="0x6000",
+                compiler_version="v0.8.20",
+                optimization_enabled=False,
+                optimization_runs=0,
+            )
+
+        class FakeAnalyzer:
+            def __init__(self, bytecode):
+                self.bytecode = bytecode
+
+            def analyze_control_flow(self):
+                return None
+
+            def identify_functions(self):
+                return {"foo": SimpleNamespace(selector="0x12345678")}
+
+        def fake_compile_source(*_args, **_kwargs):
+            return SimpleNamespace(
+                success=True,
+                errors=[],
+                contracts={
+                    "Test": SimpleNamespace(runtime_bytecode="6000"),
+                },
+            )
+
+        def fake_match(solidity_functions, _bytecode_functions, _analyzer):
+            return [
+                {
+                    "solidity_function": solidity_functions[0],
+                    "bytecode_function": SimpleNamespace(selector="0x12345678"),
+                    "tac": "function selector_12345678:\n  temp_1 = 1\n  return",
+                    "selector": "0x12345678",
+                }
+            ]
+
+        builder.etherscan.get_contract_source = fake_get_contract_source
+        monkeypatch.setattr(dataset_pipeline, "install_solc_version", lambda _version: True)
+        monkeypatch.setattr(
+            dataset_pipeline,
+            "select_compilation_configs",
+            lambda *_args, **_kwargs: [
+                {
+                    "version": "0.8.20",
+                    "optimizer_enabled": False,
+                    "optimizer_runs": 0,
+                }
+            ],
+        )
+        monkeypatch.setattr(dataset_pipeline, "compile_source", fake_compile_source)
+        monkeypatch.setattr(dataset_pipeline, "BytecodeAnalyzer", FakeAnalyzer)
+        monkeypatch.setattr(builder, "_match_functions_by_selector", fake_match)
+
+        total_pairs = builder.collect_and_compile_contracts(
+            addresses,
+            max_compiler_configs=1,
+            max_workers=2,
+        )
+
+        assert total_pairs == len(addresses)
+        assert peak_fetches == 2
+        assert len(worker_threads) >= 2
+        assert builder._last_collection_summary["max_workers"] == 2
+        assert "throughput_contracts_per_second" in builder._last_collection_summary
+
+        conn = sqlite3.connect(Path(tmp_output_dir) / "contracts.db")
+        try:
+            processed = conn.execute(
+                "SELECT COUNT(*) FROM contracts WHERE processed = TRUE"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert processed == len(addresses)
+
+
 class TestAddSelectorsToSolidityFunctions:
     def test_selector_calculation(self, builder):
         funcs = [
@@ -537,9 +674,12 @@ class TestBuildTrainingPair:
     def test_too_short_solidity(self, builder):
         match = {
             "solidity_function": {
-                "name": "x", "body": "short",
-                "signature": "function x()", "visibility": "public",
-                "is_payable": False, "is_view": False,
+                "name": "x",
+                "body": "short",
+                "signature": "function x()",
+                "visibility": "public",
+                "is_payable": False,
+                "is_view": False,
             },
             "tac": "function x:\n  temp_1 = 1\n  return",
             "selector": "0x1",
@@ -549,9 +689,12 @@ class TestBuildTrainingPair:
     def test_empty_tac(self, builder):
         match = {
             "solidity_function": {
-                "name": "y", "body": "function y() public { lots of code here }",
-                "signature": "function y()", "visibility": "public",
-                "is_payable": False, "is_view": False,
+                "name": "y",
+                "body": "function y() public { lots of code here }",
+                "signature": "function y()",
+                "visibility": "public",
+                "is_payable": False,
+                "is_view": False,
             },
             "tac": "",
             "selector": "0x2",
@@ -563,19 +706,27 @@ class TestFilterAndCleanDataset:
     def test_filtering_removes_short(self, builder, tmp_output_dir):
         # Insert a short and a long function pair.
         short = FunctionPair(
-            function_name="s", tac_representation="t" * 100,
+            function_name="s",
+            tac_representation="t" * 100,
             solidity_code="short",  # < 50 chars
-            function_signature="function s()", visibility="public",
-            is_payable=False, is_view=False, contract_address="0x1",
+            function_signature="function s()",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
+            contract_address="0x1",
         )
         long_enough = FunctionPair(
-            function_name="l", tac_representation="t" * 100,
+            function_name="l",
+            tac_representation="t" * 100,
             solidity_code=(
                 "function l() public returns (uint256) { "
                 "uint256 x = 1; uint256 y = x + 1; return y; }"
             ),
-            function_signature="function l()", visibility="public",
-            is_payable=False, is_view=False, contract_address="0x2",
+            function_signature="function l()",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
+            contract_address="0x2",
         )
         builder._store_function_pair(short)
         builder._store_function_pair(long_enough)
@@ -585,10 +736,14 @@ class TestFilterAndCleanDataset:
 
     def test_filtering_removes_long_tac(self, builder):
         fp = FunctionPair(
-            function_name="big", tac_representation="t" * 30000,
+            function_name="big",
+            tac_representation="t" * 30000,
             solidity_code="x" * 100,
-            function_signature="function big()", visibility="public",
-            is_payable=False, is_view=False, contract_address="0x3",
+            function_signature="function big()",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
+            contract_address="0x3",
         )
         builder._store_function_pair(fp)
         count = builder.filter_and_clean_dataset(min_length=50, max_length=20000)
@@ -598,10 +753,14 @@ class TestFilterAndCleanDataset:
 class TestExportDataset:
     def test_jsonl_export(self, builder, tmp_output_dir):
         fp = FunctionPair(
-            function_name="exp", tac_representation="tac_content",
+            function_name="exp",
+            tac_representation="tac_content",
             solidity_code="function exp() public {}",
-            function_signature="function exp()", visibility="public",
-            is_payable=False, is_view=True, contract_address="0xE",
+            function_signature="function exp()",
+            visibility="public",
+            is_payable=False,
+            is_view=True,
+            contract_address="0xE",
         )
         builder._store_function_pair(fp)
 
@@ -619,9 +778,13 @@ class TestExportDataset:
 
     def test_csv_export(self, builder, tmp_output_dir):
         fp = FunctionPair(
-            function_name="csv_fn", tac_representation="tac",
-            solidity_code="code", function_signature="function csv_fn()",
-            visibility="public", is_payable=False, is_view=False,
+            function_name="csv_fn",
+            tac_representation="tac",
+            solidity_code="code",
+            function_signature="function csv_fn()",
+            visibility="public",
+            is_payable=False,
+            is_view=False,
             contract_address="0xC",
         )
         builder._store_function_pair(fp)
@@ -639,16 +802,24 @@ class TestGetDatasetStatistics:
 
     def test_stats_with_data(self, builder):
         cd = ContractData(
-            address="0xS", source_code="", bytecode="0x",
-            compiler_version="", optimization_enabled=False, optimization_runs=0,
+            address="0xS",
+            source_code="",
+            bytecode="0x",
+            compiler_version="",
+            optimization_enabled=False,
+            optimization_runs=0,
         )
         builder._store_contract(cd)
 
         fp = FunctionPair(
-            function_name="stat", tac_representation="tac123",
+            function_name="stat",
+            tac_representation="tac123",
             solidity_code="code456",
-            function_signature="function stat()", visibility="external",
-            is_payable=False, is_view=False, contract_address="0xS",
+            function_signature="function stat()",
+            visibility="external",
+            is_payable=False,
+            is_view=False,
+            contract_address="0xS",
         )
         builder._store_function_pair(fp)
 
@@ -672,8 +843,15 @@ class TestProcessContractsToFunctionPairs:
                 compiler_version, optimization_enabled, optimization_runs, processed)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            ("0xPROCESSED", "contract A { function f() public {} }",
-             "0x6080", "v0.8.20", True, 200, True),
+            (
+                "0xPROCESSED",
+                "contract A { function f() public {} }",
+                "0x6080",
+                "v0.8.20",
+                True,
+                200,
+                True,
+            ),
         )
         conn.commit()
         conn.close()
@@ -703,9 +881,7 @@ class TestMatchFunctionsBySelector:
         mock_analyzer = MagicMock()
         mock_analyzer.basic_blocks = {}
 
-        matches = builder._match_functions_by_selector(
-            sol_funcs, bc_funcs, mock_analyzer
-        )
+        matches = builder._match_functions_by_selector(sol_funcs, bc_funcs, mock_analyzer)
         assert len(matches) == 1
         assert matches[0]["selector"] == "0xa9059cbb"
         assert matches[0]["solidity_function"]["name"] == "transfer"
@@ -717,9 +893,7 @@ class TestMatchFunctionsBySelector:
         bc_funcs = {"f": mock_func}
 
         mock_analyzer = MagicMock()
-        matches = builder._match_functions_by_selector(
-            sol_funcs, bc_funcs, mock_analyzer
-        )
+        matches = builder._match_functions_by_selector(sol_funcs, bc_funcs, mock_analyzer)
         assert matches == []
 
 

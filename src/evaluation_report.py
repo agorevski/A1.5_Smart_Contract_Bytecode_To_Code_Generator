@@ -7,6 +7,7 @@ import math
 import platform
 import shlex
 import subprocess
+import difflib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -60,6 +61,7 @@ def format_latest_results_report(
     world_size: int = 1,
 ) -> str:
     """Build a concise, check-in friendly quality report."""
+    summary = _summary_with_derived_metrics(summary, results_json_path)
     model = _collect_model_info(model_path)
     dataset = _collect_dataset_info(test_dataset_path)
     git = _collect_git_info()
@@ -152,6 +154,26 @@ def format_latest_results_report(
             ]
         )
 
+    if any(
+        key in summary
+        for key in (
+            "bytecode_semantic_score_mean",
+            "bytecode_semantic_checked_mean",
+            "bytecode_deployable_mean",
+            "bytecode_runtime_checked_mean",
+            "bytecode_runtime_match_mean",
+        )
+    ):
+        lines.extend(
+            [
+                f"Bytecode semantic score mean: {_metric(summary, 'bytecode_semantic_score_mean')}",
+                f"Bytecode semantic checked outputs: {_percent_metric(summary, 'bytecode_semantic_checked_mean')}",
+                f"Bytecode deployable outputs: {_percent_metric(summary, 'bytecode_deployable_mean')}",
+                f"Runtime bytecode checked outputs: {_percent_metric(summary, 'bytecode_runtime_checked_mean')}",
+                f"Runtime bytecode matches: {_percent_metric(summary, 'bytecode_runtime_match_mean')}",
+            ]
+        )
+
     lines.extend(
         [
             "",
@@ -191,6 +213,9 @@ def format_latest_results_report(
                 )
             )
 
+    _append_hallucination_bucket_report(lines, summary)
+    _append_prompt_diagnostics_report(lines, summary.get("prompt_diagnostics"))
+
     confidence_intervals = _summary_confidence_intervals(summary)
     if confidence_intervals:
         lines.extend(["", "Confidence Intervals", "--------------------"])
@@ -212,15 +237,126 @@ def format_latest_results_report(
     if isinstance(metadata_segments, Mapping):
         _append_metadata_segment_report(lines, metadata_segments)
 
+    benchmark_suites = summary.get("benchmark_suites")
+    if isinstance(benchmark_suites, Mapping):
+        _append_benchmark_suite_report(lines, benchmark_suites)
+
     baseline_comparison = summary.get("baseline_comparison") or summary.get("regression_comparison")
     if isinstance(baseline_comparison, Mapping):
         _append_baseline_comparison(lines, baseline_comparison)
+
+    _append_worst_samples_report(lines, summary.get("worst_samples"), results_json_path)
 
     if summary.get("error"):
         lines.extend(["", "Evaluation Error", "----------------", str(summary["error"])])
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _summary_with_derived_metrics(
+    summary: Mapping[str, Any],
+    results_json_path: str,
+) -> Dict[str, Any]:
+    enriched = dict(summary)
+    details = _load_results_details(results_json_path)
+    if not details:
+        return enriched
+
+    for metric in (
+        "solidity_valid",
+        "solidity_compiler_checked",
+        "solidity_ast_valid",
+        "bytecode_semantic_score",
+        "bytecode_semantic_checked",
+        "bytecode_deployable",
+        "bytecode_runtime_checked",
+        "bytecode_runtime_match",
+    ):
+        mean_key = f"{metric}_mean"
+        if mean_key not in enriched:
+            values = _detail_metric_values(details, metric)
+            if values:
+                enriched[mean_key] = sum(values) / len(values)
+
+    if "replication_hallucination_buckets" not in enriched:
+        buckets = _detail_hallucination_buckets(details)
+        if buckets:
+            enriched["replication_hallucination_buckets"] = buckets
+
+    if "metadata_segments" not in enriched:
+        try:
+            from .training_pipeline import compute_metadata_segment_metrics
+
+            enriched["metadata_segments"] = compute_metadata_segment_metrics(details)
+        except Exception:
+            pass
+
+    if "benchmark_suites" not in enriched:
+        try:
+            from .training_pipeline import compute_benchmark_suite_metrics
+
+            enriched["benchmark_suites"] = compute_benchmark_suite_metrics(details)
+        except Exception:
+            pass
+
+    if "prompt_diagnostics" not in enriched:
+        try:
+            from .training_pipeline import aggregate_prompt_diagnostics
+
+            prompt_diagnostics = aggregate_prompt_diagnostics(details)
+            if prompt_diagnostics:
+                enriched["prompt_diagnostics"] = prompt_diagnostics
+        except Exception:
+            pass
+
+    return enriched
+
+
+def _load_results_details(results_json_path: str) -> Sequence[Mapping[str, Any]]:
+    try:
+        path = Path(results_json_path)
+        if not path.exists():
+            return []
+        payload = _load_json(path)
+    except Exception:
+        return []
+    details = payload.get("details") or payload.get("detailed_results")
+    if not isinstance(details, Sequence) or isinstance(details, (str, bytes)):
+        return []
+    return [item for item in details if isinstance(item, Mapping)]
+
+
+def _detail_metric_values(details: Sequence[Mapping[str, Any]], metric: str) -> list[float]:
+    values: list[float] = []
+    for detail in details:
+        metrics = detail.get("metrics")
+        if not isinstance(metrics, Mapping):
+            continue
+        value = metrics.get(metric)
+        if isinstance(value, bool):
+            values.append(float(value))
+        elif isinstance(value, (int, float)) and not math.isnan(float(value)):
+            values.append(float(value))
+    return values
+
+
+def _detail_hallucination_buckets(details: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+    buckets: Dict[str, int] = {}
+    for detail in details:
+        metrics = detail.get("metrics")
+        if not isinstance(metrics, Mapping):
+            continue
+        metadata = metrics.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        replication = metadata.get("replication")
+        if not isinstance(replication, Mapping):
+            continue
+        for bucket, values in replication.get("hallucination_buckets", {}).items():
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                buckets[str(bucket)] = buckets.get(str(bucket), 0) + len(values)
+    return dict(sorted(buckets.items()))
 
 
 def _collect_model_info(model_path: str) -> Dict[str, Any]:
@@ -445,7 +581,231 @@ def _format_ci(interval: Mapping[str, Any]) -> str:
     return f"[{_format_number(low)}, {_format_number(high)}]"
 
 
+def _append_hallucination_bucket_report(lines: list[str], summary: Mapping[str, Any]) -> None:
+    buckets = summary.get("replication_hallucination_buckets")
+    if not isinstance(buckets, Mapping):
+        replication_metrics = summary.get("replication_metrics")
+        if isinstance(replication_metrics, Mapping):
+            buckets = replication_metrics.get("hallucination_buckets")
+    if not isinstance(buckets, Mapping) or not buckets:
+        return
+
+    total = sum(int(value) for value in buckets.values() if isinstance(value, int))
+    lines.extend(["", "Grounded Hallucination Buckets", "------------------------------"])
+    lines.append("bucket | count | rate")
+    lines.append("--- | ---: | ---:")
+    for bucket, count in sorted(buckets.items()):
+        numeric_count = int(count) if isinstance(count, int) else 0
+        rate = numeric_count / total if total else 0.0
+        lines.append(f"{bucket} | {numeric_count} | {rate * 100:.2f}%")
+
+
+def _append_prompt_diagnostics_report(lines: list[str], diagnostics: Any) -> None:
+    if not isinstance(diagnostics, Mapping) or not diagnostics:
+        return
+    total = diagnostics.get("num_details")
+    truncated = diagnostics.get("truncated_count")
+    rate = diagnostics.get("truncated_rate")
+    lines.extend(["", "Prompt/Truncation Diagnostics", "-----------------------------"])
+    if isinstance(total, int) and isinstance(truncated, int):
+        rate_text = f"{float(rate) * 100:.2f}%" if isinstance(rate, (int, float)) else "n/a"
+        lines.append(f"TAC truncated: {truncated}/{total} ({rate_text})")
+    strategy_counts = diagnostics.get("strategy_counts")
+    if isinstance(strategy_counts, Mapping) and strategy_counts:
+        strategies = ", ".join(f"{key}={value}" for key, value in sorted(strategy_counts.items()))
+        lines.append(f"Strategies: {strategies}")
+
+    lines.append("metric | mean | p50 | p90 | p95 | max")
+    lines.append("--- | ---: | ---: | ---: | ---: | ---:")
+    for key in (
+        "context_window",
+        "prompt_budget",
+        "max_new_tokens",
+        "tac_tokens_before",
+        "tac_tokens_after",
+        "prompt_tokens",
+        "generated_tokens",
+    ):
+        stats = diagnostics.get(key)
+        if not isinstance(stats, Mapping):
+            continue
+        percentiles = (
+            stats.get("percentiles") if isinstance(stats.get("percentiles"), Mapping) else {}
+        )
+        lines.append(
+            " | ".join(
+                [
+                    key,
+                    _format_number(stats.get("mean")),
+                    _format_number(percentiles.get("50th")),
+                    _format_number(percentiles.get("90th")),
+                    _format_number(percentiles.get("95th")),
+                    _format_number(stats.get("max")),
+                ]
+            )
+        )
+
+
+def _append_benchmark_suite_report(
+    lines: list[str],
+    benchmark_suites: Mapping[str, Any],
+) -> None:
+    if not benchmark_suites:
+        return
+    lines.extend(["", "Benchmark Suites", "----------------"])
+    lines.append(
+        "suite | count | semantic | edit distance | replication F1 | bytecode semantic | Solidity valid"
+    )
+    lines.append("--- | ---: | ---: | ---: | ---: | ---: | ---:")
+    for suite, suite_summary in sorted(benchmark_suites.items()):
+        if not isinstance(suite_summary, Mapping):
+            continue
+        metrics = suite_summary.get("metrics")
+        metrics = metrics if isinstance(metrics, Mapping) else {}
+        lines.append(
+            " | ".join(
+                [
+                    str(suite),
+                    str(suite_summary.get("count", 0)),
+                    _segment_metric(metrics, "semantic_similarity"),
+                    _segment_metric(metrics, "normalized_edit_distance"),
+                    _segment_metric(metrics, "replication_f1"),
+                    _segment_metric(metrics, "bytecode_semantic_score"),
+                    _segment_percent_metric(metrics, "solidity_valid"),
+                ]
+            )
+        )
+
+
+def _append_worst_samples_report(
+    lines: list[str],
+    worst_samples: Any,
+    results_json_path: str,
+    *,
+    limit: int = 5,
+) -> None:
+    if isinstance(worst_samples, Mapping):
+        samples = []
+        ordered_reasons = [
+            reason for reason in ("truncated_low_quality",) if reason in worst_samples
+        ] + [reason for reason in worst_samples if reason != "truncated_low_quality"]
+        for reason in ordered_reasons:
+            reason_samples = worst_samples.get(reason)
+            if not isinstance(reason_samples, Sequence) or isinstance(reason_samples, (str, bytes)):
+                continue
+            for sample in reason_samples:
+                if not isinstance(sample, Mapping):
+                    continue
+                sample_payload = dict(sample)
+                sample_payload.setdefault("reason", str(reason))
+                samples.append(sample_payload)
+    elif isinstance(worst_samples, Sequence) and not isinstance(worst_samples, (str, bytes)):
+        samples = [sample for sample in worst_samples if isinstance(sample, Mapping)]
+    else:
+        return
+    if not samples:
+        return
+
+    lines.extend(["", "Worst Samples", "-------------"])
+    lines.append(f"Detailed JSON: {results_json_path}")
+    for position, sample in enumerate(samples[:limit], start=1):
+        metrics = sample.get("metrics") if isinstance(sample.get("metrics"), Mapping) else {}
+        metadata = sample.get("metadata") if isinstance(sample.get("metadata"), Mapping) else {}
+        dataset_index = (
+            sample.get("dataset_index")
+            or sample.get("index")
+            or sample.get("sample_index")
+            or metadata.get("dataset_index")
+            or "n/a"
+        )
+        function = (
+            sample.get("function_signature")
+            or sample.get("signature")
+            or sample.get("function_name")
+            or metadata.get("function_signature")
+            or metadata.get("function_name")
+            or "unknown"
+        )
+        reason = (
+            sample.get("reason") or sample.get("failure_reason") or sample.get("category") or "n/a"
+        )
+        identifier = (
+            sample.get("hash") or sample.get("output_hash") or sample.get("input_hash") or "n/a"
+        )
+        metric_text = ", ".join(
+            _sample_metric(metrics, key)
+            for key in (
+                "semantic_similarity",
+                "normalized_edit_distance",
+                "replication_f1",
+                "bytecode_semantic_score",
+            )
+            if key in metrics
+        )
+        lines.extend(
+            [
+                "",
+                f"{position}. dataset_index={dataset_index} function={function}",
+                f"   reason={reason} hash={identifier}",
+                f"   metrics={metric_text or 'n/a'}",
+            ]
+        )
+        prompt_diagnostics = sample.get("prompt_diagnostics")
+        if isinstance(prompt_diagnostics, Mapping) and prompt_diagnostics:
+            diagnostic_parts = []
+            for key in (
+                "tac_truncated",
+                "strategy",
+                "marker",
+                "context_window",
+                "prompt_budget",
+                "max_new_tokens",
+                "tac_tokens_before",
+                "tac_tokens_after",
+                "prompt_tokens",
+                "generated_tokens",
+            ):
+                value = prompt_diagnostics.get(key)
+                if value not in (None, ""):
+                    diagnostic_parts.append(f"{key}={value}")
+            if diagnostic_parts:
+                lines.append(f"   prompt_diagnostics={', '.join(diagnostic_parts)}")
+        replication = _sample_replication_payload(sample)
+        if replication:
+            missing = _format_fact_diff(replication.get("missing_facts"))
+            extra = _format_fact_diff(replication.get("extra_facts"))
+            if missing:
+                lines.append(f"   missing={missing}")
+            if extra:
+                lines.append(f"   extra={extra}")
+
+        original = sample.get("original") or sample.get("reference") or sample.get("expected") or ""
+        generated = (
+            sample.get("decompiled") or sample.get("generated") or sample.get("candidate") or ""
+        )
+        if original:
+            lines.append(f"   original: {_snippet(original)}")
+        if generated:
+            lines.append(f"   generated: {_snippet(generated)}")
+        diff = sample.get("diff")
+        if not diff and original and generated:
+            diff = "\n".join(
+                difflib.unified_diff(
+                    str(original).splitlines(),
+                    str(generated).splitlines(),
+                    fromfile="original",
+                    tofile="generated",
+                    lineterm="",
+                    n=1,
+                )
+            )
+        if diff:
+            lines.append("   diff: " + _snippet(diff, limit=320))
+
+
 def _append_metadata_segment_report(lines: list[str], metadata_segments: Mapping[str, Any]) -> None:
+    _append_opcode_control_flow_coverage(lines, metadata_segments)
+
     coverage = metadata_segments.get("coverage")
     if isinstance(coverage, Mapping) and coverage:
         lines.extend(["", "Metadata Segment Coverage", "-------------------------"])
@@ -494,6 +854,99 @@ def _append_metadata_segment_report(lines: list[str], metadata_segments: Mapping
                     ]
                 )
             )
+    _append_segment_hallucination_report(lines, segments)
+
+
+def _append_opcode_control_flow_coverage(
+    lines: list[str],
+    metadata_segments: Mapping[str, Any],
+) -> None:
+    coverage = metadata_segments.get("opcode_control_flow_coverage")
+    if not isinstance(coverage, Mapping):
+        return
+    opcode_groups = coverage.get("opcode_groups")
+    control_flow = coverage.get("control_flow")
+    if not isinstance(opcode_groups, Mapping) and not isinstance(control_flow, Mapping):
+        return
+    lines.extend(["", "Opcode and Control-Flow Coverage", "--------------------------------"])
+    lines.append(f"Examples with opcode groups: {coverage.get('examples_with_opcode_groups', 0)}")
+    if isinstance(opcode_groups, Mapping) and opcode_groups:
+        lines.append(f"Opcode groups: {_format_top_segment_values(opcode_groups, limit=8)}")
+    if isinstance(control_flow, Mapping) and control_flow:
+        lines.append(f"Control-flow buckets: {_format_top_segment_values(control_flow, limit=8)}")
+
+
+def _append_segment_hallucination_report(lines: list[str], segments: Mapping[str, Any]) -> None:
+    rows: list[tuple[str, str, int, float]] = []
+    for field_name, field_segments in sorted(segments.items()):
+        if not isinstance(field_segments, Mapping):
+            continue
+        for value, segment in sorted(field_segments.items()):
+            if not isinstance(segment, Mapping):
+                continue
+            replication = segment.get("replication_metrics")
+            if not isinstance(replication, Mapping):
+                continue
+            buckets = replication.get("hallucination_buckets")
+            if not isinstance(buckets, Mapping):
+                continue
+            rates = replication.get("hallucination_rate_by_bucket")
+            rates = rates if isinstance(rates, Mapping) else {}
+            for bucket, count in sorted(buckets.items()):
+                if not isinstance(count, int):
+                    continue
+                rate = rates.get(bucket)
+                rows.append(
+                    (
+                        f"{field_name}={value}",
+                        str(bucket),
+                        count,
+                        float(rate) if isinstance(rate, (int, float)) else 0.0,
+                    )
+                )
+    if not rows:
+        return
+    lines.extend(["", "Per-Segment Hallucination Buckets", "--------------------------------"])
+    lines.append("segment | bucket | count | rate")
+    lines.append("--- | --- | ---: | ---:")
+    for segment, bucket, count, rate in rows[:20]:
+        lines.append(f"{segment} | {bucket} | {count} | {rate * 100:.2f}%")
+
+
+def _sample_metric(metrics: Mapping[str, Any], key: str) -> str:
+    return f"{key}={_format_number(metrics.get(key))}"
+
+
+def _sample_replication_payload(sample: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    replication = sample.get("replication")
+    if isinstance(replication, Mapping):
+        return replication
+    metrics = sample.get("metrics")
+    if not isinstance(metrics, Mapping):
+        return None
+    metadata = metrics.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    replication = metadata.get("replication")
+    return replication if isinstance(replication, Mapping) else None
+
+
+def _format_fact_diff(value: Any, *, limit: int = 4) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    parts: list[str] = []
+    for category, facts in sorted(value.items()):
+        if isinstance(facts, Sequence) and not isinstance(facts, (str, bytes)):
+            shown = ", ".join(str(fact) for fact in list(facts)[:limit])
+            parts.append(f"{category}=[{shown}]")
+    return "; ".join(parts)
+
+
+def _snippet(value: Any, *, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 13].rstrip() + "...<truncated>"
 
 
 def _format_top_segment_values(values: Mapping[str, Any], *, limit: int = 4) -> str:

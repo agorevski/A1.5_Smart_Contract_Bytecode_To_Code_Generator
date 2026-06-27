@@ -1,0 +1,120 @@
+name: Data quality and evaluation gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  data-quality-and-quality-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      WANDB_DISABLED: "true"
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      TMPDIR: ${{ github.workspace }}/.pytest_tmp
+      UV_LINK_MODE: copy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install CPU test environment
+        run: |
+          mkdir -p "$TMPDIR"
+          uv sync --dev --frozen
+
+      - name: Run data-quality and unit tests
+        run: |
+          uv run --frozen pytest \
+            tests/test_dataset_quality_issues.py \
+            tests/test_data_generation_export_issues.py \
+            tests
+
+      - name: Run deterministic quality-gate report smoke
+        run: |
+          uv run --frozen python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from train import evaluate_quality_gate
+          from src.evaluation_report import write_latest_results_report
+
+          results_dir = Path("results")
+          results_dir.mkdir(exist_ok=True)
+          results_json = results_dir / "ci_quality_gate_smoke.json"
+          latest_results = results_dir / "ci_latest_results.txt"
+
+          summary = {
+              "num_evaluated": 2,
+              "num_attempted": 2,
+              "num_succeeded": 2,
+              "num_failed": 0,
+              "failure_rate": 0.0,
+              "semantic_similarity_mean": 0.95,
+              "semantic_similarity_std": 0.0,
+              "edit_distance_mean": 0.05,
+              "edit_distance_std": 0.0,
+              "pct_above_0.8_similarity": 1.0,
+              "pct_below_0.4_edit_dist": 1.0,
+              "replication_f1_mean": 0.90,
+              "solidity_valid_mean": 1.0,
+              "solidity_compiler_checked_mean": 0.0,
+              "solidity_ast_valid_mean": 1.0,
+              "baseline_comparison": {"num_regressions": 0, "num_metrics_compared": 1},
+          }
+          gate_config = {
+              "enabled": True,
+              "thresholds": {
+                  "semantic_similarity_mean": {"op": ">=", "value": 0.90, "required": True},
+                  "pct_above_0.8_similarity": {"op": ">=", "value": 1.0, "required": True},
+                  "pct_below_0.4_edit_dist": {"op": ">=", "value": 1.0, "required": True},
+                  "failure_rate": {"op": "<=", "value": 0.0, "required": True},
+                  "replication_f1_mean": {"op": ">=", "value": 0.85, "required": True},
+                  "solidity_valid_mean": {"op": ">=", "value": 1.0, "required": True},
+                  "solidity_compiler_checked_mean": {"op": ">=", "value": 0.0, "required": True},
+                  "solidity_ast_valid_mean": {"op": ">=", "value": 1.0, "required": True},
+              },
+              "max_baseline_regressions": 0,
+          }
+
+          summary["quality_gate"] = evaluate_quality_gate(summary, gate_config)
+          assert summary["quality_gate"]["status"] == "passed", summary["quality_gate"]
+
+          failing_summary = dict(summary, semantic_similarity_mean=0.1)
+          failing_gate = evaluate_quality_gate(failing_summary, gate_config)
+          assert failing_gate["status"] == "failed", failing_gate
+
+          results_json.write_text(json.dumps({"summary": summary, "details": []}, indent=2))
+          report_path = write_latest_results_report(
+              summary=summary,
+              model_path="ci-smoke-model",
+              test_dataset_path="ci-smoke-dataset.jsonl",
+              results_json_path=str(results_json),
+              latest_results_path=str(latest_results),
+              argv=["ci-quality-gate-smoke"],
+              eval_limit=2,
+          )
+          report_text = Path(report_path).read_text()
+          assert "Target Checks" in report_text
+          assert "semantic_similarity_mean" in report_text
+          print(f"quality gate passed and report written to {report_path}")
+          PY

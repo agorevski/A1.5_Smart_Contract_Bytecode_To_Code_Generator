@@ -6,16 +6,40 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 MAX_BYTECODE_HEX_LENGTH = int(os.environ.get("WEB_MAX_BYTECODE_HEX_LENGTH", "200000"))
+MODELS_DIR = PROJECT_ROOT / "models"
+DEFAULT_MODEL_PATH = MODELS_DIR / "final_model"
+DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("WEB_DECOMPILE_TIMEOUT_SECONDS", "900"))
+DEFAULT_MAX_FUNCTIONS = int(os.environ.get("WEB_MAX_DECOMPILE_FUNCTIONS", "128"))
+T = TypeVar("T")
+
+
+class DecompileCliError(Exception):
+    """Structured CLI failure that can be rendered as JSON."""
+
+    exit_code = 2
+    status = "error"
+
+
+class DecompileTimeoutError(DecompileCliError):
+    exit_code = 124
+    status = "timeout"
+
+
+class DecompileWorkLimitError(DecompileCliError):
+    exit_code = 3
+    status = "work_limit_exceeded"
 
 
 def _die(message: str, exit_code: int = 2) -> None:
@@ -23,16 +47,101 @@ def _die(message: str, exit_code: int = 2) -> None:
     raise SystemExit(exit_code)
 
 
-def _parse_bool(value: Optional[str]) -> Optional[bool]:
-    if value is None:
+def _is_model_artifact(path: Path) -> bool:
+    return path.is_dir() and (path / "model_config.json").exists()
+
+
+def _model_resolution_checks(model_path: str | None) -> list[tuple[str, Path]]:
+    if model_path:
+        return [("--model-path", Path(model_path).expanduser())]
+
+    env_path = os.environ.get("WEB_MODEL_PATH")
+    if env_path:
+        return [("WEB_MODEL_PATH", Path(env_path).expanduser())]
+
+    checks: list[tuple[str, Path]] = [("models/final_model", DEFAULT_MODEL_PATH)]
+    if MODELS_DIR.is_dir():
+        discovered = [
+            path
+            for path in MODELS_DIR.iterdir()
+            if path.name.startswith("final_model") and _is_model_artifact(path)
+        ]
+        for path in sorted(discovered, key=lambda p: p.stat().st_mtime, reverse=True):
+            if path != DEFAULT_MODEL_PATH:
+                checks.append(("models/final_model*", path))
+    return checks
+
+
+def _resolve_model_path(model_path: str | None) -> Path:
+    checks = _model_resolution_checks(model_path)
+    for _label, path in checks:
+        candidate = path if path.is_absolute() else (PROJECT_ROOT / path)
+        if _is_model_artifact(candidate):
+            return candidate.resolve()
+
+    checked = ", ".join(f"{label}={path}" for label, path in checks)
+    if not checked:
+        checked = f"WEB_MODEL_PATH, {DEFAULT_MODEL_PATH}, " f"{MODELS_DIR / 'final_model*'}"
+    _die(
+        "no trained model artifact found; checked "
+        f"{checked}. Pass --model-path or set WEB_MODEL_PATH."
+    )
+
+
+def _deadline_from_timeout(timeout_seconds: float | None) -> float | None:
+    if timeout_seconds is None or timeout_seconds <= 0:
         return None
-    text = value.strip().lower()
-    if text in {"1", "true", "yes", "y", "on", "enabled"}:
-        return True
-    if text in {"0", "false", "no", "n", "off", "disabled"}:
-        return False
-    _die(f"invalid boolean value: {value!r}")
-    return None
+    return time.monotonic() + timeout_seconds
+
+
+def _remaining_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _check_deadline(deadline: float | None, timeout_seconds: float, where: str) -> None:
+    remaining = _remaining_seconds(deadline)
+    if remaining is not None and remaining <= 0:
+        raise DecompileTimeoutError(
+            f"decompile timed out after {timeout_seconds:g} seconds while {where}"
+        )
+
+
+def _run_with_deadline(
+    operation: Callable[[], T],
+    deadline: float | None,
+    timeout_seconds: float,
+    description: str,
+) -> T:
+    remaining = _remaining_seconds(deadline)
+    if remaining is None:
+        return operation()
+    if remaining <= 0:
+        raise DecompileTimeoutError(
+            f"decompile timed out after {timeout_seconds:g} seconds before {description}"
+        )
+
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def target() -> None:
+        try:
+            result_queue.put((True, operation()))
+        except BaseException as exc:  # pragma: no cover - defensive handoff
+            result_queue.put((False, exc))
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(remaining)
+    if worker.is_alive():
+        raise DecompileTimeoutError(
+            f"decompile timed out after {timeout_seconds:g} seconds during {description}"
+        )
+
+    ok, payload = result_queue.get_nowait()
+    if ok:
+        return payload
+    raise payload
 
 
 def _normalize_bytecode(raw: str) -> str:
@@ -72,18 +181,13 @@ def _read_bytecode(args: argparse.Namespace) -> str:
 
 
 def _metadata_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    metadata: Dict[str, Any] = {}
-    if args.compiler_version:
-        metadata["compiler_version"] = args.compiler_version
-    if args.optimizer_enabled is not None:
-        parsed = _parse_bool(args.optimizer_enabled)
-        if parsed is not None:
-            metadata["optimizer_enabled"] = parsed
-    if args.optimizer_runs is not None:
-        metadata["optimizer_runs"] = args.optimizer_runs
-    if args.evm_version:
-        metadata["evm_version"] = args.evm_version
-    return metadata
+    """Return production-safe metadata derived from bytecode only.
+
+    Deprecated compiler/optimizer flags are accepted by the CLI for older
+    scripts, but they are intentionally ignored because production inference
+    only has bytecode.
+    """
+    return {}
 
 
 def _load_model_config(model_path: str) -> Dict[str, Any]:
@@ -96,6 +200,26 @@ def _load_model_config(model_path: str) -> Dict[str, Any]:
         return {"model_path": model_path, "config_error": str(exc)}
     data["model_path"] = model_path
     return data
+
+
+def _validate_solidity(source_code: str, metadata: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    try:
+        from src.training_pipeline import validate_generated_solidity
+
+        return validate_generated_solidity(source_code, metadata or {}).to_dict()
+    except Exception as exc:  # pragma: no cover - dependency/runtime defensive
+        return {
+            "valid": False,
+            "method": "validation_error",
+            "scaffold_valid": False,
+            "scaffold_errors": [],
+            "compiler_checked": False,
+            "compiler_version": None,
+            "compiler_errors": [],
+            "ast_checked": False,
+            "ast_valid": None,
+            "error": str(exc),
+        }
 
 
 def _analyze_tac(bytecode: str):
@@ -113,31 +237,47 @@ def _build_function_metadata(analyzer, fname: str, base_metadata: Dict[str, Any]
     metadata = dict(base_metadata)
     func_obj = getattr(analyzer, "functions", {}).get(fname)
     if func_obj:
-        metadata.update(
-            {
-                "function_name": func_obj.name,
-                "visibility": func_obj.visibility,
-                "is_payable": func_obj.is_payable,
-                "is_view": func_obj.is_view,
-            }
-        )
+        selector = getattr(func_obj, "selector", None)
+        if selector:
+            metadata["selector"] = selector
+    metadata.update(
+        {
+            "bytecode_instruction_count": len(getattr(analyzer, "instructions", []) or []),
+            "basic_block_count": len(getattr(analyzer, "basic_blocks", {}) or {}),
+            "function_count": len(getattr(analyzer, "functions", {}) or {}),
+        }
+    )
     return metadata
 
 
 def _run_model_inference(
     args: argparse.Namespace, bytecode: str, metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
-    model_path = Path(args.model_path).expanduser().resolve()
-    if not model_path.exists() or not model_path.is_dir():
-        _die(f"model path does not exist or is not a directory: {model_path}")
+    model_path = _resolve_model_path(args.model_path)
+    deadline = _deadline_from_timeout(args.timeout_seconds)
 
     from src.model_setup import SmartContractDecompiler
 
     t0 = time.time()
-    analyzer, func_tac, combined_tac = _analyze_tac(bytecode)
+    analyzer, func_tac, combined_tac = _run_with_deadline(
+        lambda: _analyze_tac(bytecode),
+        deadline,
+        args.timeout_seconds,
+        "bytecode analysis",
+    )
     tac_time = time.time() - t0
+    if len(func_tac) > args.max_functions:
+        raise DecompileWorkLimitError(
+            f"too many functions detected ({len(func_tac)}); maximum is {args.max_functions}"
+        )
+    _check_deadline(deadline, args.timeout_seconds, "loading the model")
 
-    decompiler = SmartContractDecompiler(str(model_path))
+    decompiler = _run_with_deadline(
+        lambda: SmartContractDecompiler(str(model_path)),
+        deadline,
+        args.timeout_seconds,
+        "model load",
+    )
     generation = {
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
@@ -151,17 +291,25 @@ def _run_model_inference(
 
     t1 = time.time()
     for fname, tac_text in func_tac.items():
+        _check_deadline(deadline, args.timeout_seconds, f"decompiling {fname}")
         func_metadata = _build_function_metadata(analyzer, fname, metadata)
         call_started = time.time()
         try:
-            function_solidity[fname] = decompiler.decompile_tac_to_solidity(
-                tac_text,
-                metadata=func_metadata,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                do_sample=args.do_sample,
-                repetition_penalty=args.repetition_penalty,
+            function_solidity[fname] = _run_with_deadline(
+                lambda tac=tac_text, meta=func_metadata: decompiler.decompile_tac_to_solidity(
+                    tac,
+                    metadata=meta,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    do_sample=args.do_sample,
+                    repetition_penalty=args.repetition_penalty,
+                ),
+                deadline,
+                args.timeout_seconds,
+                f"model inference for {fname}",
             )
+        except DecompileCliError:
+            raise
         except Exception as exc:  # pragma: no cover - model runtime dependent
             function_errors[fname] = str(exc)
             function_solidity[fname] = f"// Decompilation failed: {exc}"
@@ -169,6 +317,12 @@ def _run_model_inference(
 
     gen_time = time.time() - t1
     solidity = decompiler._assemble_contract(function_solidity, analyzer)
+    function_validation = {
+        fname: _validate_solidity(source, _build_function_metadata(analyzer, fname, metadata))
+        for fname, source in function_solidity.items()
+    }
+    validation = _validate_solidity(solidity, metadata)
+    validation_failed = not bool(validation.get("valid"))
     analysis = {
         "num_instructions": len(analyzer.instructions),
         "num_basic_blocks": len(analyzer.basic_blocks),
@@ -177,29 +331,47 @@ def _run_model_inference(
         "solidity_generation_time_s": round(gen_time, 3),
         "function_errors": function_errors,
         "function_latencies_s": function_latencies,
+        "function_validation": function_validation,
+        "validation": validation,
     }
     return {
-        "success": not function_errors,
-        "decompilation_status": "partial_error" if function_errors else "model_generated",
+        "success": not function_errors and not validation_failed,
+        "decompilation_status": (
+            "partial_error"
+            if function_errors
+            else "validation_failed" if validation_failed else "model_generated"
+        ),
         "model_path": str(model_path),
         "model_config": _load_model_config(str(model_path)),
-        "compiler_metadata": metadata,
         "generation_config": generation,
         "tac": combined_tac,
         "tac_per_function": func_tac,
         "functions": function_solidity,
         "solidity": solidity,
+        "validation": validation,
+        "function_validation": function_validation,
         "analysis": analysis,
     }
 
 
-def _run_tac_only(bytecode: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+def _run_tac_only(
+    args: argparse.Namespace, bytecode: str, metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    deadline = _deadline_from_timeout(args.timeout_seconds)
     t0 = time.time()
-    analyzer, func_tac, combined_tac = _analyze_tac(bytecode)
+    analyzer, func_tac, combined_tac = _run_with_deadline(
+        lambda: _analyze_tac(bytecode),
+        deadline,
+        args.timeout_seconds,
+        "bytecode analysis",
+    )
+    if len(func_tac) > args.max_functions:
+        raise DecompileWorkLimitError(
+            f"too many functions detected ({len(func_tac)}); maximum is {args.max_functions}"
+        )
     return {
         "success": True,
         "decompilation_status": "tac_only_no_model",
-        "compiler_metadata": metadata,
         "tac": combined_tac,
         "tac_per_function": func_tac,
         "solidity": "",
@@ -228,19 +400,51 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         help="Output format (default: json)",
     )
-    parser.add_argument("--compiler-version", help="Optional Solidity compiler version")
+    parser.add_argument(
+        "--compiler-version",
+        help="Deprecated no-op; compiler metadata is ignored for bytecode-only inference",
+    )
     parser.add_argument(
         "--optimizer-enabled",
         choices=["true", "false", "1", "0", "yes", "no"],
-        help="Optional optimizer setting",
+        help="Deprecated no-op; optimizer metadata is ignored for bytecode-only inference",
     )
-    parser.add_argument("--optimizer-runs", type=int, help="Optional optimizer runs")
-    parser.add_argument("--evm-version", help="Optional EVM version")
+    parser.add_argument(
+        "--optimizer-runs",
+        type=int,
+        help="Deprecated no-op; optimizer metadata is ignored for bytecode-only inference",
+    )
+    parser.add_argument(
+        "--evm-version",
+        help="Deprecated no-op; EVM-version metadata is ignored for bytecode-only inference",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--do-sample", action="store_true", help="Enable stochastic sampling")
     parser.add_argument("--repetition-penalty", type=float, default=1.15)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=(
+            "Wall-clock deadline for analysis/model work; 0 disables "
+            f"(default: WEB_DECOMPILE_TIMEOUT_SECONDS or {DEFAULT_TIMEOUT_SECONDS:g})"
+        ),
+    )
+    parser.add_argument(
+        "--max-functions",
+        type=int,
+        default=DEFAULT_MAX_FUNCTIONS,
+        help=(
+            "Maximum decompiled functions before aborting "
+            f"(default: WEB_MAX_DECOMPILE_FUNCTIONS or {DEFAULT_MAX_FUNCTIONS})"
+        ),
+    )
     return parser
+
+
+def _error_result(status: str, message: str) -> Dict[str, Any]:
+    return {"success": False, "decompilation_status": status, "error": message}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -253,16 +457,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         _die("--temperature must be between 0.0 and 2.0")
     if not 0.8 <= args.repetition_penalty <= 2.0:
         _die("--repetition-penalty must be between 0.8 and 2.0")
+    if args.timeout_seconds < 0:
+        _die("--timeout-seconds must be >= 0")
+    if args.max_functions < 1:
+        _die("--max-functions must be >= 1")
 
     bytecode = _read_bytecode(args)
     metadata = _metadata_from_args(args)
 
-    if args.format == "tac" and not args.model_path:
-        result = _run_tac_only(bytecode, metadata)
-    else:
-        if not args.model_path:
-            _die("--model-path is required for json and solidity output")
-        result = _run_model_inference(args, bytecode, metadata)
+    try:
+        if args.format == "tac" and not args.model_path:
+            result = _run_tac_only(args, bytecode, metadata)
+        else:
+            result = _run_model_inference(args, bytecode, metadata)
+    except DecompileCliError as exc:
+        result = _error_result(exc.status, str(exc))
+        if args.format == "json":
+            print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except Exception as exc:  # pragma: no cover - model/runtime dependent
+        result = _error_result("model_failure", str(exc))
+        if args.format == "json":
+            print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     if args.format == "json":
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
