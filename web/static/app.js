@@ -90,6 +90,9 @@
   var currentSelectorMap = null; // Stored from last decompilation
   var totalFunctionCount = 0;
   var completedFunctionCount = 0;
+  var activeDecompileRequestId = 0;
+  var activeDecompileController = null;
+  var resultRevealTimer = null;
 
   // ---- Helpers ----
 
@@ -129,10 +132,41 @@
       hide(resultsSection);
       hideError();
       btnDecompile.disabled = true;
+      btnSample.disabled = true;
+      inputEl.readOnly = true;
     } else {
       hide(loadingEl);
       btnDecompile.disabled = false;
+      btnSample.disabled = false;
+      inputEl.readOnly = false;
     }
+  }
+
+  function clearResultRevealTimer() {
+    if (resultRevealTimer) {
+      clearTimeout(resultRevealTimer);
+      resultRevealTimer = null;
+    }
+  }
+
+  function isCurrentDecompileRequest(requestId) {
+    return requestId === activeDecompileRequestId;
+  }
+
+  function finishDecompileRequest(requestId) {
+    if (!isCurrentDecompileRequest(requestId)) return;
+    activeDecompileController = null;
+    setLoading(false);
+  }
+
+  function abortActiveDecompile() {
+    clearResultRevealTimer();
+    if (activeDecompileController) {
+      activeDecompileController.abort();
+      activeDecompileController = null;
+      activeDecompileRequestId += 1;
+    }
+    setLoading(false);
   }
 
   function updateOriginalTab() {
@@ -804,14 +838,22 @@
   // ---- Decompile action (SSE streaming) ----
 
   function decompile() {
+    if (activeDecompileController) {
+      return;
+    }
+
     var bytecode = inputEl.value.trim();
     if (!bytecode) {
       showError("Please enter EVM bytecode to decompile.");
       return;
     }
 
+    clearResultRevealTimer();
     setLoading(true);
     currentSelectorMap = null;
+    activeDecompileRequestId += 1;
+    var requestId = activeDecompileRequestId;
+    activeDecompileController = new AbortController();
 
     // We use fetch with a ReadableStream to process SSE from a POST request
     // (EventSource only supports GET, so we parse the stream manually)
@@ -819,8 +861,11 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ bytecode: bytecode }),
+      signal: activeDecompileController.signal,
     })
       .then(function (response) {
+        if (!isCurrentDecompileRequest(requestId)) return;
+
         if (!response.ok) {
           return response.json().then(function (data) {
             throw new Error(data.error || "Server error (" + response.status + ")");
@@ -832,11 +877,15 @@
         var buffer = "";
 
         function processChunk() {
+          if (!isCurrentDecompileRequest(requestId)) return Promise.resolve();
+
           return reader.read().then(function (result) {
+            if (!isCurrentDecompileRequest(requestId)) return;
+
             if (result.done) {
               // Process any remaining buffer
               if (buffer.trim()) {
-                parseSSEBuffer(buffer);
+                parseSSEBuffer(buffer, requestId);
               }
               return;
             }
@@ -849,7 +898,7 @@
             buffer = parts.pop() || "";
 
             for (var i = 0; i < parts.length; i++) {
-              parseSSEMessage(parts[i]);
+              parseSSEMessage(parts[i], requestId);
             }
 
             return processChunk();
@@ -859,21 +908,26 @@
         return processChunk();
       })
       .catch(function (err) {
-        setLoading(false);
+        if (err.name === "AbortError" || !isCurrentDecompileRequest(requestId)) {
+          return;
+        }
+        finishDecompileRequest(requestId);
         showError("Error: " + err.message);
       });
   }
 
-  function parseSSEBuffer(buf) {
+  function parseSSEBuffer(buf, requestId) {
     var messages = buf.split("\n\n");
     for (var i = 0; i < messages.length; i++) {
       if (messages[i].trim()) {
-        parseSSEMessage(messages[i]);
+        parseSSEMessage(messages[i], requestId);
       }
     }
   }
 
-  function parseSSEMessage(raw) {
+  function parseSSEMessage(raw, requestId) {
+    if (!isCurrentDecompileRequest(requestId)) return;
+
     var eventType = "";
     var dataLines = [];
 
@@ -903,17 +957,19 @@
         break;
 
       case "result":
-        handleResult(data);
+        handleResult(data, requestId);
         break;
 
       case "error":
-        setLoading(false);
+        finishDecompileRequest(requestId);
         showError(data.error || "Unknown server error");
         break;
     }
   }
 
-  function handleResult(data) {
+  function handleResult(data, requestId) {
+    if (!isCurrentDecompileRequest(requestId)) return;
+
     // Populate results
     tacOutput.textContent = data.tac || "(no TAC output)";
     solidityOutput.textContent = data.solidity || "(no Solidity output)";
@@ -941,8 +997,11 @@
     updateProgress(100, "Decompilation complete!");
 
     // Short delay so user sees 100% before switching to results
-    setTimeout(function () {
-      setLoading(false);
+    clearResultRevealTimer();
+    resultRevealTimer = setTimeout(function () {
+      if (!isCurrentDecompileRequest(requestId)) return;
+      resultRevealTimer = null;
+      finishDecompileRequest(requestId);
       show(resultsSection);
       resultsSection.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 600);
@@ -953,6 +1012,7 @@
   btnDecompile.addEventListener("click", decompile);
 
   btnSample.addEventListener("click", function () {
+    abortActiveDecompile();
     inputEl.value = SAMPLE_BYTECODE;
     isSampleLoaded = true;
     updateCharCount();
@@ -961,6 +1021,7 @@
   });
 
   btnClear.addEventListener("click", function () {
+    abortActiveDecompile();
     inputEl.value = "";
     isSampleLoaded = false;
     updateCharCount();
@@ -972,6 +1033,10 @@
 
   // Detect if user modifies the input away from sample
   inputEl.addEventListener("input", function () {
+    if (activeDecompileController) {
+      abortActiveDecompile();
+    }
+
     if (isSampleLoaded && inputEl.value.trim() !== SAMPLE_BYTECODE) {
       isSampleLoaded = false;
       updateOriginalTab();
@@ -986,6 +1051,7 @@
   inputEl.addEventListener("keydown", function (e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
+      if (activeDecompileController) return;
       decompile();
     }
   });
