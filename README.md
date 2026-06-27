@@ -28,7 +28,7 @@ The system implements four analysis pipelines coordinated by `PipelineOrchestrat
 ### 1. Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 > **Requirements:** Python ≥ 3.10, CUDA-compatible GPU with ≥ 4 GB VRAM (inference) / ≥ 16 GB (training).
@@ -39,21 +39,21 @@ Download verified Solidity contracts from HuggingFace (`andstor/smart_contracts`
 
 ```bash
 # Download 20 contracts (quick test)
-python download_hf_contracts.py --limit 20
+uv run python download_hf_contracts.py --limit 20
 
 # Download 100 contracts with max 3 compiler versions each
-python download_hf_contracts.py --limit 100 --max-compiler-versions 3
+uv run python download_hf_contracts.py --limit 100 --max-compiler-versions 3
 
 # Full dataset (all available contracts)
-python download_hf_contracts.py
+uv run python download_hf_contracts.py
 ```
 
 **Phases** (can be run independently):
 
 ```bash
-python download_hf_contracts.py --download-only     # Phase 1: Download only
-python download_hf_contracts.py --compile-only       # Phase 2: Compile & generate TAC
-python download_hf_contracts.py --export-only        # Phase 3: Export JSONL
+uv run python download_hf_contracts.py --download-only     # Phase 1: Download only
+uv run python download_hf_contracts.py --compile-only       # Phase 2: Compile & generate TAC
+uv run python download_hf_contracts.py --export-only        # Phase 3: Export JSONL
 ```
 
 **Output:** `data/hf_training_dataset.jsonl` — each line is `{"input": "<TAC>", "output": "<Solidity>", "metadata": {...}}`
@@ -62,16 +62,16 @@ python download_hf_contracts.py --export-only        # Phase 3: Export JSONL
 
 ```bash
 # Train on the downloaded dataset (Llama 3.2 3B with LoRA)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
 
 # Quick test (1 epoch, small batch)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
 
 # Fast E2E test with a tiny model (no GPU needed)
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
 
 # Full training with custom parameters
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
     --epochs 5 --batch-size 4 --lr 2e-4 --max-seq-length 4096
 ```
 
@@ -83,20 +83,20 @@ Evaluation runs automatically after training unless `--skip-eval` is passed. Res
 
 ```bash
 # Train and evaluate
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
 
 # Train without evaluation
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --skip-eval
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --skip-eval
 ```
 
 ## End-to-End Example
 
 ```bash
 # Step 1: Download and prepare 20 contracts
-python download_hf_contracts.py --limit 20
+uv run python download_hf_contracts.py --limit 20
 
 # Step 2: Train the model on the downloaded data
-python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
+uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
 
 # Step 3: Check results
 ls results/
@@ -108,23 +108,23 @@ For the full operator guide, including current-data sufficiency checks, data reg
 
 ```bash
 # Run all tests (~380 tests across 8 files)
-python -m pytest
+uv run pytest
 
 # Verbose output
-python -m pytest -v
+uv run pytest -v
 
 # Run specific module tests
-python -m pytest tests/test_bytecode_analyzer.py -v
-python -m pytest tests/test_dataset_pipeline.py -v
-python -m pytest tests/test_vulnerability_detector.py -v
-python -m pytest tests/test_malicious_classifier.py -v
-python -m pytest tests/test_audit_report.py -v
-python -m pytest tests/test_pipeline_orchestrator.py -v
-python -m pytest tests/test_opcode_features.py -v
-python -m pytest tests/test_e2e.py -v
+uv run pytest tests/test_bytecode_analyzer.py -v
+uv run pytest tests/test_dataset_pipeline.py -v
+uv run pytest tests/test_vulnerability_detector.py -v
+uv run pytest tests/test_malicious_classifier.py -v
+uv run pytest tests/test_audit_report.py -v
+uv run pytest tests/test_pipeline_orchestrator.py -v
+uv run pytest tests/test_opcode_features.py -v
+uv run pytest tests/test_e2e.py -v
 
 # Run with coverage
-python -m pytest --cov=src tests/
+uv run pytest --cov=src tests/
 ```
 
 ## Project Structure
@@ -132,8 +132,8 @@ python -m pytest --cov=src tests/
 ```
 ├── download_hf_contracts.py   # CLI: Download HuggingFace data → compile → export
 ├── train.py                   # CLI: Train & evaluate the decompilation model
-├── requirements.txt           # Python dependencies
-├── pyproject.toml             # Project config (pytest, black, mypy)
+├── pyproject.toml             # Project metadata, uv dependencies, and tool config
+├── uv.lock                    # Locked Python dependencies generated by uv
 │
 ├── src/                       # Core library
 │   ├── __init__.py            # Package exports (v2.0.0)
@@ -248,7 +248,7 @@ See [docs/model-details.md](docs/model-details.md) for more.
 |---------|----------|
 | CUDA out of memory | Reduce `--batch-size` or use `--tiny` |
 | `HF_TOKEN` required | Set `HF_TOKEN` env var or add to `src/settings.yaml` |
-| No training pairs generated | Check solc installation: `python -c "from solcx import get_installed_solc_versions; print(get_installed_solc_versions())"` |
+| No training pairs generated | Check solc installation: `uv run python -c "from solcx import get_installed_solc_versions; print(get_installed_solc_versions())"` |
 | Download hangs | HuggingFace data is cached after first download; check `~/.cache/huggingface/hub/` |
 
 

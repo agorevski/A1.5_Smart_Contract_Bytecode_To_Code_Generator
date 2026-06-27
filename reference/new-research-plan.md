@@ -30,7 +30,7 @@ The repository implements a **comprehensive smart contract analysis system** (v2
 - Tests: `tests/test_opcode_features.py` (~34 tests)
 
 ### 1.3 Improved Training with DPO (from Smart-LLaMA-DPO) — ✅ Infrastructure Ready
-- `trl` library added to `requirements.txt` for DPO/RLHF training support
+- `trl` library added to `pyproject.toml` for DPO/RLHF training support
 
 ### 1.4 Ensemble Inference (from LLMBugScanner) — 🔄 Future Enhancement
 - Single model inference currently implemented; ensemble support planned
@@ -88,7 +88,7 @@ web/
 ├── app.py                             # Enhanced with security endpoints ✅
 ```
 
-### 3.2 Dependencies — ✅ Added to requirements.txt
+### 3.2 Dependencies — ✅ Added to pyproject.toml
 ```
 trl                    # DPO training (TRL library)
 lightgbm               # Malicious classifier
@@ -104,7 +104,7 @@ jinja2                 # Report templates
 ### Phase 1: Core Enhancements — ✅ Complete
 1. ✅ **opcode-features**: `src/opcode_features.py` with TF-IDF, entropy-based binning, opcode normalization
 2. ✅ **cfg-fragments**: `BytecodeAnalyzer` enhanced with vulnerability-indicative CFG pattern detection
-3. ✅ **dpo-training**: `trl` library added to requirements
+3. ✅ **dpo-training**: `trl` library added to uv-managed dependencies
 
 ### Phase 2: New Models — ✅ Complete
 4. ✅ **vuln-detector**: `src/vulnerability_detector.py` with 6 vulnerability types, 5 severity levels
@@ -118,7 +118,7 @@ jinja2                 # Report templates
 ### Phase 4: Testing — ✅ Complete
 9. ✅ **unit-tests**: ~380 tests across 8 test files covering all modules
 10. ✅ **e2e-tests**: `tests/test_e2e.py` with ~15 cross-module integration tests
-11. ✅ **update-deps**: `requirements.txt` updated with all new dependencies
+11. ✅ **update-deps**: `pyproject.toml` updated with all new dependencies
 
 ---
 

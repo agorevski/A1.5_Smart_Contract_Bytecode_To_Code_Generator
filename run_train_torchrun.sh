@@ -19,7 +19,7 @@ echo "  Dataset:              ${DATASET}"
 echo "  Model:                ${MODEL}"
 echo ""
 
-torchrun \
+uv run torchrun \
     --nproc_per_node="${NGPUS}" \
     train.py \
     --skip-collection \

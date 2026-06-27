@@ -127,7 +127,7 @@ To switch from Llama 3.2 3B to Qwen 2.5 Coder 32B, the following changes are nee
 The code as written already supports this — pass the following to `train.py`:
 
 ```bash
-python train.py --model-name Qwen/Qwen2.5-Coder-32B --max-seq-length 4096 --batch-size 2
+uv run python train.py --model-name Qwen/Qwen2.5-Coder-32B --max-seq-length 4096 --batch-size 2
 ```
 
 ---
@@ -151,10 +151,10 @@ python train.py --model-name Qwen/Qwen2.5-Coder-32B --max-seq-length 4096 --batc
 
 Three training modes are available, from simplest to fastest:
 
-### 1. Single GPU (`python`)
+### 1. Single GPU (`uv run python`)
 
 ```bash
-python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --batch-size 4 --epochs 3 --lr 2e-4 --max-seq-length 2048 --skip-eval
 ```
 
@@ -215,7 +215,7 @@ For larger models, switch to ZeRO Stage 2 in `ds_config.json`:
 To use DeepSpeed manually (without the wrapper script):
 
 ```bash
-deepspeed --num_gpus=4 train.py \
+uv run --extra deepspeed deepspeed --num_gpus=4 train.py \
     --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --batch-size 4 --epochs 3 --deepspeed ds_config.json --skip-eval
 ```
@@ -290,7 +290,7 @@ The following sections provide complete training configurations for each recomme
 | **VRAM per GPU (4-bit LoRA)** | ~28–34 GB → fits on 1× RTX 8000 |
 
 ```bash
-python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --model-name deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
     --batch-size 2 --epochs 3 --lr 1.5e-4 --max-seq-length 4096 --skip-eval
 ```
@@ -330,7 +330,7 @@ python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
 | **Multi-GPU** | Required — use `run_train_deepspeed.sh` |
 
 ```bash
-NGPUS=3 deepspeed --num_gpus=3 train.py \
+NGPUS=3 uv run --extra deepspeed deepspeed --num_gpus=3 train.py \
     --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --model-name deepseek-ai/DeepSeek-V3 \
     --batch-size 1 --epochs 3 --lr 1e-4 --max-seq-length 4096 \
@@ -380,7 +380,7 @@ NGPUS=3 deepspeed --num_gpus=3 train.py \
 | **VRAM per GPU (4-bit LoRA)** | ~16–20 GB → fits easily on 1× RTX 8000 |
 
 ```bash
-python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --model-name mistralai/Codestral-22B-v0.1 \
     --batch-size 4 --epochs 3 --lr 2e-4 --max-seq-length 4096 --skip-eval
 ```
@@ -426,12 +426,12 @@ python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
 
 ```bash
 # StarCoder2 15B — fast iteration
-python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --model-name bigcode/starcoder2-15b \
     --batch-size 4 --epochs 5 --lr 2e-4 --max-seq-length 4096 --skip-eval
 
 # StarCoder2 33B — higher quality
-python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --model-name bigcode/starcoder2-33b \
     --batch-size 2 --epochs 3 --lr 2e-4 --max-seq-length 4096 --skip-eval
 ```
@@ -474,7 +474,7 @@ python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
 | **VRAM (4-bit LoRA)** | ~10–12 GB → fits trivially on any RTX 8000 |
 
 ```bash
-python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
+uv run python train.py --skip-collection --dataset ./data/hf_training_dataset.jsonl \
     --model-name microsoft/Phi-3-medium-14b-4k-instruct \
     --batch-size 4 --epochs 5 --lr 2e-4 --max-seq-length 4096 --skip-eval
 ```

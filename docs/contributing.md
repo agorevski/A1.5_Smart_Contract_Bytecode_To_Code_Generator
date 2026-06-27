@@ -5,18 +5,19 @@
 ```bash
 git clone https://github.com/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator.git
 cd A1.5_Smart_Contract_Bytecode_To_Code_Generator
-python -m venv venv && venv\Scripts\activate  # Windows
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Development Workflow
 
 1. Create a branch: `git checkout -b feature/your-feature`
 2. Make changes
-3. Run tests: `python -m pytest -v`
-4. Format: `black src/ tests/`
+3. Run tests: `uv run pytest -v`
+4. Format: `uv run black src/ tests/`
 5. Commit with conventional messages (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`)
 6. Push and open a pull request
+
+No CI workflow is configured for this repository; run the local `uv` commands before opening a pull request.
 
 ## Code Standards
 
@@ -29,11 +30,11 @@ pip install -r requirements.txt
 ## Testing
 
 ```bash
-python -m pytest                              # all tests (~380 across 8 files)
-python -m pytest tests/test_bytecode_analyzer.py -v  # specific module
-python -m pytest tests/test_vulnerability_detector.py -v  # vulnerability detection
-python -m pytest tests/test_e2e.py -v                # end-to-end integration
-python -m pytest --cov=src tests/             # with coverage
+uv run pytest                              # all tests (~380 across 8 files)
+uv run pytest tests/test_bytecode_analyzer.py -v  # specific module
+uv run pytest tests/test_vulnerability_detector.py -v  # vulnerability detection
+uv run pytest tests/test_e2e.py -v                # end-to-end integration
+uv run pytest --cov=src tests/             # with coverage
 ```
 
 ## Areas for Contribution

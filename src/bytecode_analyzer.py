@@ -202,7 +202,7 @@ class BytecodeAnalyzer:
             except ImportError:
                 raise ImportError(
                     "evmdasm is required for bytecode disassembly. "
-                    "Install it with: pip install evmdasm"
+                    "Run: uv sync"
                 )
             clean = self.bytecode[2:] if self.bytecode.startswith("0x") else self.bytecode
             evm = EvmBytecode(clean)

@@ -41,7 +41,7 @@ echo "  Model:                ${MODEL}"
 echo "  DeepSpeed config:     ${DS_CONFIG}"
 echo ""
 
-deepspeed \
+uv run --extra deepspeed deepspeed \
     --num_gpus="${NGPUS}" \
     train.py \
     --skip-collection \

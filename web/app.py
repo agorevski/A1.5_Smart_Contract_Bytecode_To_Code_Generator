@@ -444,7 +444,7 @@ def _get_gpu_stats() -> dict:
                 "clock_memory_mhz": None,
             })
 
-        result["error"] = "Install nvidia-ml-py3 for full GPU stats (pip install nvidia-ml-py3)."
+        result["error"] = "Install dependencies with `uv sync` for full GPU stats."
 
     except Exception as e:
         result["error"] = f"Failed to query GPU stats: {e}"

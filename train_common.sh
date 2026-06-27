@@ -20,7 +20,7 @@ MODEL="${MODEL:-meta-llama/Llama-3.2-3B}"
 # Override with MAX_SEQ_LEN env var to skip auto-detection.
 if [ -z "${MAX_SEQ_LEN:-}" ]; then
     echo "Auto-detecting optimal max sequence length from dataset..."
-    MAX_SEQ_LEN=$(python3 -c "
+    MAX_SEQ_LEN=$(uv run python -c "
 import json, math, sys
 
 lengths = []

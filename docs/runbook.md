@@ -22,18 +22,16 @@ Generated data, models, and results are gitignored. A clean clone will not inclu
 
 | Goal | Data | Command pattern |
 |------|------|-----------------|
-| Verify the pipeline quickly | Existing JSONL or small generated set | `python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
-| Train a baseline with current data | `data/hf_training_dataset.jsonl` | `python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
+| Verify the pipeline quickly | Existing JSONL or small generated set | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
+| Train a baseline with current data | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
 | Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
-| Build more data first | Hugging Face verified contracts | `python download_hf_contracts.py --limit 1000 --max-compiler-versions 3` |
+| Build more data first | Hugging Face verified contracts | `uv run python download_hf_contracts.py --limit 1000 --max-compiler-versions 3` |
 | Reproduce paper-scale intent | Large generated dataset | Scale `download_hf_contracts.py` until pair counts approach the target, then train/evaluate |
 
 ## 1. Install and configure
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-python -m pip install -r requirements.txt
+uv sync
 ```
 
 Requirements:
@@ -66,7 +64,7 @@ du -h data/*.jsonl demo_dataset.jsonl 2>/dev/null || true
 Validate that a JSONL file contains usable training pairs:
 
 ```bash
-python - <<'PY'
+uv run python - <<'PY'
 import json
 from pathlib import Path
 
@@ -104,21 +102,21 @@ The preferred generator is `download_hf_contracts.py`. It reads verified Solidit
 
 ```bash
 # Quick data-generation test
-python download_hf_contracts.py --limit 20
+uv run python download_hf_contracts.py --limit 20
 
 # Larger run with bounded compiler-version expansion
-python download_hf_contracts.py --limit 1000 --max-compiler-versions 3
+uv run python download_hf_contracts.py --limit 1000 --max-compiler-versions 3
 
 # Full Hugging Face-backed generation
-python download_hf_contracts.py
+uv run python download_hf_contracts.py
 ```
 
 Run phases independently when debugging or resuming:
 
 ```bash
-python download_hf_contracts.py --download-only
-python download_hf_contracts.py --compile-only
-python download_hf_contracts.py --export-only
+uv run python download_hf_contracts.py --download-only
+uv run python download_hf_contracts.py --compile-only
+uv run python download_hf_contracts.py --export-only
 ```
 
 Useful flags:
@@ -147,7 +145,7 @@ If you want to use the older Etherscan path in `train.py`, provide `ETHERSCAN_AP
 Use this to verify the pipeline without spending GPU time on the gated Llama model:
 
 ```bash
-python train.py \
+uv run python train.py \
   --skip-collection \
   --dataset data/hf_training_dataset.jsonl \
   --tiny \
@@ -159,7 +157,7 @@ python train.py \
 ### Small current-data run
 
 ```bash
-python train.py \
+uv run python train.py \
   --skip-collection \
   --dataset data/hf_training_dataset.jsonl \
   --small
@@ -170,7 +168,7 @@ python train.py \
 ### Baseline current-data run
 
 ```bash
-python train.py \
+uv run python train.py \
   --skip-collection \
   --dataset data/hf_training_dataset.jsonl \
   --epochs 3 \
@@ -233,10 +231,10 @@ The wrapper currently passes `--skip-eval`; run evaluation afterward with the ev
 
 ### DeepSpeed
 
-DeepSpeed is optional and is not installed by default from `requirements.txt`. Install it only when you need it for larger models or memory-constrained distributed runs.
+DeepSpeed is optional and is not installed by default. Sync it only when you need it for larger models or memory-constrained distributed runs.
 
 ```bash
-python -m pip install deepspeed
+uv sync --extra deepspeed
 NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_deepspeed.sh
 ```
 
@@ -245,7 +243,7 @@ For Llama 3.2 3B + LoRA, torchrun DDP is usually simpler and faster. Use DeepSpe
 ### Resume from a checkpoint
 
 ```bash
-python train.py \
+uv run python train.py \
   --skip-collection \
   --dataset data/hf_training_dataset.jsonl \
   --resume models/checkpoints/checkpoint-1000
@@ -258,7 +256,7 @@ Training evaluates automatically unless `--skip-eval` is passed. Results are wri
 Evaluate an existing model:
 
 ```bash
-python train.py \
+uv run python train.py \
   --eval-only \
   --model-path models/final_model \
   --test-dataset data/test_dataset.jsonl
@@ -267,7 +265,7 @@ python train.py \
 If you trained with `run_train_torchrun.sh`, evaluate afterward because the wrapper skips evaluation:
 
 ```bash
-torchrun --nproc_per_node=4 train.py \
+uv run torchrun --nproc_per_node=4 train.py \
   --eval-only \
   --model-path models/final_model \
   --test-dataset data/test_dataset.jsonl
@@ -276,7 +274,7 @@ torchrun --nproc_per_node=4 train.py \
 Inspect result summaries:
 
 ```bash
-python - <<'PY'
+uv run python - <<'PY'
 import glob, json
 for path in sorted(glob.glob("results/eval_*.json")):
     with open(path) as f:
@@ -337,14 +335,14 @@ decompiler = SmartContractDecompiler("models/final_model_378")
 The web app first checks `WEB_MODEL_PATH`, then `models/final_model/`, then auto-discovers the newest `models/final_model*/` directory containing `model_config.json`. You can also pass a path explicitly:
 
 ```bash
-WEB_MODEL_PATH=models/final_model_378 python web/app.py
-python web/app.py --model-path models/final_model_378
+WEB_MODEL_PATH=models/final_model_378 uv run python web/app.py
+uv run python web/app.py --model-path models/final_model_378
 ```
 
 ### Web app
 
 ```bash
-python web/app.py
+uv run python web/app.py
 ```
 
 Open `http://localhost:5000`. If no model artifact can be resolved, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
@@ -353,20 +351,20 @@ Open `http://localhost:5000`. If no model artifact can be resolved, the web app 
 
 ```bash
 # CLI help should load
-python train.py --help
-python download_hf_contracts.py --help
+uv run python train.py --help
+uv run python download_hf_contracts.py --help
 
 # Dataset should exist and have rows
 test -s data/hf_training_dataset.jsonl && wc -l data/hf_training_dataset.jsonl
 
 # GPU visibility
-python - <<'PY'
+uv run python - <<'PY'
 import torch
 print({"cuda": torch.cuda.is_available(), "gpus": torch.cuda.device_count()})
 PY
 
 # solc versions installed through py-solc-x
-python - <<'PY'
+uv run python - <<'PY'
 from solcx import get_installed_solc_versions
 print(get_installed_solc_versions())
 PY
@@ -380,6 +378,6 @@ PY
 | `HF_TOKEN` or model access error | Base model is gated | Set `HF_TOKEN`, request model access, or use `--tiny` for smoke tests |
 | No training pairs generated | Contracts failed parsing/compilation or all pairs were filtered | Check `download_hf_contracts.log`, reduce filters, verify solc install, run with a small `--limit` first |
 | CUDA out of memory | Batch/sequence/model too large | Lower `--batch-size`, lower `--max-seq-length`, use `--small`, or choose a smaller model |
-| Multi-GPU quantization issues | Bare `python train.py` with quantized model across GPUs | Use `run_train_torchrun.sh` or restrict `CUDA_VISIBLE_DEVICES=0` |
+| Multi-GPU quantization issues | Bare single-process `uv run python train.py` with quantized model across GPUs | Use `run_train_torchrun.sh` or restrict `CUDA_VISIBLE_DEVICES=0` |
 | Web app shows TAC only | `models/final_model/` is absent | Train a model or symlink/copy the trained artifact to `models/final_model/` |
 | Evaluation cannot find test data | Split files are absent | Re-run training once with `--skip-collection --dataset ... --skip-eval`, or pass `--test-dataset` explicitly |
