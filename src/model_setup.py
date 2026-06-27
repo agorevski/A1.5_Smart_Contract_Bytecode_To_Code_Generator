@@ -246,6 +246,7 @@ class SmartContractModelTrainer:
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        self.logger = logger
 
         self.tokenizer = None
         self.model = None

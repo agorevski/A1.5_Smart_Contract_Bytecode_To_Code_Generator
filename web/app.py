@@ -10,6 +10,8 @@ import os
 import logging
 import time
 import traceback
+import ipaddress
+import threading
 
 # Add project root to path so we can import src modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -87,6 +89,36 @@ MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 DEFAULT_MODEL_PATH = os.path.join(MODELS_DIR, "final_model")
 TAC_LOOKUP_DB = os.path.join(PROJECT_ROOT, "data", "tac_lookup.db")
 LOG_LEVEL = logging.INFO
+MAX_BYTECODE_HEX_LENGTH = int(
+    os.environ.get("WEB_MAX_BYTECODE_HEX_LENGTH", "200000")
+)
+MAX_CONCURRENT_DECOMPILES = max(
+    1, int(os.environ.get("WEB_MAX_CONCURRENT_DECOMPILES", "1"))
+)
+WEB_API_KEY = os.environ.get("WEB_API_KEY")
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_cors_origins() -> list[str] | str:
+    value = os.environ.get("WEB_CORS_ORIGINS")
+    if not value:
+        return ["http://127.0.0.1:5000", "http://localhost:5000"]
+    if value.strip() == "*":
+        return "*"
+    return [origin.strip() for origin in value.split(",") if origin.strip()]
+
+
+CORS_ORIGINS = _parse_cors_origins()
+ENABLE_REMOTE_SELECTOR_LOOKUP = _parse_bool_env(
+    "WEB_ENABLE_REMOTE_SELECTOR_LOOKUP", False
+)
+DECOMPILE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_DECOMPILES)
 
 # ---------------------------------------------------------------------------
 # App Setup
@@ -101,13 +133,77 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 # Security: limit request payload to 1 MB
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
 
 # Global instances (loaded once at startup)
 decompiler: SmartContractDecompiler = None  # type: ignore[assignment]
 model_config_dict: dict = {}
 tac_lookup: TACLookup = None  # type: ignore[assignment]
 mock_mode: bool = False
+
+
+def _error_response(message: str, status_code: int):
+    return jsonify({"error": message}), status_code
+
+
+def _is_loopback_request() -> bool:
+    remote_addr = request.remote_addr or ""
+    try:
+        return ipaddress.ip_address(remote_addr).is_loopback
+    except ValueError:
+        return remote_addr in {"localhost"}
+
+
+def _require_protected_api_access():
+    """Require API-key auth for non-local heavy API access."""
+    if WEB_API_KEY:
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = auth_header.removeprefix("Bearer ").strip()
+        api_key = request.headers.get("X-API-Key", "")
+        if api_key == WEB_API_KEY or bearer_token == WEB_API_KEY:
+            return None
+        return _error_response("Unauthorized API request.", 401)
+
+    if _is_loopback_request():
+        return None
+
+    return _error_response(
+        "Set WEB_API_KEY to allow non-local API access.", 403
+    )
+
+
+def _normalize_bytecode_from_request(data: dict | None):
+    """Return normalized 0x-prefixed bytecode or a Flask error response."""
+    if not data or "bytecode" not in data:
+        return None, _error_response("Missing 'bytecode' field in request body.", 400)
+
+    raw_bytecode = data["bytecode"]
+    if not isinstance(raw_bytecode, str):
+        return None, _error_response("'bytecode' must be a hexadecimal string.", 400)
+
+    bytecode = raw_bytecode.strip()
+    if not bytecode:
+        return None, _error_response("Bytecode is empty.", 400)
+
+    if not bytecode.startswith("0x"):
+        bytecode = "0x" + bytecode
+
+    hex_body = bytecode[2:]
+    if len(hex_body) > MAX_BYTECODE_HEX_LENGTH:
+        return None, _error_response(
+            f"Bytecode too large. Maximum {MAX_BYTECODE_HEX_LENGTH} hex characters allowed.",
+            400,
+        )
+
+    if (
+        not hex_body
+        or len(hex_body) % 2 != 0
+        or any(c not in "0123456789abcdefABCDEF" for c in hex_body)
+    ):
+        return None, _error_response("Invalid hexadecimal bytecode.", 400)
+
+    return bytecode, None
+
 
 def _is_model_artifact(path: str) -> bool:
     """Return whether a directory looks like a saved model artifact."""
@@ -383,36 +479,19 @@ def api_decompile():
       - ``result``    — final JSON payload (same shape as the old endpoint)
       - ``error``     — if something goes wrong
     """
+    access_error = _require_protected_api_access()
+    if access_error:
+        return access_error
+
     data = request.get_json(silent=True)
-    if not data or "bytecode" not in data:
-        return jsonify({"error": "Missing 'bytecode' field in request body."}), 400
+    bytecode, validation_error = _normalize_bytecode_from_request(data)
+    if validation_error:
+        return validation_error
 
-    raw_bytecode = data["bytecode"]
-    if not isinstance(raw_bytecode, str):
-        return jsonify({"error": "'bytecode' must be a hexadecimal string."}), 400
-
-    bytecode = raw_bytecode.strip()
-    if not bytecode:
-        return jsonify({"error": "Bytecode is empty."}), 400
-
-    # Security: limit bytecode length (max 100 KB of hex = 50 KB of actual bytecode)
-    MAX_BYTECODE_LENGTH = 200_000  # characters of hex
-    if len(bytecode) > MAX_BYTECODE_LENGTH:
-        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
-
-    # Normalise — ensure 0x prefix
-    if not bytecode.startswith("0x"):
-        bytecode = "0x" + bytecode
-
-    # Validate hex bytecode. ``int(..., 16)`` accepts signs/underscores, so
-    # validate the string shape directly.
-    hex_body = bytecode[2:]
-    if (
-        not hex_body
-        or len(hex_body) % 2 != 0
-        or any(c not in "0123456789abcdefABCDEF" for c in hex_body)
-    ):
-        return jsonify({"error": "Invalid hexadecimal bytecode."}), 400
+    if not DECOMPILE_SEMAPHORE.acquire(blocking=False):
+        return _error_response(
+            "Another decompilation is already running. Try again later.", 429
+        )
 
     def _sse(event: str, data: dict) -> str:
         """Format a single SSE message."""
@@ -438,7 +517,7 @@ def api_decompile():
             func_names = list(func_tac_map.keys())
 
             # ---- Resolve function selectors ----
-            resolver = get_resolver(use_remote=True)
+            resolver = get_resolver(use_remote=ENABLE_REMOTE_SELECTOR_LOOKUP)
             selector_results = resolver.resolve_function_names(func_names)
             selector_map = {
                 fname: res.to_dict() for fname, res in selector_results.items()
@@ -785,6 +864,8 @@ def api_decompile():
             logger.error("Decompilation failed: %s", e)
             logger.error(traceback.format_exc())
             yield _sse("error", {"error": f"Decompilation failed: {e}"})
+        finally:
+            DECOMPILE_SEMAPHORE.release()
 
     return Response(
         stream_with_context(generate()),
@@ -812,20 +893,19 @@ def api_health():
 @app.route("/api/vulnerability-scan", methods=["POST"])
 def api_vulnerability_scan():
     """Scan bytecode for vulnerabilities using CFG analysis."""
-    from src.vulnerability_detector import VulnerabilityDetector
+    access_error = _require_protected_api_access()
+    if access_error:
+        return access_error
 
-    data = request.get_json(silent=True) or {}
-    bytecode = data.get("bytecode", "")
+    data = request.get_json(silent=True)
+    bytecode, validation_error = _normalize_bytecode_from_request(data)
+    if validation_error:
+        return validation_error
     contract_address = data.get("contract_address", "")
 
-    if not bytecode:
-        return jsonify({"error": "No bytecode provided"}), 400
-
-    MAX_BYTECODE_LENGTH = 200_000
-    if len(bytecode) > MAX_BYTECODE_LENGTH:
-        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
-
     try:
+        from src.vulnerability_detector import VulnerabilityDetector
+
         detector = VulnerabilityDetector()
         report = detector.scan_from_bytecode(bytecode, contract_address)
         return jsonify({
@@ -854,20 +934,19 @@ def api_vulnerability_scan():
 @app.route("/api/classify", methods=["POST"])
 def api_classify():
     """Classify contract as malicious or legitimate."""
-    from src.malicious_classifier import MaliciousContractClassifier
+    access_error = _require_protected_api_access()
+    if access_error:
+        return access_error
 
-    data = request.get_json(silent=True) or {}
-    bytecode = data.get("bytecode", "")
+    data = request.get_json(silent=True)
+    bytecode, validation_error = _normalize_bytecode_from_request(data)
+    if validation_error:
+        return validation_error
     contract_address = data.get("contract_address", "")
 
-    if not bytecode:
-        return jsonify({"error": "No bytecode provided"}), 400
-
-    MAX_BYTECODE_LENGTH = 200_000
-    if len(bytecode) > MAX_BYTECODE_LENGTH:
-        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
-
     try:
+        from src.malicious_classifier import MaliciousContractClassifier
+
         classifier = MaliciousContractClassifier()
         result = classifier.classify_from_bytecode(bytecode, contract_address)
         return jsonify({
@@ -885,22 +964,21 @@ def api_classify():
 @app.route("/api/audit-report", methods=["POST"])
 def api_audit_report():
     """Generate comprehensive security audit report."""
-    from src.vulnerability_detector import VulnerabilityDetector
-    from src.malicious_classifier import MaliciousContractClassifier
-    from src.audit_report import AuditReportGenerator
+    access_error = _require_protected_api_access()
+    if access_error:
+        return access_error
 
-    data = request.get_json(silent=True) or {}
-    bytecode = data.get("bytecode", "")
+    data = request.get_json(silent=True)
+    bytecode, validation_error = _normalize_bytecode_from_request(data)
+    if validation_error:
+        return validation_error
     contract_address = data.get("contract_address", "")
 
-    if not bytecode:
-        return jsonify({"error": "No bytecode provided"}), 400
-
-    MAX_BYTECODE_LENGTH = 200_000
-    if len(bytecode) > MAX_BYTECODE_LENGTH:
-        return jsonify({"error": f"Bytecode too large. Maximum {MAX_BYTECODE_LENGTH} hex characters allowed."}), 400
-
     try:
+        from src.vulnerability_detector import VulnerabilityDetector
+        from src.malicious_classifier import MaliciousContractClassifier
+        from src.audit_report import AuditReportGenerator
+
         detector = VulnerabilityDetector()
         classifier = MaliciousContractClassifier()
         generator = AuditReportGenerator(
@@ -944,9 +1022,24 @@ if __name__ == "__main__":
             "models/final_model, or the newest models/final_model* artifact."
         ),
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument(
+        "--remote-selector-lookup",
+        action="store_true",
+        help=(
+            "Allow web decompile requests to resolve unknown selectors via "
+            "4byte.directory. Disabled by default; WEB_ENABLE_REMOTE_SELECTOR_LOOKUP "
+            "can also enable it."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("WEB_HOST", "127.0.0.1"),
+        help="Bind address. Defaults to WEB_HOST or 127.0.0.1.",
+    )
     parser.add_argument("--port", type=int, default=5000, help="Port number")
     parser.add_argument("--debug", action="store_true", help="Flask debug mode")
     args = parser.parse_args()
+    if args.remote_selector_lookup:
+        ENABLE_REMOTE_SELECTOR_LOOKUP = True
     load_model(use_mock=args.mockmodel, model_path=args.model_path)
     app.run(host=args.host, port=args.port, debug=args.debug)
