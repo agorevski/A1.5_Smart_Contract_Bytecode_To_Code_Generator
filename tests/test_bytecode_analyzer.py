@@ -227,6 +227,12 @@ class TestControlFlowAnalysis:
             assert 'is_dead_code' in block.metadata
             assert block.metadata['is_reachable'] != block.metadata['is_dead_code']
 
+    def test_unreachable_predecessorless_block_is_dead(self):
+        analyzer = BytecodeAnalyzer("0x005b00")  # STOP; JUMPDEST; STOP
+        blocks = analyzer.analyze_control_flow()
+        assert blocks["block_0000"].metadata["is_reachable"] is True
+        assert blocks["block_0001"].metadata["is_dead_code"] is True
+
     def test_dominance_computed(self):
         analyzer = BytecodeAnalyzer(SAMPLE_OWNER_BYTECODE)
         blocks = analyzer.analyze_control_flow()
@@ -283,6 +289,26 @@ class TestFunctionIdentification:
             assert isinstance(func.parameters, list)
             assert isinstance(func.return_types, list)
 
+    def test_constant_compare_does_not_create_public_selector(self):
+        analyzer = BytecodeAnalyzer("0x63deadbeef63deadbeef14600f57005b00")
+        analyzer.analyze_control_flow()
+        functions = analyzer.identify_functions()
+        assert all(func.selector != "0xdeadbeef" for func in functions.values())
+
+    def test_shr_dispatcher_identifies_selector(self):
+        analyzer = BytecodeAnalyzer("0x60003560e01c806312345678146010575b00")
+        analyzer.analyze_control_flow()
+        functions = analyzer.identify_functions()
+        assert "function_0x12345678" in functions
+
+    def test_legacy_div_dispatcher_identifies_selector(self):
+        divisor = "01" + ("00" * 28)
+        bytecode = "0x6000357c" + divisor + "0480631234567814602c575b00"
+        analyzer = BytecodeAnalyzer(bytecode)
+        analyzer.analyze_control_flow()
+        functions = analyzer.identify_functions()
+        assert "function_0x12345678" in functions
+
 
 # ---------------------------------------------------------------------------
 # 7. TAC Conversion Tests – Individual Opcodes
@@ -308,6 +334,14 @@ class TestTACConversion:
         assert tac.operation == TACOperationType.ASSIGN
         assert tac.operand1 == "0x42"
         assert len(stack) == 1
+
+    def test_push0_emits_zero_constant(self):
+        analyzer = BytecodeAnalyzer("0x5f00")
+        tac = analyzer.convert_to_tac()
+        assert tac[0].operation == TACOperationType.ASSIGN
+        assert tac[0].operand1 == "0"
+        assert tac[0].metadata["original_op"] == "PUSH0"
+        assert all(t.metadata.get("original_op") != "UNKNOWN_0x5f" for t in tac if t.metadata)
 
     # --- POP ---
     def test_pop(self):
@@ -359,6 +393,8 @@ class TestTACConversion:
     def test_sub(self):
         tac, _ = self._convert_single("SUB", stack=["a", "b"])
         assert tac.operator == "-"
+        assert tac.operand1 == "a"
+        assert tac.operand2 == "b"
 
     def test_mul(self):
         tac, _ = self._convert_single("MUL", stack=["a", "b"])
@@ -430,7 +466,7 @@ class TestTACConversion:
     def test_binary_op_underflow(self):
         tac, stack = self._convert_single("ADD", stack=["a"])
         assert tac.operand1 == "stack_underflow" or tac.operand2 == "stack_underflow"
-        assert len(stack) == 2  # original "a" stays + result pushed (underflow path)
+        assert len(stack) == 1
 
     # --- Unary ops ---
     def test_iszero(self):
@@ -448,12 +484,31 @@ class TestTACConversion:
         tac, stack = self._convert_single("ADDMOD", stack=["a", "b", "c"])
         assert tac.operation == TACOperationType.BINARY_OP
         assert "addmod" in tac.operand1
+        assert tac.operand1 == "addmod(a, b, c)"
         assert len(stack) == 1  # 3 popped, 1 pushed
 
     def test_mulmod(self):
         tac, stack = self._convert_single("MULMOD", stack=["a", "b", "c"])
         assert "mulmod" in tac.operand1
+        assert tac.operand1 == "mulmod(a, b, c)"
         assert len(stack) == 1
+
+    @pytest.mark.parametrize(
+        "opcode, operator",
+        [
+            ("03", "-"),
+            ("04", "/"),
+            ("10", "<"),
+            ("11", ">"),
+            ("1b", "<<"),
+            ("1c", ">>"),
+        ],
+    )
+    def test_non_commutative_bytecode_operand_order(self, opcode, operator):
+        analyzer = BytecodeAnalyzer("0x60056002" + opcode + "00")
+        tac = analyzer.convert_to_tac()
+        formatted = [analyzer._format_tac_instruction(t) for t in tac]
+        assert f"temp_3 = temp_1 {operator} temp_2" in formatted
 
     # --- Memory ops ---
     def test_mload(self):
@@ -484,6 +539,20 @@ class TestTACConversion:
         assert tac.operation == TACOperationType.STORE
         assert tac.metadata['memory_type'] == 'storage'
         assert len(stack) == 0
+
+    def test_transient_storage_opcodes(self):
+        load_tac = BytecodeAnalyzer("0x60015c00").convert_to_tac()
+        assert load_tac[1].operation == TACOperationType.LOAD
+        assert load_tac[1].metadata["original_op"] == "TLOAD"
+        assert load_tac[1].metadata["memory_type"] == "transient_storage"
+
+        store_tac = BytecodeAnalyzer("0x600260015d00").convert_to_tac()
+        assert store_tac[2].operation == TACOperationType.STORE
+        assert store_tac[2].metadata["original_op"] == "TSTORE"
+        assert "stack_underflow" not in {
+            store_tac[2].operand1,
+            store_tac[2].operand2,
+        }
 
     # --- SHA3 / KECCAK256 ---
     def test_sha3(self):
@@ -517,6 +586,12 @@ class TestTACConversion:
         tac, _ = self._convert_single("RETURNDATACOPY", stack=["d", "s", "l"])
         assert tac.operation == TACOperationType.STORE
 
+    def test_mcopy_opcode(self):
+        tac = BytecodeAnalyzer("0x6003600260015e00").convert_to_tac()
+        assert tac[3].operation == TACOperationType.STORE
+        assert tac[3].metadata["original_op"] == "MCOPY"
+        assert "stack_underflow" not in tac[3].operand2
+
     def test_extcodecopy(self):
         tac, stack = self._convert_single("EXTCODECOPY", stack=["a", "d", "s", "l"])
         assert tac.operation == TACOperationType.STORE
@@ -544,6 +619,16 @@ class TestTACConversion:
     def test_gas(self):
         tac, _ = self._convert_single("GAS")
         assert tac.operand1 == "gas"
+
+    def test_blob_opcodes(self):
+        blobhash_tac = BytecodeAnalyzer("0x60014900").convert_to_tac()
+        assert blobhash_tac[1].operation == TACOperationType.UNARY_OP
+        assert blobhash_tac[1].metadata["original_op"] == "BLOBHASH"
+
+        blobbasefee_tac = BytecodeAnalyzer("0x4a00").convert_to_tac()
+        assert blobbasefee_tac[0].operation == TACOperationType.ASSIGN
+        assert blobbasefee_tac[0].operand1 == "blobbasefee"
+        assert blobbasefee_tac[0].metadata["original_op"] == "BLOBBASEFEE"
 
     # --- 1-pop, 1-push environment ---
     def test_balance(self):
@@ -585,6 +670,40 @@ class TestTACConversion:
         tac, stack = self._convert_single("REVERT", stack=["off", "sz"])
         assert tac.operation == TACOperationType.REVERT
         assert len(stack) == 0
+
+    @pytest.mark.parametrize(
+        "operand",
+        [
+            "cf479181",
+            "0xcf479181",
+            0xCF479181,
+            "00000000000000000000000000000000000000000000000000000000cf479181",
+            "cf47918100000000000000000000000000000000000000000000000000000000",
+        ],
+    )
+    def test_custom_error_decode_operand_variants(self, operand):
+        class ErrorInfo:
+            name = "InsufficientBalance"
+            selector = "0xcf479181"
+            input_types = ["uint256", "uint256"]
+            input_names = ["required", "available"]
+
+        class Enricher:
+            errors = {"0xcf479181": ErrorInfo()}
+
+            def get_error(self, selector):
+                return self.errors.get(selector)
+
+        analyzer = BytecodeAnalyzer(MINIMAL_BYTECODE, abi_enricher=Enricher())
+        analyzer.instructions = [
+            {"name": "PUSH4", "operand": operand, "pc": 0},
+            {"name": "MSTORE", "pc": 1},
+            {"name": "REVERT", "pc": 2},
+        ]
+        analyzer._pc_to_index = {0: 0, 1: 1, 2: 2}
+        decoded = analyzer._decode_revert_data(analyzer.instructions[-1], [])
+        assert decoded["type"] == "CustomError"
+        assert decoded["name"] == "InsufficientBalance"
 
     # --- STOP / SELFDESTRUCT / INVALID ---
     def test_stop(self):
@@ -651,12 +770,13 @@ class TestTACConversion:
         assert len(stack) == 0
 
     # --- Fallback / unknown opcode ---
-    def test_unknown_opcode_pushes_temp(self):
-        """Completely unknown opcodes should still produce a temp var on stack."""
+    def test_unknown_opcode_preserves_stack(self):
+        """Completely unknown opcodes should not invent a stack push."""
         tac, stack = self._convert_single("SOME_FUTURE_OP")
         assert tac is not None
         assert tac.metadata.get('unhandled') is True
-        assert len(stack) == 1
+        assert tac.operation == TACOperationType.NOP
+        assert len(stack) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1002,19 @@ class TestEndToEnd:
         for block in analyzer.basic_blocks.values():
             assert 'block_type' in block.metadata
             assert block.metadata['block_type'] in ('exit', 'sequential', 'conditional', 'complex')
+
+    def test_stack_propagates_across_jump_blocks(self):
+        analyzer = BytecodeAnalyzer("0x60056005565b60020300")
+        output = analyzer.generate_tac_representation()
+        assert "stack_underflow - stack_underflow" not in output
+        assert "temp_4 = temp_1 - temp_3" in output
+
+    def test_stack_merge_uses_phi_for_conflicting_predecessors(self):
+        bytecode = "0x600a6001600e57506002600e56005b60010100"
+        analyzer = BytecodeAnalyzer(bytecode)
+        output = analyzer.generate_tac_representation()
+        assert "stack_underflow" not in output
+        assert "phi_block_000e_0" in output
 
 
 # ---------------------------------------------------------------------------

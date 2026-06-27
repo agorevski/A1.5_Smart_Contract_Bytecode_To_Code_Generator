@@ -92,6 +92,15 @@ class Function:
 # Module-Level Constants
 # ---------------------------------------------------------------------------
 
+_RAW_OPCODE_NAMES: Dict[int, str] = {
+    0x49: "BLOBHASH",
+    0x4A: "BLOBBASEFEE",
+    0x5C: "TLOAD",
+    0x5D: "TSTORE",
+    0x5E: "MCOPY",
+    0x5F: "PUSH0",
+}
+
 # EVM opcode stack effects: (pops, pushes) for opcodes handled by the
 # generic fallback in the stack simulator and TAC converter.
 _EVM_STACK_EFFECTS: Dict[str, Tuple[int, int]] = {
@@ -101,17 +110,19 @@ _EVM_STACK_EFFECTS: Dict[str, Tuple[int, int]] = {
     "GASPRICE": (0, 1), "RETURNDATASIZE": (0, 1), "COINBASE": (0, 1),
     "TIMESTAMP": (0, 1), "NUMBER": (0, 1), "DIFFICULTY": (0, 1),
     "PREVRANDAO": (0, 1), "GASLIMIT": (0, 1), "CHAINID": (0, 1),
-    "SELFBALANCE": (0, 1), "BASEFEE": (0, 1), "GAS": (0, 1),
+    "SELFBALANCE": (0, 1), "BASEFEE": (0, 1), "BLOBBASEFEE": (0, 1), "GAS": (0, 1),
     "PC": (0, 1), "MSIZE": (0, 1),
     # 1-pop, 1-push
     "BALANCE": (1, 1), "EXTCODESIZE": (1, 1), "EXTCODEHASH": (1, 1),
-    "BLOCKHASH": (1, 1), "CALLDATALOAD": (1, 1),
+    "BLOCKHASH": (1, 1), "CALLDATALOAD": (1, 1), "BLOBHASH": (1, 1),
+    "TLOAD": (1, 1),
     # 1-pop, 0-push
     "POP": (1, 0),
     # 2-pop, 0-push
-    "MSTORE8": (2, 0),
+    "MSTORE8": (2, 0), "TSTORE": (2, 0),
     # 3-pop, 0-push
     "CALLDATACOPY": (3, 0), "CODECOPY": (3, 0), "RETURNDATACOPY": (3, 0),
+    "MCOPY": (3, 0),
     # 4-pop, 0-push
     "EXTCODECOPY": (4, 0),
     # CALL variants
@@ -143,7 +154,7 @@ _ENV_OPS: frozenset = frozenset({
     "ADDRESS", "ORIGIN", "CALLER", "CALLVALUE", "CALLDATASIZE",
     "CODESIZE", "GASPRICE", "RETURNDATASIZE", "COINBASE",
     "TIMESTAMP", "NUMBER", "DIFFICULTY", "PREVRANDAO",
-    "GASLIMIT", "CHAINID", "SELFBALANCE", "BASEFEE",
+    "GASLIMIT", "CHAINID", "SELFBALANCE", "BASEFEE", "BLOBBASEFEE",
     "GAS", "PC", "MSIZE",
 })
 
@@ -161,6 +172,48 @@ _TERMINATING_OPS: frozenset = frozenset({
 def _stack_pop(stack: List[str]) -> str:
     """Pop from *stack*, returning ``"stack_underflow"`` if empty."""
     return stack.pop() if stack else "stack_underflow"
+
+
+def _opcode_as_int(instr: Any) -> Optional[int]:
+    """Return a raw opcode byte for dict or evmdasm instructions when available."""
+    raw = instr.get("opcode") if isinstance(instr, dict) else getattr(instr, "opcode", None)
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, bytes):
+        return int.from_bytes(raw, byteorder="big")
+    try:
+        return int(str(raw), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_opcode_name(name: Any, instr: Any = None) -> str:
+    """Normalize disassembler-specific names for opcodes added after older forks."""
+    text = str(name or "UNKNOWN").upper()
+    opcode = _opcode_as_int(instr) if instr is not None else None
+    if opcode in _RAW_OPCODE_NAMES:
+        return _RAW_OPCODE_NAMES[opcode]
+    if text.startswith("UNKNOWN_0X"):
+        try:
+            raw = int(text.rsplit("0X", 1)[1], 16)
+        except ValueError:
+            return text
+        return _RAW_OPCODE_NAMES.get(raw, text)
+    return text
+
+
+def _normalize_hex_operand(operand: Any) -> Optional[str]:
+    """Return lowercase hexadecimal text without ``0x`` prefixes."""
+    if operand is None:
+        return None
+    if isinstance(operand, int):
+        return format(operand, "x")
+    text = str(operand).strip().lower()
+    while text.startswith("0x"):
+        text = text[2:]
+    return "".join(ch for ch in text if ch in "0123456789abcdef")
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +277,13 @@ class BytecodeAnalyzer:
     def _get_instruction_name(instr: Any) -> str:
         """Return the mnemonic name of *instr*."""
         if isinstance(instr, dict):
-            return instr.get("name", "UNKNOWN")
+            return _normalize_opcode_name(instr.get("name", "UNKNOWN"), instr)
         if hasattr(instr, "name"):
-            return instr.name
+            return _normalize_opcode_name(instr.name, instr)
         if hasattr(instr, "opcode"):
-            return instr.opcode.name if hasattr(instr.opcode, "name") else str(instr.opcode)
-        return str(instr)
+            raw = instr.opcode.name if hasattr(instr.opcode, "name") else str(instr.opcode)
+            return _normalize_opcode_name(raw, instr)
+        return _normalize_opcode_name(str(instr), instr)
 
     @staticmethod
     def _get_pc(instr: Any, fallback: int) -> int:
@@ -370,7 +424,7 @@ class BytecodeAnalyzer:
             pass
 
     def _filter_jump_targets(self, targets: set) -> set:
-        """Keep only the entry point and valid JUMPDEST locations."""
+        """Keep valid jump destinations and basic-block fall-through starts."""
         if not self.instructions:
             return set()
         first_pc = self._get_pc(self.instructions[0], 0)
@@ -379,7 +433,11 @@ class BytecodeAnalyzer:
             for i, instr in enumerate(self.instructions)
             if self._get_instruction_name(instr) == "JUMPDEST"
         }
-        return {t for t in targets if t == first_pc or t in valid}
+        block_starts = {first_pc}
+        for i, instr in enumerate(self.instructions[:-1]):
+            if self._get_instruction_name(instr) in _TERMINATING_OPS:
+                block_starts.add(self._get_pc(self.instructions[i + 1], i + 1))
+        return {t for t in targets if t in valid or t in block_starts}
 
     def _resolve_jump_targets(self, jump_idx: int, stack_sim: Any) -> set:
         """Resolve targets for a JUMP/JUMPI by inspecting the preceding PUSH."""
@@ -635,11 +693,11 @@ class BytecodeAnalyzer:
 
     @staticmethod
     def _entry_blocks(blocks: Dict[str, BasicBlock]) -> List[str]:
-        """Return entry-block IDs (no predecessors), with a fallback."""
-        entries = [bid for bid, b in blocks.items() if not b.predecessors]
-        if not entries and blocks:
-            entries = [next(iter(blocks))]
-        return entries
+        """Return the bytecode entry block only."""
+        if not blocks:
+            return []
+        entry = min(blocks.values(), key=lambda b: b.start_address)
+        return [entry.id]
 
     # ------------------------------------------------------------------ #
     #  Fallback (error recovery)
@@ -670,21 +728,9 @@ class BytecodeAnalyzer:
         functions: Dict[str, Function] = {}
         logger.info("Identifying functions from bytecode dispatcher")
 
-        for i, instr in enumerate(self.instructions):
-            if self._get_instruction_name(instr) != "PUSH4":
-                continue
-
-            selector_val = self._get_operand(instr)
-            if not selector_val:
-                continue
-
-            selector = self._normalize_selector(selector_val)
-            if selector is None:
-                continue
-
-            jump_target = self._find_dispatch_target(i)
-            if jump_target is None:
-                continue
+        for pattern in self._find_dispatcher_patterns():
+            selector = pattern["selector"]
+            jump_target = pattern["target"]
 
             fname = f"function_{selector}"
             entry = self._block_at_address(jump_target) or f"block_{jump_target:04x}"
@@ -771,22 +817,12 @@ class BytecodeAnalyzer:
         path is the fallback function. We find the last dispatcher entry and
         take the fall-through block after its JUMPI.
         """
-        last_jumpi_pc = None
-        # Find the last PUSH4 ... EQ ... JUMPI in the dispatcher area
-        for i, instr in enumerate(self.instructions):
-            if self._get_instruction_name(instr) != "PUSH4":
-                continue
-            # Check this is a dispatcher pattern
-            target = self._find_dispatch_target(i)
-            if target is not None:
-                # Find the JUMPI in this pattern
-                for j in range(i + 1, min(i + 10, len(self.instructions))):
-                    if self._get_instruction_name(self.instructions[j]) == "JUMPI":
-                        last_jumpi_pc = self._get_pc(self.instructions[j], j)
-                        break
-
-        if last_jumpi_pc is None:
+        patterns = self._find_dispatcher_patterns()
+        if not patterns:
             return None
+
+        last_jumpi_idx = patterns[-1]["jumpi_idx"]
+        last_jumpi_pc = self._get_pc(self.instructions[last_jumpi_idx], last_jumpi_idx)
 
         # The fall-through from the last dispatcher JUMPI is the fallback
         ft = self._get_next_instruction_pc(last_jumpi_pc)
@@ -880,6 +916,167 @@ class BytecodeAnalyzer:
             sel = "0x" + format(int(raw), "08x")
         return sel if len(sel) == 10 else None
 
+    def _find_dispatcher_patterns(self) -> List[Dict[str, Any]]:
+        """Find selector comparisons fed by calldata selector extraction."""
+        patterns: List[Dict[str, Any]] = []
+        stack: List[Any] = []
+        max_scan = min(len(self.instructions), 256)
+
+        def pop() -> Any:
+            return stack.pop() if stack else ("unknown",)
+
+        def push_unknown() -> None:
+            stack.append(("unknown",))
+
+        def const_value(sym: Any) -> Optional[int]:
+            if isinstance(sym, tuple) and len(sym) >= 2 and sym[0] == "const":
+                return sym[1]
+            return None
+
+        def is_selector(sym: Any) -> bool:
+            return sym == ("selector",)
+
+        def selector_comparison(left: Any, right: Any) -> Optional[Tuple[str, int]]:
+            for selector_sym, const_sym in ((left, right), (right, left)):
+                value = const_value(const_sym)
+                if is_selector(selector_sym) and value is not None and 0 <= value <= 0xFFFFFFFF:
+                    selector = self._normalize_selector(value)
+                    if selector is not None:
+                        push_idx = const_sym[2] if len(const_sym) > 2 else -1
+                        return selector, push_idx
+            return None
+
+        def is_selector_divisor(value: Optional[int]) -> bool:
+            return value == (1 << 224)
+
+        for i in range(max_scan):
+            instr = self.instructions[i]
+            name = self._get_instruction_name(instr)
+
+            if patterns and name == "JUMPDEST":
+                break
+
+            if name == "JUMPDEST":
+                continue
+
+            if name == "PUSH0":
+                stack.append(("const", 0, i))
+                continue
+
+            if name.startswith("PUSH"):
+                value = self._parse_operand_as_int(self._get_operand(instr))
+                stack.append(("const", value, i) if value is not None else ("unknown",))
+                continue
+
+            if name == "POP":
+                pop()
+                continue
+
+            if name.startswith("DUP"):
+                try:
+                    depth = int(name[3:]) if len(name) > 3 else 1
+                except ValueError:
+                    depth = 1
+                stack.append(stack[-depth] if len(stack) >= depth else ("unknown",))
+                continue
+
+            if name.startswith("SWAP"):
+                try:
+                    depth = int(name[4:]) if len(name) > 4 else 1
+                except ValueError:
+                    depth = 1
+                if len(stack) > depth:
+                    stack[-1], stack[-1 - depth] = stack[-1 - depth], stack[-1]
+                continue
+
+            if name == "CALLDATASIZE":
+                stack.append(("calldatasize",))
+                continue
+
+            if name == "CALLDATALOAD":
+                offset = const_value(pop())
+                stack.append(("calldata_word_0",) if offset == 0 else ("unknown",))
+                continue
+
+            if name == "SHR":
+                shift = const_value(pop())
+                value = pop()
+                stack.append(("selector",) if value == ("calldata_word_0",) and shift == 224 else ("unknown",))
+                continue
+
+            if name == "DIV":
+                divisor = const_value(pop())
+                value = pop()
+                stack.append(("selector",) if value == ("calldata_word_0",) and is_selector_divisor(divisor) else ("unknown",))
+                continue
+
+            if name == "AND":
+                right = pop()
+                left = pop()
+                right_const = const_value(right)
+                left_const = const_value(left)
+                if (is_selector(left) and right_const == 0xFFFFFFFF) or (
+                    is_selector(right) and left_const == 0xFFFFFFFF
+                ):
+                    stack.append(("selector",))
+                else:
+                    push_unknown()
+                continue
+
+            if name == "EQ":
+                right = pop()
+                left = pop()
+                comparison = selector_comparison(left, right)
+                stack.append(("selector_eq", comparison[0], comparison[1]) if comparison else ("unknown",))
+                continue
+
+            if name == "JUMPI":
+                target = const_value(pop())
+                cond = pop()
+                if (
+                    target is not None
+                    and isinstance(cond, tuple)
+                    and len(cond) >= 3
+                    and cond[0] == "selector_eq"
+                ):
+                    patterns.append(
+                        {
+                            "selector": cond[1],
+                            "target": target,
+                            "push4_idx": cond[2],
+                            "jumpi_idx": i,
+                        }
+                    )
+                continue
+
+            if name == "JUMP":
+                pop()
+                if patterns:
+                    break
+                continue
+
+            if name in ("STOP", "RETURN", "REVERT", "INVALID", "SELFDESTRUCT"):
+                if patterns:
+                    break
+                effects = _EVM_STACK_EFFECTS.get(name, (0, 0))
+            elif name in _BINARY_OPS:
+                effects = (2, 1)
+            elif name in ("ADDMOD", "MULMOD"):
+                effects = (3, 1)
+            else:
+                effects = _EVM_STACK_EFFECTS.get(name)
+
+            if effects is None:
+                push_unknown()
+                continue
+            pops, pushes = effects
+            for _ in range(pops):
+                pop()
+            for _ in range(pushes):
+                push_unknown()
+
+        return patterns
+
     def _find_dispatch_target(self, push4_idx: int) -> Optional[int]:
         """Walk ahead from *push4_idx* looking for ``EQ … PUSH<n> <target> JUMPI``."""
         for j in range(push4_idx + 1, min(push4_idx + 10, len(self.instructions))):
@@ -937,7 +1134,7 @@ class BytecodeAnalyzer:
         if name.startswith("PUSH"):
             tmp = self._generate_temp_var()
             stack.append(tmp)
-            operand = self._get_operand(instr)
+            operand = "0" if name == "PUSH0" else self._get_operand(instr)
             return TACInstruction(
                 TACOperationType.ASSIGN, result=tmp,
                 operand1=str(operand) if operand is not None else "unknown",
@@ -969,27 +1166,27 @@ class BytecodeAnalyzer:
 
         # -- Binary ops --
         if name in _BINARY_OPS:
-            if len(stack) >= 2:
-                a, b = stack.pop(), stack.pop()
-            else:
-                a, b = "stack_underflow", "stack_underflow"
+            right = _stack_pop(stack)
+            left = _stack_pop(stack)
             tmp = self._generate_temp_var()
             stack.append(tmp)
             return TACInstruction(
                 TACOperationType.BINARY_OP, result=tmp,
-                operand1=a, operand2=b, operator=_BINARY_OPS[name],
+                operand1=left, operand2=right, operator=_BINARY_OPS[name],
                 metadata={"original_op": name},
             )
 
         # -- Ternary: ADDMOD / MULMOD --
         if name in ("ADDMOD", "MULMOD"):
             sym = "addmod" if name == "ADDMOD" else "mulmod"
-            a, b, n = _stack_pop(stack), _stack_pop(stack), _stack_pop(stack)
+            modulus = _stack_pop(stack)
+            right = _stack_pop(stack)
+            left = _stack_pop(stack)
             tmp = self._generate_temp_var()
             stack.append(tmp)
             return TACInstruction(
                 TACOperationType.BINARY_OP, result=tmp,
-                operand1=f"{sym}({a}, {b}, {n})",
+                operand1=f"{sym}({left}, {right}, {modulus})",
                 metadata={"original_op": name},
             )
 
@@ -1034,6 +1231,22 @@ class BytecodeAnalyzer:
                 metadata={"memory_type": "storage", "original_op": name},
             )
 
+        # -- Transient storage: TLOAD / TSTORE --
+        if name == "TLOAD":
+            key = _stack_pop(stack)
+            tmp = self._generate_temp_var()
+            stack.append(tmp)
+            return TACInstruction(
+                TACOperationType.LOAD, result=tmp, operand1=key,
+                metadata={"memory_type": "transient_storage", "original_op": name},
+            )
+        if name == "TSTORE":
+            key, val = _stack_pop(stack), _stack_pop(stack)
+            return TACInstruction(
+                TACOperationType.STORE, operand1=key, operand2=val,
+                metadata={"memory_type": "transient_storage", "original_op": name},
+            )
+
         # -- SHA3 / KECCAK256 --
         if name in ("SHA3", "KECCAK256"):
             off, sz = _stack_pop(stack), _stack_pop(stack)
@@ -1065,6 +1278,15 @@ class BytecodeAnalyzer:
                 metadata={"memory_type": "copy", "original_op": name},
             )
 
+        # -- Memory-to-memory copy (EIP-5656) --
+        if name == "MCOPY":
+            dst, src, length = _stack_pop(stack), _stack_pop(stack), _stack_pop(stack)
+            return TACInstruction(
+                TACOperationType.STORE, operand1=dst,
+                operand2=f"memory[{src}:{length}]",
+                metadata={"memory_type": "memory", "original_op": name},
+            )
+
         # -- EXTCODECOPY (4-pop, 0-push) --
         if name == "EXTCODECOPY":
             addr, dst, src, length = (
@@ -1087,7 +1309,7 @@ class BytecodeAnalyzer:
             )
 
         # -- 1-pop, 1-push environment --
-        if name in ("BALANCE", "EXTCODESIZE", "EXTCODEHASH", "BLOCKHASH"):
+        if name in ("BALANCE", "EXTCODESIZE", "EXTCODEHASH", "BLOCKHASH", "BLOBHASH"):
             return self._tac_unary(stack, name.lower(), name)
 
         # -- JUMP --
@@ -1250,11 +1472,10 @@ class BytecodeAnalyzer:
             if operand is None:
                 continue
             # Normalize operand to lowercase hex (no 0x prefix).
-            # evmdasm may return int, hex-string, or bare hex.
-            if isinstance(operand, int):
-                operand_str = format(operand, "x")
-            else:
-                operand_str = str(operand).lower().replace("0x", "")
+            # evmdasm may return int, hex-string, bare hex, or prefixed forms.
+            operand_str = _normalize_hex_operand(operand)
+            if not operand_str:
+                continue
 
             # Check for Error(string) selector: 08c379a0
             if "08c379a0" in operand_str:
@@ -1274,8 +1495,8 @@ class BytecodeAnalyzer:
                 return {"type": "Panic", "message": "Panic(uint256)"}
 
             # Check for custom error selectors (4 bytes = 8 hex chars)
-            if len(operand_str) == 8 and self.abi_enricher is not None:
-                error_info = self.abi_enricher.get_error("0x" + operand_str)
+            if self.abi_enricher is not None:
+                error_info = self._lookup_custom_error(operand_str)
                 if error_info is not None:
                     params = ", ".join(
                         f"{t} {n}"
@@ -1288,6 +1509,46 @@ class BytecodeAnalyzer:
                     }
 
         return None
+
+    def _lookup_custom_error(self, operand_hex: str) -> Optional[Any]:
+        """Find an ABI custom error whose selector appears in *operand_hex*."""
+        candidates = self._selector_candidates_from_operand(operand_hex)
+        if not candidates or self.abi_enricher is None:
+            return None
+
+        get_error = getattr(self.abi_enricher, "get_error", None)
+        if callable(get_error):
+            for selector in candidates:
+                for key in (f"0x{selector}", f"0x0x{selector}"):
+                    error_info = get_error(key)
+                    if error_info is not None:
+                        return error_info
+
+        for error_info in getattr(self.abi_enricher, "errors", {}).values():
+            selector = _normalize_hex_operand(getattr(error_info, "selector", None))
+            if selector and selector[-8:] in candidates:
+                return error_info
+
+        return None
+
+    @staticmethod
+    def _selector_candidates_from_operand(operand_hex: str) -> List[str]:
+        """Return likely 4-byte selector candidates from normalized operand hex."""
+        text = operand_hex.lower()
+        if len(text) < 8:
+            text = text.zfill(8)
+
+        candidates: List[str] = []
+        for candidate in (text, text[:8], text[-8:]):
+            if len(candidate) == 8 and candidate not in candidates:
+                candidates.append(candidate)
+
+        if len(text) > 8:
+            for i in range(0, len(text) - 7, 2):
+                candidate = text[i:i + 8]
+                if candidate not in candidates:
+                    candidates.append(candidate)
+        return candidates
 
     def _find_panic_code(self, selector_idx: int, revert_idx: int) -> Optional[int]:
         """Search between *selector_idx* and *revert_idx* for a small PUSH value
@@ -1328,12 +1589,11 @@ class BytecodeAnalyzer:
                 TACOperationType.ASSIGN, result=result_var,
                 metadata={"original_op": name, "unhandled": True},
             )
-        # Totally unknown — push one temp
-        result_var = self._generate_temp_var()
-        stack.append(result_var)
+        # Totally unknown — preserve the stack because the effect is unknown.
         return TACInstruction(
-            TACOperationType.ASSIGN, result=result_var,
+            TACOperationType.NOP,
             metadata={"original_op": name, "unhandled": True,
+                       "unknown_stack_effect": True,
                        "operand": getattr(instr, "operand", None)},
         )
 
@@ -1351,9 +1611,13 @@ class BytecodeAnalyzer:
         def process_instruction(self, instr: Any, index: int) -> None:
             name = self._get_name(instr)
 
-            if name.startswith("PUSH"):
+            if name == "PUSH0":
+                self.stack.append(0)
+                self.stack_values[index] = 0
+
+            elif name.startswith("PUSH"):
                 try:
-                    operand = getattr(instr, "operand", None)
+                    operand = instr.get("operand") if isinstance(instr, dict) else getattr(instr, "operand", None)
                     if operand is not None:
                         val = int(operand, 16) if isinstance(operand, str) else int(operand)
                         self.stack.append(val)
@@ -1408,11 +1672,14 @@ class BytecodeAnalyzer:
 
         @staticmethod
         def _get_name(instr: Any) -> str:
+            if isinstance(instr, dict):
+                return _normalize_opcode_name(instr.get("name", "UNKNOWN"), instr)
             if hasattr(instr, "name"):
-                return instr.name
+                return _normalize_opcode_name(instr.name, instr)
             if hasattr(instr, "opcode"):
-                return instr.opcode.name if hasattr(instr.opcode, "name") else str(instr.opcode)
-            return str(instr)
+                raw = instr.opcode.name if hasattr(instr.opcode, "name") else str(instr.opcode)
+                return _normalize_opcode_name(raw, instr)
+            return _normalize_opcode_name(str(instr), instr)
 
     # ------------------------------------------------------------------ #
     #  Per-Function TAC Generation
@@ -1515,9 +1782,13 @@ class BytecodeAnalyzer:
 
     def _convert_and_integrate_tac(self) -> None:
         """Convert raw instructions in each block to TAC and attach metadata."""
-        for bid, block in self.basic_blocks.items():
+        entry_heights = self._compute_block_entry_stack_heights()
+        exit_stacks: Dict[str, List[str]] = {}
+        actual_entries = set(self._entry_blocks(self.basic_blocks))
+
+        for bid, block in sorted(self.basic_blocks.items(), key=lambda item: item[1].start_address):
             tac_list: List[TACInstruction] = []
-            stack: List[str] = []
+            stack = self._entry_stack_for_block(bid, block, exit_stacks, entry_heights, actual_entries)
 
             for instr in block.metadata.get("raw_instructions", []):
                 result = self._convert_instruction_to_tac(instr, stack)
@@ -1534,6 +1805,163 @@ class BytecodeAnalyzer:
 
             block.instructions = tac_list
             self._add_control_flow_metadata_to_block(block)
+            block.metadata["is_entry_block"] = bid in actual_entries
+            exit_stacks[bid] = list(stack)
+
+    def _compute_block_entry_stack_heights(self) -> Dict[str, int]:
+        """Compute conservative incoming stack heights for each reachable block."""
+        if not self.basic_blocks:
+            return {}
+        heights: Dict[str, int] = {entry: 0 for entry in self._entry_blocks(self.basic_blocks)}
+        worklist: List[str] = sorted(heights, key=lambda bid: self.basic_blocks[bid].start_address)
+        iterations = 0
+        max_iterations = max(1, len(self.basic_blocks) * 128)
+
+        while worklist and iterations < max_iterations:
+            iterations += 1
+            bid = worklist.pop(0)
+            block = self.basic_blocks.get(bid)
+            if block is None:
+                continue
+            exit_height = self._simulate_block_stack_height(
+                block.metadata.get("raw_instructions", []),
+                heights.get(bid, 0),
+            )
+            for succ in block.successors:
+                if succ not in self.basic_blocks:
+                    continue
+                merged = max(heights.get(succ, 0), exit_height)
+                if succ not in heights or merged != heights[succ]:
+                    heights[succ] = min(merged, 1024)
+                    if succ not in worklist:
+                        worklist.append(succ)
+                        worklist.sort(key=lambda item: self.basic_blocks[item].start_address)
+
+        return heights
+
+    def _simulate_block_stack_height(self, raw_instructions: List[Any], entry_height: int) -> int:
+        """Apply EVM stack effects to a height without creating TAC temps."""
+        stack: List[str] = ["_"] * min(max(entry_height, 0), 1024)
+
+        def pop() -> None:
+            if stack:
+                stack.pop()
+
+        def pop_many(count: int) -> None:
+            for _ in range(count):
+                pop()
+
+        for instr in raw_instructions:
+            name = self._get_instruction_name(instr)
+            if name == "JUMPDEST":
+                continue
+            if name.startswith("PUSH"):
+                stack.append("_")
+            elif name == "POP":
+                pop()
+            elif name.startswith("DUP"):
+                stack.append("_")
+            elif name.startswith("SWAP"):
+                continue
+            elif name in _BINARY_OPS:
+                pop_many(2)
+                stack.append("_")
+            elif name in ("ADDMOD", "MULMOD"):
+                pop_many(3)
+                stack.append("_")
+            elif name in ("ISZERO", "NOT"):
+                pop()
+                stack.append("_")
+            elif name in ("MLOAD", "SLOAD", "TLOAD", "CALLDATALOAD"):
+                pop()
+                stack.append("_")
+            elif name in ("MSTORE", "MSTORE8", "SSTORE", "TSTORE"):
+                pop_many(2)
+            elif name in ("SHA3", "KECCAK256"):
+                pop_many(2)
+                stack.append("_")
+            elif name in ("CALLDATACOPY", "CODECOPY", "RETURNDATACOPY", "MCOPY"):
+                pop_many(3)
+            elif name == "EXTCODECOPY":
+                pop_many(4)
+            elif name in _ENV_OPS:
+                stack.append("_")
+            elif name in ("BALANCE", "EXTCODESIZE", "EXTCODEHASH", "BLOCKHASH", "BLOBHASH"):
+                pop()
+                stack.append("_")
+            elif name == "JUMP":
+                pop()
+            elif name == "JUMPI":
+                pop_many(2)
+            elif name in ("RETURN", "REVERT", "LOG0"):
+                pop_many(2)
+            elif name.startswith("LOG"):
+                try:
+                    pop_many(2 + int(name[3:]))
+                except ValueError:
+                    pop_many(2)
+            elif name in ("CALL", "CALLCODE"):
+                pop_many(7)
+                stack.append("_")
+            elif name in ("DELEGATECALL", "STATICCALL"):
+                pop_many(6)
+                stack.append("_")
+            elif name == "CREATE":
+                pop_many(3)
+                stack.append("_")
+            elif name == "CREATE2":
+                pop_many(4)
+                stack.append("_")
+            elif name == "SELFDESTRUCT":
+                pop()
+            else:
+                effects = _EVM_STACK_EFFECTS.get(name)
+                if effects is not None:
+                    pops, pushes = effects
+                    pop_many(pops)
+                    stack.extend(["_"] * pushes)
+            if len(stack) > 1024:
+                stack = stack[-1024:]
+
+        return len(stack)
+
+    def _entry_stack_for_block(
+        self,
+        bid: str,
+        block: BasicBlock,
+        exit_stacks: Dict[str, List[str]],
+        entry_heights: Dict[str, int],
+        actual_entries: set,
+    ) -> List[str]:
+        """Merge predecessor exit stacks into a deterministic block entry stack."""
+        if bid in actual_entries:
+            return []
+
+        available_predecessors = [
+            (pred, exit_stacks[pred])
+            for pred in block.predecessors
+            if pred in exit_stacks
+        ]
+        predecessor_stacks = [stack for _, stack in available_predecessors]
+        expected_height = entry_heights.get(bid, 0)
+
+        if not predecessor_stacks:
+            return [f"phi_{bid}_{i}" for i in range(expected_height)]
+
+        height = max([expected_height] + [len(s) for s in predecessor_stacks])
+        merged: List[str] = []
+        for i in range(height):
+            values = [
+                s[i] if i < len(s) else f"missing_{pred}_{i}"
+                for pred, s in available_predecessors
+            ]
+            if values and all(v == values[0] for v in values) and len(predecessor_stacks) == len(block.predecessors):
+                merged.append(values[0])
+            elif len(predecessor_stacks) == 1 and i < len(predecessor_stacks[0]) and len(block.predecessors) == 1:
+                merged.append(predecessor_stacks[0][i])
+            else:
+                merged.append(f"phi_{bid}_{i}")
+        return merged
 
     @staticmethod
     def _add_control_flow_metadata_to_block(block: BasicBlock) -> None:
