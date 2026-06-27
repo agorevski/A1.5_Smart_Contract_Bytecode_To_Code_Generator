@@ -82,8 +82,10 @@ class MockDecompiler:
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "final_model")
-TAC_LOOKUP_DB = os.path.join(os.path.dirname(__file__), "..", "data", "tac_lookup.db")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+DEFAULT_MODEL_PATH = os.path.join(MODELS_DIR, "final_model")
+TAC_LOOKUP_DB = os.path.join(PROJECT_ROOT, "data", "tac_lookup.db")
 LOG_LEVEL = logging.INFO
 
 # ---------------------------------------------------------------------------
@@ -107,11 +109,40 @@ model_config_dict: dict = {}
 tac_lookup: TACLookup = None  # type: ignore[assignment]
 mock_mode: bool = False
 
-def load_model(use_mock: bool = False):
+def _is_model_artifact(path: str) -> bool:
+    """Return whether a directory looks like a saved model artifact."""
+    return os.path.isdir(path) and os.path.exists(os.path.join(path, "model_config.json"))
+
+
+def resolve_model_path(model_path: str | None = None) -> str:
+    """Resolve the model path from CLI/env/defaults, with final_model* autodiscovery."""
+    explicit_path = model_path or os.environ.get("WEB_MODEL_PATH")
+    if explicit_path:
+        return os.path.abspath(os.path.expanduser(explicit_path))
+
+    if _is_model_artifact(DEFAULT_MODEL_PATH):
+        return DEFAULT_MODEL_PATH
+
+    candidates = []
+    if os.path.isdir(MODELS_DIR):
+        for name in os.listdir(MODELS_DIR):
+            path = os.path.join(MODELS_DIR, name)
+            if name.startswith("final_model") and _is_model_artifact(path):
+                candidates.append(path)
+
+    if candidates:
+        return max(candidates, key=os.path.getmtime)
+
+    return DEFAULT_MODEL_PATH
+
+
+def load_model(use_mock: bool = False, model_path: str | None = None):
     """Load the trained model and TAC lookup database into memory.
 
     Args:
         use_mock: If True, use MockDecompiler instead of the real model.
+        model_path: Optional trained model path. Defaults to WEB_MODEL_PATH,
+            models/final_model, or the newest models/final_model* artifact.
     """
     global decompiler, model_config_dict, tac_lookup, mock_mode
     mock_mode = use_mock
@@ -149,15 +180,20 @@ def load_model(use_mock: bool = False):
         logger.info("Mock model ready in %.1f seconds", elapsed)
         return
 
-    logger.info("Loading trained model from %s …", MODEL_PATH)
+    resolved_model_path = resolve_model_path(model_path)
+    if resolved_model_path != DEFAULT_MODEL_PATH:
+        logger.info("Using configured/discovered model path: %s", resolved_model_path)
+
+    logger.info("Loading trained model from %s …", resolved_model_path)
     try:
-        decompiler = SmartContractDecompiler(MODEL_PATH)
+        decompiler = SmartContractDecompiler(resolved_model_path)
         # Read the saved model config for display in the UI
         import json
-        config_path = os.path.join(MODEL_PATH, "model_config.json")
+        config_path = os.path.join(resolved_model_path, "model_config.json")
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
                 model_config_dict = json.load(f)
+        model_config_dict["model_path"] = resolved_model_path
         elapsed = time.time() - start
         logger.info("Model loaded successfully in %.1f seconds", elapsed)
     except Exception as e:
@@ -900,10 +936,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Use a fake model for E2E testing (no GPU required)",
     )
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help=(
+            "Path to a trained model. Defaults to WEB_MODEL_PATH, "
+            "models/final_model, or the newest models/final_model* artifact."
+        ),
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=5000, help="Port number")
     parser.add_argument("--debug", action="store_true", help="Flask debug mode")
     args = parser.parse_args()
-    load_model(use_mock=args.mockmodel)
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    load_model(use_mock=args.mockmodel, model_path=args.model_path)
     app.run(host=args.host, port=args.port, debug=args.debug)

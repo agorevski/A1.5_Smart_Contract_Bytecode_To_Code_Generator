@@ -303,10 +303,11 @@ from src.model_setup import SmartContractDecompiler
 decompiler = SmartContractDecompiler("models/final_model_378")
 ```
 
-The web app expects `models/final_model/`. If you want the web app to use a nonstandard artifact, copy or symlink it:
+The web app first checks `WEB_MODEL_PATH`, then `models/final_model/`, then auto-discovers the newest `models/final_model*/` directory containing `model_config.json`. You can also pass a path explicitly:
 
 ```bash
-ln -sfn final_model_378 models/final_model
+WEB_MODEL_PATH=models/final_model_378 python web/app.py
+python web/app.py --model-path models/final_model_378
 ```
 
 ### Web app
@@ -315,7 +316,7 @@ ln -sfn final_model_378 models/final_model
 python web/app.py
 ```
 
-Open `http://localhost:5000`. If `models/final_model/` is missing, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
+Open `http://localhost:5000`. If no model artifact can be resolved, the web app can still analyze bytecode and emit TAC, but model-backed Solidity generation will not be available.
 
 ## 7. Preflight checklist
 
