@@ -228,7 +228,12 @@ class PipelineOrchestrator:
         if self._report_generator is None:
             return
         audit = self._report_generator.generate_report(
-            bytecode, contract_address, include_decompilation=False
+            bytecode,
+            contract_address,
+            include_decompilation=False,
+            classification_result=result.classification_result,
+            vulnerability_report=result.vulnerability_report,
+            decompiled_source=result.decompiled_source,
         )
         result.audit_report = audit
 

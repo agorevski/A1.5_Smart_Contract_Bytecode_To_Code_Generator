@@ -10,6 +10,7 @@ These features are used by the MaliciousContractClassifier and VulnerabilityDete
 
 import logging
 import math
+import string
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,8 @@ class OpcodeFeatures:
     opcode_names: List[str] = field(default_factory=list)
     total_opcodes: int = 0
     unique_opcodes: int = 0
+    parse_success: bool = True
+    parse_error: Optional[str] = None
 
 
 class OpcodeFeatureExtractor:
@@ -76,15 +79,52 @@ class OpcodeFeatureExtractor:
         self._idf_values: Optional[Dict[str, float]] = None
         self._split_points: Optional[Dict[str, float]] = None
         self._corpus_doc_count: int = 0
+        self.last_parse_success: bool = True
+        self.last_parse_error: Optional[str] = None
+
+    @staticmethod
+    def _clean_bytecode(bytecode_hex: str) -> str:
+        """Normalize a bytecode string for parser validation."""
+        clean = (bytecode_hex or "").strip()
+        if clean.lower().startswith("0x"):
+            clean = clean[2:]
+        return clean
+
+    @classmethod
+    def validate_bytecode_hex(cls, bytecode_hex: str) -> Tuple[bool, Optional[str], bool]:
+        """
+        Validate bytecode syntax before disassembly.
+
+        Returns (is_valid, error_message, has_nonempty_payload).
+        """
+        clean = cls._clean_bytecode(bytecode_hex)
+        if not clean:
+            return True, None, False
+        if len(clean) % 2 != 0:
+            return False, "Bytecode hex payload has odd length.", True
+        if any(ch not in string.hexdigits for ch in clean):
+            return False, "Bytecode contains non-hexadecimal characters.", True
+        return True, None, True
 
     def parse_opcodes(self, bytecode_hex: str) -> List[str]:
         """Parse raw hex bytecode into a list of opcode mnemonics."""
+        self.last_parse_success = True
+        self.last_parse_error = None
         try:
+            is_valid, error, has_payload = self.validate_bytecode_hex(bytecode_hex)
+            if not is_valid:
+                raise ValueError(error)
+
             from evmdasm import EvmBytecode
-            bytecode = EvmBytecode(bytecode_hex)
+            bytecode = EvmBytecode(self._clean_bytecode(bytecode_hex))
             instructions = list(bytecode.disassemble())
-            return [inst.name for inst in instructions if hasattr(inst, "name")]
+            opcodes = [inst.name for inst in instructions if hasattr(inst, "name")]
+            if has_payload and not opcodes:
+                raise ValueError("No EVM instructions decoded from non-empty bytecode.")
+            return opcodes
         except Exception as e:
+            self.last_parse_success = False
+            self.last_parse_error = str(e)
             logger.warning("Failed to parse bytecode: %s", e)
             return []
 
@@ -294,6 +334,8 @@ class OpcodeFeatureExtractor:
             opcode_names=sorted(norm_freq.keys()),
             total_opcodes=len(opcodes),
             unique_opcodes=len(set(opcodes)),
+            parse_success=self.last_parse_success,
+            parse_error=self.last_parse_error,
         )
 
         if self._idf_values is not None:
@@ -311,6 +353,8 @@ class OpcodeFeatureExtractor:
             "normalized_frequencies": features.normalized_frequencies,
             "total_opcodes": features.total_opcodes,
             "unique_opcodes": features.unique_opcodes,
+            "parse_success": features.parse_success,
+            "parse_error": features.parse_error,
         }
         if features.tfidf_vector is not None:
             result["tfidf_vector"] = features.tfidf_vector.tolist()

@@ -19,6 +19,7 @@ from src.audit_report import (
     AuditReport,
     AuditFinding,
 )
+from src.vulnerability_detector import VulnerabilityDetector
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +173,30 @@ class TestAuditReportGenerator:
         # Should not crash
         assert isinstance(report, AuditReport)
 
+    def test_parse_failure_adds_analysis_finding(self):
+        generator = AuditReportGenerator(vulnerability_detector=VulnerabilityDetector())
+        report = generator.generate_report("0xzz", include_decompilation=False)
+
+        assert any(f.category == "analysis" for f in report.findings)
+        assert report.metadata["analysis_failed"] is True
+        assert "No issues detected" not in report.summary
+
+    def test_precomputed_decompilation_gets_source_scan_findings(self):
+        decompiled = "contract X { function kill() public { selfdestruct(msg.sender); } }"
+        generator = AuditReportGenerator(vulnerability_detector=VulnerabilityDetector())
+        report = generator.generate_report(
+            "0x600000",
+            include_decompilation=False,
+            decompiled_source=decompiled,
+        )
+
+        assert report.decompiled_source == decompiled
+        assert report.metadata["decompilation_source"] == "precomputed"
+        assert any(
+            f.category == "vulnerability_source" and "Selfdestruct" in f.title
+            for f in report.findings
+        )
+
 
 # ---------------------------------------------------------------------------
 # Risk Score and Level
@@ -186,6 +211,43 @@ class TestRiskScoring:
         report = AuditReport(findings=[sample_finding])
         score = AuditReportGenerator._compute_risk_score(report)
         assert 0.0 < score <= 1.0
+
+    def test_single_critical_finding_preserves_high_risk_floor(self):
+        report = AuditReport(findings=[
+            AuditFinding("vulnerability", "Critical Bug", "critical", 1.0, "desc")
+        ])
+        score = AuditReportGenerator._compute_risk_score(report)
+        assert score >= 0.7
+        assert AuditReportGenerator._risk_level_from_score(score) == "critical"
+
+    def test_single_high_finding_preserves_high_risk_floor(self):
+        report = AuditReport(findings=[
+            AuditFinding("vulnerability", "High Bug", "high", 0.8, "desc")
+        ])
+        score = AuditReportGenerator._compute_risk_score(report)
+        assert score >= 0.5
+        assert AuditReportGenerator._risk_level_from_score(score) == "high"
+
+    def test_malicious_contract_only_report_is_critical_risk(self):
+        report = AuditReport(findings=[
+            AuditFinding(
+                "malicious_contract",
+                "Contract Classified as Potentially Malicious",
+                "critical",
+                0.9,
+                "desc",
+            )
+        ])
+        score = AuditReportGenerator._compute_risk_score(report)
+        assert score >= 0.7
+
+    def test_mixed_findings_remain_bounded(self):
+        report = AuditReport(findings=[
+            AuditFinding("v", "Critical", "critical", 1.0, "desc"),
+            AuditFinding("v", "High", "high", 1.0, "desc"),
+            AuditFinding("v", "Medium", "medium", 1.0, "desc"),
+        ])
+        assert AuditReportGenerator._compute_risk_score(report) <= 1.0
 
     def test_risk_level_critical(self):
         assert AuditReportGenerator._risk_level_from_score(0.9) == "critical"

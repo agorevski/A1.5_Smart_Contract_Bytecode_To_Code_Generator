@@ -201,6 +201,22 @@ class TestFeatureExtraction:
         assert isinstance(features, OpcodeFeatures)
         assert features.total_opcodes >= 0
         assert isinstance(features.raw_frequencies, dict)
+        assert features.parse_success is True
+
+    def test_invalid_bytecode_records_parse_failure(self, extractor):
+        features = extractor.extract_features("0xzz")
+        assert features.parse_success is False
+        assert features.total_opcodes == 0
+        assert "hex" in features.parse_error.lower()
+
+        result = extractor.features_to_dict(features)
+        assert result["parse_success"] is False
+        assert "hex" in result["parse_error"].lower()
+
+    def test_empty_bytecode_is_not_parse_failure(self, extractor):
+        features = extractor.extract_features("0x")
+        assert features.parse_success is True
+        assert features.total_opcodes == 0
 
     def test_extract_with_fitted_idf(self, extractor, sample_corpus):
         extractor.fit_idf(sample_corpus)

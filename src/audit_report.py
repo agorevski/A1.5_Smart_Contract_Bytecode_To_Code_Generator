@@ -114,6 +114,9 @@ class AuditReportGenerator:
         bytecode: str,
         contract_address: str = "",
         include_decompilation: bool = True,
+        classification_result: Optional[Any] = None,
+        vulnerability_report: Optional[Any] = None,
+        decompiled_source: Optional[str] = None,
     ) -> AuditReport:
         """
         Generate a complete security audit report from bytecode.
@@ -128,48 +131,89 @@ class AuditReportGenerator:
         report = AuditReport(
             contract_address=contract_address,
             timestamp=datetime.now(timezone.utc).isoformat(),
-            metadata={"bytecode_length": len(bytecode)},
+            metadata={"bytecode_length": len(bytecode or "")},
         )
 
         # Step 1: Malicious classification
-        if self.malicious_classifier is not None:
+        classification = classification_result
+        if classification is None and self.malicious_classifier is not None:
             try:
-                classification = self.malicious_classifier.classify_from_bytecode(bytecode, contract_address)
-                report.is_malicious = classification.is_malicious
-                report.malicious_confidence = classification.confidence
-
-                if classification.is_malicious:
-                    report.findings.append(AuditFinding(
-                        category="malicious_contract",
-                        title="Contract Classified as Potentially Malicious",
-                        severity="critical",
-                        confidence=classification.confidence,
-                        description=classification.explanation,
-                        recommendation="Exercise extreme caution. Consider avoiding interaction with this contract.",
-                    ))
+                classification = self.malicious_classifier.classify_from_bytecode(
+                    bytecode, contract_address
+                )
             except Exception as e:
                 logger.warning("Malicious classification failed: %s", e)
 
+        if classification is not None:
+            report.is_malicious = classification.is_malicious
+            report.malicious_confidence = classification.confidence
+            classification_metadata = (
+                classification.metadata
+                if isinstance(getattr(classification, "metadata", None), dict)
+                else {}
+            )
+            report.metadata["classification_metadata"] = classification_metadata
+
+            if classification_metadata.get("analysis_failed"):
+                self._append_analysis_failure(
+                    report,
+                    "classification",
+                    classification.explanation,
+                )
+            elif classification.is_malicious:
+                report.findings.append(AuditFinding(
+                    category="malicious_contract",
+                    title="Contract Classified as Potentially Malicious",
+                    severity="critical",
+                    confidence=classification.confidence,
+                    description=classification.explanation,
+                    recommendation="Exercise extreme caution. Consider avoiding interaction with this contract.",
+                ))
+
         # Step 2: Bytecode vulnerability scan
-        if self.vulnerability_detector is not None:
+        vuln_report = vulnerability_report
+        if vuln_report is None and self.vulnerability_detector is not None:
             try:
-                vuln_report = self.vulnerability_detector.scan_from_bytecode(bytecode, contract_address)
-                for vuln in vuln_report.vulnerabilities:
-                    if vuln.detected:
-                        report.findings.append(AuditFinding(
-                            category="vulnerability",
-                            title=f"{vuln.vulnerability_type.value.replace('_', ' ').title()} Vulnerability",
-                            severity=vuln.severity.value,
-                            confidence=vuln.confidence,
-                            description=vuln.explanation,
-                            location=vuln.location,
-                            recommendation=vuln.recommendation,
-                        ))
+                vuln_report = self.vulnerability_detector.scan_from_bytecode(
+                    bytecode, contract_address
+                )
             except Exception as e:
                 logger.warning("Vulnerability scan failed: %s", e)
 
+        if vuln_report is not None:
+            scan_metadata = (
+                vuln_report.scan_metadata
+                if isinstance(getattr(vuln_report, "scan_metadata", None), dict)
+                else {}
+            )
+            report.metadata["vulnerability_scan_metadata"] = scan_metadata
+
+            for vuln in vuln_report.vulnerabilities:
+                if vuln.detected:
+                    report.findings.append(AuditFinding(
+                        category="vulnerability",
+                        title=f"{vuln.vulnerability_type.value.replace('_', ' ').title()} Vulnerability",
+                        severity=vuln.severity.value,
+                        confidence=vuln.confidence,
+                        description=vuln.explanation,
+                        location=vuln.location,
+                        recommendation=vuln.recommendation,
+                    ))
+
+            if scan_metadata.get("analysis_failed"):
+                self._append_analysis_failure(
+                    report,
+                    "vulnerability_detection",
+                    vuln_report.summary,
+                )
+
         # Step 3: Decompilation
-        if include_decompilation and self.decompiler is not None:
+        if decompiled_source is not None:
+            report.decompiled_source = decompiled_source
+            report.metadata["decompilation_success"] = True
+            report.metadata["decompilation_source"] = "precomputed"
+            self._append_source_findings(report, decompiled_source, contract_address)
+        elif include_decompilation and self.decompiler is not None:
             try:
                 if hasattr(self.decompiler, "decompile_contract"):
                     decompile_result = self.decompiler.decompile_contract(bytecode)
@@ -184,30 +228,7 @@ class AuditReportGenerator:
                 report.metadata["decompilation_success"] = True
 
                 # Step 4: Source-level scan on decompiled code
-                if self.vulnerability_detector is not None:
-                    try:
-                        source_report = self.vulnerability_detector.scan_from_source(
-                            decompiled, contract_address
-                        )
-                        for vuln in source_report.vulnerabilities:
-                            if vuln.detected:
-                                # Avoid duplicating bytecode-level findings
-                                existing_types = {
-                                    f.title for f in report.findings
-                                    if f.category == "vulnerability"
-                                }
-                                title = f"{vuln.vulnerability_type.value.replace('_', ' ').title()} (Source-Level)"
-                                if title not in existing_types:
-                                    report.findings.append(AuditFinding(
-                                        category="vulnerability_source",
-                                        title=title,
-                                        severity=vuln.severity.value,
-                                        confidence=vuln.confidence,
-                                        description=vuln.explanation,
-                                        recommendation=vuln.recommendation,
-                                    ))
-                    except Exception as e:
-                        logger.warning("Source-level scan failed: %s", e)
+                self._append_source_findings(report, decompiled, contract_address)
             except Exception as e:
                 logger.warning("Decompilation failed: %s", e)
                 report.metadata["decompilation_success"] = False
@@ -218,6 +239,66 @@ class AuditReportGenerator:
         report.summary = self._generate_summary(report)
 
         return report
+
+    def _append_source_findings(
+        self,
+        report: AuditReport,
+        decompiled: str,
+        contract_address: str,
+    ) -> None:
+        """Run source-level scanning on decompiled output and append findings."""
+        if self.vulnerability_detector is None:
+            return
+        try:
+            source_report = self.vulnerability_detector.scan_from_source(
+                decompiled, contract_address
+            )
+            report.metadata["source_scan_metadata"] = (
+                source_report.scan_metadata
+                if isinstance(getattr(source_report, "scan_metadata", None), dict)
+                else {}
+            )
+            for vuln in source_report.vulnerabilities:
+                if vuln.detected:
+                    existing_types = {
+                        f.title for f in report.findings
+                        if f.category == "vulnerability"
+                    }
+                    title = f"{vuln.vulnerability_type.value.replace('_', ' ').title()} (Source-Level)"
+                    if title not in existing_types:
+                        report.findings.append(AuditFinding(
+                            category="vulnerability_source",
+                            title=title,
+                            severity=vuln.severity.value,
+                            confidence=vuln.confidence,
+                            description=vuln.explanation,
+                            recommendation=vuln.recommendation,
+                        ))
+        except Exception as e:
+            logger.warning("Source-level scan failed: %s", e)
+            report.metadata["source_scan_error"] = str(e)
+
+    @staticmethod
+    def _append_analysis_failure(
+        report: AuditReport,
+        source: str,
+        description: str,
+    ) -> None:
+        """Add a single audit finding for failed or indeterminate analysis."""
+        if any(f.category == "analysis" and f.title == "Bytecode Analysis Failed" for f in report.findings):
+            return
+        report.metadata["analysis_failed"] = True
+        report.findings.append(AuditFinding(
+            category="analysis",
+            title="Bytecode Analysis Failed",
+            severity="medium",
+            confidence=1.0,
+            description=f"{source}: {description}",
+            recommendation=(
+                "Verify that the input is complete EVM bytecode and rerun the audit; "
+                "do not treat this result as a clean security assessment."
+            ),
+        ))
 
     @staticmethod
     def _compute_risk_score(report: AuditReport) -> float:
@@ -233,13 +314,28 @@ class AuditReportGenerator:
             "info": 0.0,
         }
 
-        total = 0.0
+        severity_floors = {
+            "critical": 0.7,
+            "high": 0.5,
+            "medium": 0.3,
+            "low": 0.1,
+            "info": 0.0,
+        }
+
+        residual_safe_probability = 1.0
+        max_severity_floor = 0.0
         for finding in report.findings:
             weight = severity_weights.get(finding.severity, 0.3)
-            total += weight * finding.confidence
+            confidence = max(0.0, min(1.0, finding.confidence))
+            contribution = max(0.0, min(1.0, weight * confidence))
+            residual_safe_probability *= 1.0 - contribution
+            max_severity_floor = max(
+                max_severity_floor,
+                severity_floors.get(finding.severity, 0.1),
+            )
 
-        # Normalize: max plausible is ~7 (6 vuln types + malicious)
-        return min(total / 7.0, 1.0)
+        aggregate_score = 1.0 - residual_safe_probability
+        return min(max(aggregate_score, max_severity_floor), 1.0)
 
     @staticmethod
     def _risk_level_from_score(score: float) -> str:

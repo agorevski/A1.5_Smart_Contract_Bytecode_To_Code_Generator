@@ -12,8 +12,12 @@ Covers:
   - Skip decompilation when malicious
 """
 
+from pathlib import Path
+
+import numpy as np
 import pytest
 from unittest.mock import MagicMock, patch
+from src.malicious_classifier import MaliciousContractClassifier
 from src.pipeline_orchestrator import (
     PipelineOrchestrator,
     PipelineConfig,
@@ -168,6 +172,51 @@ class TestPipelineExecution:
         result = orch.analyze(MINIMAL_BYTECODE, "0xABC")
         assert result.contract_address == "0xABC"
         assert len(result.stages_completed) >= 3
+
+    def test_audit_report_uses_prior_decompilation_output(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.bytecode_analyzer.analyze_bytecode_to_tac",
+            lambda bytecode: "precomputed TAC output",
+        )
+        config = PipelineConfig(stages=[
+            PipelineStage.DECOMPILE,
+            PipelineStage.AUDIT_REPORT,
+        ])
+        orch = PipelineOrchestrator(config)
+
+        result = orch.analyze(MINIMAL_BYTECODE)
+
+        assert result.decompiled_source == "precomputed TAC output"
+        assert result.audit_report.decompiled_source == "precomputed TAC output"
+        assert result.audit_report.metadata["decompilation_source"] == "precomputed"
+
+    def test_classifier_model_path_uses_model_backed_inference(self):
+        artifact_dir = Path(__file__).resolve().parent / ".test_artifacts"
+        artifact_path = artifact_dir / "pipeline_classifier.pkl"
+        try:
+            classifier = MaliciousContractClassifier()
+            classifier.fit(
+                [
+                    {"PUSH": 50, "ADD": 5, "REVERT": 4, "JUMPI": 8},
+                    {"PUSH": 30, "SELFDESTRUCT": 1, "CALL": 15},
+                    {"PUSH": 40, "SLOAD": 3, "REVERT": 3, "JUMPI": 6},
+                    {"PUSH": 20, "DELEGATECALL": 3, "CREATE": 5},
+                ],
+                np.array([0, 1, 0, 1]),
+            )
+            classifier.save(str(artifact_path))
+
+            config = PipelineConfig(
+                stages=[PipelineStage.CLASSIFY],
+                classifier_model_path=str(artifact_path),
+            )
+            result = PipelineOrchestrator(config).analyze("0x6000ff")
+
+            assert result.classification_result.metadata["method"] != "heuristic"
+        finally:
+            artifact_path.unlink(missing_ok=True)
+            if artifact_dir.exists() and not any(artifact_dir.iterdir()):
+                artifact_dir.rmdir()
 
     def test_contract_address_preserved(self, orchestrator):
         result = orchestrator.analyze(MINIMAL_BYTECODE, "0xDEF")

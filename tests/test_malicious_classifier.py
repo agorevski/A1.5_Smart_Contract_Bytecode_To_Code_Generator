@@ -11,6 +11,9 @@ Covers:
   - Edge cases
 """
 
+import builtins
+from pathlib import Path
+
 import pytest
 import numpy as np
 from src.malicious_classifier import (
@@ -26,6 +29,21 @@ from src.malicious_classifier import (
 @pytest.fixture
 def classifier():
     return MaliciousContractClassifier()
+
+
+@pytest.fixture
+def training_corpus():
+    return [
+        {"PUSH": 50, "ADD": 5, "REVERT": 4, "JUMPI": 8},
+        {"PUSH": 30, "SELFDESTRUCT": 1, "CALL": 15},
+        {"PUSH": 40, "SLOAD": 3, "REVERT": 3, "JUMPI": 6},
+        {"PUSH": 20, "DELEGATECALL": 3, "CREATE": 5},
+    ]
+
+
+@pytest.fixture
+def training_labels():
+    return np.array([0, 1, 0, 1])
 
 
 @pytest.fixture
@@ -116,6 +134,13 @@ class TestBytecodeClassification:
         result = classifier.classify_from_bytecode("600000")
         assert len(result.explanation) > 0
 
+    def test_invalid_bytecode_is_indeterminate_low_confidence(self, classifier):
+        result = classifier.classify_from_bytecode("0xzz")
+        assert result.is_malicious is False
+        assert result.confidence <= 0.1
+        assert result.metadata["analysis_failed"] is True
+        assert result.metadata["method"] == "parse_error"
+
 
 # ---------------------------------------------------------------------------
 # Model Fitting
@@ -155,6 +180,36 @@ class TestModelFitting:
         classifier.fit(corpus, labels)
         assert classifier._is_fitted is True
 
+    def test_save_load_roundtrip_preserves_model_predictions(
+        self, training_corpus, training_labels
+    ):
+        artifact_dir = Path(__file__).resolve().parent / ".test_artifacts"
+        artifact_path = artifact_dir / "classifier_roundtrip.pkl"
+        try:
+            classifier = MaliciousContractClassifier()
+            classifier.fit(training_corpus, training_labels)
+            expected = classifier.classify_from_opcodes({"PUSH": 25, "SELFDESTRUCT": 2})
+
+            saved_path = classifier.save(str(artifact_path))
+            loaded = MaliciousContractClassifier(model_path=str(saved_path))
+            actual = loaded.classify_from_opcodes({"PUSH": 25, "SELFDESTRUCT": 2})
+
+            assert loaded._is_fitted is True
+            assert loaded._feature_names == classifier._feature_names
+            assert actual.metadata["method"] != "heuristic"
+            assert actual.is_malicious == expected.is_malicious
+        finally:
+            artifact_path.unlink(missing_ok=True)
+            if artifact_dir.exists() and not any(artifact_dir.iterdir()):
+                artifact_dir.rmdir()
+
+    def test_missing_model_path_raises_clear_error(self):
+        missing_path = Path(__file__).resolve().parent / ".missing_classifier_model.pkl"
+        missing_path.unlink(missing_ok=True)
+        assert not missing_path.exists()
+        with pytest.raises(FileNotFoundError, match="Classifier model not found"):
+            MaliciousContractClassifier(model_path=str(missing_path))
+
 
 # ---------------------------------------------------------------------------
 # Explain Prediction
@@ -171,3 +226,33 @@ class TestExplainPrediction:
     def test_explain_classification_values(self, classifier):
         result = classifier.explain_prediction("600000")
         assert result["classification"] in ("malicious", "legitimate")
+
+    def test_lime_explanation_returns_lime_metadata(
+        self, classifier, training_corpus, training_labels
+    ):
+        pytest.importorskip("lime.lime_tabular")
+        classifier.fit(training_corpus, training_labels)
+
+        result = classifier.explain_prediction("0x6000ff", num_features=3)
+
+        assert result["metadata"]["explanation_method"] == "lime"
+        assert "lime_weights" in result
+        assert len(result["lime_weights"]) <= 3
+        assert set(result["lime_weights"]).issubset(result["metadata"]["feature_names"])
+
+    def test_lime_unavailable_fallback_is_explicit(
+        self, monkeypatch, classifier, training_corpus, training_labels
+    ):
+        classifier.fit(training_corpus, training_labels)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name.startswith("lime"):
+                raise ImportError("blocked lime import")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        result = classifier.explain_prediction("0x6000ff", num_features=3)
+
+        assert result["metadata"]["explanation_method"] == "feature_importance"
+        assert result["metadata"]["fallback_reason"] == "lime_unavailable"
