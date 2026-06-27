@@ -237,7 +237,7 @@ Alternatively, set these in `src/settings.yaml`.
 
 - **Base model:** Llama 3.2 3B (`meta-llama/Llama-3.2-3B`)
 - **Fine-tuning:** LoRA (r=16, α=32, dropout=0.1)
-- **Quantization:** 4-bit NF4 via bitsandbytes
+- **Quantization:** 4-bit NF4 via bitsandbytes by default (`load_in_4bit=True`)
 - **Target metrics:** Semantic similarity > 0.8, Edit distance < 0.4
 
 See [docs/model-details.md](docs/model-details.md) for more.

@@ -27,7 +27,9 @@ LoRA decomposes weight updates as: $W' = W + \frac{BA}{\alpha}$ where $B \in \ma
 
 ## Quantization
 
-4-bit NF4 loading via `bitsandbytes` keeps the base model small enough for LoRA fine-tuning on a single CUDA GPU while preserving the normal Hugging Face/PEFT training flow.
+The code defaults to 4-bit NF4 loading via `bitsandbytes` (`use_quantization=True`, `load_in_4bit=True`). This keeps the base model small enough for LoRA fine-tuning on a single CUDA GPU while preserving the normal Hugging Face/PEFT training flow.
+
+8-bit loading is not currently exposed as a separate training mode; update `ModelConfig` before documenting or relying on 8-bit quantization.
 
 ## Training Defaults
 
