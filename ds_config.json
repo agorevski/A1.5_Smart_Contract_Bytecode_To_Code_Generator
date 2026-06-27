@@ -1,6 +1,9 @@
 {
   "bf16": {
-    "enabled": true
+    "enabled": "auto"
+  },
+  "fp16": {
+    "enabled": "auto"
   },
   "zero_optimization": {
     "stage": 0

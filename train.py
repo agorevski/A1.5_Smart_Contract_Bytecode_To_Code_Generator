@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 End-to-End Training Pipeline for Smart Contract Decompilation
@@ -35,14 +34,20 @@ Usage:
     # Evaluate after re-splitting a source dataset
     python train.py --eval-only --model-path models/smart_contract_decompiler --dataset data/my_dataset.jsonl
 
+    # Ablate compiler metadata from prompts
+    python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --no-compiler-metadata
+
     # Multi-GPU evaluation with torchrun (shards test data across GPUs)
     torchrun --nproc_per_node=4 train.py --eval-only --model-path models/smart_contract_decompiler
 """
 
 import argparse
+from collections import defaultdict
+import hashlib
 import json
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -100,10 +105,9 @@ def collect_dataset(
     """Collect contracts from Etherscan and compile locally to build dataset.
 
     Uses local solc compilation (via py-solc-x) for each contract, optionally
-    compiling with multiple compiler versions for data augmentation.  Compiler
-    metadata is stored in each record's metadata field but is NOT included in
-    the training prompt (the model must learn to handle unknown compiler
-    settings at inference time).
+    compiling with multiple compiler versions for data augmentation. Compiler
+    metadata is stored in each record's metadata field and included in the
+    training prompt by default when present.
 
     Returns path to the exported JSONL dataset file.
     """
@@ -135,8 +139,7 @@ def collect_dataset(
 
     if total_pairs == 0:
         logger.warning(
-            "No function pairs created from Etherscan data. "
-            "Falling back to demo dataset."
+            "No function pairs created from Etherscan data. " "Falling back to demo dataset."
         )
         return _ensure_demo_dataset(output_dir)
 
@@ -176,6 +179,100 @@ def _ensure_demo_dataset(output_dir: str) -> str:
     return str(target)
 
 
+def _metadata_value(item: dict, *keys: str):
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _dataset_group_key(item: dict) -> str:
+    """Stable leakage-prevention key for dataset splitting."""
+    source_hash = _metadata_value(
+        item,
+        "source_hash",
+        "source_code_hash",
+        "contract_source_hash",
+    )
+    if source_hash:
+        return f"source:{source_hash}"
+
+    contract_address = _metadata_value(item, "contract_address", "address")
+    function_id = _metadata_value(
+        item,
+        "function_selector",
+        "selector",
+        "function_signature",
+        "signature",
+    )
+    if contract_address and function_id:
+        return f"contract-function:{contract_address.lower()}:{function_id}"
+
+    body_hash = _metadata_value(
+        item,
+        "body_hash",
+        "solidity_hash",
+        "function_body_hash",
+        "code_hash",
+    )
+    if body_hash:
+        return f"body:{body_hash}"
+
+    output = " ".join(str(item.get("output", "")).split())
+    if output:
+        digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        return f"output:{digest}"
+
+    digest = hashlib.sha256(json.dumps(item, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"row:{digest}"
+
+
+def _grouped_split(
+    data: list,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int = 42,
+) -> tuple:
+    """Split rows by stable groups so variants cannot cross split boundaries."""
+    groups = defaultdict(list)
+    for item in data:
+        groups[_dataset_group_key(item)].append(item)
+
+    group_keys = list(groups)
+    if len(group_keys) < 3:
+        logging.getLogger(__name__).warning(
+            "Dataset has only %d split groups; writing all rows to train and "
+            "leaving validation/test empty to avoid leakage.",
+            len(group_keys),
+        )
+        return list(data), [], []
+
+    rng = random.Random(seed)
+    rng.shuffle(group_keys)
+
+    test_ratio = 1.0 - train_ratio - val_ratio
+    test_count = max(1, round(len(group_keys) * test_ratio)) if test_ratio > 0 else 0
+    test_count = min(test_count, max(0, len(group_keys) - 2))
+    remaining = len(group_keys) - test_count
+
+    val_count = max(1, round(len(group_keys) * val_ratio)) if val_ratio > 0 else 0
+    val_count = min(val_count, max(0, remaining - 1))
+
+    test_keys = set(group_keys[:test_count])
+    val_keys = set(group_keys[test_count : test_count + val_count])
+    train_keys = set(group_keys[test_count + val_count :])
+
+    train_data = [row for key in group_keys if key in train_keys for row in groups[key]]
+    val_data = [row for key in group_keys if key in val_keys for row in groups[key]]
+    test_data = [row for key in group_keys if key in test_keys for row in groups[key]]
+    return train_data, val_data, test_data
+
+
 def split_dataset(
     dataset_path: str,
     output_dir: str = "data",
@@ -186,8 +283,6 @@ def split_dataset(
 
     Returns (train_path, val_path, test_path).
     """
-    from sklearn.model_selection import train_test_split
-
     logger = logging.getLogger(__name__)
     test_ratio = 1.0 - train_ratio - val_ratio
     if train_ratio <= 0 or val_ratio < 0 or test_ratio < 0:
@@ -203,38 +298,7 @@ def split_dataset(
             if line:
                 data.append(json.loads(line))
 
-    if len(data) < 3:
-        # Too small to split — duplicate for train/val/test
-        logger.warning(
-            f"Dataset has only {len(data)} entries. Duplicating for train/val/test."
-        )
-        train_data = data
-        val_data = data
-        test_data = data
-    else:
-        test_count = max(1, round(len(data) * test_ratio)) if test_ratio > 0 else 0
-        test_count = min(test_count, max(0, len(data) - 2))
-        if test_count:
-            train_val, test_data = train_test_split(
-                data, test_size=test_count, random_state=42
-            )
-        else:
-            train_val, test_data = data, []
-
-        if len(train_val) < 2:
-            train_data = train_val
-            val_data = train_val
-        else:
-            val_count = max(1, round(len(data) * val_ratio)) if val_ratio > 0 else 0
-            val_count = min(val_count, len(train_val) - 1)
-            if val_count:
-                train_data, val_data = train_test_split(
-                    train_val,
-                    test_size=val_count,
-                    random_state=42,
-                )
-            else:
-                train_data, val_data = train_val, []
+    train_data, val_data, test_data = _grouped_split(data, train_ratio, val_ratio)
 
     out = Path(output_dir)
     out.mkdir(exist_ok=True)
@@ -269,6 +333,7 @@ def train_model(
     deepspeed_config: str = None,
     enable_memory_monitoring: bool = False,
     gradient_accumulation_steps: int = 4,
+    include_compiler_metadata: bool = True,
 ) -> str:
     """Fine-tune the model and return path to saved model."""
     # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
@@ -294,6 +359,7 @@ def train_model(
         lora_alpha=32,
         lora_dropout=0.1,
         use_quantization=use_quantization,
+        include_compiler_metadata=include_compiler_metadata,
     )
 
     trainer = SmartContractModelTrainer(config, output_dir=output_dir)
@@ -302,6 +368,7 @@ def train_model(
     logger.info(f"  Train dataset: {train_path}")
     logger.info(f"  Val dataset:   {val_path}")
     logger.info(f"  Model:         {model_name}")
+    logger.info(f"  Compiler metadata prompts: {include_compiler_metadata}")
 
     model_path = trainer.train(
         train_dataset_path=train_path,
@@ -383,18 +450,14 @@ def evaluate_model(
     dataset_rows = len(test_data)
     if eval_limit is not None:
         test_data = test_data[:eval_limit]
-        logger.info(
-            f"Evaluation limited to {len(test_data)}/{dataset_rows} examples"
-        )
+        logger.info(f"Evaluation limited to {len(test_data)}/{dataset_rows} examples")
 
     total_examples = len(test_data)
 
     # Shard test data across ranks
     if world_size > 1:
         test_data = test_data[rank::world_size]
-        logger.info(
-            f"Rank {rank}: evaluating {len(test_data)}/{total_examples} examples"
-        )
+        logger.info(f"Rank {rank}: evaluating {len(test_data)}/{total_examples} examples")
     else:
         logger.info(f"Evaluating on {total_examples} test examples...")
 
@@ -451,9 +514,7 @@ def evaluate_model(
         if results:
             sem_sims = [r["metrics"]["semantic_similarity"] for r in results]
             edit_dists = [r["metrics"]["normalized_edit_distance"] for r in results]
-            replication_summary = aggregate_replication_scores(
-                r["metrics"] for r in results
-            )
+            replication_summary = aggregate_replication_scores(r["metrics"] for r in results)
 
             import numpy as np
 
@@ -481,9 +542,7 @@ def evaluate_model(
                         "replication_precision_mean": replication_summary.get("precision_mean"),
                         "replication_recall_mean": replication_summary.get("recall_mean"),
                         "replication_f1_mean": replication_summary.get("f1_mean"),
-                        "pct_above_0.8_replication_f1": replication_summary.get(
-                            "pct_above_0_8_f1"
-                        ),
+                        "pct_above_0.8_replication_f1": replication_summary.get("pct_above_0_8_f1"),
                         "replication_precision_micro": replication_micro.get("precision"),
                         "replication_recall_micro": replication_micro.get("recall"),
                         "replication_f1_micro": replication_micro.get("f1"),
@@ -567,12 +626,8 @@ def main():
         default="data/contract_addresses.txt",
         help="Path to contract addresses file",
     )
-    parser.add_argument(
-        "--output-dir", type=str, default="models", help="Model output directory"
-    )
-    parser.add_argument(
-        "--data-dir", type=str, default="data", help="Dataset output directory"
-    )
+    parser.add_argument("--output-dir", type=str, default="models", help="Model output directory")
+    parser.add_argument("--data-dir", type=str, default="data", help="Dataset output directory")
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
     parser.add_argument(
@@ -582,9 +637,7 @@ def main():
         help="Gradient accumulation steps",
     )
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument(
-        "--max-seq-length", type=int, default=2048, help="Max sequence length"
-    )
+    parser.add_argument("--max-seq-length", type=int, default=2048, help="Max sequence length")
     parser.add_argument(
         "--model-name",
         type=str,
@@ -596,18 +649,14 @@ def main():
         action="store_true",
         help="Use tiny model (facebook/opt-125m) for fast E2E testing",
     )
-    parser.add_argument(
-        "--resume", type=str, default=None, help="Resume from checkpoint"
-    )
+    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument(
         "--deepspeed",
         type=str,
         default=None,
         help="Path to DeepSpeed config JSON (e.g. ds_config.json)",
     )
-    parser.add_argument(
-        "--skip-eval", action="store_true", help="Skip evaluation after training"
-    )
+    parser.add_argument("--skip-eval", action="store_true", help="Skip evaluation after training")
     parser.add_argument(
         "--eval-only",
         action="store_true",
@@ -647,6 +696,14 @@ def main():
         "--enable-memory-monitoring",
         action="store_true",
         help="Enable memory usage monitoring during training",
+    )
+    parser.add_argument(
+        "--no-compiler-metadata",
+        action="store_true",
+        help=(
+            "Do not include compiler version/optimizer metadata in training "
+            "prompts even when dataset rows contain it"
+        ),
     )
 
     args = parser.parse_args()
@@ -741,29 +798,21 @@ def main():
                     break
 
         if not dataset_path or not Path(dataset_path).exists():
-            logger.error(
-                "No dataset found. Provide --dataset or remove --skip-collection."
-            )
+            logger.error("No dataset found. Provide --dataset or remove --skip-collection.")
             sys.exit(1)
 
         logger.info(f"Using existing dataset: {dataset_path}")
 
         # Always re-split from the source dataset to ensure consistency
-        train_path, val_path, test_path = split_dataset(
-            dataset_path, args.data_dir
-        )
+        train_path, val_path, test_path = split_dataset(dataset_path, args.data_dir)
     else:
         api_key = settings.get("ETHERSCAN_API_KEY")
         if not api_key:
-            logger.error(
-                "ETHERSCAN_API_KEY not found. Set it in src/settings.yaml or as env var."
-            )
+            logger.error("ETHERSCAN_API_KEY not found. Set it in src/settings.yaml or as env var.")
             sys.exit(1)
 
         max_contracts = 10 if args.small else None
-        dataset_path = collect_dataset(
-            api_key, args.addresses, args.data_dir, max_contracts
-        )
+        dataset_path = collect_dataset(api_key, args.addresses, args.data_dir, max_contracts)
 
         train_path, val_path, test_path = split_dataset(dataset_path, args.data_dir)
 
@@ -792,12 +841,14 @@ def main():
         deepspeed_config=args.deepspeed,
         enable_memory_monitoring=args.enable_memory_monitoring,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        include_compiler_metadata=not args.no_compiler_metadata,
     )
 
     # ── Step 3: Evaluation ───────────────────────────────────────
     if not args.skip_eval:
         # Free GPU memory from training before loading model for evaluation
         import torch, gc
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

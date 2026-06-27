@@ -11,6 +11,9 @@ import json
 import logging
 import time
 import traceback
+from collections import defaultdict
+import hashlib
+import random
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -19,7 +22,6 @@ import sqlite3
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 # NLP and evaluation metrics
@@ -37,6 +39,115 @@ from .model_setup import SmartContractModelTrainer, ModelConfig, SmartContractDe
 from .replication_metrics import aggregate_replication_scores, evaluate_replication
 
 logger = logging.getLogger(__name__)
+
+
+def _metadata_value(item: dict, *keys: str):
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return str(value)
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _dataset_group_key(item: dict) -> str:
+    """Stable leakage-prevention key for dataset splitting."""
+    source_hash = _metadata_value(
+        item,
+        "source_hash",
+        "source_code_hash",
+        "contract_source_hash",
+    )
+    if source_hash:
+        return f"source:{source_hash}"
+
+    contract_address = _metadata_value(item, "contract_address", "address")
+    function_id = _metadata_value(
+        item,
+        "function_selector",
+        "selector",
+        "function_signature",
+        "signature",
+    )
+    if contract_address and function_id:
+        return f"contract-function:{contract_address.lower()}:{function_id}"
+
+    body_hash = _metadata_value(
+        item,
+        "body_hash",
+        "solidity_hash",
+        "function_body_hash",
+        "code_hash",
+    )
+    if body_hash:
+        return f"body:{body_hash}"
+
+    output = " ".join(str(item.get("output", "")).split())
+    if output:
+        digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        return f"output:{digest}"
+
+    digest = hashlib.sha256(json.dumps(item, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"row:{digest}"
+
+
+def grouped_dataset_split(
+    data: List[dict],
+    train_ratio: float,
+    val_ratio: float,
+    seed: int = 42,
+) -> Tuple[List[dict], List[dict], List[dict]]:
+    """Split rows by stable groups so variants cannot cross split boundaries."""
+    groups = defaultdict(list)
+    for item in data:
+        groups[_dataset_group_key(item)].append(item)
+
+    group_keys = list(groups)
+    if len(group_keys) < 3:
+        logger.warning(
+            "Dataset has only %d split groups; writing all rows to train and "
+            "leaving validation/test empty to avoid leakage.",
+            len(group_keys),
+        )
+        return list(data), [], []
+
+    rng = random.Random(seed)
+    rng.shuffle(group_keys)
+
+    test_ratio = 1.0 - train_ratio - val_ratio
+    test_count = max(1, round(len(group_keys) * test_ratio)) if test_ratio > 0 else 0
+    test_count = min(test_count, max(0, len(group_keys) - 2))
+    remaining = len(group_keys) - test_count
+
+    val_count = max(1, round(len(group_keys) * val_ratio)) if val_ratio > 0 else 0
+    val_count = min(val_count, max(0, remaining - 1))
+
+    test_keys = set(group_keys[:test_count])
+    val_keys = set(group_keys[test_count : test_count + val_count])
+    train_keys = set(group_keys[test_count + val_count :])
+
+    train_data = [row for key in group_keys if key in train_keys for row in groups[key]]
+    val_data = [row for key in group_keys if key in val_keys for row in groups[key]]
+    test_data = [row for key in group_keys if key in test_keys for row in groups[key]]
+    return train_data, val_data, test_data
+
+
+def sample_evaluation_data(
+    test_data: List[dict],
+    sample_size: int,
+    seed: int,
+) -> Tuple[List[dict], List[int]]:
+    """Sample evaluation rows reproducibly and return rows plus source indices."""
+    if sample_size <= 0:
+        return [], []
+    if len(test_data) <= sample_size:
+        return list(test_data), list(range(len(test_data)))
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(test_data), size=sample_size, replace=False).tolist()
+    return [test_data[i] for i in indices], indices
 
 
 @dataclass
@@ -81,6 +192,7 @@ class TrainingConfig:
 
     # Evaluation
     evaluation_sample_size: int = 9731  # As mentioned in paper
+    evaluation_seed: int = 42
 
     # Output directories
     data_dir: str = "data"
@@ -667,37 +779,18 @@ class SmartContractTrainingPipeline:
                 "train_test_split and validation_split must leave a non-negative test split"
             )
 
-        test_count = max(1, round(len(data) * test_ratio)) if test_ratio > 0 else 0
-        test_count = min(test_count, max(0, len(data) - 2))
-        if test_count:
-            train_val_data, test_data = train_test_split(
-                data,
-                test_size=test_count,
-                random_state=42,
-            )
-        else:
-            train_val_data, test_data = data, []
-
-        val_count = (
-            max(1, round(len(data) * self.config.validation_split))
-            if self.config.validation_split > 0
-            else 0
+        train_data, val_data, test_data = grouped_dataset_split(
+            data,
+            self.config.train_test_split,
+            self.config.validation_split,
+            seed=42,
         )
-        val_count = min(val_count, max(0, len(train_val_data) - 1))
-        if val_count:
-            train_data, val_data = train_test_split(
-                train_val_data,
-                test_size=val_count,
-                random_state=42,
-            )
-        else:
-            train_data, val_data = train_val_data, []
 
         # Save splits
         data_dir = Path(self.config.data_dir)
 
         train_path = data_dir / "train_dataset.jsonl"
-        val_path = data_dir / "validation_dataset.jsonl"
+        val_path = data_dir / "val_dataset.jsonl"
         test_path = data_dir / "test_dataset.jsonl"
 
         for data_split, path in [
@@ -764,10 +857,19 @@ class SmartContractTrainingPipeline:
                 test_data.append(json.loads(line.strip()))
 
         # Sample for evaluation if dataset is large
-        if len(test_data) > self.config.evaluation_sample_size:
-            test_data = np.random.choice(
-                test_data, size=self.config.evaluation_sample_size, replace=False
-            ).tolist()
+        available_count = len(test_data)
+        test_data, sampled_indices = sample_evaluation_data(
+            test_data,
+            self.config.evaluation_sample_size,
+            self.config.evaluation_seed,
+        )
+        if available_count > self.config.evaluation_sample_size:
+            logger.info(
+                "Sampled %d/%d evaluation rows with seed %d",
+                len(test_data),
+                available_count,
+                self.config.evaluation_seed,
+            )
 
         # Initialize decompiler
         decompiler = SmartContractDecompiler(model_path)
@@ -824,6 +926,12 @@ class SmartContractTrainingPipeline:
 
         # Compute aggregate statistics
         aggregate_stats = self._compute_aggregate_statistics(results)
+        aggregate_stats["evaluation_metadata"] = {
+            "seed": self.config.evaluation_seed,
+            "sampled_count": len(test_data),
+            "available_count": available_count,
+            "sampled_indices": sampled_indices,
+        }
 
         # Save detailed results
         results_path = Path(self.config.results_dir) / f"evaluation_results_{int(time.time())}.json"

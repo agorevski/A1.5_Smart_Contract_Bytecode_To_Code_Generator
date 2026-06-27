@@ -8,9 +8,11 @@ including Low-Rank Adaptation (LoRA) fine-tuning with rank 16 targeting specific
 import os
 import json
 import logging
+import copy
 import inspect
+import math
 import re
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -115,6 +117,7 @@ class ModelConfig:
     target_modules: List[str] = None
     use_quantization: bool = True
     load_in_4bit: bool = True
+    include_compiler_metadata: bool = True
 
     def __post_init__(self):
         if self.target_modules is None:
@@ -140,6 +143,7 @@ class ModelConfig:
             "target_modules": self.target_modules,
             "use_quantization": self.use_quantization,
             "load_in_4bit": self.load_in_4bit,
+            "include_compiler_metadata": self.include_compiler_metadata,
         }
 
     @classmethod
@@ -154,9 +158,212 @@ class ModelConfig:
             "target_modules",
             "use_quantization",
             "load_in_4bit",
+            "include_compiler_metadata",
         }
         filtered = {k: v for k, v in d.items() if k in known_keys}
         return cls(**filtered)
+
+
+def _metadata_text(value) -> Optional[str]:
+    """Return a prompt-safe metadata string or ``None`` for empty values."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "nan"}:
+        return None
+    return text
+
+
+def _metadata_bool(value) -> Optional[bool]:
+    """Parse bool-like metadata values from JSON, Etherscan, or forms."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "enabled", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "disabled", "off"}:
+        return False
+    return None
+
+
+def _format_solc_version(version: str) -> str:
+    """Normalize compiler version metadata for prompt display."""
+    version = version.strip()
+    lower = version.lower()
+    if lower.startswith("solc "):
+        return version
+    if version.startswith("v") and len(version) > 1 and version[1].isdigit():
+        version = version[1:]
+    return f"solc {version}"
+
+
+def format_prompt_metadata(
+    metadata: Optional[Dict],
+    include_compiler_metadata: bool = True,
+) -> str:
+    """Format function/compiler metadata as a compact prompt header line."""
+    if not metadata:
+        return ""
+
+    metadata_parts = []
+    if metadata.get("function_name"):
+        metadata_parts.append(f"Function: {metadata['function_name']}")
+    if metadata.get("visibility"):
+        metadata_parts.append(f"Visibility: {metadata['visibility']}")
+    if metadata.get("is_payable"):
+        metadata_parts.append("Payable: true")
+    if metadata.get("is_view"):
+        metadata_parts.append("View/Pure: true")
+
+    if include_compiler_metadata:
+        compiler_version = (
+            _metadata_text(metadata.get("compiler_version"))
+            or _metadata_text(metadata.get("solc_version"))
+            or _metadata_text(metadata.get("solidity_compiler_version"))
+        )
+        if compiler_version:
+            metadata_parts.append(
+                f"Solidity compiler: {_format_solc_version(compiler_version)}"
+            )
+
+        optimizer_enabled = None
+        optimizer_seen = False
+        for key in ("optimizer_enabled", "optimization_enabled", "optimizer"):
+            if key in metadata:
+                optimizer_seen = True
+                optimizer_enabled = _metadata_bool(metadata.get(key))
+                break
+        if optimizer_seen:
+            if optimizer_enabled is True:
+                optimizer = "Optimizer: enabled"
+                optimizer_runs = None
+                for runs_key in ("optimizer_runs", "optimization_runs"):
+                    optimizer_runs = _metadata_text(metadata.get(runs_key))
+                    if optimizer_runs:
+                        break
+                if optimizer_runs:
+                    optimizer += f" ({optimizer_runs} runs)"
+                metadata_parts.append(optimizer)
+            elif optimizer_enabled is False:
+                metadata_parts.append("Optimizer: disabled")
+
+        evm_version = _metadata_text(metadata.get("evm_version"))
+        if evm_version:
+            metadata_parts.append(f"EVM version: {evm_version}")
+
+    return ", ".join(metadata_parts)
+
+
+def build_training_prompt_for_length(
+    item: Dict[str, Any],
+    include_compiler_metadata: bool = True,
+    template_format: str = "alpaca",
+) -> str:
+    """Build the exact training prompt text used for sequence-length detection."""
+    dataset = SmartContractDataset.__new__(SmartContractDataset)
+    dataset.template_format = template_format
+    dataset.include_compiler_metadata = include_compiler_metadata
+    return dataset._format_prompt(
+        item.get("input", ""),
+        item.get("output", ""),
+        item.get("metadata", {}) or {},
+    )
+
+
+def _tokenize_to_ids(tokenizer, text: str) -> List[int]:
+    """Tokenize text without truncation and return a flat list of token ids."""
+    tokenized = tokenizer(
+        text,
+        add_special_tokens=False,
+        truncation=False,
+        padding=False,
+        return_tensors=None,
+    )
+    input_ids = tokenized["input_ids"] if isinstance(tokenized, dict) else tokenized
+    if input_ids and isinstance(input_ids[0], list):
+        input_ids = input_ids[0]
+    return list(input_ids)
+
+
+def detect_max_sequence_length(
+    dataset_path: str,
+    tokenizer,
+    percentile: float = 0.99,
+    min_length: int = 128,
+    max_length: int = 4096,
+    default_length: int = 512,
+    include_compiler_metadata: bool = True,
+    template_format: str = "alpaca",
+) -> int:
+    """Detect max sequence length from actual tokenizer counts, rounded to pow2."""
+    lengths: List[int] = []
+    with open(dataset_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            prompt = build_training_prompt_for_length(
+                item,
+                include_compiler_metadata=include_compiler_metadata,
+                template_format=template_format,
+            )
+            lengths.append(len(_tokenize_to_ids(tokenizer, prompt)))
+
+    if not lengths:
+        return default_length
+
+    lengths.sort()
+    percentile = min(max(percentile, 0.0), 1.0)
+    p_idx = min(max(math.ceil(len(lengths) * percentile) - 1, 0), len(lengths) - 1)
+    p_tokens = max(lengths[p_idx], 1)
+    seq_len = int(2 ** math.ceil(math.log2(max(p_tokens, 64))))
+    return max(min_length, min(seq_len, max_length))
+
+
+def _cuda_supports_bf16() -> bool:
+    """Return True when the current CUDA device has native BF16 support."""
+    if not torch.cuda.is_available():
+        return False
+    major, _minor = torch.cuda.get_device_capability()
+    return major >= 8
+
+
+def resolve_training_precision(
+    deepspeed_config: Optional[str] = None,
+) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
+    """Resolve Trainer/DeepSpeed precision from CUDA capability."""
+    has_cuda = torch.cuda.is_available()
+    use_bf16 = bool(has_cuda and _cuda_supports_bf16())
+    use_fp16 = bool(has_cuda and not use_bf16)
+    adjusted_ds_config = None
+
+    if deepspeed_config:
+        try:
+            with open(deepspeed_config, "r") as ds_f:
+                adjusted_ds_config = copy.deepcopy(json.load(ds_f))
+        except Exception as e:
+            logger.warning(f"Could not read DeepSpeed config for precision settings: {e}")
+            adjusted_ds_config = None
+
+        if adjusted_ds_config is not None:
+            adjusted_ds_config.setdefault("bf16", {})["enabled"] = use_bf16
+            adjusted_ds_config.setdefault("fp16", {})["enabled"] = use_fp16
+            if use_bf16:
+                logger.info("DeepSpeed precision resolved to BF16 (GPU supports sm_80+)")
+            elif use_fp16:
+                logger.info("DeepSpeed precision resolved to FP16 (BF16 unsupported)")
+            else:
+                logger.info("DeepSpeed mixed precision disabled (CUDA unavailable)")
+
+    return use_bf16, use_fp16, adjusted_ds_config
 
 
 class SmartContractDataset(Dataset):
@@ -174,6 +381,7 @@ class SmartContractDataset(Dataset):
         max_length: int = 2048,
         template_format: str = "alpaca",
         augment_names: bool = False,
+        include_compiler_metadata: bool = True,
     ):
         """Initialize the dataset with training data.
 
@@ -183,11 +391,14 @@ class SmartContractDataset(Dataset):
             max_length: Maximum sequence length for tokenization.
             template_format: Prompt template format ('alpaca' or 'simple').
             augment_names: Whether to deterministically augment target variable names.
+            include_compiler_metadata: Whether compiler settings in metadata are
+                included in the prompt header.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.template_format = template_format
         self.augment_names = augment_names
+        self.include_compiler_metadata = include_compiler_metadata
         self.AUGMENT_RATE = 0.3
         self.data = self._load_data(data_path)
 
@@ -211,33 +422,28 @@ class SmartContractDataset(Dataset):
         )
         return f"{prefix}{target}{suffix}"
 
-    def _format_prompt_parts(
+    def _format_prompt_components(
         self, tac_input: str, solidity_output: str, metadata: Dict
-    ) -> Tuple[str, str, str]:
-        """Format an example and expose the response span for label masking."""
+    ) -> Tuple[str, str, str, str, str]:
+        """Format an example as header, TAC, footer, target, and suffix."""
         if self.template_format == "alpaca":
             instruction = "Convert the following Three-Address Code (TAC) representation to readable Solidity code."
 
             metadata_str = ""
-            if metadata:
-                metadata_parts = []
-                if metadata.get("function_name"):
-                    metadata_parts.append(f"Function: {metadata['function_name']}")
-                if metadata.get("visibility"):
-                    metadata_parts.append(f"Visibility: {metadata['visibility']}")
-                if metadata.get("is_payable"):
-                    metadata_parts.append("Payable: true")
-                if metadata.get("is_view"):
-                    metadata_parts.append("View/Pure: true")
+            metadata_line = format_prompt_metadata(
+                metadata,
+                include_compiler_metadata=self.include_compiler_metadata,
+            )
+            if metadata_line:
+                metadata_str = f"{metadata_line}\n\n"
 
-                if metadata_parts:
-                    metadata_str = f"{', '.join(metadata_parts)}\n\n"
-
-            prefix = f"""### Instruction:
+            prefix_before_tac = f"""### Instruction:
 {instruction}
 
 ### Input:
-{metadata_str}{tac_input.strip()}
+{metadata_str}"""
+            tac_text = tac_input.strip()
+            prefix_after_tac = """
 
 ### Response:
 """
@@ -245,8 +451,21 @@ class SmartContractDataset(Dataset):
             suffix = ""
 
         elif self.template_format == "simple":
-            prefix = f"""[TAC]
-{tac_input.strip()}
+            metadata_line = format_prompt_metadata(
+                metadata,
+                include_compiler_metadata=self.include_compiler_metadata,
+            )
+            metadata_str = ""
+            if metadata_line:
+                metadata_str = f"""[METADATA]
+{metadata_line}
+[/METADATA]
+
+"""
+            prefix_before_tac = f"""{metadata_str}[TAC]
+"""
+            tac_text = tac_input.strip()
+            prefix_after_tac = """
 [/TAC]
 
 [SOLIDITY]
@@ -257,6 +476,16 @@ class SmartContractDataset(Dataset):
         else:
             raise ValueError(f"Unknown template format: {self.template_format}")
 
+        return prefix_before_tac, tac_text, prefix_after_tac, target, suffix
+
+    def _format_prompt_parts(
+        self, tac_input: str, solidity_output: str, metadata: Dict
+    ) -> Tuple[str, str, str]:
+        """Format an example and expose the response span for label masking."""
+        prefix_before_tac, tac_text, prefix_after_tac, target, suffix = (
+            self._format_prompt_components(tac_input, solidity_output, metadata)
+        )
+        prefix = f"{prefix_before_tac}{tac_text}{prefix_after_tac}"
         return prefix, target, suffix
 
     def __len__(self) -> int:
@@ -269,31 +498,57 @@ class SmartContractDataset(Dataset):
         if self.augment_names and (idx % 10) < int(self.AUGMENT_RATE * 10):
             output = augment_variable_names(output, seed=idx)
 
-        prefix, target, suffix = self._format_prompt_parts(
+        _prefix, target, suffix = self._format_prompt_parts(
             item["input"], output, item.get("metadata", {})
         )
-        prompt = f"{prefix}{target}{suffix}"
 
-        # Tokenize without padding — the data collator handles padding per batch
-        tokenized = self.tokenizer(
-            prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
-            return_tensors=None,  # Return lists, not tensors
-        )
+        target_ids = _tokenize_to_ids(self.tokenizer, f"{target}{suffix}")
+        if not target_ids:
+            raise ValueError(f"Training example {idx} has an empty tokenized target")
 
-        prefix_tokenized = self.tokenizer(
-            prefix,
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
-            return_tensors=None,
-        )
-        labels = tokenized["input_ids"].copy()
-        response_start = min(len(prefix_tokenized["input_ids"]), len(labels))
-        labels[:response_start] = [-100] * response_start
-        tokenized["labels"] = labels
+        if len(target_ids) >= self.max_length:
+            input_ids = target_ids[: self.max_length]
+            prefix_len = 0
+        else:
+            prefix_before_tac, tac_text, prefix_after_tac, _target, _suffix = (
+                self._format_prompt_components(item["input"], output, item.get("metadata", {}))
+            )
+            header_ids = _tokenize_to_ids(self.tokenizer, prefix_before_tac)
+            tac_ids = _tokenize_to_ids(self.tokenizer, tac_text)
+            footer_ids = _tokenize_to_ids(self.tokenizer, prefix_after_tac)
+
+            prefix_budget = self.max_length - len(target_ids)
+            fixed_prefix_len = len(header_ids) + len(footer_ids)
+            if fixed_prefix_len > prefix_budget:
+                footer_budget = min(len(footer_ids), prefix_budget)
+                header_budget = max(0, prefix_budget - footer_budget)
+                header_ids = header_ids[:header_budget]
+                footer_ids = footer_ids[-footer_budget:] if footer_budget else []
+                tac_ids = []
+            else:
+                tac_budget = prefix_budget - fixed_prefix_len
+                tac_ids = tac_ids[:tac_budget]
+
+            prefix_ids = header_ids + tac_ids + footer_ids
+            prefix_len = len(prefix_ids)
+            input_ids = prefix_ids + target_ids
+
+        labels = [-100] * prefix_len + target_ids[: len(input_ids) - prefix_len]
+        tokenized = {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": labels,
+        }
+
+        if len(tokenized["input_ids"]) > self.max_length:
+            tokenized["input_ids"] = tokenized["input_ids"][: self.max_length]
+            tokenized["attention_mask"] = tokenized["attention_mask"][: self.max_length]
+            tokenized["labels"] = tokenized["labels"][: self.max_length]
+
+        if not any(label != -100 for label in tokenized["labels"]):
+            raise ValueError(
+                f"Training example {idx} has no supervised target tokens after truncation"
+            )
 
         return tokenized
 
@@ -526,36 +781,9 @@ class SmartContractModelTrainer:
 
         # Determine mixed-precision strategy
         has_cuda = torch.cuda.is_available()
-        use_bf16 = False
-        use_fp16 = False
-
-        # When DeepSpeed is active, align with its config to avoid conflicts
-        if deepspeed_config:
-            try:
-                with open(deepspeed_config, "r") as _ds_f:
-                    ds_cfg = json.load(_ds_f)
-                if ds_cfg.get("bf16", {}).get("enabled", False):
-                    use_bf16 = True
-                    use_fp16 = False
-                elif ds_cfg.get("fp16", {}).get("enabled", False):
-                    use_fp16 = True
-                    use_bf16 = False
-                # else: both False, full precision
-            except Exception as e:
-                logger.warning(f"Could not read DeepSpeed config for precision settings: {e}")
-                # Fall back to auto-detection below
-                if has_cuda:
-                    gpu_cap = torch.cuda.get_device_capability()
-                    if gpu_cap[0] >= 8:
-                        use_bf16 = True
-                    else:
-                        use_fp16 = True
-        elif has_cuda:
-            gpu_cap = torch.cuda.get_device_capability()
-            if gpu_cap[0] >= 8:  # Ampere+ supports bf16 natively
-                use_bf16 = True
-            else:
-                use_fp16 = True
+        use_bf16, use_fp16, adjusted_deepspeed_config = resolve_training_precision(
+            deepspeed_config
+        )
 
         training_arg_params = inspect.signature(TrainingArguments.__init__).parameters
         eval_strategy_arg = (
@@ -603,7 +831,7 @@ class SmartContractModelTrainer:
 
         # DeepSpeed integration
         if deepspeed_config:
-            args["deepspeed"] = deepspeed_config
+            args["deepspeed"] = adjusted_deepspeed_config or deepspeed_config
             logger.info(f"DeepSpeed enabled with config: {deepspeed_config}")
 
         if save_strategy == "steps":
@@ -645,6 +873,7 @@ class SmartContractModelTrainer:
             train_dataset_path,
             tokenizer,
             max_length=self.config.max_sequence_length,
+            include_compiler_metadata=self.config.include_compiler_metadata,
         )
 
         eval_dataset = None
@@ -654,7 +883,11 @@ class SmartContractModelTrainer:
                 eval_dataset_path,
                 tokenizer,
                 max_length=self.config.max_sequence_length,
+                include_compiler_metadata=self.config.include_compiler_metadata,
             )
+            if len(eval_dataset) == 0:
+                logger.warning("Evaluation dataset is empty; disabling evaluation")
+                eval_dataset = None
 
         do_eval = eval_dataset is not None
 
@@ -898,13 +1131,10 @@ class SmartContractModelTrainer:
 class SmartContractDecompiler:
     """High-level interface for using the trained model for decompilation."""
 
-    # Reserve tokens for the prompt template + generation headroom
-    _PROMPT_OVERHEAD_TOKENS = 80
-    _MAX_INPUT_TOKENS = 1500  # leaves ~500 tokens for output within 2048
-
     def __init__(self, model_path: str):
         self.trainer = SmartContractModelTrainer(ModelConfig())
         self.tokenizer, self.model = self.trainer.load_model(model_path)
+        self.config = self.trainer.config
         self.model.eval()
 
     # ------------------------------------------------------------------ #
@@ -966,6 +1196,45 @@ class SmartContractDecompiler:
         kept.append("  // ... truncated (TAC too large for context window)")
         return "\n".join(kept)
 
+    def _context_window(self) -> int:
+        return max(1, int(getattr(self.config, "max_sequence_length", 2048) or 2048))
+
+    def _prompt_token_budget(self, max_new_tokens: int) -> int:
+        generation_budget = max(0, int(max_new_tokens or 0))
+        return max(1, self._context_window() - generation_budget)
+
+    def _prompt_parts(self, metadata: Optional[Dict] = None) -> Tuple[str, str]:
+        instruction = "Convert the following Three-Address Code (TAC) representation to readable Solidity code."
+
+        metadata_str = ""
+        metadata_line = format_prompt_metadata(
+            metadata,
+            include_compiler_metadata=self.config.include_compiler_metadata,
+        )
+        if metadata_line:
+            metadata_str = f"{metadata_line}\n\n"
+
+        before_tac = f"""### Instruction:
+{instruction}
+
+### Input:
+{metadata_str}"""
+        after_tac = """
+
+### Response:
+"""
+        return before_tac, after_tac
+
+    def _tac_token_budget(
+        self,
+        metadata: Optional[Dict] = None,
+        max_new_tokens: int = 1024,
+    ) -> int:
+        before_tac, after_tac = self._prompt_parts(metadata)
+        prompt_budget = self._prompt_token_budget(max_new_tokens)
+        overhead = self._count_tokens(f"{before_tac}{after_tac}")
+        return max(1, prompt_budget - overhead)
+
     # ------------------------------------------------------------------ #
     #  Single-function decompilation (original API, now token-safe)
     # ------------------------------------------------------------------ #
@@ -974,36 +1243,14 @@ class SmartContractDecompiler:
         self,
         tac_input: str,
         metadata: Optional[Dict] = None,
+        max_new_tokens: int = 1024,
     ) -> str:
         """Build a decompilation prompt from TAC + optional metadata."""
-        instruction = "Convert the following Three-Address Code (TAC) representation to readable Solidity code."
-
-        metadata_str = ""
-        if metadata:
-            metadata_parts = []
-            if metadata.get("function_name"):
-                metadata_parts.append(f"Function: {metadata['function_name']}")
-            if metadata.get("visibility"):
-                metadata_parts.append(f"Visibility: {metadata['visibility']}")
-            if metadata.get("is_payable"):
-                metadata_parts.append("Payable: true")
-            if metadata.get("is_view"):
-                metadata_parts.append("View/Pure: true")
-            if metadata_parts:
-                metadata_str = f"{', '.join(metadata_parts)}\n\n"
-
-        # Truncate TAC to fit context window
-        budget = self._MAX_INPUT_TOKENS - self._PROMPT_OVERHEAD_TOKENS
+        before_tac, after_tac = self._prompt_parts(metadata)
+        budget = self._tac_token_budget(metadata, max_new_tokens=max_new_tokens)
         safe_tac = self._truncate_tac(tac_input, budget)
 
-        return f"""### Instruction:
-{instruction}
-
-### Input:
-{metadata_str}{safe_tac.strip()}
-
-### Response:
-"""
+        return f"{before_tac}{safe_tac.strip()}{after_tac}"
 
     def decompile_tac_to_solidity(
         self,
@@ -1022,7 +1269,7 @@ class SmartContractDecompiler:
         Defaults to **greedy decoding** (``do_sample=False``) for maximum
         GPU throughput.  Set ``do_sample=True`` for stochastic sampling.
         """
-        prompt = self._build_prompt(tac_input, metadata)
+        prompt = self._build_prompt(tac_input, metadata, max_new_tokens=max_new_tokens)
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
@@ -1073,7 +1320,7 @@ class SmartContractDecompiler:
             metadatas = [None] * len(tac_inputs)
 
         prompts = [
-            self._build_prompt(tac, meta)
+            self._build_prompt(tac, meta, max_new_tokens=max_new_tokens)
             for tac, meta in zip(tac_inputs, metadatas)
         ]
 
@@ -1083,7 +1330,7 @@ class SmartContractDecompiler:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self._MAX_INPUT_TOKENS + self._PROMPT_OVERHEAD_TOKENS,
+            max_length=self._prompt_token_budget(max_new_tokens),
         ).to(self.model.device)
 
         prompt_lengths = [
@@ -1120,6 +1367,11 @@ class SmartContractDecompiler:
         bytecode: str,
         max_new_tokens: int = 1024,
         temperature: float = 0.1,
+        metadata: Optional[Dict] = None,
+        compiler_version: Optional[str] = None,
+        optimizer_enabled: Optional[bool] = None,
+        optimizer_runs: Optional[int] = None,
+        evm_version: Optional[str] = None,
     ) -> Dict:
         """Decompile an entire contract by processing each function independently.
 
@@ -1131,6 +1383,13 @@ class SmartContractDecompiler:
             bytecode: Hex-encoded EVM bytecode (with or without ``0x`` prefix).
             max_new_tokens: Maximum tokens to generate per function.
             temperature: Sampling temperature.
+            metadata: Optional contract-level prompt metadata applied to each
+                function.
+            compiler_version: Optional Solidity compiler version used to create
+                the bytecode, for example ``"0.8.20"``.
+            optimizer_enabled: Optional optimizer setting used at compile time.
+            optimizer_runs: Optional optimizer run count used at compile time.
+            evm_version: Optional EVM version target used at compile time.
 
         Returns:
             A dict with keys:
@@ -1143,6 +1402,16 @@ class SmartContractDecompiler:
 
         import time
         t0 = time.time()
+
+        contract_metadata = dict(metadata or {})
+        if compiler_version is not None:
+            contract_metadata["compiler_version"] = compiler_version
+        if optimizer_enabled is not None:
+            contract_metadata["optimizer_enabled"] = optimizer_enabled
+        if optimizer_runs is not None:
+            contract_metadata["optimizer_runs"] = optimizer_runs
+        if evm_version is not None:
+            contract_metadata["evm_version"] = evm_version
 
         analyzer = BytecodeAnalyzer(bytecode)
         func_tac_map = analyzer.generate_per_function_tac()
@@ -1164,15 +1433,15 @@ class SmartContractDecompiler:
         function_errors: Dict[str, str] = {}
 
         for fname, tac_str in func_tac_map.items():
-            func_meta = {}
+            func_meta = dict(contract_metadata)
             func_obj = analyzer.functions.get(fname)
             if func_obj:
-                func_meta = {
+                func_meta.update({
                     "function_name": func_obj.name,
                     "visibility": func_obj.visibility,
                     "is_payable": func_obj.is_payable,
                     "is_view": func_obj.is_view,
-                }
+                })
 
             try:
                 sol = self.decompile_tac_to_solidity(
@@ -1205,6 +1474,16 @@ class SmartContractDecompiler:
                 "tac_generation_time_s": round(tac_time, 3),
                 "solidity_generation_time_s": round(gen_time, 3),
                 "function_errors": function_errors,
+                "compiler_metadata": {
+                    key: contract_metadata[key]
+                    for key in (
+                        "compiler_version",
+                        "optimizer_enabled",
+                        "optimizer_runs",
+                        "evm_version",
+                    )
+                    if key in contract_metadata
+                },
             },
         }
 
