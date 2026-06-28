@@ -1,0 +1,916 @@
+{
+  "categories": [
+    "call",
+    "member_call",
+    "state_write",
+    "guard",
+    "modifier"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl",
+    "data/curriculum/calls_state64_nonoverlap.jsonl"
+  ],
+  "focus": "calls_state",
+  "manifest_kind": "curriculum_dataset",
+  "output_dataset": "data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl",
+  "rows": [
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:ddc66a66c750df230f9ee76be02201b5",
+      "source_index": 27312,
+      "total_chars": 1931
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:8f539918ab3b9618e0d5195a74e92c99",
+      "source_index": 17575,
+      "total_chars": 1933
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:98dcddd2ce4f0ec1b4785028c94adb30",
+      "source_index": 18660,
+      "total_chars": 1933
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:8fc9673041b70000fe8374c7b8deb86e",
+      "source_index": 17629,
+      "total_chars": 1934
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 3,
+        "member_call": 6,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 24,
+      "function_signature": "function listToken()",
+      "identity": "body_hash:6699ab1f67777333cca3fb9c424ed028",
+      "source_index": 12710,
+      "total_chars": 2200
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "guard": 3,
+        "member_call": 7,
+        "modifier": 0,
+        "state_write": 2
+      },
+      "focus_total": 24,
+      "function_signature": "function authenticatedCallback(address _property, bytes32 _idHash)",
+      "identity": "body_hash:07706b40cddbc4a00149d1dfc5c67ee5",
+      "source_index": 919,
+      "total_chars": 2211
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:d88603897af426e8bced749d4117ab9c",
+      "source_index": 26599,
+      "total_chars": 2296
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:94841d3f463c4d49eb4e35ca6f873e79",
+      "source_index": 18152,
+      "total_chars": 2302
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:e44d77847da5297c4e0eedf286012fa7",
+      "source_index": 28165,
+      "total_chars": 2551
+    },
+    {
+      "focus_counts": {
+        "call": 7,
+        "guard": 5,
+        "member_call": 6,
+        "modifier": 1,
+        "state_write": 5
+      },
+      "focus_total": 24,
+      "function_signature": "function rebase()",
+      "identity": "body_hash:54895366342a8f46baaf44f29d8b855a",
+      "source_index": 10469,
+      "total_chars": 2949
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "guard": 1,
+        "member_call": 11,
+        "modifier": 0,
+        "state_write": 0
+      },
+      "focus_total": 24,
+      "function_signature": "function removeToken(\r\n        IConfigurableRightsPool self,\r\n        IBPool bPool,\r\n        address token\r\n    )",
+      "identity": "body_hash:7280d9ce71080732925daa1320f69346",
+      "source_index": 14185,
+      "total_chars": 3290
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "guard": 2,
+        "member_call": 7,
+        "modifier": 3,
+        "state_write": 0
+      },
+      "focus_total": 24,
+      "function_signature": "function kfToErc20(address pool,uint sellAmount,uint minAmount,address[][] memory paths)",
+      "identity": "body_hash:c901e4a2e885a6fc04c39341e086920e",
+      "source_index": 24667,
+      "total_chars": 3306
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 5,
+        "member_call": 5,
+        "modifier": 0,
+        "state_write": 3
+      },
+      "focus_total": 24,
+      "function_signature": "function bite(bytes32 ilk, address urn)",
+      "identity": "body_hash:971b97b79607439bb8da66d20c7b8944",
+      "source_index": 18449,
+      "total_chars": 3368
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function addLiquidityETH()",
+      "identity": "body_hash:9a8dddf713c89a9dd1dee1c5c0c16a7b",
+      "source_index": 18859,
+      "total_chars": 4700
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:02fa3b40ee39127cbe2e99bb34b0c8a9",
+      "source_index": 364,
+      "total_chars": 4763
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 2,
+        "member_call": 8,
+        "modifier": 2,
+        "state_write": 1
+      },
+      "focus_total": 24,
+      "function_signature": "function ZapIn(\r\n        address _staker,\r\n        uint256 _minPoolTokens,\r\n        address payable _agent\r\n    )",
+      "identity": "body_hash:e2f1a720e3e4ff559f518f5347cd6138",
+      "source_index": 27947,
+      "total_chars": 5499
+    },
+    {
+      "focus_counts": {
+        "call": 7,
+        "guard": 1,
+        "member_call": 5,
+        "modifier": 0,
+        "state_write": 11
+      },
+      "focus_total": 24,
+      "function_signature": "function deposit(uint256 _pid, uint256 _amount)",
+      "identity": "body_hash:5f2b1c5f5ff92a6964505af4dceea234",
+      "source_index": 11841,
+      "total_chars": 5609
+    },
+    {
+      "focus_counts": {
+        "call": 8,
+        "guard": 5,
+        "member_call": 5,
+        "modifier": 0,
+        "state_write": 6
+      },
+      "focus_total": 24,
+      "function_signature": "function depositToken(address token, uint256 amount, uint256 unlock_date)",
+      "identity": "body_hash:bd7aa3b6f1a698578e0cd5c754ed7bc7",
+      "source_index": 23232,
+      "total_chars": 6033
+    },
+    {
+      "focus_counts": {
+        "call": 6,
+        "guard": 6,
+        "member_call": 5,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 24,
+      "function_signature": "function withdrawFunds(uint left,uint right,address winner,uint reward)",
+      "identity": "body_hash:3343190bebe5dad654ed82842492ca7d",
+      "source_index": 6135,
+      "total_chars": 6228
+    },
+    {
+      "focus_counts": {
+        "call": 5,
+        "guard": 5,
+        "member_call": 3,
+        "modifier": 0,
+        "state_write": 11
+      },
+      "focus_total": 24,
+      "function_signature": "function create(address _token, address payable _beneficiary, uint256 _cliff, uint256 _vesting, uint256 _amount, bool _irrevocable)",
+      "identity": "body_hash:563ee14c1a629c2d4a94121f94a96a2b",
+      "source_index": 10704,
+      "total_chars": 7248
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "guard": 1,
+        "member_call": 8,
+        "modifier": 0,
+        "state_write": 5
+      },
+      "focus_total": 24,
+      "function_signature": "function withdraw(uint256 _pid, uint256 _amount)",
+      "identity": "body_hash:65d360e118df2b4c30056abd7d4f523f",
+      "source_index": 12617,
+      "total_chars": 7844
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:56a9eb248cbd3a1a4dd92981c1380603",
+      "source_index": 10774,
+      "total_chars": 1433
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:46c51027fca429dac2376df6058828ec",
+      "source_index": 8700,
+      "total_chars": 1493
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:27e01c585567709f4fb5b43c9a35fabe",
+      "source_index": 4791,
+      "total_chars": 1493
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:885bb71f003a588e43cc7b1aaf1370e0",
+      "source_index": 16741,
+      "total_chars": 1553
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:c4f04dbc03871a3d2d4bce1d95c1d46d",
+      "source_index": 24166,
+      "total_chars": 1559
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:35d4fdb0003ca657f743b6301d5c8c7d",
+      "source_index": 6480,
+      "total_chars": 1567
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:c8c211e0ed8d61cc9abcec2b66aab190",
+      "source_index": 24651,
+      "total_chars": 1570
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:02ed187305dae6c40a148b9bbd59d2e8",
+      "source_index": 359,
+      "total_chars": 1570
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:b5e8d73372b13d4243fe1dd2d89256d8",
+      "source_index": 22350,
+      "total_chars": 1571
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:9c41016ed9c318472a089adddaf709a1",
+      "source_index": 19066,
+      "total_chars": 1572
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:80970d9742ca5951bc5b8a9fafb149d9",
+      "source_index": 15820,
+      "total_chars": 1574
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:58c1ebb6956aee36c612e158384bb6ba",
+      "source_index": 11043,
+      "total_chars": 1576
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:1171b925425a3590cbe068d2f6dd4d7f",
+      "source_index": 2183,
+      "total_chars": 1576
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:dc3e0f444151fa59b1312f55241a1e14",
+      "source_index": 27104,
+      "total_chars": 1610
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:a539ba1770a1542975aba3706f2b50f4",
+      "source_index": 20237,
+      "total_chars": 1611
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:178ee539ccda84600e4874e71c5205e1",
+      "source_index": 2837,
+      "total_chars": 1620
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:a4642049a85ed44f5fdcea7740fc4ed8",
+      "source_index": 20128,
+      "total_chars": 1623
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:4f965a7fff26369d93f9034803743e20",
+      "source_index": 9854,
+      "total_chars": 1707
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:362b609d41b162836e234e1a203fa57d",
+      "source_index": 6529,
+      "total_chars": 1723
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:989ae78b41b1cf049c29674439a26ad7",
+      "source_index": 18633,
+      "total_chars": 1724
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:e6cf1bf7fba2a5cb6af4fd5d2d494e87",
+      "source_index": 28484,
+      "total_chars": 1727
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:4a0edf8ea562fd007cd3f22e1b5c0b41",
+      "source_index": 9131,
+      "total_chars": 1728
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:0159a56f205103b49790938bae725228",
+      "source_index": 160,
+      "total_chars": 1729
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:d5b5ed896e9cc4c5d99a54ca82483914",
+      "source_index": 26265,
+      "total_chars": 1732
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:16c3302cb46c77d6c504eccac00bf673",
+      "source_index": 2746,
+      "total_chars": 1737
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:b4bce9d8b3f2bdba26bab3c4f1d2306e",
+      "source_index": 22201,
+      "total_chars": 1738
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:d266b60017ba3aba88b4bfe30e66a193",
+      "source_index": 25863,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:ff534bbd9d76de6657e47556bf83be1c",
+      "source_index": 31487,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:760cb68220b35bd2307ce5a34aa99d35",
+      "source_index": 14579,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:102890c4052b5f8bc86f77b1b1cd6e48",
+      "source_index": 2029,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:45935b9199d127017a2a57b8c94c3acc",
+      "source_index": 8552,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:7ca6d78fea9610cef8a36e9f8c711499",
+      "source_index": 15344,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:6ef2cae99490c0826851f9a99340c2cc",
+      "source_index": 13757,
+      "total_chars": 1741
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:714d483cbdfc59318ae44d565f6d1f54",
+      "source_index": 14056,
+      "total_chars": 1744
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:60b985a97b7ec1e4bbebf5cf20a0492e",
+      "source_index": 12075,
+      "total_chars": 1744
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:c4f43f3cae843465ea37280e8265cdd0",
+      "source_index": 24176,
+      "total_chars": 1745
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:4166dc9d1fc162e0eb6ef7c7ec780e7f",
+      "source_index": 8002,
+      "total_chars": 1745
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:5650c42b653fcb0e27bf098bbad3fda4",
+      "source_index": 10719,
+      "total_chars": 1746
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:0f5ec04ff7bdf478eeec086807f68aaf",
+      "source_index": 1945,
+      "total_chars": 1746
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:8e6a080b3edcfbd07587bc9b1d7ef442",
+      "source_index": 17457,
+      "total_chars": 1746
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:097c5612c0d0b222d8d599a87b12397c",
+      "source_index": 1170,
+      "total_chars": 1747
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:9753893c5e560bdc7170b93130b3c7b0",
+      "source_index": 18473,
+      "total_chars": 1747
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 23,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:34170bf80c16cc06cecb815bde4ee4b1",
+      "source_index": 6258,
+      "total_chars": 1748
+    }
+  ],
+  "selected_rows": 64,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}

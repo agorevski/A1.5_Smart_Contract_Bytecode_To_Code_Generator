@@ -29,6 +29,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 | 17. Inference default alignment | `src/inference.py`, `src/model_setup.py`, `scripts/decompile.py`, `web/app.py`, `web/static/app.js`, `tests/test_decompile_cli.py` | Propagated the measured 1.05 repetition penalty from eval into direct model inference, CLI defaults, web API defaults, and browser UI defaults | Targeted CLI/web tests pass, and generated configs now carry `repetition_penalty=1.05` unless explicitly overridden | The best measured decode setting is no longer limited to `train.py` eval runs; ad hoc inference and UI trials should be comparable |
 | 18. Non-overlap curriculum builder | `scripts/build_curriculum_dataset.py`, `tests/test_build_curriculum_dataset.py`, `data/curriculum/calls48_nonoverlap.jsonl`, `data/curriculum/state_writes48_nonoverlap.jsonl` | Built deduplicated call/state-write curriculum sources from `data/hf_training_dataset.jsonl`, excluding the broad-30 eval body hashes and capping inputs at 9k chars/outputs at 2.5k chars | Calls curriculum: 48 unique body hashes, focus facts min 18/max 40/avg 21.92. State-write curriculum: 48 unique body hashes, focus facts min 9/max 51/avg 15.06 | The next retrain can target the known bottlenecks without leaking the fixed broad-30 eval rows or duplicating optimizer variants of the same body |
 | 19. Calls-curriculum continuation rejected | `results/eval_1782617808.json`, `results/eval_1782617880.json`, `results/eval_1782617977.json`, `train.py`, `tests/test_train_cli_issues.py` | Continued from selector-metadata checkpoint-210 on 48 call-heavy rows for 30 extra effective steps (`max_steps=240`, LR 1e-4, LoRA rank 32/alpha 64/dropout 0) and evaluated fixed calls/state slices | Calls slice: semantic 0.6662 -> 0.6726 and bytecode 0.4103 -> 0.4148, but replication F1 fell 0.5422 -> 0.5312 and recall fell 0.5056 -> 0.4944. State-write slice regressed on semantic, F1, bytecode, and validity. The generated model was deleted. | A dense calls curriculum alone is not enough and may overfit toward precision at the expense of recall; future continuation needs a heldout curriculum split, lower LR/steps, or mixed call+state+negative examples |
+| 20. Mixed continuation rejected after larger holdout | `data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl`, `results/eval_1782618265.json`, `results/eval_1782618328.json`, `results/eval_1782618444.json`, `results/eval_1782618963.json`, `results/eval_1782619383.json` | Continued from selector-metadata checkpoint-210 on 64 mixed call/member-call/state-write/guard rows for 10 extra effective steps (`max_steps=220`, LR 5e-5). It looked mildly positive on broad-30/calls-23/state-17, then was checked on a separate 64-row mixed holdout excluding broad and training body hashes. | Smoke slices: broad F1 0.6076 -> 0.6095, calls F1 0.5422 -> 0.5444, state F1 unchanged. Larger 64-row holdout rejected it: F1 0.8618 -> 0.8596, bytecode 0.8055 -> 0.8045, precision/recall both down despite tiny semantic/edit gains. The kept-model commit was reverted and the generated model was deleted. | Tiny fixed slices can produce false-positive gains; require a larger non-overlap holdout before keeping curriculum continuations |
 
 ## Durable learnings
 
@@ -47,6 +48,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 13. **Use `eval_repetition_penalty=1.05` for current Qwen QLoRA evals.** On the same 30-row broad split it beat 1.0, 1.10, and 1.15 on replication F1 and bytecode semantic score while improving Solidity-valid rate.
 14. **Failure-slice evals are now available and should be used before broad retraining.** The calls and state-write slices show lower F1/bytecode scores than broad-30, making them better short-run targets for curriculum and data fixes.
 15. **Deduplicate curriculum rows by `metadata.body_hash`.** The source dataset includes optimizer/config variants of the same Solidity body; curriculum selection now keeps one row per body hash and excludes fixed eval body hashes.
+16. **Do not keep curriculum continuations based only on broad-30/calls-23/state-17.** The mixed 10-step run looked slightly positive there but regressed on a separate 64-row non-overlap mixed holdout.
 
 ## Hypotheses
 
@@ -60,6 +62,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 8. **Medium-high confidence: decoding was slightly over-penalizing repetition at 1.15.** Evidence: lowering eval repetition penalty to 1.05 improved broad-30 semantic/edit/F1/bytecode and validity without changing model weights.
 9. **High confidence: calls are the first curriculum bottleneck.** Evidence: the calls slice has 43 missing call facts and replication F1 micro 0.5422 under the best decode setting.
 10. **Medium confidence: a small calls/state-write curriculum is the cheapest next training intervention.** Evidence: the generated 48-row non-overlap curricula are dense in the failing fact categories while staying small enough for short QLoRA loops.
+11. **Medium confidence: naive continuation from the selector-metadata checkpoint is fragile.** Evidence: both call-only and mixed continuations failed the stronger keep criteria despite low train loss and small local metric movements.
 
 ## Invalidated assumptions
 
@@ -72,6 +75,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 7. **Invalidated: "A selector-metadata retrain immediately solves heldout behavior."** The 100-row retrain improved train memorization and broad structured metrics, but heldout/broad outputs still miss bytecode behavior and remain non-deployable.
 8. **Invalidated: "0% Solidity-valid on exact overfit outputs proves syntax collapse."** The exact 30-row overfit outputs are scaffold-valid; the old metric was penalizing missing contract context from solc, not malformed Solidity.
 9. **Invalidated: "A call-dense continuation by itself will fix the calls slice."** The first 48-row calls continuation slightly improved semantic/bytecode scores but reduced replication F1 and recall on the same fixed calls slice, and it regressed state-write transfer.
+10. **Invalidated: "A small broad-30/calls-slice improvement is enough to keep a continuation."** The mixed continuation passed those small checks but failed a larger 64-row non-overlap mixed holdout, so it was reverted.
 
 ## Suggestions and next experiments
 
@@ -85,8 +89,8 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 8. **Inspect failure buckets for calls, returns, guards, and state writes.** Success criterion: reduce these buckets and improve replication recall without increasing unsupported extra facts.
 9. **Train or evaluate a failure-bucket curriculum before another broad run.** Start with rows dominated by calls/member calls, then state writes, guards, returns, and events. Success criterion: each slice improves replication recall and bytecode semantic score on a heldout slice without increasing unsupported calls/state writes.
 10. **Add compiler-version-aware syntax checks for generated fragments.** The remaining 3/30 broad syntax failures are version-related or true syntax issues: missing visibility under solc 0.5.x, `override` under solc 0.5.7, and `payable(...)` syntax under solc 0.5.17. Success criterion: prompts or targets avoid version-incompatible constructs for the target compiler.
-11. **Redesign the curriculum before another continuation.** Mix calls with state writes/guards plus unsupported-call negatives, and reserve a heldout curriculum slice. Success criterion: calls-slice replication F1 and recall both improve without state-write regression.
-12. **Try lower-risk continuation settings if retraining again.** Candidate: LR <= 5e-5, <=10 effective optimizer steps, and mixed call/state rows. Success criterion: fixed calls and state-write slices both improve against `results/eval_1782616677.json`/`results/eval_1782616749.json`.
+11. **Use `data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl` as a minimum keep gate for future curricula.** Success criterion: improve broad-30, calls-23/state-17, and this 64-row holdout together.
+12. **Try data-quality/negative-example changes before more continuation.** Add unsupported-call/state-write negative examples or target-normalization filters; success criterion: unsupported_calls and invented_state_writes fall without reducing recall on the 64-row holdout.
 
 ## Artifact map
 
@@ -116,6 +120,8 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 - Calls curriculum source: `data/curriculum/calls48_nonoverlap.jsonl`
 - State-write curriculum source: `data/curriculum/state_writes48_nonoverlap.jsonl`
 - Rejected calls-curriculum continuation evals: `results/eval_1782617808.json`, `results/eval_1782617880.json`, `results/eval_1782617977.json`
+- Mixed holdout eval slice: `data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl`
+- Rejected mixed-continuation evals: `results/eval_1782618265.json`, `results/eval_1782618328.json`, `results/eval_1782618444.json`, `results/eval_1782618963.json`, `results/eval_1782619383.json`
 - Selector-metadata retrain model: `models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/`
 - Overfit runner: `run_train_qwen_qlora_overfit_sanity_check.sh`
 - Standard sampled QLoRA runner: `run_train_qwen_qlora_500.sh`
