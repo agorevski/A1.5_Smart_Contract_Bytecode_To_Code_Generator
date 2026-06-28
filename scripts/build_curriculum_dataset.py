@@ -35,6 +35,7 @@ class CurriculumCandidate:
     source_index: int
     identity: str
     focus_counts: dict[str, int]
+    zero_category_counts: dict[str, int]
     focus_total: int
     total_chars: int
     tie_breaker: float
@@ -98,6 +99,7 @@ def select_curriculum_rows(
     exclude: set[str] | None = None,
     max_rows: int = 64,
     min_focus_facts: int = 1,
+    require_zero_categories: Sequence[str] = (),
     max_input_chars: int | None = None,
     max_output_chars: int | None = None,
     seed: int = 42,
@@ -122,6 +124,11 @@ def select_curriculum_rows(
             continue
 
         facts = extract_solidity_facts(output_text)
+        zero_category_counts = {
+            category: len(facts.get(category, set())) for category in require_zero_categories
+        }
+        if any(count != 0 for count in zero_category_counts.values()):
+            continue
         focus_counts = {category: len(facts.get(category, set())) for category in categories}
         focus_total = sum(focus_counts.values())
         if focus_total < min_focus_facts:
@@ -131,6 +138,7 @@ def select_curriculum_rows(
             source_index=index,
             identity=identity,
             focus_counts=focus_counts,
+            zero_category_counts=zero_category_counts,
             focus_total=focus_total,
             total_chars=len(input_text) + len(output_text),
             tie_breaker=rng.random(),
@@ -162,6 +170,7 @@ def write_curriculum(
     focus: str,
     categories: Sequence[str],
     exclude_datasets: Sequence[str | Path],
+    require_zero_categories: Sequence[str] = (),
 ) -> dict[str, Any]:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +185,7 @@ def write_curriculum(
         "output_dataset": str(output),
         "focus": focus,
         "categories": list(categories),
+        "require_zero_categories": list(require_zero_categories),
         "exclude_datasets": [str(path) for path in exclude_datasets],
         "selected_rows": len(candidates),
         "rows": [
@@ -184,6 +194,7 @@ def write_curriculum(
                 "identity": candidate.identity,
                 "focus_total": candidate.focus_total,
                 "focus_counts": candidate.focus_counts,
+                "zero_category_counts": candidate.zero_category_counts,
                 "total_chars": candidate.total_chars,
                 "function_signature": (
                     candidate.row.get("metadata", {}).get("function_signature")
@@ -211,6 +222,12 @@ def main() -> None:
     parser.add_argument("--exclude-dataset", action="append", default=[], help="Dataset to exclude")
     parser.add_argument("--max-rows", type=int, default=64, help="Maximum rows to write")
     parser.add_argument("--min-focus-facts", type=int, default=1)
+    parser.add_argument(
+        "--require-zero-category",
+        action="append",
+        default=[],
+        help="Only select rows where this extracted fact category is absent; repeatable",
+    )
     parser.add_argument("--max-input-chars", type=int)
     parser.add_argument("--max-output-chars", type=int)
     parser.add_argument("--seed", type=int, default=42)
@@ -225,6 +242,7 @@ def main() -> None:
         exclude=exclude,
         max_rows=args.max_rows,
         min_focus_facts=args.min_focus_facts,
+        require_zero_categories=args.require_zero_category,
         max_input_chars=args.max_input_chars,
         max_output_chars=args.max_output_chars,
         seed=args.seed,
@@ -237,6 +255,7 @@ def main() -> None:
         source_dataset=args.source_dataset,
         focus=args.focus,
         categories=categories,
+        require_zero_categories=args.require_zero_category,
         exclude_datasets=args.exclude_dataset,
     )
     print(
@@ -247,6 +266,7 @@ def main() -> None:
                 "selected_rows": manifest["selected_rows"],
                 "focus": args.focus,
                 "categories": list(categories),
+                "require_zero_categories": list(args.require_zero_category),
             },
             sort_keys=True,
         )

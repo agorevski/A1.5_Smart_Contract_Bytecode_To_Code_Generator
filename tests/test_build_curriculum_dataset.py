@@ -88,3 +88,20 @@ def test_write_curriculum_outputs_dataset_and_manifest(tmp_path):
     assert len(load_jsonl(output_path)) == 1
     assert manifest["selected_rows"] == 1
     assert manifest["rows"][0]["focus_counts"]["member_call"] == 1
+
+
+def test_select_curriculum_rows_can_require_absent_fact_categories(tmp_path):
+    rows = [
+        _row("call", "function callRow() public { token.transfer(owner, 1); }"),
+        _row("plain", "function plain() public { value = 1; }"),
+    ]
+
+    selected = select_curriculum_rows(
+        rows,
+        categories=focus_categories("abi"),
+        require_zero_categories=("call", "member_call"),
+        max_rows=8,
+    )
+
+    assert [candidate.identity for candidate in selected] == [row_identity(rows[1])]
+    assert selected[0].zero_category_counts == {"call": 0, "member_call": 0}

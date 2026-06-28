@@ -1,0 +1,981 @@
+{
+  "categories": [
+    "abi",
+    "visibility",
+    "mutability"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl",
+    "data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl"
+  ],
+  "focus": "abi",
+  "manifest_kind": "curriculum_dataset",
+  "output_dataset": "data/curriculum_negative/no_state_writes64_nonoverlap.jsonl",
+  "require_zero_categories": [
+    "state_write"
+  ],
+  "rows": [
+    {
+      "focus_counts": {
+        "abi": 15,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 17,
+      "function_signature": "function getSaleGoodsInfo(address nftContractaddr,uint256 goodsID)",
+      "identity": "body_hash:5a79290327bc08fa1ea0897f78971660",
+      "source_index": 11249,
+      "total_chars": 3533,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 15,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 17,
+      "function_signature": "function whoHoldsTheStones()",
+      "identity": "body_hash:5faeb213d81c548b4f06573e61d87218",
+      "source_index": 11932,
+      "total_chars": 5614,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 16,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 17,
+      "function_signature": "function permitAndTransfer(\r\n        address sender, address recipient, uint256 amount, uint256 fee, uint256 expiry,\r\n        uint256 nonce, uint8 v, bytes32 r, bytes32 s,\r\n        uint256 p_nonce, uint8 p_v, bytes32 p_r, bytes32 p_s)",
+      "identity": "body_hash:7bc0c2e01062902c83f49972d5285259",
+      "source_index": 15235,
+      "total_chars": 6332,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 16,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 17,
+      "function_signature": "function batchTransfer(address contractAddress,address user1,address user2,address user3,address user4,address user5,address user6,address user7,address user8,address user9,address user10,address user11,address user12)",
+      "identity": "body_hash:26b152341699e2236a92f8b3da02506d",
+      "source_index": 4655,
+      "total_chars": 7456,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 14,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 16,
+      "function_signature": "function getTokenDetail()",
+      "identity": "body_hash:8e68a4979f50a639f081017c83a16a74",
+      "source_index": 17456,
+      "total_chars": 4812,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 15,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 16,
+      "function_signature": "function batchTransfer(address contractAddress,address user1,address user2,address user3,address user4,address user5,address user6,address user7,address user8,address user9,address user10,address user11)",
+      "identity": "body_hash:84e57ba777d1e402daf77a8bee21b590",
+      "source_index": 16348,
+      "total_chars": 7261,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 15,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 16,
+      "function_signature": "function removeLiquidityETHWithPermit(\r\n        address token,\r\n        uint liquidity,\r\n        uint amountTokenMin,\r\n        uint amountETHMin,\r\n        address to,\r\n        uint deadline,\r\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\r\n    )",
+      "identity": "body_hash:b929d0430500c481048aa6590e79cda8",
+      "source_index": 22721,
+      "total_chars": 7298,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 13,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 15,
+      "function_signature": "function getInfo()",
+      "identity": "body_hash:8c77b897151177ee8336d3336dfe7076",
+      "source_index": 17241,
+      "total_chars": 2814,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 14,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 15,
+      "function_signature": "function batchTransfer(address contractAddress,address user1,address user2,address user3,address user4,address user5,address user6,address user7,address user8,address user9,address user10)",
+      "identity": "body_hash:867df88bc28834f49079f1cc4ffd7711",
+      "source_index": 16515,
+      "total_chars": 7036,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function getAccountDividendsInfo(address account)",
+      "identity": "body_hash:8942beed0304d55be95bb382f5e072c9",
+      "source_index": 16856,
+      "total_chars": 2041,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 13,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function mintWithPermit(\r\n        address to,\r\n        address tokenIn,\r\n        uint256 maxAmount,\r\n        uint256 amountIn,\r\n        bytes32[] calldata proof,\r\n        uint256 permitDeadline,\r\n        uint8 v,\r\n        bytes32 r,\r\n        bytes32 s\r\n    )",
+      "identity": "body_hash:eaa4663163e623a252ff5b98eed37ecf",
+      "source_index": 28944,
+      "total_chars": 2395,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function getMemberByAddress(address memberAddress)",
+      "identity": "body_hash:98656a05940791a229d367e81d37fc54",
+      "source_index": 18616,
+      "total_chars": 2882,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function getAccountDividendsInfoAtIndex(uint256 index)",
+      "identity": "body_hash:da88d62dc2d17d7f92d3c70c5d153a56",
+      "source_index": 26867,
+      "total_chars": 3061,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 13,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function permit(\r\n        address owner,\r\n        address spender,\r\n        uint nonce,\r\n        uint expiry,\r\n        bool allowed,\r\n        uint feeAmount,\r\n        address feeRecipient,\r\n        uint8 v,\r\n        bytes32 r,\r\n        bytes32 s\r\n    )",
+      "identity": "body_hash:2d5bd10a4ffc90ac30b21d7c5661ad73",
+      "source_index": 5480,
+      "total_chars": 3828,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function getBorrowDetails( address _vault, address _token, uint _borrowID)",
+      "identity": "body_hash:08ffdec917d053cc52bbd8017634a531",
+      "source_index": 1111,
+      "total_chars": 4203,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 13,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function makeNew(string memory name, string memory symbol, address nftCollection, address feeWallet, address dto,\r\n                  uint256 daysForWithdraw, uint256 dtNumerator, uint256 dtDenominator, uint256 feeRate)",
+      "identity": "body_hash:2c9798f37b861f16e7cba48e52af60ca",
+      "source_index": 5371,
+      "total_chars": 4907,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function getProduct(bytes32 id)",
+      "identity": "body_hash:d550c29d35406b9efd799c7e72080d17",
+      "source_index": 26207,
+      "total_chars": 5992,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 13,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 14,
+      "function_signature": "function batchTransfer(address contractAddress,address user1,address user2,address user3,address user4,address user5,address user6,address user7,address user8,address user9)",
+      "identity": "body_hash:95e9122513bfd95e91e75195822fbd41",
+      "source_index": 18325,
+      "total_chars": 6843,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function allDataFor(address _user)",
+      "identity": "body_hash:4b121afcb9390afed47d66cf79a13f2f",
+      "source_index": 9232,
+      "total_chars": 1510,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function getConfig(uint64 _termId)",
+      "identity": "body_hash:cbf460e2d743225fe378c07451047dbd",
+      "source_index": 25055,
+      "total_chars": 1802,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function trade(\r\n        address /* src */,\r\n        uint /* srcAmount */,\r\n        address /* dest */,\r\n        address /* destAddress */,\r\n        uint  maxDestAmount,\r\n        uint /* minConversionRate */,\r\n        address /* walletId */\r\n    )",
+      "identity": "body_hash:7c630291cce8557c5153493aadeed280",
+      "source_index": 15320,
+      "total_chars": 2138,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function allInfoFor(address _user)",
+      "identity": "body_hash:7c58e37f0f54cee17abec2ba0a93bb35",
+      "source_index": 15315,
+      "total_chars": 2309,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function initialize(string memory name, string memory symbol, uint8 decimals, uint256 initialSupply, address initialHolder,\r\n        uint256 stakeBasePeriod, uint256 stakeHoldPeriod, uint256 stakeDailyPercent, uint256 stakeDailyPeriod)",
+      "identity": "body_hash:4ef127ff19bcfa4210074a0fd56323a5",
+      "source_index": 9748,
+      "total_chars": 2414,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function linearInterpolation(bytes32 _name, address _target, bytes32 _ilk, bytes32 _what, uint256 _startTime, uint256 _start, uint256 _end, uint256 _duration)",
+      "identity": "body_hash:fdc449ca2467f72524000ebd4102b5f8",
+      "source_index": 31333,
+      "total_chars": 2528,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function exportState()",
+      "identity": "body_hash:cd2274b4c70ae393239f40d0b89f76b7",
+      "source_index": 25210,
+      "total_chars": 2744,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function transferWithAuthorization(\r\n    address from,\r\n    address to,\r\n    uint256 value,\r\n    uint256 validAfter,\r\n    uint256 validBefore,\r\n    bytes32 nonce,\r\n    uint8 v,\r\n    bytes32 r,\r\n    bytes32 s\r\n  )",
+      "identity": "body_hash:8972b488251fff75beb9fed1f6a9b621",
+      "source_index": 16889,
+      "total_chars": 2763,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function getCollectionInfo(uint256 _collectionId)",
+      "identity": "body_hash:73d06903cb5ef3f9368d0305e2b04e8d",
+      "source_index": 14330,
+      "total_chars": 3281,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function setNftTokenValues(\r\n        string memory name,\r\n        address owner,\r\n        string memory symbol,\r\n        string memory uri,\r\n        uint256 cap,\r\n        uint256 royaltyAmount, \r\n        address creator,\r\n        uint256 batchQuantity\r\n    )",
+      "identity": "body_hash:03074d171308b27e76cfeec8c3623ffe",
+      "source_index": 379,
+      "total_chars": 3477,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function getUserDetails(address user)",
+      "identity": "body_hash:e21811b2558eb4165bf608fa309ce16b",
+      "source_index": 27853,
+      "total_chars": 3578,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function migrateWithPermit(\r\n        address tokenA,\r\n        address tokenB,\r\n        uint256 liquidity,\r\n        uint256 amountAMin,\r\n        uint256 amountBMin,\r\n        uint256 deadline,\r\n        uint8 v,\r\n        bytes32 r,\r\n        bytes32 s\r\n    )",
+      "identity": "body_hash:bd0dacd04ab2545ee0dc03e80f1f94c9",
+      "source_index": 23183,
+      "total_chars": 4324,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function getProduct(bytes32 id)",
+      "identity": "body_hash:e5cf0dafa817e73c6dd30bbb4c27d9ec",
+      "source_index": 28359,
+      "total_chars": 4715,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function getUserX4Auto(address user)",
+      "identity": "body_hash:4dd92c2bd82b9f7907b7694d9654a2eb",
+      "source_index": 9566,
+      "total_chars": 5082,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function usersZ4Matrix(address userAddress, uint8 level)",
+      "identity": "body_hash:e7046d7d9d623563e598300229b2a720",
+      "source_index": 28508,
+      "total_chars": 5458,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function getUserX4Matrix(address userAddress, uint8 level)",
+      "identity": "body_hash:da5bd0ee0ba8dc3509aedc1b8a33f8dc",
+      "source_index": 26846,
+      "total_chars": 5575,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function calcSwapErc20ToPiptInputs(\r\n    address _swapToken,\r\n    uint256 _swapAmount,\r\n    address[] memory _tokens,\r\n    uint256 _slippage,\r\n    bool _withFee\r\n  )",
+      "identity": "body_hash:1bc21409a726b872136d145886823c08",
+      "source_index": 3305,
+      "total_chars": 5763,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function signerRegister(\r\n    uint256 _tokenId,\r\n    uint8 _v,\r\n    bytes32 _r,\r\n    bytes32 _s,\r\n    string memory _tokenURI,\r\n    address _artist,\r\n    address _paymentToken,\r\n    uint256 _paymentAmount,\r\n    uint256 _yflAmount\r\n  )",
+      "identity": "body_hash:498f0e485273117651c969e450aa45e9",
+      "source_index": 9057,
+      "total_chars": 6399,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function batchTransfer(address contractAddress,address user1,address user2,address user3,address user4,address user5,address user6,address user7,address user8)",
+      "identity": "body_hash:5ccb36144ddf47f2c9584828ed76fe54",
+      "source_index": 11544,
+      "total_chars": 6588,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 12,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function submitProposal(\r\n        address applicant,\r\n        uint256 sharesRequested,\r\n        uint256 lootRequested,\r\n        uint256 tributeOffered,\r\n        address tributeToken,\r\n        uint256 paymentRequested,\r\n        address paymentToken,\r\n        string memory details\r\n    )",
+      "identity": "body_hash:838daf8bb914b83a9a8d10e4f37dc358",
+      "source_index": 16183,
+      "total_chars": 7039,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 13,
+      "function_signature": "function isValidSigner(address _user,address _feerecipient,uint256 _amount,uint256 _fee,uint256 _signblock,uint256 _valid,bytes memory signature)",
+      "identity": "body_hash:609c3e46c19f9d16759f5662944f7813",
+      "source_index": 12058,
+      "total_chars": 7239,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function getClaim(bytes32 _claimId)",
+      "identity": "body_hash:31fe4f5ae3079021841e65215df03dc1",
+      "source_index": 5977,
+      "total_chars": 1046,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function info()",
+      "identity": "body_hash:20b3fe4f84987f9af336ffcb45e0efd0",
+      "source_index": 3962,
+      "total_chars": 1573,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function getContractStatus()",
+      "identity": "body_hash:5088d919d8698a66bf367b6d476a5b65",
+      "source_index": 9959,
+      "total_chars": 1756,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function USER_DOMAIN_INFO(address _user)",
+      "identity": "body_hash:784a3b6c604b5eef4d67ae4ffcf8ad2c",
+      "source_index": 14830,
+      "total_chars": 1894,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function poll(address user)",
+      "identity": "body_hash:0ca919ae0ec8065218d5fc2cfd305c27",
+      "source_index": 1598,
+      "total_chars": 1934,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function permit(address holder, address spender, uint256 nonce, uint256 expiry,\n    bool allowed, uint8 v, bytes32 r, bytes32 s)",
+      "identity": "body_hash:768cf815922cb333e4696ca374b11d16",
+      "source_index": 14644,
+      "total_chars": 1957,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function productInfo(uint256 _productId)",
+      "identity": "body_hash:32c01516fb65842251bb32e4b4e1eb07",
+      "source_index": 6050,
+      "total_chars": 2141,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function quote(address pair, address tokenIn, uint amountIn, address tokenOut, uint points)",
+      "identity": "body_hash:460da055d9d6f22106d245447cc3d3f5",
+      "source_index": 8602,
+      "total_chars": 2164,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function stakedetails(address add, uint256 count)",
+      "identity": "body_hash:32fb0ded5c950fd5618f5a74c8b669b9",
+      "source_index": 6090,
+      "total_chars": 2277,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function getQuestionId(uint256 templateId, string memory question, address arbitrator, uint32 timeout, uint32 openingTs, uint256 nonce)",
+      "identity": "body_hash:78c5b449f061bf5ec157b1e4d8f22429",
+      "source_index": 14890,
+      "total_chars": 2291,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function withdraw(\r\n        address _collToken, address _cCollToken, uint256 cAmountRedeem, address _borrowToken, address _cBorrowToken, uint256 amountRepay\r\n    )",
+      "identity": "body_hash:18b5de0902f048f1bde7e2c0d3f97a15",
+      "source_index": 2943,
+      "total_chars": 2306,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function linearInterpolation(bytes32 _name, address _target, bytes32 _what, uint256 _startTime, uint256 _start, uint256 _end, uint256 _duration)",
+      "identity": "body_hash:196c336074a0d004133855b556543c18",
+      "source_index": 3021,
+      "total_chars": 2504,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function verify(address _from, address _to, string memory _userId, \r\n        uint256 _tokenId, uint256 _nonce, bytes memory signature\r\n    )",
+      "identity": "body_hash:52be6011c32fdb33de4fb1a2ce453f0c",
+      "source_index": 10270,
+      "total_chars": 2541,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function deployGovernance(address admin, string calldata _name, string calldata _symbol, uint _totalSupply, uint timeLockDelay, uint _quorumVotes, uint _proposalThreshold, uint _votingPeriod)",
+      "identity": "body_hash:80e3db5bae40fd88027d20aee5da65dc",
+      "source_index": 15850,
+      "total_chars": 2633,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function getGuardianStakingRewardsData(address guardian)",
+      "identity": "body_hash:a01ef739d939c4adbda3819d2f83ad0a",
+      "source_index": 19556,
+      "total_chars": 2645,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function cloneConvex3CrvRewards(\r\n        address _vault,\r\n        address _strategist,\r\n        address _rewardsToken,\r\n        address _keeper,\r\n        uint256 _pid,\r\n        address _curvePool,\r\n        string memory _name\r\n    )",
+      "identity": "body_hash:ee27f91b7268d8601436cc6c3f386cdc",
+      "source_index": 29428,
+      "total_chars": 2920,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function swapExactTokensForETH(\r\n        address gasTokenAddress,\r\n        uint amountToFree,\r\n        address router,\r\n        uint amountOutMin,\r\n        address[] calldata path,\r\n        uint deadline,\r\n        uint bribeAmount,\r\n        uint bribePercentage\r\n    )",
+      "identity": "body_hash:b62f89a5258a7ffeda96c29c326a1e95",
+      "source_index": 22382,
+      "total_chars": 3309,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function ZapBridge(\r\n        address fromToken,\r\n        address toToken,\r\n        uint256[] calldata swapAmounts,\r\n        uint256[] calldata minTokensRec,\r\n        address[] calldata swapTargets,\r\n        bytes[] calldata swapData,\r\n        address affiliate\r\n    )",
+      "identity": "body_hash:9bce1a64c3ba3101df060adcf5004e7b",
+      "source_index": 19030,
+      "total_chars": 3667,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function getUserX3Auto(address user)",
+      "identity": "body_hash:cb280f65328e7df115f06e438f8cb4c5",
+      "source_index": 24942,
+      "total_chars": 3992,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function transferFromPreSignedHashing(\r\n        address _token,\r\n        address _from,\r\n        address _to,\r\n        uint256 _value,\r\n        uint256 _fee,\r\n        uint256 _nonce\r\n    )",
+      "identity": "body_hash:eac790775d798c91abffad8c89322e59",
+      "source_index": 28961,
+      "total_chars": 4217,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function setNftTokenValues(\r\n        string memory name, \r\n        address owner, \r\n        string memory symbol,\r\n        string memory uri, \r\n        uint256 cap,\r\n        uint256 royaltyAmount, \r\n        address creator\r\n    )",
+      "identity": "body_hash:906965e3d3fb0f477acf8d07c666757e",
+      "source_index": 17704,
+      "total_chars": 4930,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function createStakingEvent(uint256[] memory _cardIdList, uint256 _cardAmountAny, uint256[] memory _cardAmountList, uint256 _cardRewardId,\r\n        uint256 _blockStakeLength, uint256 _blockEventClose, uint256[] memory _toBurnIdList, uint256[] memory _toBurnAmountList)",
+      "identity": "body_hash:bf7be43a4472ba99fa8155fbcffcaf69",
+      "source_index": 23531,
+      "total_chars": 5211,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function buildInternalSalt(\r\n        uint128 _amount,\r\n        address _borrower,\r\n        address _creator,\r\n        address _callback,\r\n        uint256 _salt,\r\n        uint64 _expiration\r\n    )",
+      "identity": "body_hash:35e75e404a90d16374f0092bb1288c49",
+      "source_index": 6496,
+      "total_chars": 5255,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function batchTransfer(address contractAddress,address user1,address user2,address user3,address user4,address user5,address user6,address user7)",
+      "identity": "body_hash:7a30c66379a804bbdc7153cfd8cbde84",
+      "source_index": 15049,
+      "total_chars": 6335,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 10,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function usersE6Matrix(address userAddress, uint8 level)",
+      "identity": "body_hash:8259ce7d7189a1fe80883901fb62be07",
+      "source_index": 16038,
+      "total_chars": 7322,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    }
+  ],
+  "selected_rows": 64,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}
