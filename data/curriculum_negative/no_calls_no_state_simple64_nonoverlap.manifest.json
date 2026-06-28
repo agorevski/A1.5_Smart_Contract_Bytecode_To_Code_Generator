@@ -1,0 +1,1112 @@
+{
+  "categories": [
+    "abi",
+    "visibility",
+    "mutability"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl",
+    "data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl"
+  ],
+  "focus": "abi",
+  "manifest_kind": "curriculum_dataset",
+  "max_focus_facts": 5,
+  "output_dataset": "data/curriculum_negative/no_calls_no_state_simple64_nonoverlap.jsonl",
+  "require_zero_categories": [
+    "call",
+    "member_call",
+    "state_write"
+  ],
+  "rows": [
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function currentTier()",
+      "identity": "body_hash:3e7c00cbb2ee3142cd793d23b99c6159",
+      "source_index": 7621,
+      "total_chars": 342,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceInTier()",
+      "identity": "body_hash:5849eee78deacaf8006f5b5f821b8b7e",
+      "source_index": 10980,
+      "total_chars": 360,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceOf(address src)",
+      "identity": "body_hash:900a6207b97b1d045d19ffe21802a959",
+      "source_index": 17669,
+      "total_chars": 426,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function lastTokenId()",
+      "identity": "body_hash:4e6a1d2b8e3cb1bd842ace7e2f31791c",
+      "source_index": 9654,
+      "total_chars": 454,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function cancelUpdate(address _logic)",
+      "identity": "body_hash:82a84b502d7529bb1f64bb86d780e24c",
+      "source_index": 16082,
+      "total_chars": 475,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function isToken()",
+      "identity": "body_hash:7da38970660244dd43d473112c825aeb",
+      "source_index": 15463,
+      "total_chars": 526,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getDefaultChoice()",
+      "identity": "body_hash:207db7aeba75934683ebb5108487f4f5",
+      "source_index": 3930,
+      "total_chars": 550,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function getOracleAddress(string nameReference)",
+      "identity": "body_hash:950f063478d52775bfcef9eb1a91f4b0",
+      "source_index": 18217,
+      "total_chars": 554,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function xX89hH8h98()",
+      "identity": "body_hash:dcea4b758401c3e172ad1576f5dc6eb8",
+      "source_index": 27203,
+      "total_chars": 556,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function totalSupply()",
+      "identity": "body_hash:dedf85890756cbe4f1ea042f1f8030d0",
+      "source_index": 27424,
+      "total_chars": 562,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function MmMnnUbYIuinU87786756()",
+      "identity": "body_hash:23b6cd1b2b4e68783bea3e4dc0de50a2",
+      "source_index": 4316,
+      "total_chars": 566,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraw()",
+      "identity": "body_hash:06ac9be13e04ee28402e25f2f008b9d7",
+      "source_index": 846,
+      "total_chars": 581,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getEntityCount()",
+      "identity": "body_hash:43ecdbdd79deeefd933fd2c6370b4893",
+      "source_index": 8355,
+      "total_chars": 610,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function canUpgrade()",
+      "identity": "body_hash:d4250e7096e399e134ab9ee009435bd5",
+      "source_index": 26079,
+      "total_chars": 631,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraw()",
+      "identity": "body_hash:83438aa2f9cbc2faeb76c0a6d58ad05f",
+      "source_index": 16150,
+      "total_chars": 651,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function saleStarted()",
+      "identity": "body_hash:89dadbcc835937290ac0b0f8a4a8d9de",
+      "source_index": 16949,
+      "total_chars": 672,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function saleEnded()",
+      "identity": "body_hash:51d20e5fcd8744d0feec95da40de4844",
+      "source_index": 10148,
+      "total_chars": 673,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function getStats()",
+      "identity": "body_hash:814f1c99c9fba886de9adf1d3fe2bdc6",
+      "source_index": 15902,
+      "total_chars": 723,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function balance()",
+      "identity": "body_hash:6dfc2c8cc17a718a0c0a6a22abf99b61",
+      "source_index": 13653,
+      "total_chars": 760,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addEth()",
+      "identity": "body_hash:54df344593a704714985fe5f33466111",
+      "source_index": 10507,
+      "total_chars": 794,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addToWhitelist(address[] calldata users)",
+      "identity": "body_hash:abd2eb1b88a66149efbf8c3b15938679",
+      "source_index": 21086,
+      "total_chars": 814,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getChoice()",
+      "identity": "body_hash:9a7aefcd111c38c306442c32756e30b9",
+      "source_index": 18840,
+      "total_chars": 829,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraw()",
+      "identity": "body_hash:68a95e5956de823ecb433952362a801d",
+      "source_index": 12990,
+      "total_chars": 830,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deposit()",
+      "identity": "body_hash:6361c63b001684730621e472aeddecee",
+      "source_index": 12365,
+      "total_chars": 849,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function revokeConfirmation(uint256 transactionId)",
+      "identity": "body_hash:267f384d08bb83a4a3cf80d70da9b07a",
+      "source_index": 4629,
+      "total_chars": 856,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function totalSupply()",
+      "identity": "body_hash:ab778fdc1ac3e07e7aec6d02fb1d8219",
+      "source_index": 21045,
+      "total_chars": 898,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function totalSupply()",
+      "identity": "body_hash:373daa76bebfb848aac6d7e134030cb2",
+      "source_index": 6675,
+      "total_chars": 900,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeFromWhitelist(address[] calldata users)",
+      "identity": "body_hash:4ed73aa239a3adeb2df283bae33349f9",
+      "source_index": 9727,
+      "total_chars": 901,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraw()",
+      "identity": "body_hash:6c88d8c7aa7cc4a4891a6b1c31f231ef",
+      "source_index": 13477,
+      "total_chars": 908,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function authorizeOperator(address operator)",
+      "identity": "body_hash:5ab7522d4a66267ed1fda4efdbfdbf3b",
+      "source_index": 11284,
+      "total_chars": 912,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addWhitelistAddresses(address[] memory addresses)",
+      "identity": "body_hash:15f4e42f23d983525419dfcceaf46e1f",
+      "source_index": 2667,
+      "total_chars": 930,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function registerDerivatives(address[] memory _derivatives)",
+      "identity": "body_hash:eddef41b9d45b9f4c6434282d52e9956",
+      "source_index": 29384,
+      "total_chars": 938,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraw()",
+      "identity": "body_hash:b5fd2ab22eee50ccc1e7ed260efb2fbf",
+      "source_index": 22356,
+      "total_chars": 939,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function resetRisk(bytes32 trainNumber)",
+      "identity": "body_hash:69e7cbe98a2ddb77f8a3cd6739257dbf",
+      "source_index": 13155,
+      "total_chars": 943,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deposit()",
+      "identity": "body_hash:b4677d0d201262046461f39d015c02dd",
+      "source_index": 22152,
+      "total_chars": 973,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getEGTTotalSupply()",
+      "identity": "body_hash:c098f1d0b221de74f72209e7a2301e6d",
+      "source_index": 23659,
+      "total_chars": 981,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addApprove(address[] memory receivers)",
+      "identity": "body_hash:3a1368dd7ddfcc8fe20168a5813d316c",
+      "source_index": 7040,
+      "total_chars": 1035,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setBot(address[] memory bots_)",
+      "identity": "body_hash:7f5ae1b2d05c62f4f8f20b6e8192c670",
+      "source_index": 15669,
+      "total_chars": 1041,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function nonosquare(address[] memory bots_)",
+      "identity": "body_hash:b9872e56b13fe0ad849d645b92be88a1",
+      "source_index": 22769,
+      "total_chars": 1045,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function multiWhitelistRemove(address[] memory addresses)",
+      "identity": "body_hash:33713fa1ae8c5de032cb4f7c839d12f8",
+      "source_index": 6163,
+      "total_chars": 1049,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function clearCurrentCollectionTrait(uint256 index)",
+      "identity": "body_hash:bc2d36e0fcc2327ffeb2704f168f57f1",
+      "source_index": 23092,
+      "total_chars": 1068,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceOf(address _owner)",
+      "identity": "body_hash:82ca6d51047f04fe12c9fbfd8ed099b5",
+      "source_index": 16091,
+      "total_chars": 1159,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function attest(bytes32 hash)",
+      "identity": "body_hash:52fb4ad3f3c5b5abf1a3814674fd20cf",
+      "source_index": 10304,
+      "total_chars": 1169,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setFlag(uint8 data)",
+      "identity": "body_hash:104427011093295b7d2fef4147f54112",
+      "source_index": 2045,
+      "total_chars": 1199,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceOf(address _owner)",
+      "identity": "body_hash:cdf331095acd65552e0a6d90ca1a1cbf",
+      "source_index": 25338,
+      "total_chars": 1199,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdrawPartialContractBalance(uint256 amount)",
+      "identity": "body_hash:c471f63d5e83e6900ba39bde61b7451f",
+      "source_index": 24104,
+      "total_chars": 1213,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function Deposit()",
+      "identity": "body_hash:c148f59d8cf53c9b8bfb05de420a32c2",
+      "source_index": 23752,
+      "total_chars": 1226,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function write(bytes32[2] calldata data)",
+      "identity": "body_hash:240c10f02b3fa5770a21393fe58d8942",
+      "source_index": 4373,
+      "total_chars": 1238,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceOf(address _owner)",
+      "identity": "body_hash:ab72b7d5fa9680abcfe7edb9d7c40e2c",
+      "source_index": 21042,
+      "total_chars": 1245,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdrawEth(uint256 _amount)",
+      "identity": "body_hash:a5105b5e0694ee704ddb229e72d5f2c9",
+      "source_index": 20212,
+      "total_chars": 1247,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceOf(address _owner)",
+      "identity": "body_hash:e1832f3f5fec2c0d7f3f44e4dc39a271",
+      "source_index": 27767,
+      "total_chars": 1256,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeStrategy(uint256 _key)",
+      "identity": "body_hash:5ace75b1d28a4855fd1ee5ca5c3d6ef3",
+      "source_index": 11299,
+      "total_chars": 1290,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function multiWhitelistAdd(address[] memory addresses)",
+      "identity": "body_hash:8f9086c3a5aefe8384d4c7ff94bdd093",
+      "source_index": 17604,
+      "total_chars": 1297,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function getPrivilegedBalance(address _owner)",
+      "identity": "body_hash:a72bb6027aaee73d5f0a7252822e6559",
+      "source_index": 20504,
+      "total_chars": 1318,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteBytes(bytes32 _key)",
+      "identity": "body_hash:9b1a05d8ccf95c714dac8e367e23fad2",
+      "source_index": 18933,
+      "total_chars": 1406,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeSender(address _addr)",
+      "identity": "body_hash:924f6dfe5315d9a916107dc54fbb4207",
+      "source_index": 17914,
+      "total_chars": 1410,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteInt(bytes32 _key)",
+      "identity": "body_hash:446a7d89c4422432949e9865ffe80deb",
+      "source_index": 8408,
+      "total_chars": 1417,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteBytes32Value(bytes32 record)",
+      "identity": "body_hash:76a76b4ea541714aed60cfa90f145e9a",
+      "source_index": 14661,
+      "total_chars": 1425,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteIntValue(bytes32 record)",
+      "identity": "body_hash:85f3dc2c855bf0f97374748367420bc8",
+      "source_index": 16447,
+      "total_chars": 1439,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteUIntValue(bytes32 record)",
+      "identity": "body_hash:260c54e6534805efc49e10d6994f0a17",
+      "source_index": 4602,
+      "total_chars": 1441,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deposit()",
+      "identity": "body_hash:e58f9ab149b3eccff016df968d8f50a1",
+      "source_index": 28325,
+      "total_chars": 1496,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdrawPoll(uint256 pollId)",
+      "identity": "body_hash:d0eb845041341b202b382d767a8b3c0f",
+      "source_index": 25696,
+      "total_chars": 1498,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteBool(bytes32 _key)",
+      "identity": "body_hash:1ab59c19d94ef650fc4136bc2faa8b1f",
+      "source_index": 3164,
+      "total_chars": 1503,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteBooleanValue(bytes32 record)",
+      "identity": "body_hash:3d80d59b319ff17a46cba3b024ac714f",
+      "source_index": 7490,
+      "total_chars": 1553,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    }
+  ],
+  "selected_rows": 64,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}

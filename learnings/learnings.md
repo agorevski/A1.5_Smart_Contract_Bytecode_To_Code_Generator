@@ -35,6 +35,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 | 23. Simple negative controls | `data/curriculum_negative/no_calls_simple64_nonoverlap.jsonl`, `data/curriculum_negative/no_state_writes_simple64_nonoverlap.jsonl`, baseline evals `results/eval_1782622383.json`, `results/eval_1782622484.json` | Added `--max-focus-facts` to the curriculum builder and rebuilt no-call/no-state controls with `focus_total=5` rather than the earlier ABI-heavy 11-17 range. Evaluated the current accepted adapter on both simple slices. | Simple no-call vs heavy no-call: F1 0.6362 vs 0.4705, bytecode 0.4764 vs 0.3251, selector mismatches 152 vs 586, unsupported calls 43 vs 71. Simple no-state vs heavy no-state: F1 0.5701 vs 0.5002, bytecode 0.4313 vs 0.3275, selector mismatches 151 vs 574, but unsupported calls remain high at 117 and invented state writes 41. | The earlier negative slices were confounded by very complex ABI targets. Use the simple negative controls for hallucination-focused prompt/decoding/curriculum checks. |
 | 24. Simple-negative decode sweep rejected | `results/eval_1782622642.json`, `results/eval_1782622742.json`, `results/eval_1782622846.json`, `results/eval_1782622949.json`, `results/eval_1782623055.json`, `results/eval_1782623161.json`; session reports `simple_negative_256_gate.*`, `simple_negative_rp110_gate.*`, `simple_negative_rp115_gate.*` | Compared `eval_max_new_tokens=256` vs 512 and repetition penalties 1.10/1.15 vs the 1.05 baseline on the simple no-call/no-state controls. | 256 tokens was identical to 512 on both slices, so max-new-token overgeneration is not the driver. Repetition 1.15 improved no-call F1 +0.0082/bytecode +0.0080 but regressed no-state F1 -0.0356/bytecode -0.0577/valid -0.0313. Repetition 1.10 regressed both simple slices. | Keep 1.05 as the decode default; unsupported calls/state on simple negatives require model/data changes, not a max-token or repetition-penalty tweak. |
 | 25. Prompt grounding hint rejected | Candidate prompt evals `results/eval_1782623346.json`, `results/eval_1782623440.json`; session report `simple_negative_grounding_hint_gate.*` | Temporarily added an inference/training prompt hint: only include calls, storage writes, events, guards, and returns supported by TAC/metadata. Evaluated the accepted adapter on both simple negative controls, then reverted the prompt change. | The hint reduced simple no-state unsupported calls 117 -> 98 and invented state writes 41 -> 39, but regressed no-call F1 -0.0068/bytecode -0.0043 and no-state F1 -0.0034/bytecode -0.0252/valid -0.0313; it also increased invented events on both slices. | Prompt-only grounding constraints are not safe for the current adapter; they reduce some hallucination buckets but damage correctness and validity. |
+| 26. Pure call/state negative control | `data/curriculum_negative/no_calls_no_state_simple64_nonoverlap.jsonl`, eval `results/eval_1782623579.json` | Built a 64-row simple control with zero extracted `call`, `member_call`, and `state_write` facts, `focus_total=5`, and no overlap with broad/holdout gates. Evaluated the current accepted adapter. | F1 0.6162, bytecode 0.4454, semantic 0.7174, valid 0.8906. Even with no target calls or state writes, hallucinations remain: unsupported calls=74, invented state writes=30, unsupported ABI elements=88. Selector mismatches are much lower than heavy negatives (168 vs 574-586), so this isolates hallucination better. | Use this pure negative as the cleanest early target for call/state hallucination fixes; current model invents calls/state even when neither exists in the target. |
 
 ## Durable learnings
 
@@ -60,6 +61,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 20. **Negative controls should cap ABI/focus complexity.** The first negative slices selected rows with 11-17 ABI-related focus facts and were dominated by selector/ABI mismatches; `max_focus_facts=5` yields cleaner hallucination probes.
 21. **Do not change decode defaults based on simple negative slices.** Lowering max new tokens to 256 had no effect, while repetition penalties 1.10 and 1.15 regressed at least one simple negative control.
 22. **Prompt-only grounding hints are unsafe for the current adapter.** An explicit "only include supported facts" instruction reduced unsupported calls but regressed F1, bytecode score, and validity on simple negative controls.
+23. **The model hallucinates calls and state writes even on pure negative rows.** On 64 simple rows with no target calls/member calls/state writes, the accepted adapter still produced 74 unsupported calls and 30 invented state writes.
 
 ## Hypotheses
 
@@ -79,6 +81,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 14. **Medium confidence: unsupported calls are the most robust hallucination target on simple negatives.** Evidence: even after simplifying ABI complexity, simple no-state still has 117 unsupported calls and simple no-call still has 43 unsupported calls.
 15. **High confidence: repetition penalty is not the fix for negative hallucinations.** Evidence: 1.15 trades no-call improvement for large no-state regression, and 1.10 regresses both simple controls.
 16. **Medium confidence: grounding constraints need to be trained, not only added at inference.** Evidence: an untrained prompt hint changed output distribution but caused correctness regressions and more invented events.
+17. **High confidence: pure negative rows are a cleaner hallucination probe than single-category negatives.** Evidence: requiring both no calls and no state writes keeps selector mismatches relatively low while exposing unsupported calls/state writes directly.
 
 ## Invalidated assumptions
 
@@ -112,6 +115,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 15. **Use simple negative controls before training on negative examples.** Success criterion: reduce unsupported calls and invented state writes on `no_calls_simple64_nonoverlap` and `no_state_writes_simple64_nonoverlap` without regressing F1, bytecode score, semantic similarity, or Solidity validity.
 16. **Move next effort to data/model conditioning, not decoding.** Success criterion: a prompt or curriculum change improves both simple negative controls and still passes broad/calls/state/holdout64.
 17. **If grounding instructions are retried, include them during fine-tuning and gate them against simple negatives first.** Success criterion: unsupported calls/state fall without F1/bytecode/validity regression on both simple negative controls.
+18. **Gate call/state hallucination fixes on the pure negative control first.** Success criterion: reduce unsupported calls below 74 and invented state writes below 30 on `no_calls_no_state_simple64_nonoverlap` without lowering F1, bytecode score, semantic similarity, or validity.
 
 ## Artifact map
 
@@ -150,6 +154,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 - Rejected negative-mixed continuation evals: `results/eval_1782621875.json`, `results/eval_1782622164.json`
 - Simple no-call negative control: `data/curriculum_negative/no_calls_simple64_nonoverlap.jsonl`
 - Simple no-state-write negative control: `data/curriculum_negative/no_state_writes_simple64_nonoverlap.jsonl`
+- Pure no-call/no-state negative control: `data/curriculum_negative/no_calls_no_state_simple64_nonoverlap.jsonl`
 - Rejected simple-negative decode sweeps: `results/eval_1782622642.json`, `results/eval_1782622742.json`, `results/eval_1782622846.json`, `results/eval_1782622949.json`, `results/eval_1782623055.json`, `results/eval_1782623161.json`
 - Rejected prompt grounding hint evals: `results/eval_1782623346.json`, `results/eval_1782623440.json`
 - Selector-metadata retrain model: `models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/`
