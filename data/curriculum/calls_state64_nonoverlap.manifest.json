@@ -1,0 +1,915 @@
+{
+  "categories": [
+    "call",
+    "member_call",
+    "state_write",
+    "guard",
+    "modifier"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl"
+  ],
+  "focus": "calls_state",
+  "manifest_kind": "curriculum_dataset",
+  "output_dataset": "data/curriculum/calls_state64_nonoverlap.jsonl",
+  "rows": [
+    {
+      "focus_counts": {
+        "call": 21,
+        "guard": 0,
+        "member_call": 19,
+        "modifier": 0,
+        "state_write": 26
+      },
+      "focus_total": 66,
+      "function_signature": "function getInfo()",
+      "identity": "body_hash:7abf547ff7834e4fff9cc6a1d894bb36",
+      "source_index": 15119,
+      "total_chars": 4534
+    },
+    {
+      "focus_counts": {
+        "call": 0,
+        "guard": 2,
+        "member_call": 0,
+        "modifier": 0,
+        "state_write": 51
+      },
+      "focus_total": 53,
+      "function_signature": "function populateTierRates()",
+      "identity": "body_hash:9fd9b82e4d63315384e0521451bbdf62",
+      "source_index": 19533,
+      "total_chars": 2576
+    },
+    {
+      "focus_counts": {
+        "call": 0,
+        "guard": 1,
+        "member_call": 0,
+        "modifier": 0,
+        "state_write": 50
+      },
+      "focus_total": 51,
+      "function_signature": "function populateTierTokens()",
+      "identity": "body_hash:4788604d75ba18f97a148ea1199e1183",
+      "source_index": 8773,
+      "total_chars": 2399
+    },
+    {
+      "focus_counts": {
+        "call": 6,
+        "guard": 1,
+        "member_call": 3,
+        "modifier": 0,
+        "state_write": 37
+      },
+      "focus_total": 47,
+      "function_signature": "function initialize()",
+      "identity": "body_hash:424c5c18af35bda120e81904d240d14e",
+      "source_index": 8111,
+      "total_chars": 5408
+    },
+    {
+      "focus_counts": {
+        "call": 21,
+        "guard": 0,
+        "member_call": 15,
+        "modifier": 1,
+        "state_write": 6
+      },
+      "focus_total": 43,
+      "function_signature": "function adjustPosition()",
+      "identity": "body_hash:05079f46a90db433b50efacca8643cbf",
+      "source_index": 658,
+      "total_chars": 6224
+    },
+    {
+      "focus_counts": {
+        "call": 5,
+        "guard": 6,
+        "member_call": 4,
+        "modifier": 3,
+        "state_write": 23
+      },
+      "focus_total": 41,
+      "function_signature": "function startSales(uint256 tokenId,\n                        uint256 maxPrice, \n                        uint256 minPrice,\n                        uint256 startTime, \n                        uint256 durationTime,\n                        address nft,\n                        address currency)",
+      "identity": "body_hash:8ebc54db49a87b0b215b0e8461cd5878",
+      "source_index": 17490,
+      "total_chars": 4380
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 0,
+        "member_call": 10,
+        "modifier": 0,
+        "state_write": 14
+      },
+      "focus_total": 37,
+      "function_signature": "function getUserInfo(address who, address currency)",
+      "identity": "body_hash:1993a98a50ca184db816e1f400c0e2d7",
+      "source_index": 3039,
+      "total_chars": 3192
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 2,
+        "member_call": 8,
+        "modifier": 1,
+        "state_write": 12
+      },
+      "focus_total": 36,
+      "function_signature": "function liquidation(address _user, address from)",
+      "identity": "body_hash:73d8b0dbec1ac43035a9dbe297539a38",
+      "source_index": 14336,
+      "total_chars": 4512
+    },
+    {
+      "focus_counts": {
+        "call": 18,
+        "guard": 3,
+        "member_call": 9,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 34,
+      "function_signature": "function wdR()",
+      "identity": "body_hash:2a19f3e006c00665b258fd2ce5660467",
+      "source_index": 5056,
+      "total_chars": 2795
+    },
+    {
+      "focus_counts": {
+        "call": 17,
+        "guard": 0,
+        "member_call": 10,
+        "modifier": 5,
+        "state_write": 1
+      },
+      "focus_total": 33,
+      "function_signature": "function allocateSeigniorage()",
+      "identity": "body_hash:3fcd01e1df67d4e609392d81e47f65b8",
+      "source_index": 7805,
+      "total_chars": 3050
+    },
+    {
+      "focus_counts": {
+        "call": 18,
+        "guard": 2,
+        "member_call": 11,
+        "modifier": 0,
+        "state_write": 0
+      },
+      "focus_total": 31,
+      "function_signature": "function withdraw(address _property)",
+      "identity": "body_hash:7de2cf028e548514628aec46ed38c331",
+      "source_index": 15495,
+      "total_chars": 1999
+    },
+    {
+      "focus_counts": {
+        "call": 1,
+        "guard": 2,
+        "member_call": 0,
+        "modifier": 1,
+        "state_write": 27
+      },
+      "focus_total": 31,
+      "function_signature": "function resetLotteryBatch()",
+      "identity": "body_hash:e79b6abac96e3a4be34f388d4c10460d",
+      "source_index": 28591,
+      "total_chars": 2872
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 3,
+        "member_call": 10,
+        "modifier": 0,
+        "state_write": 5
+      },
+      "focus_total": 31,
+      "function_signature": "function lockTokens(address _pair, uint256 _epoch, address _tokenPayout, address _router)",
+      "identity": "body_hash:54c0ae46ece6c5c9794ffad644fb6dc9",
+      "source_index": 10496,
+      "total_chars": 2917
+    },
+    {
+      "focus_counts": {
+        "call": 8,
+        "guard": 1,
+        "member_call": 3,
+        "modifier": 1,
+        "state_write": 18
+      },
+      "focus_total": 31,
+      "function_signature": "function intializeContract()",
+      "identity": "body_hash:6b7e9ddd10041bdca4d7852bcdfa0dea",
+      "source_index": 13365,
+      "total_chars": 3003
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 4,
+        "member_call": 9,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 30,
+      "function_signature": "function postCrowdSale()",
+      "identity": "body_hash:d5939770ff2223c49ab8c376df475b8e",
+      "source_index": 26238,
+      "total_chars": 2653
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "guard": 7,
+        "member_call": 8,
+        "modifier": 0,
+        "state_write": 3
+      },
+      "focus_total": 30,
+      "function_signature": "function placeTrade(uint256 orderIndex)",
+      "identity": "body_hash:665a47f74564f0e80e30b3ecca6f3928",
+      "source_index": 12684,
+      "total_chars": 3092
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 2,
+        "member_call": 8,
+        "modifier": 1,
+        "state_write": 5
+      },
+      "focus_total": 29,
+      "function_signature": "function recoveryAddress(address wallet_lostAddress, address wallet_newAddress, address onchainID)",
+      "identity": "body_hash:8020527e20c5179b88e921248b0813b6",
+      "source_index": 15751,
+      "total_chars": 2691
+    },
+    {
+      "focus_counts": {
+        "call": 4,
+        "guard": 1,
+        "member_call": 1,
+        "modifier": 0,
+        "state_write": 23
+      },
+      "focus_total": 29,
+      "function_signature": "function initialize(address _angryTokenAddr, address _usdtTokenAddr, address _uniswapRouterAddr, address _vitalikButerinAddr, uint256 _startTime)",
+      "identity": "body_hash:03d3c738449b646a85a85df5368062f5",
+      "source_index": 479,
+      "total_chars": 3353
+    },
+    {
+      "focus_counts": {
+        "call": 15,
+        "guard": 2,
+        "member_call": 8,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 29,
+      "function_signature": "function withdraw(uint256 _shares)",
+      "identity": "body_hash:15fc139e45b6c51b78353abe1934bcdd",
+      "source_index": 2670,
+      "total_chars": 3591
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 3,
+        "member_call": 8,
+        "modifier": 1,
+        "state_write": 4
+      },
+      "focus_total": 29,
+      "function_signature": "function stakeStart(uint256 amount, uint256 numMonthsStake)",
+      "identity": "body_hash:21c25e58c044595886ec48d703c39428",
+      "source_index": 4073,
+      "total_chars": 3845
+    },
+    {
+      "focus_counts": {
+        "call": 17,
+        "guard": 2,
+        "member_call": 10,
+        "modifier": 0,
+        "state_write": 0
+      },
+      "focus_total": 29,
+      "function_signature": "function executeOperation(\r\n        address _reserve,\r\n        uint256 _amountFlashLoan,\r\n        uint256 _fee,\r\n        bytes memory _data\r\n    )",
+      "identity": "body_hash:6d8b40cca8a55e23120cfc0dfe115fec",
+      "source_index": 13584,
+      "total_chars": 4338
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "guard": 5,
+        "member_call": 11,
+        "modifier": 0,
+        "state_write": 1
+      },
+      "focus_total": 29,
+      "function_signature": "function claimFunds(address auctionAddress)",
+      "identity": "body_hash:6ee945a18ed3816f539514eca4a189df",
+      "source_index": 13754,
+      "total_chars": 4588
+    },
+    {
+      "focus_counts": {
+        "call": 8,
+        "guard": 5,
+        "member_call": 3,
+        "modifier": 1,
+        "state_write": 12
+      },
+      "focus_total": 29,
+      "function_signature": "function duplicateInvestIn()",
+      "identity": "body_hash:c6fe6197047a4c1015d45ceb5566841d",
+      "source_index": 24415,
+      "total_chars": 5357
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 1,
+        "member_call": 6,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 28,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:20a5b99b1078de62733eb70bdf90bdb2",
+      "source_index": 3954,
+      "total_chars": 1816
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 1,
+        "member_call": 6,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 28,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:88dfc5d8927cc31fa980b1f094f08bf2",
+      "source_index": 16803,
+      "total_chars": 1819
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "guard": 1,
+        "member_call": 9,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 28,
+      "function_signature": "function deposit(uint256 _amount)",
+      "identity": "body_hash:5520c1210b12749876e0590dc968bb67",
+      "source_index": 10540,
+      "total_chars": 2609
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 9
+      },
+      "focus_total": 27,
+      "function_signature": "function openTrading(address router)",
+      "identity": "body_hash:38328739968df9171b85ceae6dbab73b",
+      "source_index": 6827,
+      "total_chars": 2929
+    },
+    {
+      "focus_counts": {
+        "call": 4,
+        "guard": 6,
+        "member_call": 0,
+        "modifier": 3,
+        "state_write": 14
+      },
+      "focus_total": 27,
+      "function_signature": "function raidWorldNode(uint8 _worldNodeId, uint256 _stakes)",
+      "identity": "body_hash:de92a69ce103ec24904f59d870f71cbe",
+      "source_index": 27397,
+      "total_chars": 5175
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 9
+      },
+      "focus_total": 26,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:27b15126218ae71327acd1d77ba3f327",
+      "source_index": 4772,
+      "total_chars": 1827
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "guard": 1,
+        "member_call": 7,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 26,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:1e81a85b6df155b7be8658784107e6a8",
+      "source_index": 3648,
+      "total_chars": 2164
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "guard": 1,
+        "member_call": 7,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 26,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:5eaf8ee0b885f7b3cab18054d5fa618c",
+      "source_index": 11765,
+      "total_chars": 2165
+    },
+    {
+      "focus_counts": {
+        "call": 15,
+        "guard": 2,
+        "member_call": 9,
+        "modifier": 0,
+        "state_write": 0
+      },
+      "focus_total": 26,
+      "function_signature": "function harvest()",
+      "identity": "body_hash:c932e48c74523adb891e705048e8b08a",
+      "source_index": 24709,
+      "total_chars": 2227
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "guard": 1,
+        "member_call": 7,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 26,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:a517ed7143c0ca6c504133ade8b82efc",
+      "source_index": 20219,
+      "total_chars": 2371
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "guard": 3,
+        "member_call": 7,
+        "modifier": 5,
+        "state_write": 1
+      },
+      "focus_total": 26,
+      "function_signature": "function buyBonds(uint256 amount, uint256 targetPrice)",
+      "identity": "body_hash:6e931c906ece325ac3c384ccbd772d6a",
+      "source_index": 13711,
+      "total_chars": 2635
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 3,
+        "member_call": 7,
+        "modifier": 0,
+        "state_write": 3
+      },
+      "focus_total": 26,
+      "function_signature": "function authenticatedCallback(address _property, bytes32 _idHash)",
+      "identity": "body_hash:0cd35db4aa08784bc52929dbf70bf312",
+      "source_index": 1615,
+      "total_chars": 2665
+    },
+    {
+      "focus_counts": {
+        "call": 16,
+        "guard": 0,
+        "member_call": 10,
+        "modifier": 0,
+        "state_write": 0
+      },
+      "focus_total": 26,
+      "function_signature": "function beforeBalanceChange(\r\n\t\taddress _property,\r\n\t\taddress _from,\r\n\t\taddress _to\r\n\t)",
+      "identity": "body_hash:cdba1b6acc52ea0ed5e84955d93bc5c2",
+      "source_index": 25313,
+      "total_chars": 2846
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 3,
+        "member_call": 8,
+        "modifier": 0,
+        "state_write": 4
+      },
+      "focus_total": 26,
+      "function_signature": "function stakeLP(uint256 _amount)",
+      "identity": "body_hash:bcbe76ec6fab21babcb7ff503d4a666a",
+      "source_index": 23157,
+      "total_chars": 5376
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 3,
+        "member_call": 8,
+        "modifier": 0,
+        "state_write": 4
+      },
+      "focus_total": 26,
+      "function_signature": "function stakeLP(uint _amount)",
+      "identity": "body_hash:2e6ecd4e13704fca1432406558aea19a",
+      "source_index": 5597,
+      "total_chars": 5382
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 4,
+        "member_call": 9,
+        "modifier": 0,
+        "state_write": 2
+      },
+      "focus_total": 26,
+      "function_signature": "function mintThenDeposit(\r\n        address payable _wbtcDestination, \r\n        uint256 _amount, \r\n        uint256[2] calldata _amounts, \r\n        uint256 _min_mint_amount, \r\n        uint256 _new_min_mint_amount, \r\n        bytes32 _nHash, \r\n        bytes calldata _sig\r\n    )",
+      "identity": "body_hash:7aa45664d11b6f29ebab556911dde207",
+      "source_index": 15108,
+      "total_chars": 7450
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:0ada983ca34a3223b182b336597d0ef5",
+      "source_index": 1339,
+      "total_chars": 1508
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:710001ffda7f6fc7f5ad2bc97768ea8e",
+      "source_index": 14010,
+      "total_chars": 1575
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:ef73544f2b000e77d50724da68e94606",
+      "source_index": 29592,
+      "total_chars": 1658
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:ac284904e54fa8262e0c1b5621afceca",
+      "source_index": 21148,
+      "total_chars": 1786
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:ba64f18ebab02a4261e4ea4620fbb495",
+      "source_index": 22881,
+      "total_chars": 1820
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:47ecbb7bd9a380eb0404696e400eabcc",
+      "source_index": 8824,
+      "total_chars": 1825
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:b8ade6c24a31fdb9c69f55e40ff324cb",
+      "source_index": 22669,
+      "total_chars": 1826
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 2,
+        "member_call": 8,
+        "modifier": 1,
+        "state_write": 3
+      },
+      "focus_total": 25,
+      "function_signature": "function participateInAuction()",
+      "identity": "body_hash:b567ed8bbe365ba26377ddf49d1c05a0",
+      "source_index": 22285,
+      "total_chars": 2108
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:e35e81962edeb67f6cf2219fc73a5203",
+      "source_index": 28010,
+      "total_chars": 2338
+    },
+    {
+      "focus_counts": {
+        "call": 8,
+        "guard": 6,
+        "member_call": 3,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 25,
+      "function_signature": "function create_bid(uint64 amount, uint16 price)",
+      "identity": "body_hash:9b8b74ab003182255bccbfd667bc8f94",
+      "source_index": 18988,
+      "total_chars": 2909
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "guard": 6,
+        "member_call": 7,
+        "modifier": 0,
+        "state_write": 2
+      },
+      "focus_total": 25,
+      "function_signature": "function buy(uint tokenId)",
+      "identity": "body_hash:655e56c4fe0965dd64c6cb680d24bf93",
+      "source_index": 12577,
+      "total_chars": 2911
+    },
+    {
+      "focus_counts": {
+        "call": 7,
+        "guard": 9,
+        "member_call": 7,
+        "modifier": 0,
+        "state_write": 2
+      },
+      "focus_total": 25,
+      "function_signature": "function placeBid(\r\n    address auctionAddress\r\n  )",
+      "identity": "body_hash:08c466ca660fc99a193eb358ca1da30e",
+      "source_index": 1082,
+      "total_chars": 3760
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 2,
+        "member_call": 8,
+        "modifier": 0,
+        "state_write": 4
+      },
+      "focus_total": 25,
+      "function_signature": "function stakeNFY(uint256 _amount)",
+      "identity": "body_hash:3210fecdc1d35173fc5a72026af87986",
+      "source_index": 5985,
+      "total_chars": 4041
+    },
+    {
+      "focus_counts": {
+        "call": 5,
+        "guard": 0,
+        "member_call": 5,
+        "modifier": 0,
+        "state_write": 15
+      },
+      "focus_total": 25,
+      "function_signature": "function ticketDatas(uint256[] memory _tickets)",
+      "identity": "body_hash:76c9389bcc6264627702cf6ae62eb51c",
+      "source_index": 14683,
+      "total_chars": 4143
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:773377dabea7950718dcbc67491ad1ce",
+      "source_index": 14723,
+      "total_chars": 4680
+    },
+    {
+      "focus_counts": {
+        "call": 6,
+        "guard": 9,
+        "member_call": 2,
+        "modifier": 2,
+        "state_write": 6
+      },
+      "focus_total": 25,
+      "function_signature": "function sponsorProposal(uint256 proposalId)",
+      "identity": "body_hash:0df250d29215db0dac108ebcdf71fc35",
+      "source_index": 1736,
+      "total_chars": 5781
+    },
+    {
+      "focus_counts": {
+        "call": 17,
+        "guard": 0,
+        "member_call": 5,
+        "modifier": 0,
+        "state_write": 3
+      },
+      "focus_total": 25,
+      "function_signature": "function ClaimCompTwo(address[] calldata tokens, uint setId)",
+      "identity": "body_hash:b8fb4b4b08fce2002e45b17894ab05e6",
+      "source_index": 22699,
+      "total_chars": 5817
+    },
+    {
+      "focus_counts": {
+        "call": 9,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 7,
+        "state_write": 4
+      },
+      "focus_total": 25,
+      "function_signature": "function invalidateName(string calldata unhashedName)",
+      "identity": "body_hash:69427b8cffc98ce6bf269462998ac587",
+      "source_index": 13058,
+      "total_chars": 6297
+    },
+    {
+      "focus_counts": {
+        "call": 9,
+        "guard": 0,
+        "member_call": 8,
+        "modifier": 0,
+        "state_write": 8
+      },
+      "focus_total": 25,
+      "function_signature": "function calcSwapEthToPiptInputs(\r\n    uint256 _ethValue,\r\n    address[] memory _tokens,\r\n    uint256 _slippage\r\n  )",
+      "identity": "body_hash:208f6a1f8912ca8052155d3c355aa220",
+      "source_index": 3940,
+      "total_chars": 6855
+    },
+    {
+      "focus_counts": {
+        "call": 6,
+        "guard": 5,
+        "member_call": 6,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 25,
+      "function_signature": "function userWithdrawTokens ()",
+      "identity": "body_hash:a4539a6899c7ea3136faf7bb624f4dca",
+      "source_index": 20117,
+      "total_chars": 7838
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:8c34bb1b15fcce2e63981e680f18cd52",
+      "source_index": 17209,
+      "total_chars": 1522
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:8d05afa2c6e9dbc03259ec4bd3c9aca1",
+      "source_index": 17293,
+      "total_chars": 1619
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:77f2636b844f44f275dd85ade1d4a62f",
+      "source_index": 14788,
+      "total_chars": 1788
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "guard": 0,
+        "member_call": 9,
+        "modifier": 0,
+        "state_write": 2
+      },
+      "focus_total": 24,
+      "function_signature": "function createNewCurveVaultAndStrat(uint256 _pid, uint256 _depositLimit)",
+      "identity": "body_hash:1ff459b5db8d0b0ddbf11b04325d5ec8",
+      "source_index": 3850,
+      "total_chars": 1812
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "guard": 1,
+        "member_call": 4,
+        "modifier": 1,
+        "state_write": 7
+      },
+      "focus_total": 24,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:7af46b44e4c16d12d649bd059abd6759",
+      "source_index": 15147,
+      "total_chars": 1829
+    }
+  ],
+  "selected_rows": 64,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}
