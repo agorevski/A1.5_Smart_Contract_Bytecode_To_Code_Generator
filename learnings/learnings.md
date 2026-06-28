@@ -28,6 +28,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 | 16. State-write slice eval | `results/eval_1782616749.json`, dataset `data/eval_failure_slices/broad30_reppenalty_1_05/state_writes.jsonl` | 17-row state-write slice, same model, greedy, `eval_max_new_tokens=512`, default repetition penalty 1.05 | Semantic 0.7017, edit distance 0.6639, replication F1 micro 0.5399, bytecode semantic 0.3763, solidity valid 88.2%; missing state_write=18 and invented_state_writes=15 | State writes are intertwined with calls/guards and should be the second curriculum target after calls |
 | 17. Inference default alignment | `src/inference.py`, `src/model_setup.py`, `scripts/decompile.py`, `web/app.py`, `web/static/app.js`, `tests/test_decompile_cli.py` | Propagated the measured 1.05 repetition penalty from eval into direct model inference, CLI defaults, web API defaults, and browser UI defaults | Targeted CLI/web tests pass, and generated configs now carry `repetition_penalty=1.05` unless explicitly overridden | The best measured decode setting is no longer limited to `train.py` eval runs; ad hoc inference and UI trials should be comparable |
 | 18. Non-overlap curriculum builder | `scripts/build_curriculum_dataset.py`, `tests/test_build_curriculum_dataset.py`, `data/curriculum/calls48_nonoverlap.jsonl`, `data/curriculum/state_writes48_nonoverlap.jsonl` | Built deduplicated call/state-write curriculum sources from `data/hf_training_dataset.jsonl`, excluding the broad-30 eval body hashes and capping inputs at 9k chars/outputs at 2.5k chars | Calls curriculum: 48 unique body hashes, focus facts min 18/max 40/avg 21.92. State-write curriculum: 48 unique body hashes, focus facts min 9/max 51/avg 15.06 | The next retrain can target the known bottlenecks without leaking the fixed broad-30 eval rows or duplicating optimizer variants of the same body |
+| 19. Calls-curriculum continuation rejected | `results/eval_1782617808.json`, `results/eval_1782617880.json`, `results/eval_1782617977.json`, `train.py`, `tests/test_train_cli_issues.py` | Continued from selector-metadata checkpoint-210 on 48 call-heavy rows for 30 extra effective steps (`max_steps=240`, LR 1e-4, LoRA rank 32/alpha 64/dropout 0) and evaluated fixed calls/state slices | Calls slice: semantic 0.6662 -> 0.6726 and bytecode 0.4103 -> 0.4148, but replication F1 fell 0.5422 -> 0.5312 and recall fell 0.5056 -> 0.4944. State-write slice regressed on semantic, F1, bytecode, and validity. The generated model was deleted. | A dense calls curriculum alone is not enough and may overfit toward precision at the expense of recall; future continuation needs a heldout curriculum split, lower LR/steps, or mixed call+state+negative examples |
 
 ## Durable learnings
 
@@ -70,6 +71,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 6. **Invalidated: "Wrong function names are only a model-capacity problem."** Local selector provenance recovered all tested signatures; exposing that provenance fixed many function identity errors without changing weights.
 7. **Invalidated: "A selector-metadata retrain immediately solves heldout behavior."** The 100-row retrain improved train memorization and broad structured metrics, but heldout/broad outputs still miss bytecode behavior and remain non-deployable.
 8. **Invalidated: "0% Solidity-valid on exact overfit outputs proves syntax collapse."** The exact 30-row overfit outputs are scaffold-valid; the old metric was penalizing missing contract context from solc, not malformed Solidity.
+9. **Invalidated: "A call-dense continuation by itself will fix the calls slice."** The first 48-row calls continuation slightly improved semantic/bytecode scores but reduced replication F1 and recall on the same fixed calls slice, and it regressed state-write transfer.
 
 ## Suggestions and next experiments
 
@@ -83,8 +85,8 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 8. **Inspect failure buckets for calls, returns, guards, and state writes.** Success criterion: reduce these buckets and improve replication recall without increasing unsupported extra facts.
 9. **Train or evaluate a failure-bucket curriculum before another broad run.** Start with rows dominated by calls/member calls, then state writes, guards, returns, and events. Success criterion: each slice improves replication recall and bytecode semantic score on a heldout slice without increasing unsupported calls/state writes.
 10. **Add compiler-version-aware syntax checks for generated fragments.** The remaining 3/30 broad syntax failures are version-related or true syntax issues: missing visibility under solc 0.5.x, `override` under solc 0.5.7, and `payable(...)` syntax under solc 0.5.17. Success criterion: prompts or targets avoid version-incompatible constructs for the target compiler.
-11. **Run a calls-focused micro-curriculum training loop next.** Use `data/curriculum/calls48_nonoverlap.jsonl` for training and evaluate on `data/eval_failure_slices/broad30_reppenalty_1_05/calls.jsonl`; success criterion: calls-slice replication F1 rises above 0.60 and missing call facts drop materially without increasing unsupported calls.
-12. **Then run a state-write/guard curriculum.** Use `data/curriculum/state_writes48_nonoverlap.jsonl`; success criterion: state-write slice bytecode semantic score improves above 0.45 and invented state writes do not increase.
+11. **Redesign the curriculum before another continuation.** Mix calls with state writes/guards plus unsupported-call negatives, and reserve a heldout curriculum slice. Success criterion: calls-slice replication F1 and recall both improve without state-write regression.
+12. **Try lower-risk continuation settings if retraining again.** Candidate: LR <= 5e-5, <=10 effective optimizer steps, and mixed call/state rows. Success criterion: fixed calls and state-write slices both improve against `results/eval_1782616677.json`/`results/eval_1782616749.json`.
 
 ## Artifact map
 
@@ -113,6 +115,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 - State-write slice eval: `results/eval_1782616749.json`
 - Calls curriculum source: `data/curriculum/calls48_nonoverlap.jsonl`
 - State-write curriculum source: `data/curriculum/state_writes48_nonoverlap.jsonl`
+- Rejected calls-curriculum continuation evals: `results/eval_1782617808.json`, `results/eval_1782617880.json`, `results/eval_1782617977.json`
 - Selector-metadata retrain model: `models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/`
 - Overfit runner: `run_train_qwen_qlora_overfit_sanity_check.sh`
 - Standard sampled QLoRA runner: `run_train_qwen_qlora_500.sh`
