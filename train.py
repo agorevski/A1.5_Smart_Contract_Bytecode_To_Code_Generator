@@ -1460,6 +1460,7 @@ def _record_preflight_error(
 def _preflight_prompt_parts(
     item: dict,
     include_bytecode_metadata: bool,
+    include_selector_signature_metadata: bool,
     template_format: str,
 ) -> tuple[str, str, str]:
     from src.model_setup import SmartContractDataset
@@ -1467,6 +1468,7 @@ def _preflight_prompt_parts(
     dataset = SmartContractDataset.__new__(SmartContractDataset)
     dataset.template_format = template_format
     dataset.include_bytecode_metadata = include_bytecode_metadata
+    dataset.include_selector_signature_metadata = include_selector_signature_metadata
     dataset.include_compiler_metadata = False
     return dataset._format_prompt_parts(
         item.get("input", ""),
@@ -1481,6 +1483,7 @@ def validate_jsonl_schema_and_lengths(
     *,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     include_bytecode_metadata: bool = True,
+    include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
     fail_on_context_overlength: bool = True,
@@ -1632,6 +1635,7 @@ def validate_jsonl_schema_and_lengths(
                 prefix, target, suffix = _preflight_prompt_parts(
                     item,
                     include_bytecode_metadata=include_bytecode_metadata,
+                    include_selector_signature_metadata=include_selector_signature_metadata,
                     template_format=template_format,
                 )
                 context_tokens = len(_tokenize_to_ids(tokenizer, prefix))
@@ -1757,6 +1761,7 @@ def run_data_preflight(
     tokenizer_source: str | None,
     max_seq_length: int,
     include_bytecode_metadata: bool = True,
+    include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool = False,
     skip: bool = False,
     allow_tokenizer_download: bool = False,
@@ -1796,6 +1801,9 @@ def run_data_preflight(
                 "tokenizer": tokenizer_info,
                 "max_seq_length": int(max_seq_length),
                 "include_bytecode_metadata": bool(include_bytecode_metadata),
+                "include_selector_signature_metadata": bool(
+                    include_selector_signature_metadata
+                ),
                 "include_compiler_metadata": False,
                 "template_format": "alpaca",
                 "allow_legacy_metadata_schema": bool(allow_legacy_metadata_schema),
@@ -1818,6 +1826,7 @@ def run_data_preflight(
             tokenizer=tokenizer,
             max_seq_length=max_seq_length,
             include_bytecode_metadata=include_bytecode_metadata,
+            include_selector_signature_metadata=include_selector_signature_metadata,
             allow_legacy_metadata_schema=allow_legacy_metadata_schema,
         )
         if cache_dir and cache_metadata:
@@ -2698,6 +2707,13 @@ def _count_jsonl_rows(path: str | Path | None) -> int:
     return rows
 
 
+def _decompiler_selector_signature_metadata(decompiler: Any) -> bool:
+    if hasattr(decompiler, "include_selector_signature_metadata"):
+        return bool(getattr(decompiler, "include_selector_signature_metadata"))
+    config = getattr(decompiler, "config", None)
+    return bool(getattr(config, "include_selector_signature_metadata", True))
+
+
 def _effective_training_runtime_settings(args: argparse.Namespace, train_path: str) -> dict:
     train_rows = _count_jsonl_rows(train_path)
     has_cuda = _cuda_device_count() > 0
@@ -2837,6 +2853,7 @@ def train_model(
     gradient_accumulation_steps: int | None = None,
     global_batch_size: int | None = DEFAULT_GLOBAL_BATCH_SIZE,
     include_bytecode_metadata: bool = True,
+    include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool | None = None,
     max_steps: int = -1,
     tokenization_cache: dict | str | bool | None = None,
@@ -2897,6 +2914,7 @@ def train_model(
         dataloader_prefetch_factor=dataloader_prefetch_factor,
         gradient_checkpointing=gradient_checkpointing,
         include_bytecode_metadata=include_bytecode_metadata,
+        include_selector_signature_metadata=include_selector_signature_metadata,
         report_to=report_to,
     )
 
@@ -2919,6 +2937,7 @@ def train_model(
         gradient_accumulation_steps,
     )
     logger.info(f"  Bytecode metadata prompts: {include_bytecode_metadata}")
+    logger.info("  Selector signature prompts: %s", include_selector_signature_metadata)
 
     model_path = trainer.train(
         train_dataset_path=train_path,
@@ -2962,6 +2981,7 @@ def evaluate_model(
     baseline_results_path: str | None = None,
     baseline_tolerance: float = 0.0,
     quality_gate_config: dict | None = None,
+    include_selector_signature_metadata: bool | None = None,
 ) -> dict:
     """Evaluate the trained model on the test set.
 
@@ -3065,6 +3085,16 @@ def evaluate_model(
 
     # Initialize model on this rank's GPU
     decompiler = SmartContractDecompiler(model_path)
+    if include_selector_signature_metadata is not None:
+        decompiler_config = getattr(decompiler, "config", None)
+        if decompiler_config is not None:
+            decompiler_config.include_selector_signature_metadata = bool(
+                include_selector_signature_metadata
+            )
+        else:
+            decompiler.include_selector_signature_metadata = bool(
+                include_selector_signature_metadata
+            )
     evaluator = SmartContractEvaluator()
 
     results = []
@@ -3480,6 +3510,9 @@ def evaluate_model(
                 "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
                 "eval_max_new_tokens": int(eval_max_new_tokens),
+                "include_selector_signature_metadata": _decompiler_selector_signature_metadata(
+                    decompiler
+                ),
                 "generation_config": generation_config,
                 "model_path": model_path,
                 "test_dataset": test_path,
@@ -3530,6 +3563,9 @@ def evaluate_model(
                 "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
                 "eval_max_new_tokens": int(eval_max_new_tokens),
+                "include_selector_signature_metadata": _decompiler_selector_signature_metadata(
+                    decompiler
+                ),
                 "generation_config": generation_config,
                 "model_path": model_path,
                 "test_dataset": test_path,
@@ -4047,6 +4083,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--no-selector-signature-metadata",
+        action="store_true",
+        help=(
+            "Do not include locally resolved selector signatures in prompt metadata; "
+            "raw selector hex is still included when bytecode metadata is enabled"
+        ),
+    )
+    parser.add_argument(
         "--skip-data-preflight",
         action="store_true",
         help="Skip JSONL schema and token-length preflight before training/evaluation",
@@ -4325,6 +4369,7 @@ def main():
                 tokenizer_source=args.model_path,
                 max_seq_length=args.max_seq_length,
                 include_bytecode_metadata=not args.no_bytecode_metadata,
+                include_selector_signature_metadata=not args.no_selector_signature_metadata,
                 skip=args.skip_data_preflight,
                 allow_tokenizer_download=args.preflight_tokenizer_download,
                 allow_whitespace_fallback=args.allow_whitespace_preflight_fallback,
@@ -4350,6 +4395,7 @@ def main():
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
+                include_selector_signature_metadata=not args.no_selector_signature_metadata,
             )
             manifest["evaluation"] = {
                 "summary": summary,
@@ -4359,6 +4405,7 @@ def main():
                     "eval_first_n": args.eval_first_n,
                     "eval_batch_size": args.eval_batch_size,
                     "eval_max_new_tokens": args.eval_max_new_tokens,
+                    "include_selector_signature_metadata": not args.no_selector_signature_metadata,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
                     "baseline_tolerance": args.baseline_tolerance,
@@ -4569,6 +4616,7 @@ def main():
                 "enable_memory_monitoring": args.enable_memory_monitoring,
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "include_bytecode_metadata": not args.no_bytecode_metadata,
+                "include_selector_signature_metadata": not args.no_selector_signature_metadata,
                 "max_steps": args.max_steps,
                 "tokenization_cache": tokenization_cache_config,
                 "train_eval_strategy": args.train_eval_strategy,
@@ -4614,6 +4662,7 @@ def main():
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             global_batch_size=args.global_batch_size,
             include_bytecode_metadata=not args.no_bytecode_metadata,
+            include_selector_signature_metadata=not args.no_selector_signature_metadata,
             max_steps=args.max_steps,
             tokenization_cache=tokenization_cache_config,
             instrumentation_config=instrumentation_config,
@@ -4669,6 +4718,7 @@ def main():
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
+                include_selector_signature_metadata=not args.no_selector_signature_metadata,
             )
             manifest["evaluation"] = {
                 "summary": summary,
@@ -4678,6 +4728,7 @@ def main():
                     "eval_first_n": args.eval_first_n,
                     "eval_batch_size": args.eval_batch_size,
                     "eval_max_new_tokens": args.eval_max_new_tokens,
+                    "include_selector_signature_metadata": not args.no_selector_signature_metadata,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
                     "baseline_tolerance": args.baseline_tolerance,

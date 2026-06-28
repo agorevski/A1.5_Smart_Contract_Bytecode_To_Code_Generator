@@ -1572,6 +1572,35 @@ def aggregate_prompt_diagnostics(results: Sequence[Mapping[str, Any]]) -> Dict[s
     return summary
 
 
+_SIGNATURE_FACT_PREFIXES = (
+    "function_name:",
+    "param_count:",
+    "param_type:",
+    "return_count:",
+    "return_type:",
+)
+
+
+def solidity_function_signature_facts(code: str) -> set[str]:
+    """Return normalized ABI signature facts for the first Solidity function."""
+    abi_facts = extract_solidity_facts(code).get("abi", set())
+    signature_facts = {
+        fact
+        for fact in abi_facts
+        if any(fact.startswith(prefix) for prefix in _SIGNATURE_FACT_PREFIXES)
+    }
+    if not any(fact.startswith("function_name:") for fact in signature_facts):
+        return set()
+    return signature_facts
+
+
+def solidity_function_signature_matches(reference: str, candidate: str) -> bool:
+    """Compare function name, parameter types/count, and return types/count."""
+    reference_signature = solidity_function_signature_facts(reference)
+    candidate_signature = solidity_function_signature_facts(candidate)
+    return bool(reference_signature) and reference_signature == candidate_signature
+
+
 @dataclass
 class EvaluationMetrics:
     """Container for evaluation metrics as described in the paper."""
@@ -2057,9 +2086,10 @@ class SmartContractEvaluator:
                 replication=replication,
             )
 
-            function_signature_match = original_metadata.get(
-                "has_function_keyword"
-            ) == decompiled_metadata.get("has_function_keyword")
+            function_signature_match = solidity_function_signature_matches(
+                original,
+                decompiled,
+            )
 
             visibility_match = original_metadata.get("visibility") == decompiled_metadata.get(
                 "visibility"

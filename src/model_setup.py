@@ -135,6 +135,7 @@ class ModelConfig:
     dataloader_prefetch_factor: Optional[int] = None
     gradient_checkpointing: bool = True
     include_bytecode_metadata: bool = True
+    include_selector_signature_metadata: bool = True
     include_compiler_metadata: bool = False  # Deprecated; ignored for prompt safety.
     report_to: Union[str, List[str]] = "none"
 
@@ -176,6 +177,7 @@ class ModelConfig:
             "dataloader_prefetch_factor": self.dataloader_prefetch_factor,
             "gradient_checkpointing": self.gradient_checkpointing,
             "include_bytecode_metadata": self.include_bytecode_metadata,
+            "include_selector_signature_metadata": self.include_selector_signature_metadata,
             "report_to": self.report_to,
         }
 
@@ -199,6 +201,7 @@ class ModelConfig:
             "dataloader_prefetch_factor",
             "gradient_checkpointing",
             "include_bytecode_metadata",
+            "include_selector_signature_metadata",
             "include_compiler_metadata",
             "report_to",
         }
@@ -490,9 +493,36 @@ def _format_count_part(label: str, value: Optional[int]) -> Optional[str]:
     return f"{label}={value}"
 
 
+def resolve_selector_signature_for_prompt(selector: Optional[str]) -> Optional[str]:
+    """Resolve a selector locally for prompt context without remote lookups."""
+    normalized = _normalize_selector(selector)
+    if not normalized:
+        return None
+    try:
+        from src.selector_resolver import get_resolver
+
+        result = get_resolver(use_remote=False).resolve(normalized)
+    except Exception as exc:
+        logger.debug("Selector prompt resolution failed for %s: %s", normalized, exc)
+        return None
+
+    best = getattr(result, "best_match", None)
+    if best is None or getattr(best, "source", None) == "unknown":
+        return None
+    try:
+        confidence = float(getattr(best, "confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    signature = str(getattr(best, "signature", "") or "").strip()
+    if confidence < 0.8 or not signature:
+        return None
+    return signature
+
+
 def format_prompt_metadata(
     metadata: Optional[Dict],
     include_bytecode_metadata: bool = True,
+    include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool = False,
     tac_input: Optional[str] = None,
 ) -> str:
@@ -510,6 +540,10 @@ def format_prompt_metadata(
     metadata_parts = []
     if selector:
         metadata_parts.append(f"selector={selector}")
+        if include_selector_signature_metadata:
+            selector_signature = resolve_selector_signature_for_prompt(selector)
+            if selector_signature:
+                metadata_parts.append(f"selector_signature={selector_signature}")
 
     tac_blocks = (stats.get("tac_blocks", 0) if has_tac else 0) or _metadata_nonnegative_int(
         metadata,
@@ -582,6 +616,7 @@ def format_prompt_metadata(
 def build_training_prompt_for_length(
     item: Dict[str, Any],
     include_bytecode_metadata: bool = True,
+    include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
 ) -> str:
@@ -589,6 +624,7 @@ def build_training_prompt_for_length(
     dataset = SmartContractDataset.__new__(SmartContractDataset)
     dataset.template_format = template_format
     dataset.include_bytecode_metadata = include_bytecode_metadata
+    dataset.include_selector_signature_metadata = include_selector_signature_metadata
     dataset.include_compiler_metadata = False
     return dataset._format_prompt(
         item.get("input", ""),
@@ -1016,6 +1052,7 @@ class SmartContractDataset(Dataset):
         template_format: str = "alpaca",
         augment_names: bool = False,
         include_bytecode_metadata: bool = True,
+        include_selector_signature_metadata: bool = True,
         include_compiler_metadata: bool = False,
         tokenization_cache: Optional[Union[TokenizationCacheConfig, str, Path, bool]] = None,
     ):
@@ -1029,6 +1066,8 @@ class SmartContractDataset(Dataset):
             augment_names: Whether to deterministically augment target variable names.
             include_bytecode_metadata: Whether bytecode/TAC-derived metadata is
                 included in the prompt header.
+            include_selector_signature_metadata: Whether locally resolved
+                selector signatures are included in the prompt header.
             include_compiler_metadata: Deprecated no-op; compiler metadata is
                 never included in prompts.
             tokenization_cache: Optional cache config/path. Disabled by default
@@ -1039,6 +1078,7 @@ class SmartContractDataset(Dataset):
         self.template_format = template_format
         self.augment_names = augment_names
         self.include_bytecode_metadata = include_bytecode_metadata
+        self.include_selector_signature_metadata = include_selector_signature_metadata
         self.include_compiler_metadata = False
         self.AUGMENT_RATE = 0.3
         self.data = self._load_data(data_path)
@@ -1069,6 +1109,9 @@ class SmartContractDataset(Dataset):
             "tokenizer": tokenizer_cache_identity(self.tokenizer),
             "template_format": self.template_format,
             "include_bytecode_metadata": bool(self.include_bytecode_metadata),
+            "include_selector_signature_metadata": bool(
+                self.include_selector_signature_metadata
+            ),
             "augment_names": bool(self.augment_names),
             "max_length": int(self.max_length),
             "num_examples": len(self.data),
@@ -1239,6 +1282,11 @@ class SmartContractDataset(Dataset):
             metadata_line = format_prompt_metadata(
                 metadata,
                 include_bytecode_metadata=getattr(self, "include_bytecode_metadata", True),
+                include_selector_signature_metadata=getattr(
+                    self,
+                    "include_selector_signature_metadata",
+                    True,
+                ),
                 tac_input=tac_text,
             )
             if metadata_line:
@@ -1260,6 +1308,11 @@ class SmartContractDataset(Dataset):
             metadata_line = format_prompt_metadata(
                 metadata,
                 include_bytecode_metadata=getattr(self, "include_bytecode_metadata", True),
+                include_selector_signature_metadata=getattr(
+                    self,
+                    "include_selector_signature_metadata",
+                    True,
+                ),
                 tac_input=tac_text,
             )
             metadata_str = ""
@@ -2755,6 +2808,11 @@ class SmartContractDecompiler:
         metadata_line = format_prompt_metadata(
             metadata,
             include_bytecode_metadata=getattr(self.config, "include_bytecode_metadata", True),
+            include_selector_signature_metadata=getattr(
+                self.config,
+                "include_selector_signature_metadata",
+                True,
+            ),
             tac_input=tac_input,
         )
         if metadata_line:

@@ -3,41 +3,41 @@ Smart Contract Decompiler - Latest Evaluation Results
 
 Run
 ---
-Generated at: 2026-06-27T03:15:56+00:00
-Command: train.py --eval-only --model-path models/final_model_378 --test-dataset data/test_dataset.jsonl --eval-limit 3
-Git commit: edfbd30
+Generated at: 2026-06-28T01:22:13+00:00
+Command: train.py --eval-only --model-path models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/final_model --test-dataset data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl --eval-batch-size 1 --eval-max-new-tokens 512 --latest-results models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/latest_results_broad30.txt --skip-data-preflight
+Git commit: 3e5945a
 Git dirty: yes
 Python: 3.13.9
-Platform: Linux-6.8.0-117-generic-x86_64-with-glibc2.39
-Evaluation duration: 35.7s
-Distributed world size: 1
-Eval limit: 3
+Platform: Linux-6.8.0-124-generic-x86_64-with-glibc2.39
+Evaluation duration: 1m 18.7s
+Distributed world size: 4
+Eval limit: none
 
 Model
 -----
-Model path: models/final_model_378
-Base model: meta-llama/Llama-3.2-3B
-Model artifact size: 109.3 MiB
-Adapter size: 92.8 MiB
-Tokenizer size: 16.4 MiB
-Max sequence length: 2048
-LoRA rank: 16
-LoRA alpha: 32
-LoRA dropout: 0.1
+Model path: models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/final_model
+Base model: Qwen/Qwen2.5-Coder-7B-Instruct
+Model artifact size: 323.2 MiB
+Adapter size: 308.1 MiB
+Tokenizer size: 10.9 MiB
+Max sequence length: 8192
+LoRA rank: 32
+LoRA alpha: 64
+LoRA dropout: 0.0
 Target modules: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 Quantization: 4-bit
 Compiler metadata prompts: unknown
 
 Training Parameters
 -------------------
-num_train_epochs: 3
-per_device_train_batch_size: 4
-per_device_eval_batch_size: 4
-gradient_accumulation_steps: 4
+num_train_epochs: 10
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 1
 learning_rate: 0.0002
 weight_decay: 0.01
 warmup_steps: 100
-lr_scheduler_type: SchedulerType.LINEAR
+lr_scheduler_type: SchedulerType.COSINE_WITH_RESTARTS
 optim: OptimizerNames.ADAMW_TORCH_FUSED
 bf16: False
 fp16: True
@@ -45,45 +45,652 @@ seed: 42
 
 Evaluation Data
 ---------------
-Test dataset: data/test_dataset.jsonl
-Dataset rows: 4154
-Dataset size: 14.8 MiB
-Detailed JSON: results/eval_1782530156.json
+Test dataset: data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl
+Dataset rows: 30
+Dataset size: 94.9 KiB
+Detailed JSON: results/eval_1782609733.json
+
+Executive Evaluation Readout
+----------------------------
+Overall status: needs_attention
+
+What is going well:
+- Evaluation completed without generation failures. (failure_rate=0.00%)
+
+What needs attention:
+- [P1/high] Bytecode-grounded behavior does not match reference behavior often enough. Evidence: bytecode_semantic_score_mean=0.2374 (target >= 0.8000)
+  Likely cause: The model may recover text that looks plausible but changes guards, returns, calls, or state effects.
+- [P1/high] The model is adding facts not grounded in the reference or bytecode evidence. Evidence: replication_hallucination_rate=36.89% (target <= 5.00%); replication_groundedness_score_mean=0.6174 (target >= 0.9500)
+  Likely cause: Training examples may reward common Solidity boilerplate even when bytecode evidence is absent.
+- [P1/high] Generated Solidity is not consistently semantically close to the reference. Evidence: semantic_similarity_mean=0.6933 (target >= 0.8200)
+  Likely cause: Training data may under-represent the failing opcode/control-flow slices.
+- [P1/high] Generated outputs often fail Solidity syntax or validation checks. Evidence: solidity_valid_mean=0.00% (target >= 95.00%)
+  Likely cause: Targets may contain inconsistent Solidity versions or formatting.
+- [P1/high] Generated Solidity differs substantially from reference source shape. Evidence: edit_distance_mean=0.5937 (target <= 0.4000)
+  Likely cause: The model may be producing generic scaffolds or omitting reference-specific statements.
+
+Suggested next experiments:
+- [P1] Fine-tune or evaluate separately on rows with bytecode mismatch buckets before broad retraining. Success metric: bytecode_semantic_score_mean improves and replication_f1_micro does not regress
+- [P1] Create a small negative eval slice from the top hallucination buckets and tune prompts/decoding against it. Success metric: replication_hallucination_rate drops without reducing replication_recall_micro
+- [P1] Fine-tune on the weakest metadata/opcode segments and compare semantic_similarity_mean by segment. Success metric: semantic_similarity_mean improves without baseline regressions
+- [P1] Sweep temperature/top_p/max_new_tokens on the same eval split to separate decoding noise from model capacity. Success metric: pct_above_0.8_similarity increases and edit_distance_mean does not regress
+- [P1] Cluster scaffold/compiler errors and patch the largest target/prompt class first. Success metric: solidity_valid_mean reaches at least 95%
+
+Caveats:
+- Metadata coverage for opcode_group is incomplete (100% unknown); segment conclusions may be biased.
+- Metadata coverage for control_flow is incomplete (100% unknown); segment conclusions may be biased.
+
+Machine-readable diagnostics:
+```json
+{
+  "caveats": [
+    "Metadata coverage for opcode_group is incomplete (100% unknown); segment conclusions may be biased.",
+    "Metadata coverage for control_flow is incomplete (100% unknown); segment conclusions may be biased."
+  ],
+  "issue_counts_by_severity": {
+    "high": 5,
+    "medium": 3
+  },
+  "issues": [
+    {
+      "category": "model_behavior",
+      "evidence": [
+        "bytecode_semantic_score_mean=0.2374 (target >= 0.8000)"
+      ],
+      "id": "bytecode_semantic_gap",
+      "likely_root_causes": [
+        "The model may recover text that looks plausible but changes guards, returns, calls, or state effects.",
+        "Training may need examples that emphasize bytecode behavior over lexical similarity."
+      ],
+      "priority": "P1",
+      "severity": "high",
+      "suggested_experiments": [
+        {
+          "action": "Fine-tune or evaluate separately on rows with bytecode mismatch buckets before broad retraining.",
+          "area": "model/training",
+          "id": "bytecode-mismatch-slice",
+          "success_metric": "bytecode_semantic_score_mean improves and replication_f1_micro does not regress"
+        }
+      ],
+      "title": "Bytecode-grounded behavior does not match reference behavior often enough."
+    },
+    {
+      "category": "model_behavior",
+      "evidence": [
+        "replication_hallucination_rate=36.89% (target <= 5.00%)",
+        "replication_groundedness_score_mean=0.6174 (target >= 0.9500)",
+        "top hallucination buckets: unsupported_abi_elements=39, unsupported_calls=39, invented_state_writes=12"
+      ],
+      "id": "grounded_hallucinations",
+      "likely_root_causes": [
+        "Training examples may reward common Solidity boilerplate even when bytecode evidence is absent.",
+        "Decoding may be too permissive, causing over-generation of calls, guards, events, or returns."
+      ],
+      "priority": "P1",
+      "severity": "high",
+      "suggested_experiments": [
+        {
+          "action": "Create a small negative eval slice from the top hallucination buckets and tune prompts/decoding against it.",
+          "area": "data/model",
+          "id": "hallucination-negative-set",
+          "success_metric": "replication_hallucination_rate drops without reducing replication_recall_micro"
+        }
+      ],
+      "title": "The model is adding facts not grounded in the reference or bytecode evidence."
+    },
+    {
+      "category": "model_behavior",
+      "evidence": [
+        "semantic_similarity_mean=0.6933 (target >= 0.8200)"
+      ],
+      "id": "semantic_fidelity_gap",
+      "likely_root_causes": [
+        "Training data may under-represent the failing opcode/control-flow slices.",
+        "The model may be learning surface syntax while missing bytecode-grounded behavior.",
+        "Learning rate, LoRA rank, or epoch count may not provide enough capacity for semantic recovery."
+      ],
+      "priority": "P1",
+      "severity": "high",
+      "suggested_experiments": [
+        {
+          "action": "Fine-tune on the weakest metadata/opcode segments and compare semantic_similarity_mean by segment.",
+          "area": "data/training",
+          "id": "segment-targeted-finetune",
+          "success_metric": "semantic_similarity_mean improves without baseline regressions"
+        },
+        {
+          "action": "Sweep temperature/top_p/max_new_tokens on the same eval split to separate decoding noise from model capacity.",
+          "area": "model",
+          "id": "generation-config-sweep",
+          "success_metric": "pct_above_0.8_similarity increases and edit_distance_mean does not regress"
+        }
+      ],
+      "title": "Generated Solidity is not consistently semantically close to the reference."
+    },
+    {
+      "category": "syntax_and_deployability",
+      "evidence": [
+        "solidity_valid_mean=0.00% (target >= 95.00%)"
+      ],
+      "id": "solidity_validity_gap",
+      "likely_root_causes": [
+        "Targets may contain inconsistent Solidity versions or formatting.",
+        "Generation may stop early or exceed the model's learned function boundary patterns.",
+        "Prompt truncation can remove declarations needed for syntactically valid output."
+      ],
+      "priority": "P1",
+      "severity": "high",
+      "suggested_experiments": [
+        {
+          "action": "Cluster scaffold/compiler errors and patch the largest target/prompt class first.",
+          "area": "data/model",
+          "id": "syntax-error-cluster",
+          "success_metric": "solidity_valid_mean reaches at least 95%"
+        }
+      ],
+      "title": "Generated outputs often fail Solidity syntax or validation checks."
+    },
+    {
+      "category": "model_behavior",
+      "evidence": [
+        "edit_distance_mean=0.5937 (target <= 0.4000)"
+      ],
+      "id": "textual_distance_gap",
+      "likely_root_causes": [
+        "The model may be producing generic scaffolds or omitting reference-specific statements.",
+        "Training targets may mix formatting styles or include noisy boilerplate."
+      ],
+      "priority": "P1",
+      "severity": "high",
+      "suggested_experiments": [
+        {
+          "action": "Audit low-edit-distance failures for boilerplate/noisy target patterns before adding more training data.",
+          "area": "data",
+          "id": "target-normalization-audit",
+          "success_metric": "edit_distance_mean decreases while replication_f1_micro stays stable or improves"
+        }
+      ],
+      "title": "Generated Solidity differs substantially from reference source shape."
+    },
+    {
+      "category": "syntax_and_deployability",
+      "evidence": [
+        "bytecode_deployable_mean=0.00% (target >= 95.00%)"
+      ],
+      "id": "deployability_gap",
+      "likely_root_causes": [
+        "Compiler version or constructor/runtime context may be missing.",
+        "Generated source may pass scaffold syntax but fail real compiler/deployment checks."
+      ],
+      "priority": "P2",
+      "severity": "medium",
+      "suggested_experiments": [
+        {
+          "action": "Run local solc validation for the dominant compiler-version segments and inspect deploy failures.",
+          "area": "evaluation/data",
+          "id": "compiler-matrix-eval",
+          "success_metric": "bytecode_deployable_mean reaches 95%+ on compiler-checked rows"
+        }
+      ],
+      "title": "Generated Solidity is not consistently deployable in bytecode-aware validation."
+    },
+    {
+      "category": "evaluation_data",
+      "category_counts": {
+        "bytecode:call_mismatch": 101,
+        "bytecode:control_flow_mismatch": 9,
+        "bytecode:deployability_failure": 30,
+        "bytecode:event_mismatch": 10,
+        "bytecode:guard_mismatch": 22,
+        "bytecode:return_mismatch": 21,
+        "bytecode:selector_mismatch": 71,
+        "bytecode:storage_write_mismatch": 31,
+        "compiler_or_deployability": 30,
+        "syntax_or_scaffold": 30
+      },
+      "evidence": [
+        "top categories: bytecode:call_mismatch=101, bytecode:selector_mismatch=71, bytecode:storage_write_mismatch=31, bytecode:deployability_failure=30, compiler_or_deployability=30"
+      ],
+      "id": "quality_taxonomy_findings",
+      "likely_root_causes": [
+        "Failures are clustered rather than random; use the largest category to choose the next data/model fix."
+      ],
+      "priority": "P2",
+      "severity": "medium",
+      "suggested_experiments": [
+        {
+          "action": "Address the largest quality_issue_summary category and rerun the same evaluation split.",
+          "area": "evaluation/data/model",
+          "id": "taxonomy-first-triage",
+          "success_metric": "largest quality issue category count decreases"
+        }
+      ],
+      "title": "The detailed evaluation taxonomy found recurring quality issue categories."
+    },
+    {
+      "category": "model_behavior",
+      "category_gaps": [
+        {
+          "category": "return",
+          "f1": 0.0,
+          "false_negatives": 11,
+          "false_positives": 10,
+          "precision": 0.0,
+          "recall": 0.0
+        },
+        {
+          "category": "event",
+          "f1": 0.0,
+          "false_negatives": 6,
+          "false_positives": 4,
+          "precision": 0.0,
+          "recall": 0.0
+        },
+        {
+          "category": "guard",
+          "f1": 0.08333333333333334,
+          "false_negatives": 14,
+          "false_positives": 8,
+          "precision": 0.1111111111111111,
+          "recall": 0.06666666666666667
+        },
+        {
+          "category": "control_flow",
+          "f1": 0.18181818181818182,
+          "false_negatives": 7,
+          "false_positives": 2,
+          "precision": 0.3333333333333333,
+          "recall": 0.125
+        },
+        {
+          "category": "state_write",
+          "f1": 0.27906976744186046,
+          "false_negatives": 19,
+          "false_positives": 12,
+          "precision": 0.3333333333333333,
+          "recall": 0.24
+        }
+      ],
+      "evidence": [
+        "replication_f1_micro=0.5954 (target >= 0.7500)",
+        "replication_recall_micro=0.5636 (target >= 0.7500)",
+        "replication_precision_micro=0.6311 (target >= 0.8500)",
+        "weakest categories: return f1=0.0000, event f1=0.0000, guard f1=0.0833"
+      ],
+      "id": "structured_replication_gap",
+      "likely_root_causes": [
+        "Dataflow-heavy examples such as state writes, guards, events, or ABI details are under-learned.",
+        "Prompt evidence may not expose enough selector/opcode context for the failing fact categories.",
+        "Training may need harder negative examples that penalize plausible but unsupported facts."
+      ],
+      "priority": "P2",
+      "severity": "medium",
+      "suggested_experiments": [
+        {
+          "action": "Oversample rows from the weakest replication categories and rerun the same holdout split.",
+          "area": "data/training",
+          "id": "category-balanced-replay",
+          "success_metric": "replication_by_category_micro improves for the targeted categories"
+        },
+        {
+          "action": "Manually inspect worst_samples missing/extra facts and propose target-specific data repairs.",
+          "area": "model/data",
+          "id": "fact-loss-review",
+          "success_metric": "replication_f1_micro improves and hallucination_rate does not increase"
+        }
+      ],
+      "title": "Structured Solidity facts are missing or incorrect."
+    }
+  ],
+  "metrics_used": {
+    "bytecode_deployable_mean": 0,
+    "bytecode_runtime_checked_mean": 0,
+    "bytecode_runtime_match_mean": 0,
+    "bytecode_semantic_checked_mean": 1,
+    "bytecode_semantic_score_mean": 0.23737829803047192,
+    "edit_distance_mean": 0.5937013793025788,
+    "failure_rate": 0,
+    "num_evaluated": 30,
+    "prompt_truncated_rate": 0,
+    "replication_f1_micro": 0.5954198473282443,
+    "replication_groundedness_score_mean": 0.6174065749065749,
+    "replication_hallucination_rate": 0.36893203883495146,
+    "replication_precision_micro": 0.6310679611650486,
+    "replication_recall_micro": 0.5635838150289018,
+    "semantic_similarity_mean": 0.6933491498231887,
+    "solidity_valid_mean": 0
+  },
+  "next_experiments": [
+    {
+      "action": "Fine-tune or evaluate separately on rows with bytecode mismatch buckets before broad retraining.",
+      "area": "model/training",
+      "id": "bytecode-mismatch-slice",
+      "priority": "P1",
+      "success_metric": "bytecode_semantic_score_mean improves and replication_f1_micro does not regress",
+      "triggered_by": "bytecode_semantic_gap"
+    },
+    {
+      "action": "Create a small negative eval slice from the top hallucination buckets and tune prompts/decoding against it.",
+      "area": "data/model",
+      "id": "hallucination-negative-set",
+      "priority": "P1",
+      "success_metric": "replication_hallucination_rate drops without reducing replication_recall_micro",
+      "triggered_by": "grounded_hallucinations"
+    },
+    {
+      "action": "Fine-tune on the weakest metadata/opcode segments and compare semantic_similarity_mean by segment.",
+      "area": "data/training",
+      "id": "segment-targeted-finetune",
+      "priority": "P1",
+      "success_metric": "semantic_similarity_mean improves without baseline regressions",
+      "triggered_by": "semantic_fidelity_gap"
+    },
+    {
+      "action": "Sweep temperature/top_p/max_new_tokens on the same eval split to separate decoding noise from model capacity.",
+      "area": "model",
+      "id": "generation-config-sweep",
+      "priority": "P1",
+      "success_metric": "pct_above_0.8_similarity increases and edit_distance_mean does not regress",
+      "triggered_by": "semantic_fidelity_gap"
+    },
+    {
+      "action": "Cluster scaffold/compiler errors and patch the largest target/prompt class first.",
+      "area": "data/model",
+      "id": "syntax-error-cluster",
+      "priority": "P1",
+      "success_metric": "solidity_valid_mean reaches at least 95%",
+      "triggered_by": "solidity_validity_gap"
+    },
+    {
+      "action": "Audit low-edit-distance failures for boilerplate/noisy target patterns before adding more training data.",
+      "area": "data",
+      "id": "target-normalization-audit",
+      "priority": "P1",
+      "success_metric": "edit_distance_mean decreases while replication_f1_micro stays stable or improves",
+      "triggered_by": "textual_distance_gap"
+    },
+    {
+      "action": "Run local solc validation for the dominant compiler-version segments and inspect deploy failures.",
+      "area": "evaluation/data",
+      "id": "compiler-matrix-eval",
+      "priority": "P2",
+      "success_metric": "bytecode_deployable_mean reaches 95%+ on compiler-checked rows",
+      "triggered_by": "deployability_gap"
+    },
+    {
+      "action": "Address the largest quality_issue_summary category and rerun the same evaluation split.",
+      "area": "evaluation/data/model",
+      "id": "taxonomy-first-triage",
+      "priority": "P2",
+      "success_metric": "largest quality issue category count decreases",
+      "triggered_by": "quality_taxonomy_findings"
+    }
+  ],
+  "overall_status": "needs_attention",
+  "schema_version": 1,
+  "strengths": [
+    {
+      "evidence": [
+        "failure_rate=0.00%"
+      ],
+      "id": "no_generation_failures",
+      "title": "Evaluation completed without generation failures."
+    }
+  ]
+}
+```
 
 Quality Summary
 ---------------
-Examples evaluated: 3
-Semantic similarity mean: 0.7340
-Semantic similarity std: 0.0812
-Edit distance mean: 0.4655
-Edit distance std: 0.2289
-Functions > 0.8 semantic similarity: 0.00%
-Functions < 0.4 edit distance: 66.67%
-Replication precision mean: 0.5757
-Replication recall mean: 0.7106
-Replication F1 mean: 0.6062
-Replication precision micro: 0.4545
-Replication recall micro: 0.7407
-Replication F1 micro: 0.5634
-Functions > 0.8 replication F1: 33.33%
+Examples evaluated: 30
+Examples attempted: 30
+Examples succeeded: 30
+Examples failed: 0
+Failure rate: 0.00%
+Semantic similarity mean: 0.6933
+Semantic similarity std: 0.1414
+Edit distance mean: 0.5937
+Edit distance std: 0.1841
+Functions > 0.8 semantic similarity: 26.67%
+Functions < 0.4 edit distance: 10.00%
+Replication precision mean: 0.6174
+Replication recall mean: 0.6153
+Replication F1 mean: 0.6028
+Replication precision micro: 0.6311
+Replication recall micro: 0.5636
+Replication F1 micro: 0.5954
+Functions > 0.8 replication F1: 6.67%
+Solidity valid outputs: 0.00%
+Solidity compiler-checked outputs: 100.00%
+Solidity AST-valid outputs: 0.00%
+Bytecode semantic score mean: 0.2374
+Bytecode semantic checked outputs: 100.00%
+Bytecode deployable outputs: 0.00%
+Runtime bytecode checked outputs: 0.00%
+Runtime bytecode matches: 0.00%
 
 Target Checks
 -------------
-semantic_similarity_mean: FAIL (0.7340 >= 0.8200)
-pct_above_0.8_similarity: FAIL (0.0000 >= 0.7800)
-pct_below_0.4_edit_dist: FAIL (0.6667 >= 0.8200)
+semantic_similarity_mean: FAIL (0.6933 >= 0.8200)
+pct_above_0.8_similarity: FAIL (0.2667 >= 0.7800)
+pct_below_0.4_edit_dist: FAIL (0.1000 >= 0.8200)
 
 Replication by Category (micro)
 -------------------------------
 category | precision | recall | f1 | TP | FP | FN
 --- | ---: | ---: | ---: | ---: | ---: | ---:
-abi | 1.0000 | 1.0000 | 1.0000 | 12 | 0 | 0
-call | 0.1818 | 0.5000 | 0.2667 | 2 | 9 | 2
-control_flow | 0.5000 | 1.0000 | 0.6667 | 1 | 1 | 0
-event | 0.0000 | 1.0000 | 0.0000 | 0 | 2 | 0
-guard | 0.3333 | 0.5000 | 0.4000 | 1 | 2 | 1
-member_call | 0.0000 | 0.0000 | 0.0000 | 0 | 5 | 2
-mutability | 1.0000 | 1.0000 | 1.0000 | 1 | 0 | 0
-return | 0.0000 | 0.0000 | 0.0000 | 0 | 2 | 2
-state_write | 0.0000 | 1.0000 | 0.0000 | 0 | 3 | 0
-visibility | 1.0000 | 1.0000 | 1.0000 | 3 | 0 | 0
+abi | 0.9137 | 0.9338 | 0.9236 | 127 | 12 | 9
+call | 0.3958 | 0.3065 | 0.3455 | 19 | 29 | 43
+control_flow | 0.3333 | 0.1250 | 0.1818 | 1 | 2 | 7
+event | 0.0000 | 0.0000 | 0.0000 | 0 | 4 | 6
+guard | 0.1111 | 0.0667 | 0.0833 | 1 | 8 | 14
+member_call | 0.4737 | 0.3214 | 0.3830 | 9 | 10 | 19
+modifier | 0.2609 | 0.3529 | 0.3000 | 6 | 17 | 11
+mutability | 1.0000 | 0.8750 | 0.9333 | 7 | 0 | 1
+return | 0.0000 | 0.0000 | 0.0000 | 0 | 10 | 11
+state_write | 0.3333 | 0.2400 | 0.2791 | 6 | 12 | 19
+visibility | 0.6552 | 0.6333 | 0.6441 | 19 | 10 | 11
+
+Grounded Hallucination Buckets
+------------------------------
+Total hallucinated facts: 114
+Groundedness score mean: 0.6174
+bucket | count | rate
+--- | ---: | ---:
+invented_events | 4 | 1.29%
+invented_guards | 8 | 2.59%
+invented_state_writes | 12 | 3.88%
+unsupported_abi_elements | 39 | 12.62%
+unsupported_calls | 39 | 12.62%
+unsupported_control_flow | 2 | 0.65%
+unsupported_return_expressions | 10 | 3.24%
+
+Quality Issue Taxonomy
+----------------------
+category | count
+--- | ---:
+bytecode:call_mismatch | 101
+bytecode:control_flow_mismatch | 9
+bytecode:deployability_failure | 30
+bytecode:event_mismatch | 10
+bytecode:guard_mismatch | 22
+bytecode:return_mismatch | 21
+bytecode:selector_mismatch | 71
+bytecode:storage_write_mismatch | 31
+compiler_or_deployability | 30
+syntax_or_scaffold | 30
+
+Remediation hints:
+- compiler_or_deployability: Run local solc validation and compare generated bytecode/deployment errors.
+- syntax_or_scaffold: Check prompt truncation and Solidity syntax generation before compiler validation.
+
+Example failures:
+- bytecode:call_mismatch: idx=0 input=670e0e7d2a6ba23aff9d263ffb0e8a8060cd7c8e512f414d1350e8aef8723b2a; idx=4 input=c980faf6b71d2cafface2116afdce0118a4a61bee67fda652f68c8651359505a; idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1
+- bytecode:control_flow_mismatch: idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1; idx=9 input=892bb08dc7ea524164789f7cf034b70a08898554cf95fd47362d75c347410ffa; idx=6 input=2deea84868eeddbe4da97f2553744358a8e76248e662631670a70e484070bb5e
+- bytecode:deployability_failure: idx=0 input=670e0e7d2a6ba23aff9d263ffb0e8a8060cd7c8e512f414d1350e8aef8723b2a; idx=4 input=c980faf6b71d2cafface2116afdce0118a4a61bee67fda652f68c8651359505a; idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1
+- bytecode:event_mismatch: idx=12 input=39bbb61aa0b1cb49f26e2ff54b758539f3e1d74b0d1aa2db9d9a8d330f59c735; idx=24 input=9989b05276fa15d44775f7498de203501c4b8e8e4f2515036942d9692c5b4276; idx=25 input=733780b191ba228d754fd8bd2ae2a6a99fd2fbc1b9063393f51240e05dfd1c9f
+- bytecode:guard_mismatch: idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1; idx=12 input=39bbb61aa0b1cb49f26e2ff54b758539f3e1d74b0d1aa2db9d9a8d330f59c735; idx=24 input=9989b05276fa15d44775f7498de203501c4b8e8e4f2515036942d9692c5b4276
+- bytecode:return_mismatch: idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1; idx=9 input=892bb08dc7ea524164789f7cf034b70a08898554cf95fd47362d75c347410ffa; idx=17 input=56c2a8baec5f694c5d0a716cfe32ed4fe4ff57b6e508f00e4b394da374a9e7a1
+- bytecode:selector_mismatch: idx=0 input=670e0e7d2a6ba23aff9d263ffb0e8a8060cd7c8e512f414d1350e8aef8723b2a; idx=4 input=c980faf6b71d2cafface2116afdce0118a4a61bee67fda652f68c8651359505a; idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1
+- bytecode:storage_write_mismatch: idx=0 input=670e0e7d2a6ba23aff9d263ffb0e8a8060cd7c8e512f414d1350e8aef8723b2a; idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1; idx=12 input=39bbb61aa0b1cb49f26e2ff54b758539f3e1d74b0d1aa2db9d9a8d330f59c735
+- compiler_or_deployability: idx=0 input=670e0e7d2a6ba23aff9d263ffb0e8a8060cd7c8e512f414d1350e8aef8723b2a; idx=4 input=c980faf6b71d2cafface2116afdce0118a4a61bee67fda652f68c8651359505a; idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1
+- syntax_or_scaffold: idx=0 input=670e0e7d2a6ba23aff9d263ffb0e8a8060cd7c8e512f414d1350e8aef8723b2a; idx=4 input=c980faf6b71d2cafface2116afdce0118a4a61bee67fda652f68c8651359505a; idx=8 input=948e0368dc022d99918f5beca72afe9626edb008022eb555cb678b30dd20c1b1
+
+Prompt/Truncation Diagnostics
+-----------------------------
+TAC truncated: 0/30 (0.00%)
+Strategies: none=30
+metric | mean | p50 | p90 | p95 | max
+--- | ---: | ---: | ---: | ---: | ---:
+context_window | 8192.0000 | 8192.0000 | 8192.0000 | 8192.0000 | 8192.0000
+prompt_budget | 7680.0000 | 7680.0000 | 7680.0000 | 7680.0000 | 7680.0000
+max_new_tokens | 512.0000 | 512.0000 | 512.0000 | 512.0000 | 512.0000
+tac_tokens_before | 1103.1667 | 1035.0000 | 1863.2000 | 2269.2500 | 3105.0000
+tac_tokens_after | 1103.1667 | 1035.0000 | 1863.2000 | 2269.2500 | 3105.0000
+prompt_tokens | 1195.2000 | 1123.0000 | 1955.8000 | 2362.6500 | 3195.0000
+generated_tokens | 57.3000 | 46.0000 | 82.2000 | 96.8500 | 300.0000
+
+Confidence Intervals
+--------------------
+metric | mean | 95% CI | n
+--- | ---: | ---: | ---:
+bleu_score_mean | 0.0951 | [0.0490, 0.1413] | 30
+bytecode_deployable_mean | 0.0000 | [0.0000, 0.0000] | 30
+bytecode_runtime_checked_mean | 0.0000 | [0.0000, 0.0000] | 30
+bytecode_runtime_match_mean | 0.0000 | [0.0000, 0.0000] | 30
+bytecode_semantic_checked_mean | 1.0000 | [1.0000, 1.0000] | 30
+bytecode_semantic_score_mean | 0.2374 | [0.2228, 0.2520] | 30
+function_signature_match_mean | 0.8000 | [0.6544, 0.9456] | 30
+normalized_edit_distance_mean | 0.5937 | [0.5267, 0.6607] | 30
+replication_f1_mean | 0.6028 | [0.5329, 0.6727] | 30
+replication_precision_mean | 0.6174 | [0.5505, 0.6843] | 30
+replication_recall_mean | 0.6153 | [0.5308, 0.6998] | 30
+rouge_l_score_mean | 0.3861 | [0.3190, 0.4532] | 30
+semantic_similarity_mean | 0.6933 | [0.6419, 0.7448] | 30
+solidity_ast_valid_mean | 0.0000 | [0.0000, 0.0000] | 30
+solidity_compiler_checked_mean | 1.0000 | [1.0000, 1.0000] | 30
+solidity_valid_mean | 0.0000 | [0.0000, 0.0000] | 30
+structural_preservation_mean | 0.7804 | [0.7181, 0.8428] | 30
+token_accuracy_mean | 0.2693 | [0.2193, 0.3193] | 30
+visibility_match_mean | 0.6000 | [0.4217, 0.7783] | 30
+
+Opcode and Control-Flow Coverage
+--------------------------------
+Examples with opcode groups: 0
+
+Metadata Segment Coverage
+-------------------------
+field | known | unknown | top values
+--- | ---: | ---: | ---
+bytecode_length_bucket | 30 | 0 | tiny (30)
+compiler_version | 30 | 0 | 0.5.17 (7), 0.6.12 (6), 0.8.26 (4), 0.8.20 (3)
+contract_kind | 0 | 30 | unknown (30)
+control_flow | 0 | 30 | unknown (30)
+language_version | 0 | 30 | unknown (30)
+opcode_group | 0 | 30 | unknown (30)
+optimizer_enabled | 30 | 0 | False (15), True (15)
+optimizer_runs | 30 | 0 | 200 (27), 500 (1), 9999 (1), 999999 (1)
+
+Per-Segment Metrics
+-------------------
+segment | count | semantic | edit distance | replication F1 | Solidity valid
+--- | ---: | ---: | ---: | ---: | ---:
+bytecode_length_bucket=tiny | 30 | 0.6933 | 0.5937 | 0.6028 | 0.00%
+compiler_version=0.4.24 | 1 | 0.5257 | 0.6529 | 0.8000 | 0.00%
+compiler_version=0.5.0 | 1 | 0.5062 | 0.6190 | 0.5556 | 0.00%
+compiler_version=0.5.10 | 1 | 0.6875 | 0.5856 | 0.2857 | 0.00%
+compiler_version=0.5.12 | 1 | 0.7043 | 0.5935 | 0.5556 | 0.00%
+compiler_version=0.5.17 | 7 | 0.6536 | 0.7109 | 0.5403 | 0.00%
+compiler_version=0.5.7 | 1 | 0.6080 | 0.6455 | 0.2963 | 0.00%
+compiler_version=0.6.12 | 6 | 0.7200 | 0.5106 | 0.6158 | 0.00%
+compiler_version=0.6.6 | 1 | 0.6361 | 0.6853 | 0.6667 | 0.00%
+compiler_version=0.8.10 | 2 | 0.5820 | 0.6173 | 0.5686 | 0.00%
+compiler_version=0.8.11 | 1 | 0.6482 | 0.5477 | 0.8000 | 0.00%
+compiler_version=0.8.20 | 3 | 0.7082 | 0.7169 | 0.5769 | 0.00%
+compiler_version=0.8.26 | 4 | 0.9042 | 0.3325 | 0.8509 | 0.00%
+compiler_version=0.8.8 | 1 | 0.6841 | 0.7258 | 0.3750 | 0.00%
+contract_kind=unknown | 30 | 0.6933 | 0.5937 | 0.6028 | 0.00%
+control_flow=unknown | 30 | 0.6933 | 0.5937 | 0.6028 | 0.00%
+language_version=unknown | 30 | 0.6933 | 0.5937 | 0.6028 | 0.00%
+opcode_group=unknown | 30 | 0.6933 | 0.5937 | 0.6028 | 0.00%
+optimizer_enabled=False | 15 | 0.7275 | 0.6233 | 0.5644 | 0.00%
+optimizer_enabled=True | 15 | 0.6592 | 0.5641 | 0.6412 | 0.00%
+optimizer_runs=200 | 27 | 0.7009 | 0.5902 | 0.5998 | 0.00%
+optimizer_runs=500 | 1 | 0.5896 | 0.6232 | 0.8000 | 0.00%
+optimizer_runs=9999 | 1 | 0.4687 | 0.6622 | 0.5000 | 0.00%
+optimizer_runs=999999 | 1 | 0.8185 | 0.5915 | 0.5882 | 0.00%
+
+Per-Segment Hallucination Buckets
+--------------------------------
+segment | bucket | count | rate
+--- | --- | ---: | ---:
+bytecode_length_bucket=tiny | invented_events | 4 | 1.29%
+bytecode_length_bucket=tiny | invented_guards | 8 | 2.59%
+bytecode_length_bucket=tiny | invented_state_writes | 12 | 3.88%
+bytecode_length_bucket=tiny | unsupported_abi_elements | 39 | 12.62%
+bytecode_length_bucket=tiny | unsupported_calls | 39 | 12.62%
+bytecode_length_bucket=tiny | unsupported_control_flow | 2 | 0.65%
+bytecode_length_bucket=tiny | unsupported_return_expressions | 10 | 3.24%
+compiler_version=0.4.24 | unsupported_abi_elements | 1 | 12.50%
+compiler_version=0.4.24 | unsupported_calls | 1 | 12.50%
+compiler_version=0.5.0 | invented_state_writes | 2 | 22.22%
+compiler_version=0.5.0 | unsupported_abi_elements | 2 | 22.22%
+compiler_version=0.5.10 | invented_events | 1 | 8.33%
+compiler_version=0.5.10 | invented_state_writes | 1 | 8.33%
+compiler_version=0.5.10 | unsupported_abi_elements | 1 | 8.33%
+compiler_version=0.5.10 | unsupported_calls | 6 | 50.00%
+compiler_version=0.5.12 | unsupported_abi_elements | 4 | 40.00%
+compiler_version=0.5.12 | unsupported_return_expressions | 1 | 10.00%
+compiler_version=0.5.17 | invented_events | 1 | 1.37%
+compiler_version=0.5.17 | invented_guards | 2 | 2.74%
+compiler_version=0.5.17 | invented_state_writes | 5 | 6.85%
+
+Benchmark Suites
+----------------
+suite | count | semantic | edit distance | replication F1 | bytecode semantic | Solidity valid
+--- | ---: | ---: | ---: | ---: | ---: | ---:
+broad_holdout | 30 | 0.6933 | 0.5937 | 0.6028 | 0.2374 | 0.00%
+
+Worst Samples
+-------------
+Detailed JSON: results/eval_1782609733.json
+
+1. dataset_index=2 function=function Frozen(address payable recepient)
+   reason=lowest_semantic_similarity hash=2ff0c0cceda6c6667df49bdaa6e80a3e49c08c8b2ac2ca13a3267ed8ced56e6c
+   metrics=semantic_similarity=0.4467, normalized_edit_distance=0.5641, replication_f1=0.4706, bytecode_semantic_score=0.2500
+   prompt_diagnostics=tac_truncated=False, strategy=none, context_window=8192, prompt_budget=7680, max_new_tokens=512, tac_tokens_before=475, tac_tokens_after=475, prompt_tokens=566, generated_tokens=24
+   original: function Frozen(address payable recepient) public payable { uint256 amount = msg.value; recepient.transfer(amount); }
+   generated: function Frozen(address account) public onlyGovernance { _members.remove(account); emit MemberRemoved(account); }
+   diff: --- original +++ generated @@ -1,5 +1,4 @@ -function Frozen(address payable recepient) public payable { - uint256 amount = msg.value; - recepient.transfer(amount); - +function Frozen(address account) public onlyGovernance { + _members.remove(account); + emit MemberRemoved(account); }
+
+2. dataset_index=10 function=function withdraw(address _property)
+   reason=lowest_semantic_similarity hash=b8f91bc4247d9675741e5a383e6d62cae1c4fe77830b4f8ee8cbe79ee9e21038
+   metrics=semantic_similarity=0.4674, normalized_edit_distance=0.8731, replication_f1=0.0952, bytecode_semantic_score=0.0500
+   prompt_diagnostics=tac_truncated=False, strategy=none, context_window=8192, prompt_budget=7680, max_new_tokens=512, tac_tokens_before=644, tac_tokens_after=644, prompt_tokens=733, generated_tokens=66
+   original: function withdraw(address _property) external { /** * Validates the passed Property address is included the Property address set. */ addressValidator().validateGroup(_property, config().propertyGroup()); /** * Gets the withdraw...<truncated>
+   generated: function withdraw(address payable _payee, uint256 _payment) public onlyPrimary { require(_payment > 0 && address(this).balance >= _payment, "Insufficient funds in the charity fund"); _payee.transfer(_payment); emit LogEthSent(_...<truncated>
+   diff: --- original +++ generated @@ -1,52 +1,5 @@ -function withdraw(address _property) external { - /** - * Validates the passed Property address is included the Property address set. - */ - addressValidator().validateGroup(_property, config().propertyGroup()); - - /** - * Gets the withdrawable rewards amount a...<truncated>
+
+3. dataset_index=4 function=function withdrawAll(address _strategy)
+   reason=lowest_semantic_similarity hash=496403dd6633d4176ead427621f0f3f8c794470153d61afff27350e0ecea87ed
+   metrics=semantic_similarity=0.4687, normalized_edit_distance=0.6622, replication_f1=0.5000, bytecode_semantic_score=0.2500
+   prompt_diagnostics=tac_truncated=False, strategy=none, context_window=8192, prompt_budget=7680, max_new_tokens=512, tac_tokens_before=1724, tac_tokens_after=1724, prompt_tokens=1814, generated_tokens=42
+   original: function withdrawAll(address _strategy) external onlyStrategist { // WithdrawAll sends 'want' to 'vault' ILpPairStrategy(_strategy).withdrawAll(); }
+   generated: function withdrawAll(address _payee) public onlyPrimary { uint256 payment = _payments[_payee]; _payee.transfer(payment); delete _payments[_payee]; }
+   diff: --- original +++ generated @@ -1,4 +1,5 @@ -function withdrawAll(address _strategy) external onlyStrategist { - // WithdrawAll sends 'want' to 'vault' - ILpPairStrategy(_strategy).withdrawAll(); +function withdrawAll(address _payee) public onlyPrimary { + uint256 payment = _payments[_payee]; + _payee.trans...<truncated>
+
+4. dataset_index=20 function=function freeze(address /* _from */, uint256 /* _value */)
+   reason=lowest_semantic_similarity hash=2322c35d3c25171ad4ed11520a09fc8706b006dbffbb22e7ee761ef05a6ac3c0
+   metrics=semantic_similarity=0.5062, normalized_edit_distance=0.6190, replication_f1=0.5556, bytecode_semantic_score=0.2500
+   prompt_diagnostics=tac_truncated=False, strategy=none, context_window=8192, prompt_budget=7680, max_new_tokens=512, tac_tokens_before=2519, tac_tokens_after=2519, prompt_tokens=2616, generated_tokens=36
+   original: function freeze(address /* _from */, uint256 /* _value */) external onlyMe onlySealed { requirement1Backsys(); }
+   generated: function freeze(address account, uint256 balance) public onlyOwner { _freezed[account] = true; _balances[account] = balance; }
+   diff: --- original +++ generated @@ -1,6 +1,4 @@ -function freeze(address /* _from */, uint256 /* _value */) external - onlyMe - onlySealed - { - requirement1Backsys(); +function freeze(address account, uint256 balance) public onlyOwner { + _freezed[account] = true; + _balances[account] = balance; }
+
+5. dataset_index=19 function=function presentto()
+   reason=lowest_semantic_similarity hash=bd056861dce23bac627d8946b7a1b4791b3fb6854dd740f505d3f1ce015015ca
+   metrics=semantic_similarity=0.5257, normalized_edit_distance=0.6529, replication_f1=0.8000, bytecode_semantic_score=0.2500
+   prompt_diagnostics=tac_truncated=False, strategy=none, context_window=8192, prompt_budget=7680, max_new_tokens=512, tac_tokens_before=389, tac_tokens_after=389, prompt_tokens=479, generated_tokens=28
+   original: function presentto()public{ for(uint i=0;i<bebdsds.length;i++){ bebTokenTransfer.transfer(bebdsds[i],8848*10**18); } //bebTokenTransfer.transfer(msg.sender,888*10**18); }
+   generated: function presentto() public onlyOwner { uint256 amount = address(this).balance; owner().transfer(amount); }
+   diff: --- original +++ generated @@ -1,7 +1,4 @@ -function presentto()public{ - for(uint i=0;i<bebdsds.length;i++){ - bebTokenTransfer.transfer(bebdsds[i],8848*10**18); - } - //bebTokenTransfer.transfer(msg.sender,888*10**18); - - } +function presentto() public onlyOwner { + uint256 amount = address(this).balanc...<truncated>

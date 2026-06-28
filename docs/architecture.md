@@ -11,7 +11,7 @@ source/metadata collection ──► runtime bytecode ──► bytecode-only TA
                                       └─► CFG fragments ───────► vulnerability scanner ──► audit report
 ```
 
-Compiler/source/ABI information may be stored in datasets, manifests, traces, and selector provenance, but prompt text is intentionally restricted to bytecode-derived TAC plus compact bytecode/TAC statistics.
+Compiler/source/ABI information may be stored in datasets, manifests, traces, and selector provenance, but prompt text is intentionally restricted to bytecode-derived TAC plus compact bytecode/TAC statistics and locally resolved selector-signature provenance.
 
 ## Major entry points
 

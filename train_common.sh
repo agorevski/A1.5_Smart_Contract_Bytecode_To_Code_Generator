@@ -18,6 +18,7 @@ GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 THROUGHPUT_SWEEP_DEFAULTS="${THROUGHPUT_SWEEP_DEFAULTS:-false}"
 REPORT_TO="${REPORT_TO:-tensorboard}"
 SKIP_EVAL="${SKIP_EVAL:-false}"
+SELECTOR_SIGNATURE_METADATA="${SELECTOR_SIGNATURE_METADATA:-true}"
 MAX_SEQ_LEN_CAP="${MAX_SEQ_LEN_CAP:-8192}"
 
 if [ "${GRADIENT_CHECKPOINTING}" = "false" ] || [ "${GRADIENT_CHECKPOINTING}" = "0" ]; then
@@ -29,6 +30,9 @@ fi
 TRAIN_EXTRA_ARGS=("${GRADIENT_CHECKPOINTING_ARG}" "--report-to" "${REPORT_TO}")
 if [ "${SKIP_EVAL}" = "true" ] || [ "${SKIP_EVAL}" = "1" ]; then
     TRAIN_EXTRA_ARGS+=("--skip-eval")
+fi
+if [ "${SELECTOR_SIGNATURE_METADATA}" = "false" ] || [ "${SELECTOR_SIGNATURE_METADATA}" = "0" ]; then
+    TRAIN_EXTRA_ARGS+=("--no-selector-signature-metadata")
 fi
 
 # ── Sequence length ──────────────────────────────────────────

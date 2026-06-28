@@ -68,7 +68,8 @@ block_success:
     )
 
     assert line == (
-        "Bytecode metadata: selector=0xa9059cbb, tac_blocks=2, tac_ops=6, "
+        "Bytecode metadata: selector=0xa9059cbb, "
+        "selector_signature=transfer(address,uint256), tac_blocks=2, tac_ops=6, "
         "branches=1, storage_reads=1, storage_writes=1, external_calls=1, "
         "logs=1, reverts=1, bytecode_len=512, bytecode_instructions=123, "
         "functions=4"
@@ -109,6 +110,7 @@ block_entry:
     )
 
     assert "Bytecode metadata: selector=0xa9059cbb" in prefix
+    assert "selector_signature=transfer(address,uint256)" in prefix
     assert "function function_0xa9059cbb:" in prefix
     assert "// selector 0xa9059cbb" in prefix
     assert "block_entry:" in prefix
@@ -145,10 +147,11 @@ block_entry:
 
     assert decompiler.config.include_compiler_metadata is False
     assert "Bytecode metadata: selector=0x70a08231" in prompt
+    assert "selector_signature=balanceOf(address)" in prompt
     assert "bytecode_len=256" in prompt
     assert "function function_0x70a08231:" in prompt
     assert_source_metadata_excluded(prompt)
-    assert "balanceOf" not in prompt
+    assert "function balanceOf" not in prompt
     assert "### Response:" in prompt
 
 

@@ -12,6 +12,7 @@ from src.training_pipeline import (
     load_curated_evaluation_benchmarks,
     mean_confidence_interval,
     normalized_levenshtein_distance,
+    solidity_function_signature_matches,
     validate_generated_solidity,
 )
 from src.replication_metrics import evaluate_replication
@@ -49,6 +50,33 @@ def test_solidity_validity_fallback_rejects_malformed_function():
     assert result.valid is False
     assert result.method == "scaffold"
     assert result.scaffold_errors
+
+
+def test_function_signature_match_compares_name_params_and_returns():
+    reference = """
+    function transfer(address to, uint256 amount) public returns (bool) {
+        return true;
+    }
+    """
+    wrong_name = """
+    function approve(address to, uint256 amount) public returns (bool) {
+        return true;
+    }
+    """
+    wrong_params = """
+    function transfer(address to) public returns (bool) {
+        return true;
+    }
+    """
+    same_signature = """
+    function transfer(address recipient, uint256 value) external returns (bool) {
+        return true;
+    }
+    """
+
+    assert solidity_function_signature_matches(reference, same_signature) is True
+    assert solidity_function_signature_matches(reference, wrong_name) is False
+    assert solidity_function_signature_matches(reference, wrong_params) is False
 
 
 def test_metadata_segment_metrics_report_coverage_and_per_segment_means():
