@@ -79,7 +79,7 @@
     max_new_tokens: 1024,
     temperature: 0.1,
     do_sample: false,
-    repetition_penalty: 1.15
+    repetition_penalty: 1.05
   };
   var generationControlsInitialized = false;
 

@@ -23,7 +23,11 @@ from src.contract_reconstruction import (
     build_function_quality,
     build_reconstruction_plan,
 )
-from src.inference import InferenceWorkLimitError, run_bytecode_inference
+from src.inference import (
+    DEFAULT_GENERATION_CONFIG,
+    InferenceWorkLimitError,
+    run_bytecode_inference,
+)
 
 MAX_BYTECODE_HEX_LENGTH = int(os.environ.get("WEB_MAX_BYTECODE_HEX_LENGTH", "200000"))
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -436,7 +440,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--do-sample", action="store_true", help="Enable stochastic sampling")
-    parser.add_argument("--repetition-penalty", type=float, default=1.15)
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=DEFAULT_GENERATION_CONFIG["repetition_penalty"],
+    )
     parser.add_argument(
         "--timeout-seconds",
         type=float,

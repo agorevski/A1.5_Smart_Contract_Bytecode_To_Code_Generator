@@ -23,7 +23,7 @@ DEFAULT_GENERATION_CONFIG: Dict[str, Any] = {
     "max_new_tokens": 1024,
     "temperature": 0.1,
     "do_sample": False,
-    "repetition_penalty": 1.15,
+    "repetition_penalty": 1.05,
 }
 
 

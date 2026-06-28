@@ -53,6 +53,7 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 TOKENIZATION_CACHE_VERSION = 2
+DEFAULT_REPETITION_PENALTY = 1.05
 
 SOLIDITY_RESERVED_WORDS = {
     "address",
@@ -2897,7 +2898,7 @@ class SmartContractDecompiler:
         max_new_tokens: int = 1024,
         temperature: float = 0.1,
         do_sample: bool = False,
-        repetition_penalty: float = 1.15,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     ) -> str:
         """Decompile TAC representation to Solidity code.
 
@@ -2937,7 +2938,7 @@ class SmartContractDecompiler:
         tac_inputs: List[str],
         metadatas: Optional[List[Optional[Dict]]] = None,
         max_new_tokens: int = 1024,
-        repetition_penalty: float = 1.15,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     ) -> List[str]:
         """Decompile multiple TAC functions in a single batched forward pass.
 

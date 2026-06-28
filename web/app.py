@@ -35,6 +35,7 @@ from src.contract_reconstruction import (
     build_function_quality,
     build_reconstruction_plan,
 )
+from src.inference import DEFAULT_GENERATION_CONFIG as INFERENCE_DEFAULT_GENERATION_CONFIG
 from src.model_setup import SmartContractDecompiler
 from src.selector_resolver import get_resolver
 from src.tac_lookup import TACLookup
@@ -144,7 +145,11 @@ DEFAULT_GENERATION_CONFIG = {
     "max_new_tokens": _parse_int_env("WEB_DEFAULT_MAX_NEW_TOKENS", 1024, 1),
     "temperature": _parse_float_env("WEB_DEFAULT_TEMPERATURE", 0.1, 0.0),
     "do_sample": _parse_bool_env("WEB_DEFAULT_DO_SAMPLE", False),
-    "repetition_penalty": _parse_float_env("WEB_DEFAULT_REPETITION_PENALTY", 1.15, 0.0),
+    "repetition_penalty": _parse_float_env(
+        "WEB_DEFAULT_REPETITION_PENALTY",
+        INFERENCE_DEFAULT_GENERATION_CONFIG["repetition_penalty"],
+        0.0,
+    ),
 }
 DEFAULT_GENERATION_CONFIG["max_new_tokens"] = min(
     DEFAULT_GENERATION_CONFIG["max_new_tokens"], MAX_NEW_TOKENS_LIMIT

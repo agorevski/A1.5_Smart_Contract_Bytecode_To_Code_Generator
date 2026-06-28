@@ -142,11 +142,14 @@ def test_cli_json_includes_solidity_validation(monkeypatch, capsys):
         ),
     )
 
+    calls = []
+
     class FakeDecompiler:
         def __init__(self, model_path):
             self.model_path = model_path
 
         def decompile_tac_to_solidity(self, tac, metadata=None, **kwargs):
+            calls.append(kwargs)
             return "function foo() public { }"
 
         def _assemble_contract(self, functions, analyzer):
@@ -167,5 +170,7 @@ def test_cli_json_includes_solidity_validation(monkeypatch, capsys):
     assert data["function_results"][0]["source"] == "model_inference"
     assert data["lookup"]["enabled"] is False
     assert data["trace"]["status"] in {"success", "partial"}
+    assert data["effective_generation_config"]["repetition_penalty"] == 1.05
+    assert calls[0]["repetition_penalty"] == 1.05
 
     shutil.rmtree(model_dir, ignore_errors=True)

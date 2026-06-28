@@ -26,6 +26,8 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 | 14. Failure-slice tooling and 100-step checklist | `scripts/analyze_eval_failures.py`, `tests/test_eval_failure_analysis.py`, `data/eval_failure_slices/broad30_reppenalty_1_05/slice_manifest.json` | Analyzed best broad-30 eval and materialized ranked JSONL slices plus a deterministic 100-iteration checklist | Top actionable slices: calls (23 rows, F1 ~0.580 from broad details), selectors (22), unsupported ABI/calls (20 each), calldata (20), state writes (17), guards (17), events (11), returns (11) | Future loops should use fixed failure slices instead of broad-only averages; calls and state writes are the first curriculum targets |
 | 15. Calls slice eval | `results/eval_1782616677.json`, dataset `data/eval_failure_slices/broad30_reppenalty_1_05/calls.jsonl` | 23-row calls slice, same model, greedy, `eval_max_new_tokens=512`, default repetition penalty 1.05 | Semantic 0.6662, edit distance 0.6403, replication F1 micro 0.5422, bytecode semantic 0.4103, solidity valid 91.3%; missing call facts=43 and unsupported calls=36 | Calls/member calls are the clearest first failing capability; broad improvements will likely be capped until this slice improves |
 | 16. State-write slice eval | `results/eval_1782616749.json`, dataset `data/eval_failure_slices/broad30_reppenalty_1_05/state_writes.jsonl` | 17-row state-write slice, same model, greedy, `eval_max_new_tokens=512`, default repetition penalty 1.05 | Semantic 0.7017, edit distance 0.6639, replication F1 micro 0.5399, bytecode semantic 0.3763, solidity valid 88.2%; missing state_write=18 and invented_state_writes=15 | State writes are intertwined with calls/guards and should be the second curriculum target after calls |
+| 17. Inference default alignment | `src/inference.py`, `src/model_setup.py`, `scripts/decompile.py`, `web/app.py`, `web/static/app.js`, `tests/test_decompile_cli.py` | Propagated the measured 1.05 repetition penalty from eval into direct model inference, CLI defaults, web API defaults, and browser UI defaults | Targeted CLI/web tests pass, and generated configs now carry `repetition_penalty=1.05` unless explicitly overridden | The best measured decode setting is no longer limited to `train.py` eval runs; ad hoc inference and UI trials should be comparable |
+| 18. Non-overlap curriculum builder | `scripts/build_curriculum_dataset.py`, `tests/test_build_curriculum_dataset.py`, `data/curriculum/calls48_nonoverlap.jsonl`, `data/curriculum/state_writes48_nonoverlap.jsonl` | Built deduplicated call/state-write curriculum sources from `data/hf_training_dataset.jsonl`, excluding the broad-30 eval body hashes and capping inputs at 9k chars/outputs at 2.5k chars | Calls curriculum: 48 unique body hashes, focus facts min 18/max 40/avg 21.92. State-write curriculum: 48 unique body hashes, focus facts min 9/max 51/avg 15.06 | The next retrain can target the known bottlenecks without leaking the fixed broad-30 eval rows or duplicating optimizer variants of the same body |
 
 ## Durable learnings
 
@@ -43,6 +45,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 12. **Evaluation records need TAC-derived segment metadata.** Without copying derived opcode/control-flow groups into per-row metadata, reports can show opcode/control-flow coverage as unknown even when the TAC input contains enough evidence for segmentation.
 13. **Use `eval_repetition_penalty=1.05` for current Qwen QLoRA evals.** On the same 30-row broad split it beat 1.0, 1.10, and 1.15 on replication F1 and bytecode semantic score while improving Solidity-valid rate.
 14. **Failure-slice evals are now available and should be used before broad retraining.** The calls and state-write slices show lower F1/bytecode scores than broad-30, making them better short-run targets for curriculum and data fixes.
+15. **Deduplicate curriculum rows by `metadata.body_hash`.** The source dataset includes optimizer/config variants of the same Solidity body; curriculum selection now keeps one row per body hash and excludes fixed eval body hashes.
 
 ## Hypotheses
 
@@ -55,6 +58,7 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 7. **Medium confidence: selector-metadata retraining helps broad generalization modestly, but the current 100-row scale is still too small.** Evidence: broad-30 old-adapter selector-on F1 was ~0.5524, while the selector-metadata retrain reached ~0.5954; exact correctness remained 0/30.
 8. **Medium-high confidence: decoding was slightly over-penalizing repetition at 1.15.** Evidence: lowering eval repetition penalty to 1.05 improved broad-30 semantic/edit/F1/bytecode and validity without changing model weights.
 9. **High confidence: calls are the first curriculum bottleneck.** Evidence: the calls slice has 43 missing call facts and replication F1 micro 0.5422 under the best decode setting.
+10. **Medium confidence: a small calls/state-write curriculum is the cheapest next training intervention.** Evidence: the generated 48-row non-overlap curricula are dense in the failing fact categories while staying small enough for short QLoRA loops.
 
 ## Invalidated assumptions
 
@@ -79,8 +83,8 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 8. **Inspect failure buckets for calls, returns, guards, and state writes.** Success criterion: reduce these buckets and improve replication recall without increasing unsupported extra facts.
 9. **Train or evaluate a failure-bucket curriculum before another broad run.** Start with rows dominated by calls/member calls, then state writes, guards, returns, and events. Success criterion: each slice improves replication recall and bytecode semantic score on a heldout slice without increasing unsupported calls/state writes.
 10. **Add compiler-version-aware syntax checks for generated fragments.** The remaining 3/30 broad syntax failures are version-related or true syntax issues: missing visibility under solc 0.5.x, `override` under solc 0.5.7, and `payable(...)` syntax under solc 0.5.17. Success criterion: prompts or targets avoid version-incompatible constructs for the target compiler.
-11. **Build a calls-focused micro-curriculum next.** Use the generated calls slice and additional non-overlapping call-heavy rows from the source dataset; success criterion: calls-slice replication F1 rises above 0.60 and missing call facts drop materially without increasing unsupported calls.
-12. **Then build a state-write/guard curriculum.** Success criterion: state-write slice bytecode semantic score improves above 0.45 and invented state writes do not increase.
+11. **Run a calls-focused micro-curriculum training loop next.** Use `data/curriculum/calls48_nonoverlap.jsonl` for training and evaluate on `data/eval_failure_slices/broad30_reppenalty_1_05/calls.jsonl`; success criterion: calls-slice replication F1 rises above 0.60 and missing call facts drop materially without increasing unsupported calls.
+12. **Then run a state-write/guard curriculum.** Use `data/curriculum/state_writes48_nonoverlap.jsonl`; success criterion: state-write slice bytecode semantic score improves above 0.45 and invented state writes do not increase.
 
 ## Artifact map
 
@@ -107,6 +111,8 @@ This file is the persistent research log for TAC-to-Solidity training runs. It r
 - Failure slices manifest: `data/eval_failure_slices/broad30_reppenalty_1_05/slice_manifest.json`
 - Calls slice eval: `results/eval_1782616677.json`
 - State-write slice eval: `results/eval_1782616749.json`
+- Calls curriculum source: `data/curriculum/calls48_nonoverlap.jsonl`
+- State-write curriculum source: `data/curriculum/state_writes48_nonoverlap.jsonl`
 - Selector-metadata retrain model: `models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/`
 - Overfit runner: `run_train_qwen_qlora_overfit_sanity_check.sh`
 - Standard sampled QLoRA runner: `run_train_qwen_qlora_500.sh`
