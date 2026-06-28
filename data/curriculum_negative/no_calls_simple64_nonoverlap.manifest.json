@@ -1,0 +1,1047 @@
+{
+  "categories": [
+    "abi",
+    "visibility",
+    "mutability"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl",
+    "data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl"
+  ],
+  "focus": "abi",
+  "manifest_kind": "curriculum_dataset",
+  "max_focus_facts": 5,
+  "output_dataset": "data/curriculum_negative/no_calls_simple64_nonoverlap.jsonl",
+  "require_zero_categories": [
+    "call",
+    "member_call"
+  ],
+  "rows": [
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function currentTier()",
+      "identity": "body_hash:3e7c00cbb2ee3142cd793d23b99c6159",
+      "source_index": 7622,
+      "total_chars": 342,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceInTier()",
+      "identity": "body_hash:5849eee78deacaf8006f5b5f821b8b7e",
+      "source_index": 10980,
+      "total_chars": 360,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function balanceOf(address src)",
+      "identity": "body_hash:900a6207b97b1d045d19ffe21802a959",
+      "source_index": 17669,
+      "total_chars": 426,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeMinter(address minter)",
+      "identity": "body_hash:c6fed078e1e0f9ab1e0fbca3f71cea73",
+      "source_index": 24418,
+      "total_chars": 428,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setRewardsPerNFT(uint256 _tokensPerNFT)",
+      "identity": "body_hash:eff22d3aaf613129f89f1b6fc1c5f27e",
+      "source_index": 29667,
+      "total_chars": 441,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addUser(address account)",
+      "identity": "body_hash:a6e9334b6a48fd4dd3572ab2f46a318a",
+      "source_index": 20467,
+      "total_chars": 448,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function changeOwner(address _recipient)",
+      "identity": "body_hash:e6cf3d41a0f0beb658b94c943b0d1de4",
+      "source_index": 28485,
+      "total_chars": 451,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setMaxWalletAmount(uint256 amount)",
+      "identity": "body_hash:c07e3d0002f3de6cdeb3216c5e4a63b2",
+      "source_index": 23636,
+      "total_chars": 452,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setMaxTx(uint256 maxTransactionAmount)",
+      "identity": "body_hash:9d6a11384d3dd7fdcc0919573142a87c",
+      "source_index": 19219,
+      "total_chars": 452,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function changeOwner(address newOwner)",
+      "identity": "body_hash:dfed4744b152102e26ad6d4910b05219",
+      "source_index": 27555,
+      "total_chars": 452,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeUser(address account)",
+      "identity": "body_hash:33d7b10d09a57793e92f0d74e14aeb8a",
+      "source_index": 6224,
+      "total_chars": 452,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setRewardDuration(uint256 _rewardDuration)",
+      "identity": "body_hash:e793acee0da9e458a01eca26ddfbd5b2",
+      "source_index": 28584,
+      "total_chars": 454,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function lastTokenId()",
+      "identity": "body_hash:4e6a1d2b8e3cb1bd842ace7e2f31791c",
+      "source_index": 9654,
+      "total_chars": 454,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function changeDevFees(address _devFees)",
+      "identity": "body_hash:23d0918dbfc6aca135a0b4b0d89ecf57",
+      "source_index": 4331,
+      "total_chars": 455,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addMinter(address minter)",
+      "identity": "body_hash:39ab463d69921931ee255266f8e2ad86",
+      "source_index": 7000,
+      "total_chars": 456,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setFiatPerEthRate(uint256 _newRate)",
+      "identity": "body_hash:e312b366ed073b356824acdab7ecf3a7",
+      "source_index": 27967,
+      "total_chars": 458,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function disableTransferDelay()",
+      "identity": "body_hash:ace7009a6d4492e08686af3662a94af0",
+      "source_index": 21224,
+      "total_chars": 462,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function decreaseAllowance(address safeOwner)",
+      "identity": "body_hash:9ef4ad53f71454d21cf78ff20aea95e3",
+      "source_index": 19412,
+      "total_chars": 471,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeMinter(address _minter)",
+      "identity": "body_hash:8733319250a085226a89763263ddd1b5",
+      "source_index": 16603,
+      "total_chars": 475,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function cancelUpdate(address _logic)",
+      "identity": "body_hash:82a84b502d7529bb1f64bb86d780e24c",
+      "source_index": 16082,
+      "total_chars": 475,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function unFreezeAccount(address target)",
+      "identity": "body_hash:7bee19831d6d0118270c3912e726c668",
+      "source_index": 15258,
+      "total_chars": 476,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function timeunlockAccount(address target)",
+      "identity": "body_hash:bf648760278459c198cbb594c965596c",
+      "source_index": 23517,
+      "total_chars": 478,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setController(address _controller)",
+      "identity": "body_hash:ef209325e2628d01c948156afaa43b86",
+      "source_index": 29559,
+      "total_chars": 480,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setOracleHeartbeatPeriod(uint256 _newOracleHeartbeatPeriod)",
+      "identity": "body_hash:c00fe1cd2112a0a85649406dcd036360",
+      "source_index": 23587,
+      "total_chars": 483,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addExchangePartnerTargetAddress(address _partner)",
+      "identity": "body_hash:033087ebf358e165dbe02be40fdb9e4c",
+      "source_index": 401,
+      "total_chars": 484,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function cancelAddMinter(address _minter)",
+      "identity": "body_hash:4f75e63413e45e18297d06b42b7bb7d3",
+      "source_index": 9830,
+      "total_chars": 484,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeExchangePartnerTargetAddress(address _partner)",
+      "identity": "body_hash:f438355012504b168714a85ce22112fe",
+      "source_index": 30197,
+      "total_chars": 488,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setGovernance(address _governance)",
+      "identity": "body_hash:45d828daf3bb3446d3cc501cabcdd738",
+      "source_index": 8580,
+      "total_chars": 488,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setController(address _controller)",
+      "identity": "body_hash:b617e102d18d7e4c86af39db1eae6fce",
+      "source_index": 22366,
+      "total_chars": 488,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setStrategyDev(address _strategyDev)",
+      "identity": "body_hash:409245f8f9e72ca38628b66ba2e594f3",
+      "source_index": 7900,
+      "total_chars": 490,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setBurnAddress(address _burnAddress)",
+      "identity": "body_hash:93b5946c9eeb1996345757cc615df9c3",
+      "source_index": 18069,
+      "total_chars": 490,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function pendingAddMinter(address _minter)",
+      "identity": "body_hash:eaeddd092a9cf48a66a72ca0b571a740",
+      "source_index": 28988,
+      "total_chars": 499,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setFoundationAddress(address _foundationAddress)",
+      "identity": "body_hash:650b26cc5931817d5e2312f77880b029",
+      "source_index": 12536,
+      "total_chars": 513,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function isToken()",
+      "identity": "body_hash:7da38970660244dd43d473112c825aeb",
+      "source_index": 15463,
+      "total_chars": 526,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setOwner(address _owner)",
+      "identity": "body_hash:122c888ce2d0725d9c501dae95728c12",
+      "source_index": 2268,
+      "total_chars": 530,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function changeBot(address newBot)",
+      "identity": "body_hash:e51e038e18c27a2c6f31a66fce4137a3",
+      "source_index": 28278,
+      "total_chars": 532,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setMaxTxLimit(uint256 maxTx)",
+      "identity": "body_hash:b9ced17b2a6b31a8ddc619474d98d4cb",
+      "source_index": 22797,
+      "total_chars": 549,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function _ADMIN_SET_ADMIN (address newCasperzAdmin)",
+      "identity": "body_hash:e37975fc29f2ae5c2f78aa3fc8788869",
+      "source_index": 28025,
+      "total_chars": 550,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getDefaultChoice()",
+      "identity": "body_hash:207db7aeba75934683ebb5108487f4f5",
+      "source_index": 3930,
+      "total_chars": 550,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setClosePositionFeeDecay(uint256 _newClosePositionFeeDecayPeriod)",
+      "identity": "body_hash:8193d8b06420d38ef0817b588bf9035e",
+      "source_index": 15932,
+      "total_chars": 551,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 5,
+        "mutability": 0,
+        "visibility": 0
+      },
+      "focus_total": 5,
+      "function_signature": "function getOracleAddress(string nameReference)",
+      "identity": "body_hash:950f063478d52775bfcef9eb1a91f4b0",
+      "source_index": 18216,
+      "total_chars": 554,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function xX89hH8h98()",
+      "identity": "body_hash:dcea4b758401c3e172ad1576f5dc6eb8",
+      "source_index": 27203,
+      "total_chars": 556,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function totalSupply()",
+      "identity": "body_hash:dedf85890756cbe4f1ea042f1f8030d0",
+      "source_index": 27424,
+      "total_chars": 562,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addMinter(address _minter)",
+      "identity": "body_hash:bd713874bd1608ec7c50aedc5cf450ef",
+      "source_index": 23225,
+      "total_chars": 563,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeMinter(address _minter)",
+      "identity": "body_hash:3fef538b2e389c553690ac6bd282d898",
+      "source_index": 7831,
+      "total_chars": 566,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function MmMnnUbYIuinU87786756()",
+      "identity": "body_hash:23b6cd1b2b4e68783bea3e4dc0de50a2",
+      "source_index": 4316,
+      "total_chars": 566,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function changeTierAdmin(address _tierAdmin)",
+      "identity": "body_hash:9f9c34c7fc65f456362f9e65c35d5dd4",
+      "source_index": 19495,
+      "total_chars": 567,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraw()",
+      "identity": "body_hash:06ac9be13e04ee28402e25f2f008b9d7",
+      "source_index": 846,
+      "total_chars": 581,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function transferOwnership(address newOwner)",
+      "identity": "body_hash:9fc277cb3067172f87b6590d9083701d",
+      "source_index": 19523,
+      "total_chars": 582,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function updateMinimumBond(uint256 _nextMinimumBond)",
+      "identity": "body_hash:38935fba82f9234f10107f56145bc224",
+      "source_index": 6863,
+      "total_chars": 584,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function openTrading(uint256 protectionBlocks)",
+      "identity": "body_hash:710c8d08fa7a0e4436b4614929ef6203",
+      "source_index": 14019,
+      "total_chars": 587,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setFee(uint256 newFee)",
+      "identity": "body_hash:d3f3b47538863da5d47c1fee1687f282",
+      "source_index": 26055,
+      "total_chars": 589,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setFeeReceiver(address payable newFeeReceiver)",
+      "identity": "body_hash:d7a3a493d2eb49c96beefa1ec027e7b9",
+      "source_index": 26502,
+      "total_chars": 589,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function updateMinimumPodSize(uint256 _nextMinimumPodSize)",
+      "identity": "body_hash:332ff3610ccd72cb651f8572891dc372",
+      "source_index": 6119,
+      "total_chars": 596,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setDevFee(uint16 _DEV_FEE)",
+      "identity": "body_hash:6c0e96ccf98b1bfaf791be3812f5d0e3",
+      "source_index": 13411,
+      "total_chars": 599,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setTurbulenceUpdator(address _newUpdator)",
+      "identity": "body_hash:38a149ba10c2c71a4f981c53749074ea",
+      "source_index": 6870,
+      "total_chars": 605,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function sendERC20(address account)",
+      "identity": "body_hash:6613c86afed5d3829d8578c486f5c03f",
+      "source_index": 12649,
+      "total_chars": 609,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function selfCall(address account)",
+      "identity": "body_hash:b990fc6d2f33df4288e95135b8fd0ba3",
+      "source_index": 22772,
+      "total_chars": 609,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getEntityCount()",
+      "identity": "body_hash:43ecdbdd79deeefd933fd2c6370b4893",
+      "source_index": 8355,
+      "total_chars": 610,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function setFeesOnSellersAndBuyers(bool _enabled)",
+      "identity": "body_hash:46f7756257e6ddbe0bff9225b293d996",
+      "source_index": 8717,
+      "total_chars": 626,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function canUpgrade()",
+      "identity": "body_hash:d4250e7096e399e134ab9ee009435bd5",
+      "source_index": 26079,
+      "total_chars": 631,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function updateOwner(address _owner)",
+      "identity": "body_hash:a9785acc17af258400d35cce2ad2284d",
+      "source_index": 20790,
+      "total_chars": 640,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function transferOwnership(address newOwner)",
+      "identity": "body_hash:30ae25cf90365bf50f84d11fdde618cc",
+      "source_index": 5841,
+      "total_chars": 640,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function _ADMIN_WL_TRUE_IS_OFF (bool _onOrOff)",
+      "identity": "body_hash:620bbea5d77f24af286fcaa6f3aa3f2c",
+      "source_index": 12229,
+      "total_chars": 644,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0
+      }
+    }
+  ],
+  "selected_rows": 64,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}

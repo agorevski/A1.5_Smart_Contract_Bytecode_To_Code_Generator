@@ -105,3 +105,20 @@ def test_select_curriculum_rows_can_require_absent_fact_categories(tmp_path):
 
     assert [candidate.identity for candidate in selected] == [row_identity(rows[1])]
     assert selected[0].zero_category_counts == {"call": 0, "member_call": 0}
+
+
+def test_select_curriculum_rows_can_cap_focus_fact_count(tmp_path):
+    rows = [
+        _row("many", "function many() public returns (uint256) { return balance + total; }"),
+        _row("simple", "function simple() public { }"),
+    ]
+
+    selected = select_curriculum_rows(
+        rows,
+        categories=focus_categories("abi"),
+        max_focus_facts=4,
+        max_rows=8,
+    )
+
+    assert [candidate.identity for candidate in selected] == [row_identity(rows[1])]
+    assert selected[0].focus_total <= 4

@@ -99,6 +99,7 @@ def select_curriculum_rows(
     exclude: set[str] | None = None,
     max_rows: int = 64,
     min_focus_facts: int = 1,
+    max_focus_facts: int | None = None,
     require_zero_categories: Sequence[str] = (),
     max_input_chars: int | None = None,
     max_output_chars: int | None = None,
@@ -108,6 +109,8 @@ def select_curriculum_rows(
         raise ValueError("max_rows must be positive")
     if min_focus_facts < 1:
         raise ValueError("min_focus_facts must be positive")
+    if max_focus_facts is not None and max_focus_facts < min_focus_facts:
+        raise ValueError("max_focus_facts must be greater than or equal to min_focus_facts")
 
     excluded = exclude or set()
     rng = random.Random(seed)
@@ -132,6 +135,8 @@ def select_curriculum_rows(
         focus_counts = {category: len(facts.get(category, set())) for category in categories}
         focus_total = sum(focus_counts.values())
         if focus_total < min_focus_facts:
+            continue
+        if max_focus_facts is not None and focus_total > max_focus_facts:
             continue
         candidate = CurriculumCandidate(
             row=row,
@@ -171,6 +176,7 @@ def write_curriculum(
     categories: Sequence[str],
     exclude_datasets: Sequence[str | Path],
     require_zero_categories: Sequence[str] = (),
+    max_focus_facts: int | None = None,
 ) -> dict[str, Any]:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -186,6 +192,7 @@ def write_curriculum(
         "focus": focus,
         "categories": list(categories),
         "require_zero_categories": list(require_zero_categories),
+        "max_focus_facts": max_focus_facts,
         "exclude_datasets": [str(path) for path in exclude_datasets],
         "selected_rows": len(candidates),
         "rows": [
@@ -222,6 +229,7 @@ def main() -> None:
     parser.add_argument("--exclude-dataset", action="append", default=[], help="Dataset to exclude")
     parser.add_argument("--max-rows", type=int, default=64, help="Maximum rows to write")
     parser.add_argument("--min-focus-facts", type=int, default=1)
+    parser.add_argument("--max-focus-facts", type=int)
     parser.add_argument(
         "--require-zero-category",
         action="append",
@@ -242,6 +250,7 @@ def main() -> None:
         exclude=exclude,
         max_rows=args.max_rows,
         min_focus_facts=args.min_focus_facts,
+        max_focus_facts=args.max_focus_facts,
         require_zero_categories=args.require_zero_category,
         max_input_chars=args.max_input_chars,
         max_output_chars=args.max_output_chars,
@@ -256,6 +265,7 @@ def main() -> None:
         focus=args.focus,
         categories=categories,
         require_zero_categories=args.require_zero_category,
+        max_focus_facts=args.max_focus_facts,
         exclude_datasets=args.exclude_dataset,
     )
     print(
@@ -267,6 +277,7 @@ def main() -> None:
                 "focus": args.focus,
                 "categories": list(categories),
                 "require_zero_categories": list(args.require_zero_category),
+                "max_focus_facts": args.max_focus_facts,
             },
             sort_keys=True,
         )
