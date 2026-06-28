@@ -1,0 +1,20 @@
+{
+  "augment_names": false,
+  "cache_version": 2,
+  "dataset_fingerprint": "4d1ef943752b5f11f0f60ef3abbcadb4f0eb2c45e852b109e769052e6518cf70",
+  "include_bytecode_metadata": true,
+  "max_length": 8192,
+  "num_examples": 33,
+  "template_format": "alpaca",
+  "tokenizer": {
+    "bos_token_id": null,
+    "class": "transformers.models.qwen2.tokenization_qwen2_fast.Qwen2TokenizerFast",
+    "eos_token_id": 151645,
+    "model_max_length": 8192,
+    "name_or_path": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "pad_token_id": 151643,
+    "unk_token_id": null,
+    "vocab_sha256": "dc7ea6f13bd605358984ebee3db685ef741e6bbb985b8128afd616fb7f59e1cf",
+    "vocab_size": 151665
+  }
+}

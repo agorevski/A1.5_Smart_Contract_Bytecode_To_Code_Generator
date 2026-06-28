@@ -1,0 +1,495 @@
+{
+  "categories": [
+    "state_write"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl"
+  ],
+  "focus": "state_writes",
+  "manifest_kind": "curriculum_dataset",
+  "output_dataset": "data/curriculum/state_writes48_nonoverlap.jsonl",
+  "rows": [
+    {
+      "focus_counts": {
+        "state_write": 51
+      },
+      "focus_total": 51,
+      "function_signature": "function populateTierRates()",
+      "identity": "body_hash:9fd9b82e4d63315384e0521451bbdf62",
+      "source_index": 19534,
+      "total_chars": 2576
+    },
+    {
+      "focus_counts": {
+        "state_write": 50
+      },
+      "focus_total": 50,
+      "function_signature": "function populateTierTokens()",
+      "identity": "body_hash:4788604d75ba18f97a148ea1199e1183",
+      "source_index": 8773,
+      "total_chars": 2399
+    },
+    {
+      "focus_counts": {
+        "state_write": 37
+      },
+      "focus_total": 37,
+      "function_signature": "function initialize()",
+      "identity": "body_hash:424c5c18af35bda120e81904d240d14e",
+      "source_index": 8111,
+      "total_chars": 5408
+    },
+    {
+      "focus_counts": {
+        "state_write": 27
+      },
+      "focus_total": 27,
+      "function_signature": "function resetLotteryBatch()",
+      "identity": "body_hash:e79b6abac96e3a4be34f388d4c10460d",
+      "source_index": 28592,
+      "total_chars": 2872
+    },
+    {
+      "focus_counts": {
+        "state_write": 26
+      },
+      "focus_total": 26,
+      "function_signature": "function getInfo()",
+      "identity": "body_hash:7abf547ff7834e4fff9cc6a1d894bb36",
+      "source_index": 15119,
+      "total_chars": 4534
+    },
+    {
+      "focus_counts": {
+        "state_write": 23
+      },
+      "focus_total": 23,
+      "function_signature": "function initialize(address _angryTokenAddr, address _usdtTokenAddr, address _uniswapRouterAddr, address _vitalikButerinAddr, uint256 _startTime)",
+      "identity": "body_hash:03d3c738449b646a85a85df5368062f5",
+      "source_index": 479,
+      "total_chars": 3353
+    },
+    {
+      "focus_counts": {
+        "state_write": 23
+      },
+      "focus_total": 23,
+      "function_signature": "function startSales(uint256 tokenId,\n                        uint256 maxPrice, \n                        uint256 minPrice,\n                        uint256 startTime, \n                        uint256 durationTime,\n                        address nft,\n                        address currency)",
+      "identity": "body_hash:8ebc54db49a87b0b215b0e8461cd5878",
+      "source_index": 17490,
+      "total_chars": 4380
+    },
+    {
+      "focus_counts": {
+        "state_write": 20
+      },
+      "focus_total": 20,
+      "function_signature": "function getUserInfo(address user, uint roundId, uint i)",
+      "identity": "body_hash:5a8f2dde6200196795803ab39cabcd83",
+      "source_index": 11266,
+      "total_chars": 3485
+    },
+    {
+      "focus_counts": {
+        "state_write": 19
+      },
+      "focus_total": 19,
+      "function_signature": "function tokenURI(uint256 id)",
+      "identity": "body_hash:24d7439d35f5cec6efec741ed5960667",
+      "source_index": 4462,
+      "total_chars": 2593
+    },
+    {
+      "focus_counts": {
+        "state_write": 18
+      },
+      "focus_total": 18,
+      "function_signature": "function intializeContract()",
+      "identity": "body_hash:6b7e9ddd10041bdca4d7852bcdfa0dea",
+      "source_index": 13365,
+      "total_chars": 3003
+    },
+    {
+      "focus_counts": {
+        "state_write": 16
+      },
+      "focus_total": 16,
+      "function_signature": "function mint(address account, address refferer)",
+      "identity": "body_hash:1c1ec3da65d54971a4bb9328682c07ab",
+      "source_index": 3342,
+      "total_chars": 6164
+    },
+    {
+      "focus_counts": {
+        "state_write": 15
+      },
+      "focus_total": 15,
+      "function_signature": "function ticketDatas(uint256[] memory _tickets)",
+      "identity": "body_hash:76c9389bcc6264627702cf6ae62eb51c",
+      "source_index": 14683,
+      "total_chars": 4143
+    },
+    {
+      "focus_counts": {
+        "state_write": 14
+      },
+      "focus_total": 14,
+      "function_signature": "function getUserInfo(address who, address currency)",
+      "identity": "body_hash:1993a98a50ca184db816e1f400c0e2d7",
+      "source_index": 3039,
+      "total_chars": 3192
+    },
+    {
+      "focus_counts": {
+        "state_write": 14
+      },
+      "focus_total": 14,
+      "function_signature": "function createCollection(\r\n        address _artist,\r\n        uint256 _artistPercentage,\r\n        uint256 _price,\r\n        uint256 _priceGen,\r\n        uint256 _maxInvocations,\r\n        uint256 _maxMint,\r\n        bool _requiresMembership,\r\n        address[] memory _collaborators,\r\n        uint256[] memory _collaboratorPercentages,\r\n        uint256 _maxMintPerTransaction\r\n    )",
+      "identity": "body_hash:c3a2f7adee5729920a4dfd08791a3967",
+      "source_index": 24016,
+      "total_chars": 3743
+    },
+    {
+      "focus_counts": {
+        "state_write": 14
+      },
+      "focus_total": 14,
+      "function_signature": "function raidWorldNode(uint8 _worldNodeId, uint256 _stakes)",
+      "identity": "body_hash:de92a69ce103ec24904f59d870f71cbe",
+      "source_index": 27397,
+      "total_chars": 5175
+    },
+    {
+      "focus_counts": {
+        "state_write": 13
+      },
+      "focus_total": 13,
+      "function_signature": "function setTaxes(uint256 marketingFee, uint256 liquidityFee, uint256 teamFee, uint256 communityFee, uint256 burnFee)",
+      "identity": "body_hash:23181a910d4d467bd14e86a54f882d65",
+      "source_index": 4251,
+      "total_chars": 2650
+    },
+    {
+      "focus_counts": {
+        "state_write": 13
+      },
+      "focus_total": 13,
+      "function_signature": "function toTimestamp(uint16 year, uint8 month, uint8 day)",
+      "identity": "body_hash:e130ea8958df10e2f19870520c1e8cbd",
+      "source_index": 27728,
+      "total_chars": 3216
+    },
+    {
+      "focus_counts": {
+        "state_write": 13
+      },
+      "focus_total": 13,
+      "function_signature": "function getPoolParticipants()",
+      "identity": "body_hash:11a55c1588763543bd443075403ee6d1",
+      "source_index": 2195,
+      "total_chars": 6138
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function HappyHour()",
+      "identity": "body_hash:c72fcdb53c2218d40176c5f5cbe02596",
+      "source_index": 24443,
+      "total_chars": 2388
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function StartGame()",
+      "identity": "body_hash:0892d0ec0ca899c0955fdb1158dfddcd",
+      "source_index": 1062,
+      "total_chars": 2947
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function signDoubleContract(address _to, uint256 _value)",
+      "identity": "body_hash:c1150b714048bebc66cb853fd6486325",
+      "source_index": 23728,
+      "total_chars": 3063
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function queryStakesOfOwner(address _ownerAccount)",
+      "identity": "body_hash:8f2285175a3fd7dfd89dd7a20cf4ee59",
+      "source_index": 17549,
+      "total_chars": 3528
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function ownerClaim(uint256 tokenId, uint256 manaCost, uint256 hpCost, uint256 stamina, uint256 coolDown)",
+      "identity": "body_hash:f8f405605f0a905d8a02b569e95971b1",
+      "source_index": 30781,
+      "total_chars": 3716
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function liquidation(address _user, address from)",
+      "identity": "body_hash:73d8b0dbec1ac43035a9dbe297539a38",
+      "source_index": 14336,
+      "total_chars": 4512
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function duplicateInvestIn()",
+      "identity": "body_hash:c6fe6197047a4c1015d45ceb5566841d",
+      "source_index": 24415,
+      "total_chars": 5357
+    },
+    {
+      "focus_counts": {
+        "state_write": 12
+      },
+      "focus_total": 12,
+      "function_signature": "function    storeDiamondTransaction(bool        isBuy,\r\n                                        uint256     indexInOurDb,\r\n                                        uint256     authorityId,\r\n                                        uint256     certificate,\r\n                                        uint256     providerId,\r\n                                        uint256     vaultId,\r\n                                        uint256     caratAmount,\r\n                                        uint256     tokenAmount,\r\n                                        uint256     sourceId,\r\n                                        uint256     tokenId)",
+      "identity": "body_hash:cfe6ad8450c4afd664de9917b94e70ae",
+      "source_index": 25599,
+      "total_chars": 6546
+    },
+    {
+      "focus_counts": {
+        "state_write": 11
+      },
+      "focus_total": 11,
+      "function_signature": "function height(uint256 _tokenId)",
+      "identity": "body_hash:5d71d72ae17b5cd85f8cc465ccce668e",
+      "source_index": 11603,
+      "total_chars": 2627
+    },
+    {
+      "focus_counts": {
+        "state_write": 11
+      },
+      "focus_total": 11,
+      "function_signature": "function getRound(uint256 _disputeId, uint256 _roundId)",
+      "identity": "body_hash:8a09b31bfcfd05b8b77afee50e986f43",
+      "source_index": 16963,
+      "total_chars": 3326
+    },
+    {
+      "focus_counts": {
+        "state_write": 11
+      },
+      "focus_total": 11,
+      "function_signature": "function historyDatas(uint256[] memory _issueIndexs)",
+      "identity": "body_hash:6730118bc45dcfa2ea3fae79e6c08c26",
+      "source_index": 12776,
+      "total_chars": 4189
+    },
+    {
+      "focus_counts": {
+        "state_write": 11
+      },
+      "focus_total": 11,
+      "function_signature": "function deposit(uint256 _pid, uint256 _amount)",
+      "identity": "body_hash:5f2b1c5f5ff92a6964505af4dceea234",
+      "source_index": 11841,
+      "total_chars": 5609
+    },
+    {
+      "focus_counts": {
+        "state_write": 11
+      },
+      "focus_total": 11,
+      "function_signature": "function initialize()",
+      "identity": "body_hash:c97d96141ee9daaeb64177f6046d991b",
+      "source_index": 24743,
+      "total_chars": 5889
+    },
+    {
+      "focus_counts": {
+        "state_write": 11
+      },
+      "focus_total": 11,
+      "function_signature": "function create(address _token, address payable _beneficiary, uint256 _cliff, uint256 _vesting, uint256 _amount, bool _irrevocable)",
+      "identity": "body_hash:563ee14c1a629c2d4a94121f94a96a2b",
+      "source_index": 10704,
+      "total_chars": 7248
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function supplyDydx(uint256 amount)",
+      "identity": "body_hash:10d3d0c622131236b2857e670c484e34",
+      "source_index": 2124,
+      "total_chars": 2203
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function signSingleContract(address _to, uint256 _value)",
+      "identity": "body_hash:41b5e9900b639a988d70c3a0ddd02780",
+      "source_index": 8048,
+      "total_chars": 2340
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function setBothFees(\r\n        uint16 buy_tax,\r\n        uint16 buy_liquidity,\r\n        uint16 buy_marketing,\r\n        uint16 buy_dev,\r\n        uint16 buy_donation,\r\n        uint16 sell_tax,\r\n        uint16 sell_liquidity,\r\n        uint16 sell_marketing,\r\n        uint16 sell_dev,\r\n        uint16 sell_donation\r\n\r\n    )",
+      "identity": "body_hash:cda3f1ece81cd468b5ecc05e2cf2ded1",
+      "source_index": 25306,
+      "total_chars": 2537
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function colors(uint256 _n)",
+      "identity": "body_hash:f2a01677859c502d059c65adf96b45fd",
+      "source_index": 29962,
+      "total_chars": 2802
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function initializePresale(\r\n      uint256 _tokensForPresale,\r\n      uint256 _startDate,\r\n      uint256 _endDate,\r\n      uint256 _minCommitment,\r\n      uint256 _maxCommitment,\r\n      uint256 _softCap,\r\n      uint256 _hardCap,\r\n      uint256 _pricePresale\r\n    )",
+      "identity": "body_hash:b330210fc9fff35038f0235bbce97352",
+      "source_index": 22013,
+      "total_chars": 3397
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function withdraw(uint256 _pid)",
+      "identity": "body_hash:0398d8921c4ad56170262d72a54f6b03",
+      "source_index": 460,
+      "total_chars": 4147
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function processGuildKickProposal(uint256 proposalIndex)",
+      "identity": "body_hash:33970c6a846a0c62184373214392bce8",
+      "source_index": 6188,
+      "total_chars": 4469
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function processGuildKickProposal(uint256 proposalIndex)",
+      "identity": "body_hash:c4903731ee4fb75ddf604926c282c495",
+      "source_index": 24120,
+      "total_chars": 6175
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function initialize(address owner_, address seigniorageAddress)",
+      "identity": "body_hash:9f690883b0a0af71b48f42f60b7878be",
+      "source_index": 19458,
+      "total_chars": 7038
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function splitLock (address _lpToken, uint256 _index, uint256 _lockID, uint256 _amount)",
+      "identity": "body_hash:9ffb866d0392998b3cd68f2009a4ceb1",
+      "source_index": 19539,
+      "total_chars": 7692
+    },
+    {
+      "focus_counts": {
+        "state_write": 10
+      },
+      "focus_total": 10,
+      "function_signature": "function createCollection(\r\n        string calldata name_,\r\n        uint256 size_,\r\n        uint256 commissionRate_,\r\n        bool willAcceptBLES_,\r\n        address[] calldata collaborators_\r\n    )",
+      "identity": "body_hash:33a4baf3750f06cbb3a8416a0dae8857",
+      "source_index": 6205,
+      "total_chars": 7771
+    },
+    {
+      "focus_counts": {
+        "state_write": 9
+      },
+      "focus_total": 9,
+      "function_signature": "function initContract()",
+      "identity": "body_hash:af32052c719b11fb7c742b32c82be15c",
+      "source_index": 21502,
+      "total_chars": 1638
+    },
+    {
+      "focus_counts": {
+        "state_write": 9
+      },
+      "focus_total": 9,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:27b15126218ae71327acd1d77ba3f327",
+      "source_index": 4772,
+      "total_chars": 1827
+    },
+    {
+      "focus_counts": {
+        "state_write": 9
+      },
+      "focus_total": 9,
+      "function_signature": "function unlockBatch()",
+      "identity": "body_hash:2d3a62ac48d05a18d722d9cf9efe28c1",
+      "source_index": 5463,
+      "total_chars": 2051
+    },
+    {
+      "focus_counts": {
+        "state_write": 9
+      },
+      "focus_total": 9,
+      "function_signature": "function getMemberById(uint256 memberId)",
+      "identity": "body_hash:32f39d6776f1c21e8ebfeb6af64a0463",
+      "source_index": 6086,
+      "total_chars": 2135
+    },
+    {
+      "focus_counts": {
+        "state_write": 9
+      },
+      "focus_total": 9,
+      "function_signature": "function proposalInfo()",
+      "identity": "body_hash:f578d353b7345aa6633ee6b87e275593",
+      "source_index": 30366,
+      "total_chars": 2228
+    }
+  ],
+  "selected_rows": 48,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}

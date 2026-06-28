@@ -1,0 +1,16 @@
+{
+  "allow_legacy_metadata_schema": false,
+  "dataset_path": "data/qwen_qlora_500_loop_iter4_sample100_updates/splits/test_dataset.jsonl",
+  "dataset_sha256": "1be9276af968e99e7cc6321392a0349462599893c47779ecc30910a52b70640b",
+  "include_bytecode_metadata": true,
+  "include_compiler_metadata": false,
+  "include_selector_signature_metadata": true,
+  "max_seq_length": 8192,
+  "schema_version": 2,
+  "template_format": "alpaca",
+  "tokenizer": {
+    "local_files_only": true,
+    "mode": "transformers",
+    "name_or_path": "Qwen/Qwen2.5-Coder-7B-Instruct"
+  }
+}

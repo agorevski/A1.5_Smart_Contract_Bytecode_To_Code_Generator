@@ -1,0 +1,477 @@
+{
+  "cache": {
+    "manifest_path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-160610/splits/split_manifest.json",
+    "reason": "manifest_missing",
+    "reused": false
+  },
+  "coverage": {
+    "fields": [
+      "compiler_version",
+      "optimizer",
+      "visibility",
+      "source",
+      "length_bucket",
+      "function_family"
+    ],
+    "holdout": {
+      "fields": {
+        "compiler_version": {
+          "0.5.1": 1,
+          "0.5.10": 2,
+          "0.5.12": 4,
+          "0.5.15": 2,
+          "0.5.16": 1,
+          "0.5.17": 7,
+          "0.5.8": 2,
+          "0.6.12": 14,
+          "0.6.2": 1,
+          "0.8.0": 1,
+          "0.8.10": 1,
+          "0.8.11": 3,
+          "0.8.20": 6,
+          "0.8.26": 4,
+          "0.8.7": 1
+        },
+        "function_family": {
+          "access_control": 1,
+          "approval": 1,
+          "fallback_receive": 1,
+          "mint": 2,
+          "other": 21,
+          "read_getter": 12,
+          "transfer": 5,
+          "write_setter": 7
+        },
+        "length_bucket": {
+          "257-512": 17,
+          "513-1024": 5,
+          "<=256": 28
+        },
+        "optimizer": {
+          "disabled": 31,
+          "enabled": 19
+        },
+        "source": {
+          "huggingface": 50
+        },
+        "visibility": {
+          "external": 16,
+          "public": 34
+        }
+      },
+      "row_count": 50
+    },
+    "min_holdout_stratum_count": 0,
+    "splits": {
+      "test": {
+        "fields": {
+          "compiler_version": {
+            "0.5.12": 3,
+            "0.5.17": 4,
+            "0.5.8": 2,
+            "0.6.12": 4,
+            "0.8.0": 1,
+            "0.8.11": 2,
+            "0.8.20": 1
+          },
+          "function_family": {
+            "fallback_receive": 1,
+            "mint": 1,
+            "other": 10,
+            "read_getter": 5
+          },
+          "length_bucket": {
+            "257-512": 7,
+            "513-1024": 1,
+            "<=256": 9
+          },
+          "optimizer": {
+            "disabled": 10,
+            "enabled": 7
+          },
+          "source": {
+            "huggingface": 17
+          },
+          "visibility": {
+            "external": 6,
+            "public": 11
+          }
+        },
+        "group_count": 8,
+        "row_count": 17
+      },
+      "train": {
+        "fields": {
+          "compiler_version": {
+            "0.4.11": 2,
+            "0.4.18": 1,
+            "0.4.19": 1,
+            "0.4.24": 3,
+            "0.5.0": 1,
+            "0.5.10": 6,
+            "0.5.11": 7,
+            "0.5.12": 7,
+            "0.5.13": 1,
+            "0.5.15": 4,
+            "0.5.16": 5,
+            "0.5.17": 46,
+            "0.5.2": 3,
+            "0.5.3": 1,
+            "0.5.4": 1,
+            "0.5.6": 1,
+            "0.5.7": 3,
+            "0.5.8": 1,
+            "0.5.9": 2,
+            "0.6.1": 2,
+            "0.6.10": 1,
+            "0.6.12": 44,
+            "0.6.2": 1,
+            "0.6.6": 3,
+            "0.6.9": 1,
+            "0.7.0": 1,
+            "0.7.4": 1,
+            "0.7.5": 2,
+            "0.7.6": 1,
+            "0.8.0": 1,
+            "0.8.1": 1,
+            "0.8.10": 14,
+            "0.8.12": 2,
+            "0.8.20": 16,
+            "0.8.26": 35,
+            "0.8.3": 2,
+            "0.8.4": 3,
+            "0.8.6": 3,
+            "0.8.7": 16,
+            "0.8.9": 4
+          },
+          "function_family": {
+            "access_control": 7,
+            "approval": 8,
+            "burn": 4,
+            "mint": 9,
+            "other": 133,
+            "pause": 1,
+            "read_getter": 40,
+            "transfer": 17,
+            "write_setter": 31
+          },
+          "length_bucket": {
+            "257-512": 66,
+            "513-1024": 33,
+            "<=256": 151
+          },
+          "optimizer": {
+            "disabled": 119,
+            "enabled": 131
+          },
+          "source": {
+            "huggingface": 250
+          },
+          "visibility": {
+            "external": 73,
+            "public": 177
+          }
+        },
+        "group_count": 250,
+        "row_count": 250
+      },
+      "val": {
+        "fields": {
+          "compiler_version": {
+            "0.5.1": 1,
+            "0.5.10": 2,
+            "0.5.12": 1,
+            "0.5.15": 2,
+            "0.5.16": 1,
+            "0.5.17": 3,
+            "0.6.12": 10,
+            "0.6.2": 1,
+            "0.8.10": 1,
+            "0.8.11": 1,
+            "0.8.20": 5,
+            "0.8.26": 4,
+            "0.8.7": 1
+          },
+          "function_family": {
+            "access_control": 1,
+            "approval": 1,
+            "mint": 1,
+            "other": 11,
+            "read_getter": 7,
+            "transfer": 5,
+            "write_setter": 7
+          },
+          "length_bucket": {
+            "257-512": 10,
+            "513-1024": 4,
+            "<=256": 19
+          },
+          "optimizer": {
+            "disabled": 21,
+            "enabled": 12
+          },
+          "source": {
+            "huggingface": 33
+          },
+          "visibility": {
+            "external": 10,
+            "public": 23
+          }
+        },
+        "group_count": 26,
+        "row_count": 33
+      }
+    },
+    "status": "passed",
+    "total": {
+      "fields": {
+        "compiler_version": {
+          "0.4.11": 2,
+          "0.4.18": 1,
+          "0.4.19": 1,
+          "0.4.24": 3,
+          "0.5.0": 1,
+          "0.5.1": 1,
+          "0.5.10": 8,
+          "0.5.11": 7,
+          "0.5.12": 11,
+          "0.5.13": 1,
+          "0.5.15": 6,
+          "0.5.16": 6,
+          "0.5.17": 53,
+          "0.5.2": 3,
+          "0.5.3": 1,
+          "0.5.4": 1,
+          "0.5.6": 1,
+          "0.5.7": 3,
+          "0.5.8": 3,
+          "0.5.9": 2,
+          "0.6.1": 2,
+          "0.6.10": 1,
+          "0.6.12": 58,
+          "0.6.2": 2,
+          "0.6.6": 3,
+          "0.6.9": 1,
+          "0.7.0": 1,
+          "0.7.4": 1,
+          "0.7.5": 2,
+          "0.7.6": 1,
+          "0.8.0": 2,
+          "0.8.1": 1,
+          "0.8.10": 15,
+          "0.8.11": 3,
+          "0.8.12": 2,
+          "0.8.20": 22,
+          "0.8.26": 39,
+          "0.8.3": 2,
+          "0.8.4": 3,
+          "0.8.6": 3,
+          "0.8.7": 17,
+          "0.8.9": 4
+        },
+        "function_family": {
+          "access_control": 8,
+          "approval": 9,
+          "burn": 4,
+          "fallback_receive": 1,
+          "mint": 11,
+          "other": 154,
+          "pause": 1,
+          "read_getter": 52,
+          "transfer": 22,
+          "write_setter": 38
+        },
+        "length_bucket": {
+          "257-512": 83,
+          "513-1024": 38,
+          "<=256": 179
+        },
+        "optimizer": {
+          "disabled": 150,
+          "enabled": 150
+        },
+        "source": {
+          "huggingface": 300
+        },
+        "visibility": {
+          "external": 89,
+          "public": 211
+        }
+      },
+      "row_count": 300
+    },
+    "violation_count": 0,
+    "violations": []
+  },
+  "created_at": "2026-06-27T23:06:15Z",
+  "group_counts": {
+    "source": 284,
+    "test": 8,
+    "train": 250,
+    "val": 26
+  },
+  "input_sha256": "0f0a9f6d96a687325226da444878fabbb5626346cbfa52de61fe9806d98650e5",
+  "leakage_validation": {
+    "checked_categories": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "input_hash",
+      "output_hash"
+    ],
+    "overlap_counts": {
+      "body_hash": 0,
+      "contract_address": 0,
+      "contract_function": 0,
+      "input_hash": 0,
+      "output_hash": 0,
+      "source_hash": 0
+    },
+    "sample_overlaps": [],
+    "status": "passed",
+    "total_overlap_keys": 0
+  },
+  "manifest_kind": "dataset_split",
+  "outputs": {
+    "test": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "test_split",
+      "exists": true,
+      "modified_at": "2026-06-27T23:06:15Z",
+      "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-160610/splits/test_dataset.jsonl",
+      "row_count": 17,
+      "sha256": "2dd60ecf00bd0cc22c5f4adcd56c4eab247f561d9c772309b18b3d38e11b0510",
+      "size_bytes": 52195
+    },
+    "train": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "train_split",
+      "exists": true,
+      "modified_at": "2026-06-27T23:06:15Z",
+      "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-160610/splits/train_dataset.jsonl",
+      "row_count": 250,
+      "sha256": "761b81c7595cb7a28a5a20e81962d0cb01e4fdccdf82eeaeda938bbae2fb2d39",
+      "size_bytes": 795135
+    },
+    "val": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "validation_split",
+      "exists": true,
+      "modified_at": "2026-06-27T23:06:15Z",
+      "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-160610/splits/val_dataset.jsonl",
+      "row_count": 33,
+      "sha256": "4d1ef943752b5f11f0f60ef3abbcadb4f0eb2c45e852b109e769052e6518cf70",
+      "size_bytes": 117040
+    }
+  },
+  "parameters": {
+    "allow_degenerate_splits": false,
+    "group_key_precedence": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "output_hash",
+      "input_hash"
+    ],
+    "leakage_key_categories": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "input_hash",
+      "output_hash"
+    ],
+    "max_component_target_ratio": 1.0,
+    "min_holdout_stratum_count": 0,
+    "min_split_target_ratio": 0.5,
+    "seed": 42,
+    "stratification_fields": [
+      "compiler_version",
+      "optimizer",
+      "visibility",
+      "source",
+      "length_bucket",
+      "function_family"
+    ],
+    "test_ratio": 0.05000000000000002,
+    "train_ratio": 0.85,
+    "val_ratio": 0.1
+  },
+  "row_counts": {
+    "source": 300,
+    "test": 17,
+    "train": 250,
+    "val": 33
+  },
+  "schema_version": 2,
+  "source_dataset": {
+    "artifact_type": "file",
+    "dataset_artifact_type": "full_source_dataset",
+    "dataset_role": "source",
+    "exists": true,
+    "modified_at": "2026-06-27T23:06:10Z",
+    "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-160610/qwen_qlora_300_sample.jsonl",
+    "row_count": 300,
+    "sha256": "0f0a9f6d96a687325226da444878fabbb5626346cbfa52de61fe9806d98650e5",
+    "size_bytes": 964370
+  },
+  "split_quality": {
+    "allow_degenerate_splits": false,
+    "component_count": 284,
+    "largest_component_ratio": 0.01,
+    "largest_component_rows": 3,
+    "largest_components": [
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "max_component_target_ratio": 1.0,
+    "min_split_target_ratio": 0.5,
+    "row_counts": {
+      "test": 17,
+      "train": 250,
+      "val": 33
+    },
+    "status": "passed",
+    "target_rows": {
+      "test": 15.000000000000005,
+      "train": 255.0,
+      "val": 30.0
+    },
+    "target_vs_actual": {
+      "test": {
+        "actual": 17,
+        "actual_to_target_ratio": 1.1333333333333329,
+        "delta": 1.9999999999999947,
+        "target": 15.000000000000005
+      },
+      "train": {
+        "actual": 250,
+        "actual_to_target_ratio": 0.9803921568627451,
+        "delta": -5.0,
+        "target": 255.0
+      },
+      "val": {
+        "actual": 33,
+        "actual_to_target_ratio": 1.1,
+        "delta": 3.0,
+        "target": 30.0
+      }
+    },
+    "total_rows": 300,
+    "violation_count": 0,
+    "violations": []
+  }
+}

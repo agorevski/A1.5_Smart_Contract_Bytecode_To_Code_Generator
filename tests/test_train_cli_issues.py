@@ -1143,6 +1143,33 @@ def test_split_dataset_reuses_matching_manifest_without_resplitting(tmp_path, mo
     assert train.split_dataset.last_status["reused"] is True
 
 
+def test_split_dataset_creates_nested_output_directory(tmp_path):
+    rows = [
+        {
+            "input": f"tac {i}",
+            "output": f"function f{i}() public {{}}",
+            "metadata": {"contract_address": f"0x{i}", "function_signature": f"f{i}()"},
+        }
+        for i in range(12)
+    ]
+    dataset_path = tmp_path / "dataset.jsonl"
+    nested_split_dir = tmp_path / "runs" / "curriculum" / "splits"
+    _write_jsonl(dataset_path, rows)
+
+    train_path, val_path, test_path = train.split_dataset(
+        str(dataset_path),
+        str(nested_split_dir),
+        train_ratio=0.6,
+        val_ratio=0.2,
+        seed=99,
+    )
+
+    assert Path(train_path).exists()
+    assert Path(val_path).exists()
+    assert Path(test_path).exists()
+    assert (nested_split_dir / "split_manifest.json").exists()
+
+
 def test_split_quality_gate_fails_oversized_component_by_default(tmp_path):
     rows = [
         {

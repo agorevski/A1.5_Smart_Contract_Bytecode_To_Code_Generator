@@ -1,0 +1,99 @@
+{
+  "created_at": "2026-06-27T23:11:40Z",
+  "input_sha256": "5d0c583efc71c302f89956687b31b889be44b2029cd759e0e2e9bdffa587d483",
+  "manifest_kind": "dataset_split",
+  "outputs": {
+    "test": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "test_split",
+      "exists": true,
+      "modified_at": "2026-06-27T23:11:40Z",
+      "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_overfit_sanity_20260627-161140/splits/test_dataset.jsonl",
+      "row_count": 2,
+      "sha256": "5d0c583efc71c302f89956687b31b889be44b2029cd759e0e2e9bdffa587d483",
+      "size_bytes": 1457
+    },
+    "train": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "train_split",
+      "exists": true,
+      "modified_at": "2026-06-27T23:11:40Z",
+      "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_overfit_sanity_20260627-161140/splits/train_dataset.jsonl",
+      "row_count": 2,
+      "sha256": "5d0c583efc71c302f89956687b31b889be44b2029cd759e0e2e9bdffa587d483",
+      "size_bytes": 1457
+    },
+    "val": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "val_split",
+      "exists": true,
+      "modified_at": "2026-06-27T23:11:40Z",
+      "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_overfit_sanity_20260627-161140/splits/val_dataset.jsonl",
+      "row_count": 2,
+      "sha256": "5d0c583efc71c302f89956687b31b889be44b2029cd759e0e2e9bdffa587d483",
+      "size_bytes": 1457
+    }
+  },
+  "overfit_sanity_check": {
+    "description": "Train, validation, and test splits intentionally point to the same sampled rows.",
+    "enabled": true,
+    "sample_count": 2,
+    "seed": 42,
+    "selection_strategy": "shortest"
+  },
+  "parameters": {
+    "allow_degenerate_splits": true,
+    "group_key_precedence": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "output_hash",
+      "input_hash"
+    ],
+    "leakage_key_categories": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "input_hash",
+      "output_hash"
+    ],
+    "max_component_target_ratio": 1.0,
+    "min_holdout_stratum_count": 0,
+    "min_split_target_ratio": 0.5,
+    "seed": 42,
+    "stratification_fields": [
+      "compiler_version",
+      "optimizer",
+      "visibility",
+      "source",
+      "length_bucket",
+      "function_family"
+    ],
+    "test_ratio": 0.05000000000000002,
+    "train_ratio": 0.85,
+    "val_ratio": 0.1
+  },
+  "row_counts": {
+    "source": 2,
+    "test": 2,
+    "train": 2,
+    "val": 2
+  },
+  "schema_version": 2,
+  "source_dataset": {
+    "artifact_type": "file",
+    "dataset_artifact_type": "full_source_dataset",
+    "dataset_role": "source",
+    "exists": true,
+    "modified_at": "2026-06-27T23:11:40Z",
+    "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_overfit_sanity_20260627-161140/qwen_qlora_overfit_2_sample.jsonl",
+    "row_count": 2,
+    "sha256": "5d0c583efc71c302f89956687b31b889be44b2029cd759e0e2e9bdffa587d483",
+    "size_bytes": 1457
+  }
+}

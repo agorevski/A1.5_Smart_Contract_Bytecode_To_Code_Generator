@@ -1,0 +1,28 @@
+{
+  "blank_line_count": 0,
+  "cache": {
+    "hit": false,
+    "metadata_path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-152736/splits/preflight_cache/val-val_dataset-69a78e7bedfccd361d08f8b0a30dbce1.preflight.meta.json",
+    "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-152736/splits/preflight_cache/val-val_dataset-69a78e7bedfccd361d08f8b0a30dbce1.preflight.json"
+  },
+  "error_counts": {},
+  "errors": [],
+  "fail_on_context_overlength": true,
+  "lengths": {
+    "context_overlength_count": 0,
+    "max_context_tokens": 4107,
+    "max_target_tokens": 487,
+    "max_total_tokens": 4153,
+    "target_overlength_count": 0
+  },
+  "max_seq_length": 8192,
+  "metadata_schema": {
+    "allow_legacy": false,
+    "schema_version": 1,
+    "validator": "src.dataset_pipeline.validate_training_metadata_schema"
+  },
+  "path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_500_20260627-152736/splits/val_dataset.jsonl",
+  "row_count": 58,
+  "status": "passed",
+  "valid_row_count": 58
+}

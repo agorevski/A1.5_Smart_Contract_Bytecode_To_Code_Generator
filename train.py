@@ -1241,7 +1241,7 @@ def split_dataset(
         raise ValueError("train_ratio, val_ratio, and test_ratio must sum to 1.0")
 
     out = Path(output_dir)
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     source_path = Path(dataset_path)
     manifest_target = Path(manifest_path) if manifest_path else out / "split_manifest.json"
     parameters = _split_parameters(

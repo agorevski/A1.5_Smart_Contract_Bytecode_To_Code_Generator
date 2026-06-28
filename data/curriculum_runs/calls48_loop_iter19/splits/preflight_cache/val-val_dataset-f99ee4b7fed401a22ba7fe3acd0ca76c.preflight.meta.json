@@ -1,0 +1,16 @@
+{
+  "allow_legacy_metadata_schema": false,
+  "dataset_path": "data/curriculum_runs/calls48_loop_iter19/splits/val_dataset.jsonl",
+  "dataset_sha256": "f68e68a1f8f78a867a60c34c2d1fa469a2f68702d7ae43cf421369451a9562b7",
+  "include_bytecode_metadata": true,
+  "include_compiler_metadata": false,
+  "include_selector_signature_metadata": true,
+  "max_seq_length": 8192,
+  "schema_version": 2,
+  "template_format": "alpaca",
+  "tokenizer": {
+    "local_files_only": true,
+    "mode": "transformers",
+    "name_or_path": "Qwen/Qwen2.5-Coder-7B-Instruct"
+  }
+}

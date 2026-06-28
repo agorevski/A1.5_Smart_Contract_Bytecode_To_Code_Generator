@@ -1,0 +1,544 @@
+{
+  "categories": [
+    "call",
+    "member_call"
+  ],
+  "exclude_datasets": [
+    "data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl"
+  ],
+  "focus": "calls",
+  "manifest_kind": "curriculum_dataset",
+  "output_dataset": "data/curriculum/calls48_nonoverlap.jsonl",
+  "rows": [
+    {
+      "focus_counts": {
+        "call": 21,
+        "member_call": 19
+      },
+      "focus_total": 40,
+      "function_signature": "function getInfo()",
+      "identity": "body_hash:7abf547ff7834e4fff9cc6a1d894bb36",
+      "source_index": 15119,
+      "total_chars": 4534
+    },
+    {
+      "focus_counts": {
+        "call": 21,
+        "member_call": 15
+      },
+      "focus_total": 36,
+      "function_signature": "function adjustPosition()",
+      "identity": "body_hash:05079f46a90db433b50efacca8643cbf",
+      "source_index": 658,
+      "total_chars": 6224
+    },
+    {
+      "focus_counts": {
+        "call": 18,
+        "member_call": 11
+      },
+      "focus_total": 29,
+      "function_signature": "function withdraw(address _property)",
+      "identity": "body_hash:7de2cf028e548514628aec46ed38c331",
+      "source_index": 15495,
+      "total_chars": 1999
+    },
+    {
+      "focus_counts": {
+        "call": 18,
+        "member_call": 9
+      },
+      "focus_total": 27,
+      "function_signature": "function wdR()",
+      "identity": "body_hash:2a19f3e006c00665b258fd2ce5660467",
+      "source_index": 5056,
+      "total_chars": 2795
+    },
+    {
+      "focus_counts": {
+        "call": 17,
+        "member_call": 10
+      },
+      "focus_total": 27,
+      "function_signature": "function allocateSeigniorage()",
+      "identity": "body_hash:3fcd01e1df67d4e609392d81e47f65b8",
+      "source_index": 7805,
+      "total_chars": 3050
+    },
+    {
+      "focus_counts": {
+        "call": 17,
+        "member_call": 10
+      },
+      "focus_total": 27,
+      "function_signature": "function executeOperation(\r\n        address _reserve,\r\n        uint256 _amountFlashLoan,\r\n        uint256 _fee,\r\n        bytes memory _data\r\n    )",
+      "identity": "body_hash:6d8b40cca8a55e23120cfc0dfe115fec",
+      "source_index": 13584,
+      "total_chars": 4338
+    },
+    {
+      "focus_counts": {
+        "call": 16,
+        "member_call": 10
+      },
+      "focus_total": 26,
+      "function_signature": "function beforeBalanceChange(\r\n\t\taddress _property,\r\n\t\taddress _from,\r\n\t\taddress _to\r\n\t)",
+      "identity": "body_hash:cdba1b6acc52ea0ed5e84955d93bc5c2",
+      "source_index": 25313,
+      "total_chars": 2846
+    },
+    {
+      "focus_counts": {
+        "call": 15,
+        "member_call": 9
+      },
+      "focus_total": 24,
+      "function_signature": "function harvest()",
+      "identity": "body_hash:c932e48c74523adb891e705048e8b08a",
+      "source_index": 24709,
+      "total_chars": 2227
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 10
+      },
+      "focus_total": 23,
+      "function_signature": "function convergePolicy(address _currentPolicyAddress)",
+      "identity": "body_hash:ae40875050d58248b0618a58ba4cd06e",
+      "source_index": 21404,
+      "total_chars": 2133
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "member_call": 9
+      },
+      "focus_total": 23,
+      "function_signature": "function deposit(uint256 _amount)",
+      "identity": "body_hash:5520c1210b12749876e0590dc968bb67",
+      "source_index": 10540,
+      "total_chars": 2609
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 10
+      },
+      "focus_total": 23,
+      "function_signature": "function lockTokens(address _pair, uint256 _epoch, address _tokenPayout, address _router)",
+      "identity": "body_hash:54c0ae46ece6c5c9794ffad644fb6dc9",
+      "source_index": 10496,
+      "total_chars": 2917
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 10
+      },
+      "focus_total": 23,
+      "function_signature": "function getUserInfo(address who, address currency)",
+      "identity": "body_hash:1993a98a50ca184db816e1f400c0e2d7",
+      "source_index": 3039,
+      "total_chars": 3192
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 11
+      },
+      "focus_total": 23,
+      "function_signature": "function removeToken(\r\n        IConfigurableRightsPool self,\r\n        IBPool bPool,\r\n        address token\r\n    )",
+      "identity": "body_hash:7280d9ce71080732925daa1320f69346",
+      "source_index": 14185,
+      "total_chars": 3290
+    },
+    {
+      "focus_counts": {
+        "call": 15,
+        "member_call": 8
+      },
+      "focus_total": 23,
+      "function_signature": "function withdraw(uint256 _shares)",
+      "identity": "body_hash:15fc139e45b6c51b78353abe1934bcdd",
+      "source_index": 2670,
+      "total_chars": 3591
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 11
+      },
+      "focus_total": 23,
+      "function_signature": "function claimFunds(address auctionAddress)",
+      "identity": "body_hash:6ee945a18ed3816f539514eca4a189df",
+      "source_index": 13754,
+      "total_chars": 4588
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 9
+      },
+      "focus_total": 22,
+      "function_signature": "function createNewCurveVaultAndStrat(uint256 _pid, uint256 _depositLimit)",
+      "identity": "body_hash:1ff459b5db8d0b0ddbf11b04325d5ec8",
+      "source_index": 3850,
+      "total_chars": 1812
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 11
+      },
+      "focus_total": 22,
+      "function_signature": "function calcLsLmsrCost(\r\n        uint256 q1,\r\n        uint256 q2,\r\n        uint256 _alpha\r\n    )",
+      "identity": "body_hash:c717fd5073a9e48e0213bb6f5229bba2",
+      "source_index": 24433,
+      "total_chars": 2446
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 9
+      },
+      "focus_total": 22,
+      "function_signature": "function postCrowdSale()",
+      "identity": "body_hash:d5939770ff2223c49ab8c376df475b8e",
+      "source_index": 26238,
+      "total_chars": 2653
+    },
+    {
+      "focus_counts": {
+        "call": 17,
+        "member_call": 5
+      },
+      "focus_total": 22,
+      "function_signature": "function ClaimCompTwo(address[] calldata tokens, uint setId)",
+      "identity": "body_hash:b8fb4b4b08fce2002e45b17894ab05e6",
+      "source_index": 22699,
+      "total_chars": 5817
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 9
+      },
+      "focus_total": 21,
+      "function_signature": "function create(address _newPolicyAddress)",
+      "identity": "body_hash:b83b66073318ac7886ec084f73eaf502",
+      "source_index": 22637,
+      "total_chars": 1981
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "member_call": 7
+      },
+      "focus_total": 21,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:1e81a85b6df155b7be8658784107e6a8",
+      "source_index": 3648,
+      "total_chars": 2164
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "member_call": 7
+      },
+      "focus_total": 21,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:5eaf8ee0b885f7b3cab18054d5fa618c",
+      "source_index": 11765,
+      "total_chars": 2165
+    },
+    {
+      "focus_counts": {
+        "call": 14,
+        "member_call": 7
+      },
+      "focus_total": 21,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:a517ed7143c0ca6c504133ade8b82efc",
+      "source_index": 20219,
+      "total_chars": 2371
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 8
+      },
+      "focus_total": 21,
+      "function_signature": "function recoveryAddress(address wallet_lostAddress, address wallet_newAddress, address onchainID)",
+      "identity": "body_hash:8020527e20c5179b88e921248b0813b6",
+      "source_index": 15751,
+      "total_chars": 2691
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 8
+      },
+      "focus_total": 21,
+      "function_signature": "function stakeStart(uint256 amount, uint256 numMonthsStake)",
+      "identity": "body_hash:21c25e58c044595886ec48d703c39428",
+      "source_index": 4073,
+      "total_chars": 3845
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 8
+      },
+      "focus_total": 21,
+      "function_signature": "function liquidation(address _user, address from)",
+      "identity": "body_hash:73d8b0dbec1ac43035a9dbe297539a38",
+      "source_index": 14336,
+      "total_chars": 4512
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 7
+      },
+      "focus_total": 20,
+      "function_signature": "function authenticatedCallback(address _property, bytes32 _idHash)",
+      "identity": "body_hash:0cd35db4aa08784bc52929dbf70bf312",
+      "source_index": 1615,
+      "total_chars": 2665
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 8
+      },
+      "focus_total": 20,
+      "function_signature": "function burn()",
+      "identity": "body_hash:4a1b8898dd4a03232f416bf183c7075f",
+      "source_index": 9133,
+      "total_chars": 2828
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 8
+      },
+      "focus_total": 20,
+      "function_signature": "function placeTrade(uint256 orderIndex)",
+      "identity": "body_hash:665a47f74564f0e80e30b3ecca6f3928",
+      "source_index": 12684,
+      "total_chars": 3092
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 9
+      },
+      "focus_total": 20,
+      "function_signature": "function mintThenDeposit(\r\n        address payable _wbtcDestination, \r\n        uint256 _amount, \r\n        uint256[2] calldata _amounts, \r\n        uint256 _min_mint_amount, \r\n        uint256 _new_min_mint_amount, \r\n        bytes32 _nHash, \r\n        bytes calldata _sig\r\n    )",
+      "identity": "body_hash:7aa45664d11b6f29ebab556911dde207",
+      "source_index": 15108,
+      "total_chars": 7450
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 8
+      },
+      "focus_total": 19,
+      "function_signature": "function buy(\r\n    uint256 _tokenId\r\n  )",
+      "identity": "body_hash:0ed2b14e68daf8bb064cf68a5984a3d0",
+      "source_index": 1871,
+      "total_chars": 1802
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 6
+      },
+      "focus_total": 19,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:20a5b99b1078de62733eb70bdf90bdb2",
+      "source_index": 3954,
+      "total_chars": 1816
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 6
+      },
+      "focus_total": 19,
+      "function_signature": "function openTrading()",
+      "identity": "body_hash:88dfc5d8927cc31fa980b1f094f08bf2",
+      "source_index": 16803,
+      "total_chars": 1819
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 7
+      },
+      "focus_total": 19,
+      "function_signature": "function redeemIdleToken(uint256 _amount, bool _skipRebalance, uint256[] memory _clientProtocolAmounts)",
+      "identity": "body_hash:ee55c3256e8082de87bc7eb2f1244019",
+      "source_index": 29450,
+      "total_chars": 1831
+    },
+    {
+      "focus_counts": {
+        "call": 13,
+        "member_call": 6
+      },
+      "focus_total": 19,
+      "function_signature": "function swapToMkrOtc(address tokenAddr, uint govFee)",
+      "identity": "body_hash:28e2330506a22b20e9f4381e7210c8c5",
+      "source_index": 4931,
+      "total_chars": 2062
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 8
+      },
+      "focus_total": 19,
+      "function_signature": "function participateInAuction()",
+      "identity": "body_hash:b567ed8bbe365ba26377ddf49d1c05a0",
+      "source_index": 22285,
+      "total_chars": 2108
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 7
+      },
+      "focus_total": 19,
+      "function_signature": "function authenticatedCallback(address _property, bytes32 _idHash)",
+      "identity": "body_hash:07706b40cddbc4a00149d1dfc5c67ee5",
+      "source_index": 919,
+      "total_chars": 2211
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "member_call": 9
+      },
+      "focus_total": 19,
+      "function_signature": "function getCompoundAPRAdjusted(address token, uint256 _supply)",
+      "identity": "body_hash:6c10f8ab2c0de56fff901dfd464daa18",
+      "source_index": 13413,
+      "total_chars": 2474
+    },
+    {
+      "focus_counts": {
+        "call": 9,
+        "member_call": 10
+      },
+      "focus_total": 19,
+      "function_signature": "function balanceOf(address _user)",
+      "identity": "body_hash:c3172d4b6a47412ece6bb863675006c8",
+      "source_index": 23948,
+      "total_chars": 3000
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 7
+      },
+      "focus_total": 19,
+      "function_signature": "function kfToErc20(address pool,uint sellAmount,uint minAmount,address[][] memory paths)",
+      "identity": "body_hash:c901e4a2e885a6fc04c39341e086920e",
+      "source_index": 24667,
+      "total_chars": 3306
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "member_call": 9
+      },
+      "focus_total": 19,
+      "function_signature": "function predictCompAccrued()",
+      "identity": "body_hash:b2152cb46213ede6720f3cc099c384b8",
+      "source_index": 21865,
+      "total_chars": 3606
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 8
+      },
+      "focus_total": 19,
+      "function_signature": "function stakeNFY(uint256 _amount)",
+      "identity": "body_hash:3210fecdc1d35173fc5a72026af87986",
+      "source_index": 5985,
+      "total_chars": 4041
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 8
+      },
+      "focus_total": 19,
+      "function_signature": "function stakeLP(uint256 _amount)",
+      "identity": "body_hash:bcbe76ec6fab21babcb7ff503d4a666a",
+      "source_index": 23157,
+      "total_chars": 5376
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 8
+      },
+      "focus_total": 19,
+      "function_signature": "function stakeLP(uint _amount)",
+      "identity": "body_hash:2e6ecd4e13704fca1432406558aea19a",
+      "source_index": 5597,
+      "total_chars": 5382
+    },
+    {
+      "focus_counts": {
+        "call": 11,
+        "member_call": 8
+      },
+      "focus_total": 19,
+      "function_signature": "function ZapIn(\r\n        address _staker,\r\n        uint256 _minPoolTokens,\r\n        address payable _agent\r\n    )",
+      "identity": "body_hash:e2f1a720e3e4ff559f518f5347cd6138",
+      "source_index": 27947,
+      "total_chars": 5499
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "member_call": 9
+      },
+      "focus_total": 19,
+      "function_signature": "function updatePool(uint256 _pid)",
+      "identity": "body_hash:ae7eb2b9bd5be472cd3f679775253639",
+      "source_index": 21427,
+      "total_chars": 5723
+    },
+    {
+      "focus_counts": {
+        "call": 12,
+        "member_call": 6
+      },
+      "focus_total": 18,
+      "function_signature": "function addGroup(address _addr)",
+      "identity": "body_hash:1253d87cf5c7f03bae516d76a4e4c1a0",
+      "source_index": 2279,
+      "total_chars": 1727
+    },
+    {
+      "focus_counts": {
+        "call": 10,
+        "member_call": 8
+      },
+      "focus_total": 18,
+      "function_signature": "function vote(address _property, bool _agree)",
+      "identity": "body_hash:c704126d03a5dd2b851022b3ba93050d",
+      "source_index": 24421,
+      "total_chars": 2098
+    }
+  ],
+  "selected_rows": 48,
+  "source_dataset": "data/hf_training_dataset.jsonl"
+}

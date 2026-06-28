@@ -1,0 +1,15 @@
+{
+  "allow_legacy_metadata_schema": false,
+  "dataset_path": "/home/algore/GIT/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator/data/qwen_qlora_overfit_sanity_20260627-161140/splits/test_dataset.jsonl",
+  "dataset_sha256": "5d0c583efc71c302f89956687b31b889be44b2029cd759e0e2e9bdffa587d483",
+  "include_bytecode_metadata": true,
+  "include_compiler_metadata": false,
+  "max_seq_length": 8192,
+  "schema_version": 2,
+  "template_format": "alpaca",
+  "tokenizer": {
+    "local_files_only": true,
+    "mode": "transformers",
+    "name_or_path": "Qwen/Qwen2.5-Coder-7B-Instruct"
+  }
+}

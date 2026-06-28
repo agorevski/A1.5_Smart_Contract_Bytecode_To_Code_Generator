@@ -1,0 +1,416 @@
+{
+  "cache": {
+    "manifest_path": "data/qwen_qlora_500_loop_iter4_sample100_updates/splits/split_manifest.json",
+    "reason": "parameter_mismatch:allow_degenerate_splits",
+    "reused": false
+  },
+  "coverage": {
+    "fields": [
+      "compiler_version",
+      "optimizer",
+      "visibility",
+      "source",
+      "length_bucket",
+      "function_family"
+    ],
+    "holdout": {
+      "fields": {
+        "compiler_version": {
+          "0.4.11": 1,
+          "0.5.12": 1,
+          "0.5.16": 1,
+          "0.5.17": 3,
+          "0.6.12": 5,
+          "0.7.4": 1,
+          "0.8.10": 1,
+          "0.8.20": 1,
+          "0.8.26": 1,
+          "0.8.7": 2
+        },
+        "function_family": {
+          "access_control": 1,
+          "mint": 2,
+          "other": 8,
+          "read_getter": 5,
+          "write_setter": 1
+        },
+        "length_bucket": {
+          "257-512": 6,
+          "513-1024": 2,
+          "<=256": 9
+        },
+        "optimizer": {
+          "disabled": 10,
+          "enabled": 7
+        },
+        "source": {
+          "huggingface": 17
+        },
+        "visibility": {
+          "external": 4,
+          "public": 13
+        }
+      },
+      "row_count": 17
+    },
+    "min_holdout_stratum_count": 0,
+    "splits": {
+      "test": {
+        "fields": {
+          "compiler_version": {
+            "0.5.16": 1,
+            "0.6.12": 2,
+            "0.7.4": 1,
+            "0.8.10": 1,
+            "0.8.20": 1
+          },
+          "function_family": {
+            "mint": 1,
+            "other": 2,
+            "read_getter": 2,
+            "write_setter": 1
+          },
+          "length_bucket": {
+            "257-512": 2,
+            "513-1024": 1,
+            "<=256": 3
+          },
+          "optimizer": {
+            "disabled": 5,
+            "enabled": 1
+          },
+          "source": {
+            "huggingface": 6
+          },
+          "visibility": {
+            "external": 1,
+            "public": 5
+          }
+        },
+        "group_count": 5,
+        "row_count": 6
+      },
+      "train": {
+        "fields": {
+          "compiler_version": {
+            "0.4.11": 1,
+            "0.5.10": 3,
+            "0.5.11": 3,
+            "0.5.13": 1,
+            "0.5.15": 1,
+            "0.5.16": 2,
+            "0.5.17": 15,
+            "0.5.2": 2,
+            "0.5.7": 2,
+            "0.6.12": 16,
+            "0.6.6": 2,
+            "0.6.9": 1,
+            "0.7.0": 1,
+            "0.7.5": 1,
+            "0.8.0": 1,
+            "0.8.1": 1,
+            "0.8.10": 6,
+            "0.8.20": 6,
+            "0.8.26": 9,
+            "0.8.3": 1,
+            "0.8.7": 7,
+            "0.8.9": 1
+          },
+          "function_family": {
+            "access_control": 3,
+            "approval": 3,
+            "mint": 2,
+            "other": 45,
+            "read_getter": 18,
+            "transfer": 5,
+            "write_setter": 7
+          },
+          "length_bucket": {
+            "257-512": 24,
+            "513-1024": 13,
+            "<=256": 46
+          },
+          "optimizer": {
+            "disabled": 40,
+            "enabled": 43
+          },
+          "source": {
+            "huggingface": 83
+          },
+          "visibility": {
+            "external": 24,
+            "public": 59
+          }
+        },
+        "group_count": 83,
+        "row_count": 83
+      },
+      "val": {
+        "fields": {
+          "compiler_version": {
+            "0.4.11": 1,
+            "0.5.12": 1,
+            "0.5.17": 3,
+            "0.6.12": 3,
+            "0.8.26": 1,
+            "0.8.7": 2
+          },
+          "function_family": {
+            "access_control": 1,
+            "mint": 1,
+            "other": 6,
+            "read_getter": 3
+          },
+          "length_bucket": {
+            "257-512": 4,
+            "513-1024": 1,
+            "<=256": 6
+          },
+          "optimizer": {
+            "disabled": 5,
+            "enabled": 6
+          },
+          "source": {
+            "huggingface": 11
+          },
+          "visibility": {
+            "external": 3,
+            "public": 8
+          }
+        },
+        "group_count": 11,
+        "row_count": 11
+      }
+    },
+    "status": "passed",
+    "total": {
+      "fields": {
+        "compiler_version": {
+          "0.4.11": 2,
+          "0.5.10": 3,
+          "0.5.11": 3,
+          "0.5.12": 1,
+          "0.5.13": 1,
+          "0.5.15": 1,
+          "0.5.16": 3,
+          "0.5.17": 18,
+          "0.5.2": 2,
+          "0.5.7": 2,
+          "0.6.12": 21,
+          "0.6.6": 2,
+          "0.6.9": 1,
+          "0.7.0": 1,
+          "0.7.4": 1,
+          "0.7.5": 1,
+          "0.8.0": 1,
+          "0.8.1": 1,
+          "0.8.10": 7,
+          "0.8.20": 7,
+          "0.8.26": 10,
+          "0.8.3": 1,
+          "0.8.7": 9,
+          "0.8.9": 1
+        },
+        "function_family": {
+          "access_control": 4,
+          "approval": 3,
+          "mint": 4,
+          "other": 53,
+          "read_getter": 23,
+          "transfer": 5,
+          "write_setter": 8
+        },
+        "length_bucket": {
+          "257-512": 30,
+          "513-1024": 15,
+          "<=256": 55
+        },
+        "optimizer": {
+          "disabled": 50,
+          "enabled": 50
+        },
+        "source": {
+          "huggingface": 100
+        },
+        "visibility": {
+          "external": 28,
+          "public": 72
+        }
+      },
+      "row_count": 100
+    },
+    "violation_count": 0,
+    "violations": []
+  },
+  "created_at": "2026-06-28T01:03:50Z",
+  "group_counts": {
+    "source": 99,
+    "test": 5,
+    "train": 83,
+    "val": 11
+  },
+  "input_sha256": "c84059367911413d0e8e064bd1bdc60a43b826519d57fe64fadccac507ca0a65",
+  "leakage_validation": {
+    "checked_categories": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "input_hash",
+      "output_hash"
+    ],
+    "overlap_counts": {
+      "body_hash": 0,
+      "contract_address": 0,
+      "contract_function": 0,
+      "input_hash": 0,
+      "output_hash": 0,
+      "source_hash": 0
+    },
+    "sample_overlaps": [],
+    "status": "passed",
+    "total_overlap_keys": 0
+  },
+  "manifest_kind": "dataset_split",
+  "outputs": {
+    "test": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "test_split",
+      "exists": true,
+      "modified_at": "2026-06-28T01:03:49Z",
+      "path": "data/qwen_qlora_500_loop_iter4_sample100_updates/splits/test_dataset.jsonl",
+      "row_count": 6,
+      "sha256": "1be9276af968e99e7cc6321392a0349462599893c47779ecc30910a52b70640b",
+      "size_bytes": 22546
+    },
+    "train": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "train_split",
+      "exists": true,
+      "modified_at": "2026-06-28T01:03:49Z",
+      "path": "data/qwen_qlora_500_loop_iter4_sample100_updates/splits/train_dataset.jsonl",
+      "row_count": 83,
+      "sha256": "0fba30e713e946eadf0f96cdbda441bb9c3c1087cb3b45a173fa7ee1522a834d",
+      "size_bytes": 272448
+    },
+    "val": {
+      "artifact_type": "file",
+      "dataset_artifact_type": "derived_split_artifact",
+      "dataset_role": "validation_split",
+      "exists": true,
+      "modified_at": "2026-06-28T01:03:49Z",
+      "path": "data/qwen_qlora_500_loop_iter4_sample100_updates/splits/val_dataset.jsonl",
+      "row_count": 11,
+      "sha256": "703281f6e6bc64ed1a5de573aec3fe09dc7d6df4fdc589ae12682a791009a950",
+      "size_bytes": 39282
+    }
+  },
+  "parameters": {
+    "allow_degenerate_splits": true,
+    "group_key_precedence": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "output_hash",
+      "input_hash"
+    ],
+    "leakage_key_categories": [
+      "source_hash",
+      "contract_address",
+      "contract_function",
+      "body_hash",
+      "input_hash",
+      "output_hash"
+    ],
+    "max_component_target_ratio": 1.0,
+    "min_holdout_stratum_count": 0,
+    "min_split_target_ratio": 0.5,
+    "seed": 42,
+    "stratification_fields": [
+      "compiler_version",
+      "optimizer",
+      "visibility",
+      "source",
+      "length_bucket",
+      "function_family"
+    ],
+    "test_ratio": 0.05000000000000002,
+    "train_ratio": 0.85,
+    "val_ratio": 0.1
+  },
+  "row_counts": {
+    "source": 100,
+    "test": 6,
+    "train": 83,
+    "val": 11
+  },
+  "schema_version": 2,
+  "source_dataset": {
+    "artifact_type": "file",
+    "dataset_artifact_type": "full_source_dataset",
+    "dataset_role": "source",
+    "exists": true,
+    "modified_at": "2026-06-27T23:54:46Z",
+    "path": "data/qwen_qlora_500_loop_iter4_sample100_updates/qwen_qlora_100_sample.jsonl",
+    "row_count": 100,
+    "sha256": "c84059367911413d0e8e064bd1bdc60a43b826519d57fe64fadccac507ca0a65",
+    "size_bytes": 334276
+  },
+  "split_quality": {
+    "allow_degenerate_splits": true,
+    "component_count": 99,
+    "largest_component_ratio": 0.02,
+    "largest_component_rows": 2,
+    "largest_components": [
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "max_component_target_ratio": 1.0,
+    "min_split_target_ratio": 0.5,
+    "row_counts": {
+      "test": 6,
+      "train": 83,
+      "val": 11
+    },
+    "status": "passed",
+    "target_rows": {
+      "test": 5.000000000000002,
+      "train": 85.0,
+      "val": 10.0
+    },
+    "target_vs_actual": {
+      "test": {
+        "actual": 6,
+        "actual_to_target_ratio": 1.1999999999999995,
+        "delta": 0.9999999999999982,
+        "target": 5.000000000000002
+      },
+      "train": {
+        "actual": 83,
+        "actual_to_target_ratio": 0.9764705882352941,
+        "delta": -2.0,
+        "target": 85.0
+      },
+      "val": {
+        "actual": 11,
+        "actual_to_target_ratio": 1.1,
+        "delta": 1.0,
+        "target": 10.0
+      }
+    },
+    "total_rows": 100,
+    "violation_count": 0,
+    "violations": []
+  }
+}
