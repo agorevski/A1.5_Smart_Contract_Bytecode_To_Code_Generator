@@ -12,6 +12,7 @@
 #   SAMPLE_COUNT=1000 EPOCHS=1 ./run_train_qwen_qlora_500.sh
 #   NUM_GPUS=4 BATCH_SIZE=1 GLOBAL_BATCH_SIZE=4 ./run_train_qwen_qlora_500.sh
 #   LORA_RANK=32 LORA_ALPHA=64 LORA_DROPOUT=0 TRAIN_EVAL_STRATEGY=no ./run_train_qwen_qlora_500.sh
+#   RESUME=/path/to/checkpoint ./run_train_qwen_qlora_500.sh
 #   DRY_RUN=1 ./run_train_qwen_qlora_500.sh
 
 set -euo pipefail
@@ -45,6 +46,7 @@ EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-256}"
 EVAL_REPETITION_PENALTY="${EVAL_REPETITION_PENALTY:-1.05}"
 TRAIN_EVAL_STRATEGY="${TRAIN_EVAL_STRATEGY:-auto}"
 SELECTOR_SIGNATURE_METADATA="${SELECTOR_SIGNATURE_METADATA:-true}"
+RESUME="${RESUME:-}"
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.1}"
@@ -154,6 +156,9 @@ fi
 if [[ -n "${TRAIN_EVAL_STEPS:-}" ]]; then
     TRAIN_CMD+=(--train-eval-steps "${TRAIN_EVAL_STEPS}")
 fi
+if [[ -n "${RESUME}" ]]; then
+    TRAIN_CMD+=(--resume "${RESUME}")
+fi
 if [[ "${SKIP_EVAL:-false}" == "true" || "${SKIP_EVAL:-false}" == "1" ]]; then
     TRAIN_CMD+=(--skip-eval)
 fi
@@ -182,6 +187,9 @@ fi
 echo "  Max sequence length:   ${MAX_SEQ_LEN}"
 echo "  Train eval strategy:   ${TRAIN_EVAL_STRATEGY}"
 echo "  Selector signatures:   ${SELECTOR_SIGNATURE_METADATA}"
+if [[ -n "${RESUME}" ]]; then
+    echo "  Resume checkpoint:     ${RESUME}"
+fi
 echo "  Eval max new tokens:   ${EVAL_MAX_NEW_TOKENS}"
 echo "  Eval repetition pen.:  ${EVAL_REPETITION_PENALTY}"
 echo "  GPUs:                  ${NUM_GPUS}"
