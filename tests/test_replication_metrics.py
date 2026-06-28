@@ -41,6 +41,22 @@ class TestSolidityFactExtraction:
             "balances[param_0]",
         }
 
+    def test_extracts_nested_mapping_state_writes(self):
+        code = """
+        function approve(address spender, uint256 amount) public returns (bool) {
+            allowed[msg.sender][spender] = amount;
+            freemintAddresses[addresses[i]] = true;
+            return true;
+        }
+        """
+
+        facts = extract_solidity_facts(code)
+
+        assert facts["state_write"] == {
+            "allowed[msg.sender][param_0]",
+            "freemintaddresses[addresses[i]]",
+        }
+
     def test_parameter_renames_do_not_penalize_guard_matching(self):
         reference = """
         function setOwner(address newOwner) external onlyOwner {

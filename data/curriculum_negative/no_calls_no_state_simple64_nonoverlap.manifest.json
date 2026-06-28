@@ -61,7 +61,7 @@
       "focus_total": 5,
       "function_signature": "function balanceOf(address src)",
       "identity": "body_hash:900a6207b97b1d045d19ffe21802a959",
-      "source_index": 17669,
+      "source_index": 17668,
       "total_chars": 426,
       "zero_category_counts": {
         "call": 0,
@@ -146,7 +146,7 @@
       "focus_total": 5,
       "function_signature": "function getOracleAddress(string nameReference)",
       "identity": "body_hash:950f063478d52775bfcef9eb1a91f4b0",
-      "source_index": 18217,
+      "source_index": 18216,
       "total_chars": 554,
       "zero_category_counts": {
         "call": 0,
@@ -365,23 +365,6 @@
         "visibility": 1
       },
       "focus_total": 5,
-      "function_signature": "function addToWhitelist(address[] calldata users)",
-      "identity": "body_hash:abd2eb1b88a66149efbf8c3b15938679",
-      "source_index": 21086,
-      "total_chars": 814,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
       "function_signature": "function getChoice()",
       "identity": "body_hash:9a7aefcd111c38c306442c32756e30b9",
       "source_index": 18840,
@@ -433,23 +416,6 @@
         "visibility": 1
       },
       "focus_total": 5,
-      "function_signature": "function revokeConfirmation(uint256 transactionId)",
-      "identity": "body_hash:267f384d08bb83a4a3cf80d70da9b07a",
-      "source_index": 4629,
-      "total_chars": 856,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
       "function_signature": "function totalSupply()",
       "identity": "body_hash:ab778fdc1ac3e07e7aec6d02fb1d8219",
       "source_index": 21045,
@@ -479,23 +445,6 @@
     },
     {
       "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function removeFromWhitelist(address[] calldata users)",
-      "identity": "body_hash:4ed73aa239a3adeb2df283bae33349f9",
-      "source_index": 9727,
-      "total_chars": 901,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
         "abi": 3,
         "mutability": 1,
         "visibility": 1
@@ -505,57 +454,6 @@
       "identity": "body_hash:6c88d8c7aa7cc4a4891a6b1c31f231ef",
       "source_index": 13477,
       "total_chars": 908,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function authorizeOperator(address operator)",
-      "identity": "body_hash:5ab7522d4a66267ed1fda4efdbfdbf3b",
-      "source_index": 11284,
-      "total_chars": 912,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function addWhitelistAddresses(address[] memory addresses)",
-      "identity": "body_hash:15f4e42f23d983525419dfcceaf46e1f",
-      "source_index": 2667,
-      "total_chars": 930,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function registerDerivatives(address[] memory _derivatives)",
-      "identity": "body_hash:eddef41b9d45b9f4c6434282d52e9956",
-      "source_index": 29384,
-      "total_chars": 938,
       "zero_category_counts": {
         "call": 0,
         "member_call": 0,
@@ -637,74 +535,6 @@
         "visibility": 1
       },
       "focus_total": 5,
-      "function_signature": "function addApprove(address[] memory receivers)",
-      "identity": "body_hash:3a1368dd7ddfcc8fe20168a5813d316c",
-      "source_index": 7040,
-      "total_chars": 1035,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function setBot(address[] memory bots_)",
-      "identity": "body_hash:7f5ae1b2d05c62f4f8f20b6e8192c670",
-      "source_index": 15669,
-      "total_chars": 1041,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function nonosquare(address[] memory bots_)",
-      "identity": "body_hash:b9872e56b13fe0ad849d645b92be88a1",
-      "source_index": 22769,
-      "total_chars": 1045,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function multiWhitelistRemove(address[] memory addresses)",
-      "identity": "body_hash:33713fa1ae8c5de032cb4f7c839d12f8",
-      "source_index": 6163,
-      "total_chars": 1049,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
       "function_signature": "function clearCurrentCollectionTrait(uint256 index)",
       "identity": "body_hash:bc2d36e0fcc2327ffeb2704f168f57f1",
       "source_index": 23092,
@@ -751,14 +581,14 @@
     },
     {
       "focus_counts": {
-        "abi": 4,
+        "abi": 5,
         "mutability": 0,
-        "visibility": 1
+        "visibility": 0
       },
       "focus_total": 5,
-      "function_signature": "function setFlag(uint8 data)",
-      "identity": "body_hash:104427011093295b7d2fef4147f54112",
-      "source_index": 2045,
+      "function_signature": "function balanceOf(address _owner)",
+      "identity": "body_hash:cdf331095acd65552e0a6d90ca1a1cbf",
+      "source_index": 25338,
       "total_chars": 1199,
       "zero_category_counts": {
         "call": 0,
@@ -768,14 +598,14 @@
     },
     {
       "focus_counts": {
-        "abi": 5,
+        "abi": 4,
         "mutability": 0,
-        "visibility": 0
+        "visibility": 1
       },
       "focus_total": 5,
-      "function_signature": "function balanceOf(address _owner)",
-      "identity": "body_hash:cdf331095acd65552e0a6d90ca1a1cbf",
-      "source_index": 25338,
+      "function_signature": "function setFlag(uint8 data)",
+      "identity": "body_hash:104427011093295b7d2fef4147f54112",
+      "source_index": 2045,
       "total_chars": 1199,
       "zero_category_counts": {
         "call": 0,
@@ -879,40 +709,6 @@
       "identity": "body_hash:e1832f3f5fec2c0d7f3f44e4dc39a271",
       "source_index": 27767,
       "total_chars": 1256,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function removeStrategy(uint256 _key)",
-      "identity": "body_hash:5ace75b1d28a4855fd1ee5ca5c3d6ef3",
-      "source_index": 11299,
-      "total_chars": 1290,
-      "zero_category_counts": {
-        "call": 0,
-        "member_call": 0,
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
-        "abi": 4,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 5,
-      "function_signature": "function multiWhitelistAdd(address[] memory addresses)",
-      "identity": "body_hash:8f9086c3a5aefe8384d4c7ff94bdd093",
-      "source_index": 17604,
-      "total_chars": 1297,
       "zero_category_counts": {
         "call": 0,
         "member_call": 0,
@@ -1100,6 +896,210 @@
       "identity": "body_hash:3d80d59b319ff17a46cba3b024ac714f",
       "source_index": 7490,
       "total_chars": 1553,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function getOwners()",
+      "identity": "body_hash:bc604388f13e57934715b4053210f5e4",
+      "source_index": 23115,
+      "total_chars": 1581,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteAddressValue(bytes32 record)",
+      "identity": "body_hash:050e92d36d705a062db7405d9727fb52",
+      "source_index": 662,
+      "total_chars": 1638,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function deleteAddress(bytes32 _key)",
+      "identity": "body_hash:2f7203902146ceba4aa2102b168aa34b",
+      "source_index": 5715,
+      "total_chars": 1648,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeFeed(uint256 _emaTimePeriod)",
+      "identity": "body_hash:99408056f03488f223739a72c5e41a33",
+      "source_index": 18705,
+      "total_chars": 1657,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function initialize(address nestPriceFacade)",
+      "identity": "body_hash:f5d6b19cac7d90edaaa7a86b9600118d",
+      "source_index": 30428,
+      "total_chars": 1962,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeController(address _address)",
+      "identity": "body_hash:b56ab98a68caf3f0da0b6d02ff84b919",
+      "source_index": 22287,
+      "total_chars": 2046,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addAddressToSupply(address addedAddress)",
+      "identity": "body_hash:97f9cef6e6c903d5d511917b3a344601",
+      "source_index": 18542,
+      "total_chars": 2081,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 3,
+        "mutability": 1,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function addLiquidity()",
+      "identity": "body_hash:1fbcad6f5e106de13be181913425eddc",
+      "source_index": 3809,
+      "total_chars": 2102,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function minimumsClear(\r\n        address addr\r\n    )",
+      "identity": "body_hash:80338a3b2660997dd1d0ad6e57d31e3b",
+      "source_index": 15768,
+      "total_chars": 2107,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function withdraweth(uint256 amount)",
+      "identity": "body_hash:2291db209c4094f9329a8e4c61938963",
+      "source_index": 4170,
+      "total_chars": 2117,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function claimArtem(address holder)",
+      "identity": "body_hash:497c8a3d3f6771491187ad1b6a23c888",
+      "source_index": 9041,
+      "total_chars": 2205,
+      "zero_category_counts": {
+        "call": 0,
+        "member_call": 0,
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 4,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 5,
+      "function_signature": "function removeGameController(address controllerAddress)",
+      "identity": "body_hash:cae2bf6387f55fd702d1ec57044018bd",
+      "source_index": 24883,
+      "total_chars": 2300,
       "zero_category_counts": {
         "call": 0,
         "member_call": 0,

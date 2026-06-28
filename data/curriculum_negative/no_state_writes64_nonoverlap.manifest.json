@@ -10,6 +10,7 @@
   ],
   "focus": "abi",
   "manifest_kind": "curriculum_dataset",
+  "max_focus_facts": null,
   "output_dataset": "data/curriculum_negative/no_state_writes64_nonoverlap.jsonl",
   "require_zero_categories": [
     "state_write"
@@ -354,7 +355,7 @@
       "focus_total": 13,
       "function_signature": "function initialize(string memory name, string memory symbol, uint8 decimals, uint256 initialSupply, address initialHolder,\r\n        uint256 stakeBasePeriod, uint256 stakeHoldPeriod, uint256 stakeDailyPercent, uint256 stakeDailyPeriod)",
       "identity": "body_hash:4ef127ff19bcfa4210074a0fd56323a5",
-      "source_index": 9748,
+      "source_index": 9749,
       "total_chars": 2414,
       "zero_category_counts": {
         "state_write": 0
@@ -392,21 +393,6 @@
     },
     {
       "focus_counts": {
-        "abi": 12,
-        "mutability": 0,
-        "visibility": 1
-      },
-      "focus_total": 13,
-      "function_signature": "function transferWithAuthorization(\r\n    address from,\r\n    address to,\r\n    uint256 value,\r\n    uint256 validAfter,\r\n    uint256 validBefore,\r\n    bytes32 nonce,\r\n    uint8 v,\r\n    bytes32 r,\r\n    bytes32 s\r\n  )",
-      "identity": "body_hash:8972b488251fff75beb9fed1f6a9b621",
-      "source_index": 16889,
-      "total_chars": 2763,
-      "zero_category_counts": {
-        "state_write": 0
-      }
-    },
-    {
-      "focus_counts": {
         "abi": 11,
         "mutability": 1,
         "visibility": 1
@@ -414,7 +400,7 @@
       "focus_total": 13,
       "function_signature": "function getCollectionInfo(uint256 _collectionId)",
       "identity": "body_hash:73d06903cb5ef3f9368d0305e2b04e8d",
-      "source_index": 14330,
+      "source_index": 14331,
       "total_chars": 3281,
       "zero_category_counts": {
         "state_write": 0
@@ -609,7 +595,7 @@
       "focus_total": 12,
       "function_signature": "function getClaim(bytes32 _claimId)",
       "identity": "body_hash:31fe4f5ae3079021841e65215df03dc1",
-      "source_index": 5977,
+      "source_index": 5978,
       "total_chars": 1046,
       "zero_category_counts": {
         "state_write": 0
@@ -971,6 +957,21 @@
       "identity": "body_hash:8259ce7d7189a1fe80883901fb62be07",
       "source_index": 16038,
       "total_chars": 7322,
+      "zero_category_counts": {
+        "state_write": 0
+      }
+    },
+    {
+      "focus_counts": {
+        "abi": 11,
+        "mutability": 0,
+        "visibility": 1
+      },
+      "focus_total": 12,
+      "function_signature": "function permitAndTransfer(address holder, address spender, uint256 nonce, uint256 expiry,\n    uint256 amount, uint8 v, bytes32 r, bytes32 s)",
+      "identity": "body_hash:39eb63fa488a74df42f37771c833cdc4",
+      "source_index": 7022,
+      "total_chars": 7588,
       "zero_category_counts": {
         "state_write": 0
       }

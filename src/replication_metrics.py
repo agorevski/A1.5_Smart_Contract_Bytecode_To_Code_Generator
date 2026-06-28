@@ -697,8 +697,8 @@ def _add_state_write_facts(
     aliases: Mapping[str, str],
 ):
     assignment_re = re.compile(
-        r"\b([A-Za-z_][A-Za-z0-9_]*(?:\s*\[[^\]]+\])?"
-        r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)?)\s*"
+        r"\b([A-Za-z_][A-Za-z0-9_]*"
+        r"(?:(?:\s*\[[^;\n=]+\])|\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*"
         r"(\+\+|--|\+=|-=|\*=|/=|%=|=(?!=))"
     )
     for match in assignment_re.finditer(body):
