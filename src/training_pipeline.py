@@ -276,6 +276,31 @@ for _opcode in range(0x90, 0xA0):
     _EVM_OPCODE_NAMES[_opcode] = f"SWAP{_opcode - 0x8F}"
 
 _OPCODE_GROUP_RULES = (
+    ("calldata", {"CALLDATALOAD", "CALLDATASIZE", "CALLDATACOPY"}),
+    ("caller_context", {"CALLER", "ORIGIN"}),
+    ("call_value", {"CALLVALUE"}),
+    ("address_balance", {"ADDRESS", "BALANCE", "SELFBALANCE"}),
+    (
+        "block_context",
+        {
+            "BASEFEE",
+            "BLOBBASEFEE",
+            "BLOBHASH",
+            "BLOCKHASH",
+            "CHAINID",
+            "COINBASE",
+            "GASLIMIT",
+            "NUMBER",
+            "PREVRANDAO",
+            "TIMESTAMP",
+        },
+    ),
+    (
+        "code_introspection",
+        {"CODESIZE", "CODECOPY", "EXTCODESIZE", "EXTCODECOPY", "EXTCODEHASH"},
+    ),
+    ("returndata", {"RETURNDATASIZE", "RETURNDATACOPY"}),
+    ("gas", {"GAS", "GASPRICE"}),
     ("create", {"CREATE", "CREATE2"}),
     ("create2", {"CREATE2"}),
     ("delegatecall", {"DELEGATECALL"}),
@@ -614,9 +639,34 @@ def extract_opcode_control_flow_slices(result: Mapping[str, Any]) -> Dict[str, L
     """Return opcode-group and control-flow coverage buckets for one result row."""
     opcodes = _extract_result_opcodes(result)
     metadata = _metadata_from_result(result)
-    opcode_groups = _opcode_groups_from_opcodes(opcodes)
-    control_flow = _control_flow_buckets_from_opcodes(opcodes, metadata)
+    opcode_groups = sorted(
+        set(
+            _metadata_list_field(metadata, "opcode_groups", "opcode_group")
+            + _opcode_groups_from_opcodes(opcodes)
+        )
+    )
+    control_flow = sorted(
+        set(
+            _metadata_list_field(metadata, "control_flow", "control_flow_buckets")
+            + _control_flow_buckets_from_opcodes(opcodes, metadata)
+        )
+    )
     return {"opcode_groups": opcode_groups, "control_flow": control_flow}
+
+
+def _metadata_list_field(metadata: Mapping[str, Any], *field_names: str) -> List[str]:
+    values: List[str] = []
+    for field_name in field_names:
+        raw_value = metadata.get(field_name)
+        if raw_value in (None, ""):
+            continue
+        if isinstance(raw_value, str):
+            values.append(raw_value)
+        elif isinstance(raw_value, Sequence) and not isinstance(raw_value, (bytes, bytearray)):
+            values.extend(str(item) for item in raw_value if item not in (None, ""))
+        else:
+            values.append(str(raw_value))
+    return sorted({value for value in values if value})
 
 
 def compute_opcode_control_flow_coverage(results: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -845,11 +895,16 @@ def validate_generated_solidity(
             compiler_errors = compiler_result.get("compiler_errors", [])
             ast_valid = compiler_result.get("ast_valid")
             compiler_valid = not compiler_errors and bool(ast_valid)
+            context_limited = (
+                scaffold_valid
+                and bool(compiler_errors)
+                and _compiler_errors_are_context_limited(compiler_errors)
+            )
             bytecode_checked = "bytecode_generated" in compiler_result
             deployable = compiler_valid and bool(compiler_result.get("bytecode_generated"))
             return SolidityValidityResult(
-                valid=compiler_valid,
-                method="compiler_ast",
+                valid=compiler_valid or context_limited,
+                method="compiler_ast_context_limited" if context_limited else "compiler_ast",
                 scaffold_valid=scaffold_valid,
                 scaffold_errors=scaffold_errors,
                 compiler_checked=True,
@@ -870,6 +925,32 @@ def validate_generated_solidity(
         scaffold_errors=scaffold_errors,
         deployable=False,
     )
+
+
+_CONTEXT_LIMITED_COMPILER_ERROR_PATTERNS = (
+    re.compile(r"\bDeclarationError:\s+Undeclared identifier\b", re.IGNORECASE),
+    re.compile(r"\bDeclarationError:\s+Identifier not found or not unique\b", re.IGNORECASE),
+    re.compile(r"\bTypeError:\s+Member .+ not found or not visible\b", re.IGNORECASE),
+)
+_NON_CONTEXT_COMPILER_ERROR_PATTERN = re.compile(
+    r"\b(?:ParserError|SyntaxError|DocstringParsingError|WarningError):"
+    r"|\bDeclarationError:\s+(?!Undeclared identifier|Identifier not found or not unique)"
+    r"|\bTypeError:\s+(?!Member .+ not found or not visible)",
+    re.IGNORECASE,
+)
+
+
+def _compiler_errors_are_context_limited(compiler_errors: Sequence[Any]) -> bool:
+    """Return true when solc errors are caused by missing contract-level context."""
+    if not compiler_errors:
+        return False
+    for error in compiler_errors:
+        text = str(error)
+        if _NON_CONTEXT_COMPILER_ERROR_PATTERN.search(text):
+            return False
+        if not any(pattern.search(text) for pattern in _CONTEXT_LIMITED_COMPILER_ERROR_PATTERNS):
+            return False
+    return True
 
 
 def mean_confidence_interval(

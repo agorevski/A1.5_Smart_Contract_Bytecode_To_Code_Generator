@@ -9,6 +9,7 @@ from src.training_pipeline import (
     compare_evaluation_to_baseline,
     compute_benchmark_suite_metrics,
     compute_metadata_segment_metrics,
+    extract_opcode_control_flow_slices,
     load_curated_evaluation_benchmarks,
     mean_confidence_interval,
     normalized_levenshtein_distance,
@@ -50,6 +51,55 @@ def test_solidity_validity_fallback_rejects_malformed_function():
     assert result.valid is False
     assert result.method == "scaffold"
     assert result.scaffold_errors
+
+
+def test_solidity_validity_keeps_context_limited_fragments_syntax_valid(monkeypatch):
+    import src.training_pipeline as training_pipeline
+
+    def fake_solc_validation(source_code, metadata):
+        return {
+            "compiler_version": "0.8.20",
+            "compiler_errors": [
+                "Evaluation.sol:2:42: DeclarationError: Undeclared identifier.\n"
+                "function guarded() public onlyOwner { balances[msg.sender] = 1; }\n"
+                "                          ^-------^"
+            ],
+            "ast_valid": False,
+        }
+
+    monkeypatch.setattr(training_pipeline, "_try_local_solc_ast_validation", fake_solc_validation)
+
+    result = training_pipeline.validate_generated_solidity(
+        "function guarded() public onlyOwner { balances[msg.sender] = 1; }"
+    )
+
+    assert result.valid is True
+    assert result.method == "compiler_ast_context_limited"
+    assert result.scaffold_valid is True
+    assert result.compiler_checked is True
+    assert result.ast_valid is False
+    assert result.deployable is False
+
+
+def test_solidity_validity_rejects_non_context_compiler_errors(monkeypatch):
+    import src.training_pipeline as training_pipeline
+
+    def fake_solc_validation(source_code, metadata):
+        return {
+            "compiler_version": "0.8.20",
+            "compiler_errors": ["Evaluation.sol:1:1: ParserError: Expected pragma or contract."],
+            "ast_valid": False,
+        }
+
+    monkeypatch.setattr(training_pipeline, "_try_local_solc_ast_validation", fake_solc_validation)
+
+    result = training_pipeline.validate_generated_solidity(
+        "function guarded() public onlyOwner { balances[msg.sender] = 1; }"
+    )
+
+    assert result.valid is False
+    assert result.method == "compiler_ast"
+    assert result.scaffold_valid is True
 
 
 def test_function_signature_match_compares_name_params_and_returns():
@@ -122,6 +172,55 @@ def test_metadata_segment_metrics_report_coverage_and_per_segment_means():
     assert compiler_segment["count"] == 2
     assert compiler_segment["metrics"]["semantic_similarity"]["mean"] == pytest.approx(0.8)
     assert compiler_segment["metrics"]["solidity_valid"]["mean"] == pytest.approx(0.5)
+
+
+def test_metadata_segment_metrics_honor_precomputed_opcode_slices():
+    result = {
+        "metrics": {
+            "semantic_similarity": 0.9,
+            "normalized_edit_distance": 0.1,
+            "replication_f1": 0.8,
+            "solidity_valid": True,
+        },
+        "metadata": {
+            "opcode_groups": ["storage", "revert"],
+            "control_flow": ["branching"],
+        },
+    }
+
+    slices = extract_opcode_control_flow_slices(result)
+    summary = compute_metadata_segment_metrics([result])
+
+    assert slices["opcode_groups"] == ["revert", "storage"]
+    assert slices["control_flow"] == ["branching"]
+    assert summary["opcode_control_flow_coverage"]["opcode_groups"] == {
+        "revert": 1,
+        "storage": 1,
+    }
+    assert summary["opcode_control_flow_coverage"]["control_flow"] == {"branching": 1}
+
+
+def test_opcode_segments_include_common_context_and_calldata_groups():
+    result = {
+        "input": """
+        temp_1 = calldatasize
+        temp_2 = caller
+        temp_3 = callvalue
+        temp_4 = timestamp
+        temp_5 = extcodesize
+        """,
+        "metadata": {},
+    }
+
+    slices = extract_opcode_control_flow_slices(result)
+
+    assert {
+        "block_context",
+        "calldata",
+        "caller_context",
+        "call_value",
+        "code_introspection",
+    }.issubset(slices["opcode_groups"])
 
 
 def test_confidence_intervals_and_baseline_comparison_are_deterministic():

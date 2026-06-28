@@ -2993,6 +2993,7 @@ def evaluate_model(
         SmartContractEvaluator,
         aggregate_prompt_diagnostics,
         compare_evaluation_to_baseline,
+        extract_opcode_control_flow_slices,
         sample_evaluation_data,
     )
     from src.model_setup import SmartContractDecompiler
@@ -3139,6 +3140,39 @@ def evaluate_model(
             logger.debug("Prompt diagnostics unavailable for row: %s", exc)
             return None
         return diagnostics if isinstance(diagnostics, dict) else None
+
+    def _merged_metadata_values(existing: Any, detected: list[str]) -> list[str]:
+        values: set[str] = set(detected)
+        if isinstance(existing, str) and existing:
+            values.add(existing)
+        elif isinstance(existing, list):
+            values.update(str(item) for item in existing if item not in (None, ""))
+        elif existing not in (None, ""):
+            values.add(str(existing))
+        return sorted(values)
+
+    def _evaluation_metadata(item: dict) -> dict:
+        source_metadata = item.get("metadata", {})
+        if not isinstance(source_metadata, dict):
+            source_metadata = {}
+        metadata = dict(source_metadata)
+        slices = extract_opcode_control_flow_slices(
+            {
+                "input": item.get("input", ""),
+                "metadata": source_metadata,
+            }
+        )
+        if slices["opcode_groups"]:
+            metadata["opcode_groups"] = _merged_metadata_values(
+                metadata.get("opcode_groups") or metadata.get("opcode_group"),
+                slices["opcode_groups"],
+            )
+        if slices["control_flow"]:
+            metadata["control_flow"] = _merged_metadata_values(
+                metadata.get("control_flow") or metadata.get("control_flow_buckets"),
+                slices["control_flow"],
+            )
+        return metadata
 
     def _zero_metrics(error: Exception | None = None) -> dict:
         metadata = {
@@ -3294,9 +3328,7 @@ def evaluate_model(
         generation_mode: str = "single",
         error: Exception | None = None,
     ) -> dict:
-        source_metadata = item.get("metadata", {})
-        if not isinstance(source_metadata, dict):
-            source_metadata = {}
+        source_metadata = _evaluation_metadata(item)
         record = {
             "dataset_index": item.get("_dataset_index", item_number - 1),
             "evaluation_rank": rank,
@@ -3356,7 +3388,7 @@ def evaluate_model(
         generation_mode: str = "single",
     ) -> None:
         metric_start = time.time()
-        metrics = evaluator.evaluate_function(item["output"], decompiled, item.get("metadata", {}))
+        metrics = evaluator.evaluate_function(item["output"], decompiled, _evaluation_metadata(item))
         metrics_dict = _complete_quality_metrics(asdict(metrics), success=True)
         results.append(
             _detail_record(
