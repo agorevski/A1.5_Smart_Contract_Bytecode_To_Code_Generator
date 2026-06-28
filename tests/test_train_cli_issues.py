@@ -453,12 +453,26 @@ def test_evaluate_model_uses_decompile_batch_chunks(tmp_path, monkeypatch):
         def __init__(self, model_path):
             self.model_path = model_path
 
-        def decompile_batch(self, tac_inputs, metadatas=None, max_new_tokens=1024):
-            self.batch_calls.append((list(tac_inputs), list(metadatas), max_new_tokens))
+        def decompile_batch(
+            self,
+            tac_inputs,
+            metadatas=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
+            self.batch_calls.append(
+                (list(tac_inputs), list(metadatas), max_new_tokens, repetition_penalty)
+            )
             return [f"sol:{tac}" for tac in tac_inputs]
 
-        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
-            self.single_calls.append((tac, metadata, max_new_tokens))
+        def decompile_tac_to_solidity(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
+            self.single_calls.append((tac, metadata, max_new_tokens, repetition_penalty))
             return f"sol:{tac}"
 
     _patch_evaluation_dependencies(monkeypatch, FakeDecompiler)
@@ -479,13 +493,16 @@ def test_evaluate_model_uses_decompile_batch_chunks(tmp_path, monkeypatch):
         latest_results_path=str(tmp_path / "latest.txt"),
         eval_batch_size=2,
         eval_max_new_tokens=77,
+        eval_repetition_penalty=1.05,
     )
 
     assert [call[0] for call in FakeDecompiler.batch_calls] == [["tac0", "tac1"], ["tac2"]]
     assert [call[2] for call in FakeDecompiler.batch_calls] == [77, 77]
+    assert [call[3] for call in FakeDecompiler.batch_calls] == [1.05, 1.05]
     assert FakeDecompiler.single_calls == []
     assert summary["eval_batch_size"] == 2
     assert summary["eval_max_new_tokens"] == 77
+    assert summary["eval_repetition_penalty"] == 1.05
     assert summary["num_evaluated"] == 3
     assert Path(summary["results_path"]).exists()
 
@@ -498,12 +515,24 @@ def test_evaluate_model_batch_oom_falls_back_to_single_examples(tmp_path, monkey
         def __init__(self, model_path):
             self.model_path = model_path
 
-        def decompile_batch(self, tac_inputs, metadatas=None, max_new_tokens=1024):
+        def decompile_batch(
+            self,
+            tac_inputs,
+            metadatas=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
             self.batch_calls.append(list(tac_inputs))
             raise RuntimeError("CUDA out of memory")
 
-        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
-            self.single_calls.append((tac, metadata, max_new_tokens))
+        def decompile_tac_to_solidity(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
+            self.single_calls.append((tac, metadata, max_new_tokens, repetition_penalty))
             return f"single:{tac}"
 
     _patch_evaluation_dependencies(monkeypatch, OOMDecompiler)
@@ -534,7 +563,13 @@ def test_evaluate_model_records_failed_rows_and_traceable_details(tmp_path, monk
         def __init__(self, model_path):
             self.model_path = model_path
 
-        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+        def decompile_tac_to_solidity(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
             if tac == "bad tac":
                 raise RuntimeError("generation failed")
             return f"sol:{tac}"
@@ -587,7 +622,13 @@ def test_evaluate_model_persists_prompt_truncation_diagnostics(tmp_path, monkeyp
         def __init__(self, model_path):
             self.model_path = model_path
 
-        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+        def decompile_tac_to_solidity(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
             return "generated solidity"
 
         def prompt_diagnostics(
@@ -652,7 +693,13 @@ def test_evaluate_model_uses_seeded_limit_and_full_aggregation(tmp_path, monkeyp
         def __init__(self, model_path):
             self.model_path = model_path
 
-        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+        def decompile_tac_to_solidity(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
             return f"sol:{tac}"
 
     _patch_evaluation_dependencies(monkeypatch, FakeDecompiler)
@@ -715,7 +762,13 @@ def test_evaluate_model_baseline_comparison_and_quality_gate(tmp_path, monkeypat
         def __init__(self, model_path):
             self.model_path = model_path
 
-        def decompile_tac_to_solidity(self, tac, metadata=None, max_new_tokens=1024):
+        def decompile_tac_to_solidity(
+            self,
+            tac,
+            metadata=None,
+            max_new_tokens=1024,
+            repetition_penalty=1.15,
+        ):
             return f"sol:{tac}"
 
     _patch_evaluation_dependencies(monkeypatch, FakeDecompiler)

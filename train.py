@@ -73,6 +73,7 @@ DEFAULT_BATCH_SIZE = 1
 DEFAULT_GLOBAL_BATCH_SIZE = 16
 DEFAULT_MAX_SEQ_LENGTH = 8192
 DEFAULT_EVAL_MAX_NEW_TOKENS = 256
+DEFAULT_EVAL_REPETITION_PENALTY = 1.05
 DEFAULT_GLOBAL_SEED = 42
 DEFAULT_USE_QUANTIZATION = False
 DEFAULT_PRECISION = "fp16"
@@ -2978,6 +2979,7 @@ def evaluate_model(
     eval_seed: int = DEFAULT_EVAL_SEED,
     eval_first_n: bool = False,
     eval_max_new_tokens: int = DEFAULT_EVAL_MAX_NEW_TOKENS,
+    eval_repetition_penalty: float = DEFAULT_EVAL_REPETITION_PENALTY,
     baseline_results_path: str | None = None,
     baseline_tolerance: float = 0.0,
     quality_gate_config: dict | None = None,
@@ -3014,6 +3016,8 @@ def evaluate_model(
         raise ValueError("--eval-batch-size must be at least 1")
     if eval_max_new_tokens < 1:
         raise ValueError("--eval-max-new-tokens must be at least 1")
+    if eval_repetition_penalty <= 0:
+        raise ValueError("--eval-repetition-penalty must be greater than 0")
 
     # ── Distributed setup ────────────────────────────────────────
     distributed = "LOCAL_RANK" in os.environ
@@ -3113,6 +3117,7 @@ def evaluate_model(
     generation_config = {
         "max_new_tokens": int(eval_max_new_tokens),
         "eval_batch_size": eval_batch_size,
+        "repetition_penalty": float(eval_repetition_penalty),
     }
 
     def _prompt_diagnostics(item: dict, generated_text: str | None = None) -> dict | None:
@@ -3413,6 +3418,7 @@ def evaluate_model(
             item["input"],
             metadata=item.get("metadata", {}),
             max_new_tokens=generation_config["max_new_tokens"],
+            repetition_penalty=generation_config["repetition_penalty"],
         )
         _record_result(
             item,
@@ -3447,6 +3453,7 @@ def evaluate_model(
                 [item["input"] for item in chunk],
                 metadatas=[item.get("metadata", {}) for item in chunk],
                 max_new_tokens=generation_config["max_new_tokens"],
+                repetition_penalty=generation_config["repetition_penalty"],
             )
             if len(decompiled_batch) != len(chunk):
                 raise ValueError(
@@ -3542,6 +3549,7 @@ def evaluate_model(
                 "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
                 "eval_max_new_tokens": int(eval_max_new_tokens),
+                "eval_repetition_penalty": float(eval_repetition_penalty),
                 "include_selector_signature_metadata": _decompiler_selector_signature_metadata(
                     decompiler
                 ),
@@ -3595,6 +3603,7 @@ def evaluate_model(
                 "eval_sample_indices": sampled_indices,
                 "eval_batch_size": eval_batch_size,
                 "eval_max_new_tokens": int(eval_max_new_tokens),
+                "eval_repetition_penalty": float(eval_repetition_penalty),
                 "include_selector_signature_metadata": _decompiler_selector_signature_metadata(
                     decompiler
                 ),
@@ -3999,6 +4008,12 @@ def main():
         help="Maximum new Solidity tokens generated per evaluation example",
     )
     parser.add_argument(
+        "--eval-repetition-penalty",
+        type=float,
+        default=DEFAULT_EVAL_REPETITION_PENALTY,
+        help="Repetition penalty used during evaluation generation",
+    )
+    parser.add_argument(
         "--baseline-results",
         type=str,
         default=None,
@@ -4283,6 +4298,8 @@ def main():
         raise SystemExit("--eval-limit must be non-negative")
     if args.eval_max_new_tokens < 1:
         raise SystemExit("--eval-max-new-tokens must be at least 1")
+    if args.eval_repetition_penalty <= 0:
+        raise SystemExit("--eval-repetition-penalty must be greater than 0")
     if args.baseline_tolerance < 0:
         raise SystemExit("--baseline-tolerance must be non-negative")
     if args.max_baseline_regressions is not None and args.max_baseline_regressions < 0:
@@ -4424,6 +4441,7 @@ def main():
                 eval_seed=args.eval_seed,
                 eval_first_n=args.eval_first_n,
                 eval_max_new_tokens=args.eval_max_new_tokens,
+                eval_repetition_penalty=args.eval_repetition_penalty,
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
@@ -4437,6 +4455,7 @@ def main():
                     "eval_first_n": args.eval_first_n,
                     "eval_batch_size": args.eval_batch_size,
                     "eval_max_new_tokens": args.eval_max_new_tokens,
+                    "eval_repetition_penalty": args.eval_repetition_penalty,
                     "include_selector_signature_metadata": not args.no_selector_signature_metadata,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
@@ -4747,6 +4766,7 @@ def main():
                 eval_seed=args.eval_seed,
                 eval_first_n=args.eval_first_n,
                 eval_max_new_tokens=args.eval_max_new_tokens,
+                eval_repetition_penalty=args.eval_repetition_penalty,
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
@@ -4760,6 +4780,7 @@ def main():
                     "eval_first_n": args.eval_first_n,
                     "eval_batch_size": args.eval_batch_size,
                     "eval_max_new_tokens": args.eval_max_new_tokens,
+                    "eval_repetition_penalty": args.eval_repetition_penalty,
                     "include_selector_signature_metadata": not args.no_selector_signature_metadata,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,

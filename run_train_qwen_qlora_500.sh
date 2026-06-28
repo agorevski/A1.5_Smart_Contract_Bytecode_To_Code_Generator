@@ -42,6 +42,7 @@ NUM_GPUS="${NUM_GPUS:-4}"
 REPORT_TO="${REPORT_TO:-tensorboard}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-256}"
+EVAL_REPETITION_PENALTY="${EVAL_REPETITION_PENALTY:-1.05}"
 TRAIN_EVAL_STRATEGY="${TRAIN_EVAL_STRATEGY:-auto}"
 SELECTOR_SIGNATURE_METADATA="${SELECTOR_SIGNATURE_METADATA:-true}"
 LORA_RANK="${LORA_RANK:-16}"
@@ -138,6 +139,7 @@ TRAIN_CMD=(
     "${SELECTOR_SIGNATURE_ARGS[@]}"
     --eval-batch-size "${EVAL_BATCH_SIZE}"
     --eval-max-new-tokens "${EVAL_MAX_NEW_TOKENS}"
+    --eval-repetition-penalty "${EVAL_REPETITION_PENALTY}"
 )
 
 if [[ -n "${GRADIENT_ACCUMULATION_STEPS}" ]]; then
@@ -181,6 +183,7 @@ echo "  Max sequence length:   ${MAX_SEQ_LEN}"
 echo "  Train eval strategy:   ${TRAIN_EVAL_STRATEGY}"
 echo "  Selector signatures:   ${SELECTOR_SIGNATURE_METADATA}"
 echo "  Eval max new tokens:   ${EVAL_MAX_NEW_TOKENS}"
+echo "  Eval repetition pen.:  ${EVAL_REPETITION_PENALTY}"
 echo "  GPUs:                  ${NUM_GPUS}"
 echo "  Launcher:              torchrun"
 echo "  Output dir:            ${OUTPUT_DIR}"
