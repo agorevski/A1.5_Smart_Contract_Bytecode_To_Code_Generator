@@ -1,10 +1,10 @@
 """
 Local Solidity Compiler Integration
 
-Uses py-solc-x to compile Solidity source code locally with multiple
-compiler versions, producing runtime bytecode for TAC generation.
-This eliminates the need to fetch bytecode from a live Ethereum node
-and enables data augmentation through multi-version compilation.
+Uses py-solc-x to compile Solidity source code locally, producing runtime
+bytecode for TAC generation. The training-data path should compile each
+verified source with a single source-aligned compiler configuration instead of
+expanding one target body across synthetic compiler-version variants.
 """
 
 import json
@@ -598,22 +598,26 @@ def select_compilation_configs(
     original_runs: Optional[int] = None,
     max_configs: int = 3,
 ) -> List[Dict]:
-    """Select compilation configurations for data augmentation.
+    """Select the single source-aligned compilation configuration.
 
-    Picks diverse compiler settings that are compatible with the pragma.
-    Always includes the original settings if provided, plus variants.
+    The old generator used this hook for multi-version data augmentation. That
+    over-weights duplicate Solidity bodies and does not match the verified
+    on-chain compiler setting, so generation now returns at most one config:
+    the verified compiler/optimizer settings when they satisfy all pragmas, or
+    one compatible fallback when verified compiler metadata is unavailable.
 
     Args:
         pragma_constraint: Pragma version constraint(s) from source.
         original_version: Original compiler version used (from Etherscan).
         original_optimizer: Original optimizer setting.
         original_runs: Original optimizer runs.
-        max_configs: Maximum number of configs to return.
+        max_configs: Retained for API compatibility; values above one no longer
+            request synthetic compiler expansion.
 
     Returns:
-        List of config dicts with keys: version, optimizer_enabled, optimizer_runs.
+        A zero- or one-element list of config dicts with keys: version,
+        optimizer_enabled, optimizer_runs.
     """
-    configs = []
     pragma_constraints = (
         list(pragma_constraint)
         if isinstance(pragma_constraint, (list, tuple))
@@ -622,39 +626,22 @@ def select_compilation_configs(
     if not pragma_constraints:
         pragma_constraints = [">=0.4.0"]
 
-    # 1. Always include the original config if available
+    def build_config(version: str) -> Dict:
+        return {
+            "version": version,
+            "optimizer_enabled": (
+                bool(original_optimizer) if original_optimizer is not None else True
+            ),
+            "optimizer_runs": original_runs if original_runs is not None else 200,
+        }
+
     if original_version:
         norm_ver = _normalize_version(original_version)
         if norm_ver and version_satisfies_all_pragmas(norm_ver, pragma_constraints):
-            configs.append(
-                {
-                    "version": norm_ver,
-                    "optimizer_enabled": original_optimizer if original_optimizer is not None else True,
-                    "optimizer_runs": original_runs if original_runs is not None else 200,
-                }
-            )
+            return [build_config(norm_ver)]
 
-    # 2. Find compatible versions for augmentation
     compatible = compatible_versions_for_pragmas(pragma_constraints)
+    if not compatible:
+        return []
 
-    # Deduplicate against original
-    existing_versions = {c["version"] for c in configs}
-
-    for ver in compatible:
-        if len(configs) >= max_configs:
-            break
-        if ver in existing_versions:
-            continue
-
-        # Alternate optimizer settings for diversity
-        opt_enabled = len(configs) % 2 == 0  # alternate on/off
-        configs.append(
-            {
-                "version": ver,
-                "optimizer_enabled": opt_enabled,
-                "optimizer_runs": 200,
-            }
-        )
-        existing_versions.add(ver)
-
-    return configs[:max_configs]
+    return [build_config(compatible[0])]

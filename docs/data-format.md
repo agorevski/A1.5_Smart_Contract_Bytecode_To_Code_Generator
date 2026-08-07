@@ -236,8 +236,8 @@ Important tables:
 - `hf_download_manifest.json`: HuggingFace lineage (`andstor/smart_contracts`,
   config `flattened`, split `train`, requested/resolved revision), streamed
   Parquet parameters/performance, artifact hashes, row/status/drop counts.
-- `hf_compile_manifest.json`: compile parameters (`max_compiler_versions`,
-  optimizer variants, workers, body cap), row counts, status/drop counts, and
+- `hf_compile_manifest.json`: compile parameters (single source-aligned compiler
+  configuration policy, workers, body cap), row counts, status/drop counts, and
   summarized compile/analysis failures.
 - `hf_export_manifest.json`: output/reject/database artifacts, export selection,
   duplicate stats, validation blocks, reject counts, solc versions, and

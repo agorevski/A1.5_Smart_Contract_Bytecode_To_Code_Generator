@@ -1399,7 +1399,7 @@ class DatasetBuilder:
     def collect_and_compile_contracts(
         self,
         contract_addresses: List[str],
-        max_compiler_configs: int = 2,
+        max_compiler_configs: int = 1,
         max_workers: int = 1,
     ) -> int:
         """Download source from Etherscan and compile locally with bounded workers.
@@ -1420,7 +1420,8 @@ class DatasetBuilder:
 
         logger.info(
             "Collect/compile preprocessing starting: addresses=%s, "
-            "max_workers=%s, max_compiler_configs=%s",
+            "max_workers=%s, compiler_config_policy=single_source_aligned "
+            "(requested max_compiler_configs=%s)",
             len(contract_addresses),
             effective_workers,
             max_compiler_configs,

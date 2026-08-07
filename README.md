@@ -35,14 +35,14 @@ uv sync
 
 ### 2. Download Training Data
 
-Download verified Solidity contracts from HuggingFace (`andstor/smart_contracts`), compile each with compatible solc versions, generate TAC, and export training pairs:
+Download verified Solidity contracts from HuggingFace (`andstor/smart_contracts`), compile each with one source-aligned solc/optimizer configuration, generate TAC, and export training pairs:
 
 ```bash
 # Download 20 contracts (quick test)
 uv run python download_hf_contracts.py --limit 20
 
-# Download 100 contracts with max 3 compiler versions each
-uv run python download_hf_contracts.py --limit 100 --max-compiler-versions 3
+# Download 100 contracts
+uv run python download_hf_contracts.py --limit 100
 
 # Full dataset (all available contracts)
 uv run python download_hf_contracts.py
@@ -263,7 +263,7 @@ uv run pytest tests/test_e2e.py -v
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--limit N` | `0` (all) | Max contracts to download |
-| `--max-compiler-versions N` | `5` | Max solc versions per contract; each compiles optimizer on/off |
+| `--max-compiler-versions N` | `1` | Deprecated compatibility option; generation always uses one source-aligned compiler config |
 | `--workers N` | auto | Parallel compilation workers |
 | `--max-body-dupes N` | `2` | Max copies of same function body |
 | `--min-body-length N` | `50` | Min Solidity body length |

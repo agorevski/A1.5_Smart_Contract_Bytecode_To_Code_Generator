@@ -46,7 +46,7 @@ is intentionally too small for meaningful fine-tuning.
 | Verify the pipeline quickly | Existing JSONL or small generated set | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
 | Train a baseline with current data | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
 | Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` or `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
-| Build more data first | Hugging Face verified contracts | `uv run python download_hf_contracts.py --limit 1000 --max-compiler-versions 3` |
+| Build more data first | Hugging Face verified contracts | `uv run python download_hf_contracts.py --limit 1000` |
 | Rebuild exact-match lookup | `data/contracts.db` | `uv run python scripts/build_lookup_db.py --source-db data/contracts.db --lookup-db data/tac_lookup.db` |
 | Evaluate an existing local model | `models/final_model_378/` and `data/test_dataset.jsonl` | `uv run python train.py --eval-only --model-path models/final_model_378 --test-dataset data/test_dataset.jsonl --eval-limit 3` |
 | Run the local UI/API | Bytecode and optional model artifact | `WEB_MODEL_PATH=models/final_model_378 uv run python web/app.py` |
@@ -150,19 +150,18 @@ real pairs fail fast unless `--allow-demo-fallback` is set.
 
 ## 3. Generate or refresh training data
 
-The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles them with compatible `solc` versions, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests. For production prompt design, treat compiler version and optimizer fields/comments in generated data as oracle-only and exclude or sanitize them before training.
+The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles each with one source-aligned `solc`/optimizer configuration, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests. For production prompt design, treat compiler version and optimizer fields/comments in generated data as oracle-only and exclude or sanitize them before training.
 
 ```bash
 # Quick data-generation test
 uv run python download_hf_contracts.py --limit 20
 
-# Larger run with bounded compiler-version expansion
-uv run python download_hf_contracts.py --limit 1000 --max-compiler-versions 3
+# Larger run
+uv run python download_hf_contracts.py --limit 1000
 
 # Larger run with explicit manifests and rejects quarantine
 uv run python download_hf_contracts.py \
   --limit 1000 \
-  --max-compiler-versions 3 \
   --manifest-dir data/manifests \
   --rejects-output data/hf_training_dataset.rejects.jsonl
 
@@ -191,7 +190,7 @@ Useful flags:
 | Flag | Default | Use |
 |------|---------|-----|
 | `--limit N` | all | Cap downloaded contracts for test runs |
-| `--max-compiler-versions N` | 5 | Limit compiler-version expansion per contract; optimizer on/off doubles compile jobs |
+| `--max-compiler-versions N` | 1 | Deprecated compatibility option; generation always uses one source-aligned compiler config |
 | `--workers N` | CPU count | Parallel compile workers |
 | `--max-body-dupes N` | 2 | Cap repeated normalized Solidity bodies |
 | `--min-body-length N` | 50 | Filter short/trivial bodies |
@@ -220,8 +219,8 @@ Expected outputs:
 - Manifests: `data/hf_download_manifest.json`, `data/hf_compile_manifest.json`, and `data/hf_training_dataset.jsonl.manifest.json` by default, or `hf_download_manifest.json`, `hf_compile_manifest.json`, and `hf_export_manifest.json` under `--manifest-dir`. These capture source/revision lineage, command args, git state, artifact hashes, row counts, typed status/drop counts, duplicate stats, timings, and compile failure diagnostics.
 
 `hf_compile_manifest.json` may legitimately be `completed_with_errors` on large
-runs because many verified sources do not compile under the attempted local
-compiler configurations. Treat that as actionable only if `function_pairs` and
+runs because many verified sources do not compile under their selected local
+compiler configuration. Treat that as actionable only if `function_pairs` and
 `rows_exported` are unexpectedly low.
 
 If `--validate-jsonl` or export-time validation fails, inspect the reported top

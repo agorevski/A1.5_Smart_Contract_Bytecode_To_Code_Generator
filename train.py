@@ -312,16 +312,16 @@ def collect_dataset(
     addresses_file: str,
     output_dir: str = "data",
     max_contracts: int = None,
-    max_compiler_configs: int = 2,
+    max_compiler_configs: int = 1,
     max_workers: int = 3,
     allow_demo_fallback: bool = False,
 ) -> str:
     """Collect contracts from Etherscan and compile locally to build dataset.
 
-    Uses local solc compilation (via py-solc-x) for each contract, optionally
-    compiling with multiple compiler versions for data augmentation. Compiler
-    metadata is stored in each record's metadata field, but prompts only use
-    bytecode/TAC-derived metadata and sanitize oracle annotations.
+    Uses local solc compilation (via py-solc-x) for each contract with one
+    source-aligned compiler configuration. Compiler metadata is stored in each
+    record's metadata field, but prompts only use bytecode/TAC-derived metadata
+    and sanitize oracle annotations.
 
     Returns path to the exported JSONL dataset file.
     """
@@ -342,7 +342,8 @@ def collect_dataset(
     # Collect, compile locally, and build function pairs in one pass
     logger.info(
         "Downloading source from Etherscan and compiling locally "
-        "(up to %s configs per contract; requested workers=%s)...",
+        "(single source-aligned config per contract; requested max configs=%s; "
+        "requested workers=%s)...",
         max_compiler_configs,
         max_workers,
     )
@@ -3719,8 +3720,11 @@ def main():
     parser.add_argument(
         "--max-compiler-configs",
         type=int,
-        default=2,
-        help="Maximum compiler configurations per collected contract",
+        default=1,
+        help=(
+            "Deprecated compatibility option; collection uses one source-aligned "
+            "compiler configuration per contract"
+        ),
     )
     parser.add_argument(
         "--allow-demo-fallback",

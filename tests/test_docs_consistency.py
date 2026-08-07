@@ -33,13 +33,13 @@ def test_downloader_defaults_are_documented_from_cli_help():
     readme = read_project_file("README.md")
     runbook = read_project_file("docs/runbook.md")
 
-    assert re.search(r"--max-compiler-versions .*default: 5", help_text)
+    assert re.search(r"--max-compiler-versions .*default: 1", help_text)
     assert re.search(r"--max-body-dupes .*default: 2", help_text)
     assert re.search(r"--max-seq-length .*default: 8192", help_text)
-    assert "| `--max-compiler-versions N` | `5` |" in readme
+    assert "| `--max-compiler-versions N` | `1` |" in readme
     assert "| `--max-body-dupes N` | `2` |" in readme
     assert "| `--max-seq-length N` | `8192` |" in readme
-    assert "| `--max-compiler-versions N` | 5 |" in runbook
+    assert "| `--max-compiler-versions N` | 1 |" in runbook
     assert "| `--max-body-dupes N` | 2 |" in runbook
     assert "| `--max-seq-length N` | 8192 |" in runbook
     for flag in ("--cache-dir", "--hf-revision", "--export-selectors", "--import-selectors"):

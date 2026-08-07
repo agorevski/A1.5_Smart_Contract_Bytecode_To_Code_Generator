@@ -1813,8 +1813,28 @@ class TestGitHubIssue36_MultiFilePragmaIntersection:
             max_configs=3,
         )
         versions = [cfg["version"] for cfg in configs]
+        assert len(configs) == 1
         assert "0.8.10" not in versions
-        assert "0.8.20" in versions
+        assert versions[0] in {"0.8.20", "0.8.26"}
+
+    def test_compiler_config_selection_does_not_expand_versions(self):
+        from src.local_compiler import select_compilation_configs
+
+        configs = select_compilation_configs(
+            "^0.8.0",
+            original_version="v0.8.20+commit.a1b79de6",
+            original_optimizer=False,
+            original_runs=777,
+            max_configs=3,
+        )
+
+        assert configs == [
+            {
+                "version": "0.8.20",
+                "optimizer_enabled": False,
+                "optimizer_runs": 777,
+            }
+        ]
 
     def test_no_intersection_returns_no_versions(self):
         from src.local_compiler import compatible_versions_for_pragmas

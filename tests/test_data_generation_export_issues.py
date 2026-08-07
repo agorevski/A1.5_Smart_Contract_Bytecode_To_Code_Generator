@@ -199,6 +199,40 @@ def test_download_contracts_streams_parquet_batches_without_full_dataframe(tmp_p
     assert manifest["drop_counts"]["non_solidity"] == 1
 
 
+def test_prepare_contract_uses_single_source_aligned_compiler_config():
+    import download_hf_contracts
+
+    source = """
+    pragma solidity ^0.8.0;
+    contract Token {
+        function transfer(address to, uint256 amount) public {
+            require(to != address(0));
+            emit Transfer(to, amount);
+        }
+        event Transfer(address indexed to, uint256 amount);
+    }
+    """
+
+    prepared = download_hf_contracts._prepare_contract(
+        "0x0000000000000000000000000000000000000001",
+        source,
+        "v0.8.20+commit.a1b79de6",
+        False,
+        777,
+        "Token",
+    )
+
+    assert prepared is not None
+    assert prepared["compile_configs"] == [
+        {
+            "version": "0.8.20",
+            "optimizer_enabled": False,
+            "optimizer_runs": 777,
+        }
+    ]
+    assert "compatible_versions" not in prepared
+
+
 def test_export_training_data_quarantines_overlength_rows(tmp_path):
     import download_hf_contracts
 

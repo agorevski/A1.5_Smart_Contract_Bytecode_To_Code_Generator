@@ -3,10 +3,10 @@
 Download Smart Contracts from HuggingFace & Generate Training Data
 
 Downloads verified Solidity contracts from the andstor/smart_contracts
-dataset on HuggingFace, compiles each with every compatible solc version
-(optimizer on + off), generates TAC via BytecodeAnalyzer, and exports
-JSONL training pairs with bytecode-only TAC input, Solidity output, and
-metadata retained only for analysis/filtering/manifests.
+dataset on HuggingFace, compiles each with one source-aligned solc/optimizer
+configuration, generates TAC via BytecodeAnalyzer, and exports JSONL training
+pairs with bytecode-only TAC input, Solidity output, and metadata retained only
+for analysis/filtering/manifests.
 
 Deduplication strategy (multi-layer):
   1. Contract-level: address PRIMARY KEY + source_hash dedup
@@ -24,7 +24,6 @@ Usage:
     python download_hf_contracts.py --compile-only           # compile only
     python download_hf_contracts.py --limit 100              # limit downloads
     python download_hf_contracts.py --workers 8              # set parallelism
-    python download_hf_contracts.py --max-compiler-versions 3
     python download_hf_contracts.py --max-body-dupes 5       # cap duplicates
     python download_hf_contracts.py --min-body-length 50     # quality filter
     python download_hf_contracts.py --validate-jsonl data/hf_training_dataset.jsonl
@@ -87,12 +86,10 @@ from src.abi_enrichment import (
 from src.local_compiler import (
     compile_source,
     compile_multi_file,
-    compatible_versions_for_pragmas,
     install_solc_version,
     parse_etherscan_source,
     parse_pragma,
-    version_satisfies_all_pragmas,
-    _normalize_version,
+    select_compilation_configs,
 )
 
 try:
@@ -1396,8 +1393,8 @@ def _prepare_contract(
     address: str,
     source_code: str,
     orig_version: str,
+    orig_optimizer: Optional[bool],
     orig_runs: int,
-    max_compiler_versions: int,
     target_contract_name: str = "",
 ) -> Optional[Dict]:
     """Parse a contract and return a compile job spec (runs in worker)."""
@@ -1411,21 +1408,14 @@ def _prepare_contract(
         pragmas = parse_pragma(combined_source)
         pragma_constraints = pragmas or [">=0.4.0"]
 
-        compatible = compatible_versions_for_pragmas(pragma_constraints)
-        if not compatible:
+        compile_configs = select_compilation_configs(
+            pragma_constraints,
+            original_version=orig_version,
+            original_optimizer=orig_optimizer,
+            original_runs=orig_runs,
+        )
+        if not compile_configs:
             return None
-
-        if orig_version:
-            norm_orig = _normalize_version(orig_version)
-            if (
-                norm_orig
-                and norm_orig not in compatible
-                and version_satisfies_all_pragmas(norm_orig, pragma_constraints)
-            ):
-                compatible.insert(0, norm_orig)
-
-        if max_compiler_versions > 0:
-            compatible = compatible[:max_compiler_versions]
 
         parser = SolidityParser()
         solidity_functions = parser.extract_functions(combined_source)
@@ -1435,9 +1425,8 @@ def _prepare_contract(
         return {
             "address": address,
             "source_files": source_files,
-            "compatible_versions": compatible,
+            "compile_configs": compile_configs,
             "solidity_functions": _add_selectors(solidity_functions),
-            "runs": orig_runs or 200,
             "target_contract_name": target_contract_name or "",
         }
     except Exception:
@@ -1571,7 +1560,7 @@ def _compile_one_job(
 
 
 def compile_and_generate(
-    max_compiler_versions: int = 0,
+    max_compiler_versions: int = 1,
     workers: int = 0,
     max_body_dupes: int = 5,
     min_body_length: int = 50,
@@ -1586,6 +1575,8 @@ def compile_and_generate(
     Dedup is handled deterministically by DB unique indexes and
     ROW_NUMBER() at export time (not in-memory frequency caps).
     """
+    requested_max_compiler_versions = max_compiler_versions
+    max_compiler_versions = 1
     started_at = _now_utc_iso()
     start_time = time.perf_counter()
     run_id = run_id or _make_run_id("compile")
@@ -1608,6 +1599,8 @@ def compile_and_generate(
             duration_seconds=time.perf_counter() - start_time,
             parameters={
                 "max_compiler_versions": max_compiler_versions,
+                "requested_max_compiler_versions": requested_max_compiler_versions,
+                "compiler_config_policy": "single_source_aligned",
                 "workers": workers,
                 "max_body_dupes": max_body_dupes,
                 "min_body_length": min_body_length,
@@ -1644,9 +1637,9 @@ def compile_and_generate(
                 batch_rows = rows[batch_start : batch_start + SUBMIT_BATCH]
                 futures = {
                     executor.submit(
-                        _prepare_contract, addr, src, ver, runs, max_compiler_versions, contract_name
+                        _prepare_contract, addr, src, ver, opt, runs, contract_name
                     ): addr
-                    for addr, src, ver, _opt, runs, contract_name in batch_rows
+                    for addr, src, ver, opt, runs, contract_name in batch_rows
                 }
                 for fut in as_completed(futures):
                     addr = futures[fut]
@@ -1682,22 +1675,21 @@ def compile_and_generate(
             ],
         )
 
-    # Build compile jobs: each (contract x version x optimizer_flag).
+    # Build compile jobs: one source-aligned compiler/optimizer config per contract.
     # Verified ABI/source details stay out of TAC prompt inputs.
     compile_jobs = [
         (
             addr,
             prep["source_files"],
             prep["solidity_functions"],
-            ver,
-            opt,
-            prep["runs"],
+            cfg["version"],
+            cfg["optimizer_enabled"],
+            cfg["optimizer_runs"],
             min_body_length,
             prep.get("target_contract_name", ""),
         )
         for addr, prep in sorted(prepared.items())
-        for ver in prep["compatible_versions"]
-        for opt in (True, False)
+        for cfg in prep["compile_configs"]
     ]
 
     total_jobs = len(compile_jobs)
@@ -1719,6 +1711,8 @@ def compile_and_generate(
             duration_seconds=time.perf_counter() - start_time,
             parameters={
                 "max_compiler_versions": max_compiler_versions,
+                "requested_max_compiler_versions": requested_max_compiler_versions,
+                "compiler_config_policy": "single_source_aligned",
                 "workers": workers,
                 "max_body_dupes": max_body_dupes,
                 "min_body_length": min_body_length,
@@ -1876,6 +1870,8 @@ def compile_and_generate(
         duration_seconds=time.perf_counter() - start_time,
         parameters={
             "max_compiler_versions": max_compiler_versions,
+            "requested_max_compiler_versions": requested_max_compiler_versions,
+            "compiler_config_policy": "single_source_aligned",
             "workers": workers,
             "max_body_dupes": max_body_dupes,
             "min_body_length": min_body_length,
@@ -2676,8 +2672,8 @@ def export_training_data(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Download smart contracts from HuggingFace, compile with every "
-            "compatible solc version, and generate TAC->Solidity training data. "
+            "Download smart contracts from HuggingFace, compile with one "
+            "source-aligned solc configuration, and generate TAC->Solidity training data. "
             "Includes multi-layer deduplication for clean training data."
         ),
     )
@@ -2694,10 +2690,11 @@ def main():
     parser.add_argument(
         "--max-compiler-versions",
         type=int,
-        default=5,
-        help="Max solc versions per contract (default: 5). "
-        "Each version is compiled with optimizer on+off, "
-        "so 5 versions = up to 10 compile jobs per contract.",
+        default=1,
+        help=(
+            "Deprecated compatibility option; compiler-version expansion is disabled "
+            "and generation uses one source-aligned config per contract (default: 1)."
+        ),
     )
     parser.add_argument(
         "--workers", type=int, default=0, help="Parallel workers (0 = auto-detect CPU count)."
@@ -2796,6 +2793,12 @@ def main():
         raise SystemExit("--max-seq-length must be at least 1")
 
     setup_logging()
+    if args.max_compiler_versions != 1:
+        logger.warning(
+            "--max-compiler-versions=%s is deprecated and ignored; using one "
+            "source-aligned compiler config per contract.",
+            args.max_compiler_versions,
+        )
 
     if args.validate_jsonl:
         validation = validate_jsonl_body_duplicate_cap(
