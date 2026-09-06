@@ -12,8 +12,7 @@ import time
 import traceback
 import ipaddress
 import threading
-import queue
-import multiprocessing
+import atexit
 import hmac
 import hashlib
 import re
@@ -32,11 +31,19 @@ from src.bytecode_analyzer import BytecodeAnalyzer
 from src.contract_reconstruction import (
     assemble_reconstructed_contract,
     build_contract_quality,
-    build_function_quality,
     build_reconstruction_plan,
 )
 from src.inference import DEFAULT_GENERATION_CONFIG as INFERENCE_DEFAULT_GENERATION_CONFIG
-from src.model_setup import SmartContractDecompiler
+from src.inference import (
+    PersistentModelWorker, inference_outcome, analyzer_status, selector_context_provenance,
+    _build_function_results as shared_function_results,
+    _source_summary as shared_source_summary,
+    validate_solidity_output as shared_validate_solidity,
+    _load_model_config as shared_load_model_config,
+    saved_selector_results,
+    model_tac_compatibility,
+    InferenceCompatibilityError,
+)
 from src.selector_resolver import get_resolver
 from src.tac_lookup import TACLookup
 
@@ -53,6 +60,9 @@ class MockDecompiler:
     """
 
     _SIMULATED_DELAY = 0.3  # seconds per function to mimic inference latency
+
+    def __init__(self, model_path=None):
+        pass
 
     def decompile_tac_to_solidity(self, tac_input: str, metadata: dict = None, **kwargs) -> str:
         time.sleep(self._SIMULATED_DELAY)
@@ -79,7 +89,7 @@ class MockDecompiler:
     @staticmethod
     def _assemble_contract(function_solidity, analyzer):
         """Reuse the real assembler logic."""
-        return SmartContractDecompiler._assemble_contract(function_solidity, analyzer)
+        return assemble_reconstructed_contract(function_solidity, analyzer)
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +193,10 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
 
 # Global instances (loaded once at startup)
-decompiler: SmartContractDecompiler = None  # type: ignore[assignment]
+decompiler: PersistentModelWorker | None = None
 model_config_dict: dict = {}
 tac_lookup: TACLookup = None  # type: ignore[assignment]
+lookup_load_error: str | None = None
 mock_mode: bool = False
 active_model_path: str | None = None
 model_load_error: str | None = None
@@ -247,13 +258,17 @@ def _set_job_process(job: dict | None, process) -> None:
 
 
 def _terminate_process(process) -> None:
-    if process is None or not getattr(process, "is_alive", lambda: False)():
-        return
-    process.terminate()
-    process.join(timeout=2)
-    if process.is_alive():  # pragma: no cover - defensive hard kill
-        process.kill()
+    try:
+        if process is None or not getattr(process, "is_alive", lambda: False)():
+            return
+        process.terminate()
         process.join(timeout=2)
+        if process.is_alive():  # pragma: no cover - defensive hard kill
+            process.kill()
+            process.join(timeout=2)
+    except ValueError:
+        # The request thread may already have joined and closed this worker.
+        return
 
 
 def _mark_job_finished(job: dict | None, status: str, trace_path: str | None = None) -> None:
@@ -296,7 +311,7 @@ def _check_job_cancelled(job: dict | None, description: str = "decompile") -> No
 
 
 def _run_with_timeout(operation, timeout_seconds: float | None, description: str, job: dict | None = None):
-    """Run blocking work with a request-level hard timeout."""
+    """Cooperative CPU deadline: never leave orphaned work after releasing capacity."""
     _check_job_cancelled(job, description)
     if timeout_seconds is None:
         return operation()
@@ -305,33 +320,15 @@ def _run_with_timeout(operation, timeout_seconds: float | None, description: str
             f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds before {description}."
         )
 
-    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        try:
-            result_queue.put((True, operation()))
-        except BaseException as exc:  # pragma: no cover - defensive handoff
-            result_queue.put((False, exc))
-
-    worker = threading.Thread(target=target, daemon=True)
-    worker.start()
-    worker.join(timeout_seconds)
-    if worker.is_alive():
+    start = time.monotonic()
+    result = operation()
+    _check_job_cancelled(job, description)
+    if time.monotonic() - start >= timeout_seconds:
         raise DecompileTimeoutError(
             f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds during {description}."
         )
 
-    ok, payload = result_queue.get_nowait()
-    if ok:
-        return payload
-    raise payload
-
-
-def _process_worker_target(result_queue, operation) -> None:
-    try:
-        result_queue.put((True, operation()))
-    except BaseException as exc:  # pragma: no cover - defensive handoff
-        result_queue.put((False, exc))
+    return result
 
 
 def _run_killable_with_timeout(
@@ -340,67 +337,23 @@ def _run_killable_with_timeout(
     description: str,
     job: dict | None = None,
 ):
-    """Run model work in a killable child process with timeout/cancel polling."""
+    """Execute IPC against the persistent spawn worker, never fork a CUDA model."""
     _check_job_cancelled(job, description)
-    if not KILLABLE_INFERENCE_WORKERS:
+    if not KILLABLE_INFERENCE_WORKERS and not isinstance(decompiler, PersistentModelWorker):
         return _run_with_timeout(operation, timeout_seconds, description, job=job)
-
-    if timeout_seconds is not None and timeout_seconds <= 0:
-        raise DecompileTimeoutError(
-            f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds before {description}."
+    if not isinstance(decompiler, PersistentModelWorker):
+        raise DecompileRequestError(
+            "Hard timeout requires a PersistentModelWorker. Load the model through load_model(), "
+            "or explicitly disable WEB_KILLABLE_INFERENCE_WORKERS for cooperative test execution."
         )
-
     try:
-        context = multiprocessing.get_context("fork")
-    except ValueError:  # pragma: no cover - non-Unix fallback
-        return _run_with_timeout(operation, timeout_seconds, description, job=job)
-
-    result_queue = context.Queue(maxsize=1)
-    process = context.Process(target=_process_worker_target, args=(result_queue, operation))
-    process.start()
-    _set_job_process(job, process)
-    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
-    try:
-        while True:
-            _check_job_cancelled(job, description)
-            wait_timeout = 0.05
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _terminate_process(process)
-                    raise DecompileTimeoutError(
-                        f"Decompile timed out after {DECOMPILE_TIMEOUT_SECONDS:.0f} seconds during {description}."
-                    )
-                wait_timeout = min(wait_timeout, remaining)
-            try:
-                ok, payload = result_queue.get(timeout=wait_timeout)
-                process.join(timeout=0.2)
-                _terminate_process(process)
-                if ok:
-                    return payload
-                raise payload
-            except queue.Empty:
-                if not process.is_alive():
-                    break
-
-        _check_job_cancelled(job, description)
-        try:
-            ok, payload = result_queue.get(timeout=1)
-        except queue.Empty:
-            raise DecompileRequestError(f"Worker process ended without a result during {description}.")
-        process.join(timeout=0)
-        if ok:
-            return payload
-        raise payload
-    except DecompileCancelledError:
-        _terminate_process(process)
-        raise
-    finally:
-        try:
-            result_queue.close()
-        except Exception:
-            pass
-        _set_job_process(job, None)
+        return decompiler.run(
+            operation, timeout_seconds,
+            cancelled=lambda: _check_job_cancelled(job, description),
+            process_callback=lambda process: _set_job_process(job, process),
+        )
+    except TimeoutError as exc:
+        raise DecompileTimeoutError(str(exc)) from exc
 
 
 def _error_response(message: str, status_code: int, **extra):
@@ -1096,6 +1049,8 @@ def _lookup_stats(include_sensitive: bool = True) -> dict:
     payload = {
         "available": available,
         "stats": stats,
+        "status": "invalid" if lookup_load_error else "ready" if available else "unavailable",
+        "error": lookup_load_error,
     }
     if include_sensitive:
         payload["db_path"] = TAC_LOOKUP_DB
@@ -1141,8 +1096,13 @@ def _readiness_payload(include_sensitive: bool = False) -> dict:
             "max_functions": MAX_DECOMPILE_FUNCTIONS,
             "timeout_seconds": DECOMPILE_TIMEOUT_SECONDS,
             "timeout_enforcement": (
-                "killable_worker_process" if KILLABLE_INFERENCE_WORKERS else "daemon_thread"
+                "spawn_model_worker_cpu_cooperative"
+                if isinstance(decompiler, PersistentModelWorker) else
+                "unsupported_injected_model" if KILLABLE_INFERENCE_WORKERS and decompiler is not None
+                else "cooperative"
             ),
+            "model_timeout_enforced": isinstance(decompiler, PersistentModelWorker),
+            "analysis_timeout_enforced": False,
             "max_new_tokens": MAX_NEW_TOKENS_LIMIT,
             "max_abi_json_chars": MAX_ABI_JSON_CHARS,
             "max_contract_metadata_json_chars": MAX_CONTRACT_METADATA_JSON_CHARS,
@@ -1373,6 +1333,12 @@ def _prompt_diagnostics(
         diag["generated_chars"] = len(generated_text)
         diag["generated_tokens"] = _count_tokens_for_diagnostics(model, generated_text)
 
+    if isinstance(model, PersistentModelWorker):
+        try:
+            diag.update(model.prompt_diagnostics(tac_text))
+        except RuntimeError as exc:
+            diag["diagnostics_error"] = str(exc)
+
     if INFERENCE_TRACE_INCLUDE_SAMPLES:
         diag["tac_sample_prefix"] = tac_text[:512]
         diag["tac_sample_suffix"] = tac_text[-512:]
@@ -1408,37 +1374,14 @@ def _build_function_results(
     validation_by_function: dict | None = None,
     lookup_provenance: dict | None = None,
 ) -> list[dict]:
-    results = []
-    for fname in func_names:
-        source = function_sources.get(fname, "unknown")
-        error = function_errors.get(fname)
-        validation = (validation_by_function or {}).get(fname)
-        status = "error" if error else "ok"
-        if status == "ok" and validation and not validation.get("valid"):
-            status = "validation_failed"
-        item = {
-            "name": fname,
-            "status": status,
-            "source": source,
-            "error": error,
-            "elapsed_s": function_latencies.get(fname),
-            "diagnostics": prompt_diagnostics.get(fname),
-            "validation": validation,
-        }
-        if lookup_provenance and lookup_provenance.get(fname):
-            item["lookup_provenance"] = lookup_provenance[fname]
-        item.update(_selector_summary(selector_map, fname))
-        item["quality"] = build_function_quality(
-            validation=validation,
-            diagnostics=prompt_diagnostics.get(fname),
-            source=source,
-            error=error,
-            selector_confidence=item.get("confidence"),
-        )
-        abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
+    results = shared_function_results(
+        func_names, function_sources, function_errors, function_latencies,
+        selector_map, prompt_diagnostics, validation_by_function, lookup_provenance,
+    )
+    for item in results:
+        abi_fact = _abi_fact_for_function(item["name"], analyzer, contract_metadata)
         if abi_fact:
             item["abi"] = abi_fact
-        results.append(item)
     return results
 
 
@@ -1447,42 +1390,14 @@ def _source_summary(
     function_errors: dict,
     function_results: list[dict] | None = None,
 ) -> dict:
-    summary = {"exact_match": 0, "model_inference": 0, "error": 0, "unknown": 0}
-    for fname, source in function_sources.items():
-        if fname in function_errors:
-            summary["error"] += 1
-        elif source in summary:
-            summary[source] += 1
-        else:
-            summary["unknown"] += 1
+    summary = shared_source_summary(function_sources, function_errors, function_results)
     if function_results is not None:
         summary["abi_functions_used"] = sum(1 for item in function_results if item.get("abi"))
-        summary["validation_failed"] = sum(
-            1
-            for item in function_results
-            if item.get("validation") and not item["validation"].get("valid")
-        )
     return summary
 
 
 def _validate_solidity_output(source_code: str, metadata: dict | None = None) -> dict:
-    try:
-        from src.training_pipeline import validate_generated_solidity
-
-        return validate_generated_solidity(source_code, metadata or {}).to_dict()
-    except Exception as exc:  # pragma: no cover - dependency/runtime defensive
-        return {
-            "valid": False,
-            "method": "validation_error",
-            "scaffold_valid": False,
-            "scaffold_errors": [],
-            "compiler_checked": False,
-            "compiler_version": None,
-            "compiler_errors": [],
-            "ast_checked": False,
-            "ast_valid": None,
-            "error": str(exc),
-        }
+    return shared_validate_solidity(source_code, metadata)
 
 
 def _is_model_artifact(path: str) -> bool:
@@ -1528,26 +1443,9 @@ def _reset_warmup_state(enabled: bool | None = None) -> None:
 
 
 def _run_warmup_with_timeout(operation, timeout_seconds: float | None):
-    if not timeout_seconds or timeout_seconds <= 0:
-        return operation()
-
-    result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        try:
-            result_queue.put((True, operation()))
-        except BaseException as exc:  # pragma: no cover - defensive handoff
-            result_queue.put((False, exc))
-
-    worker = threading.Thread(target=target, daemon=True)
-    worker.start()
-    worker.join(timeout_seconds)
-    if worker.is_alive():
-        raise TimeoutError(f"warmup exceeded {timeout_seconds:g} seconds")
-    ok, payload = result_queue.get_nowait()
-    if ok:
-        return payload
-    raise payload
+    if isinstance(decompiler, PersistentModelWorker):
+        return decompiler.run(operation, timeout_seconds or None)
+    return _run_with_timeout(operation, timeout_seconds or None, "cooperative warmup")
 
 
 def _warm_model() -> None:
@@ -1595,10 +1493,14 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
     """
     global decompiler, model_config_dict, tac_lookup, mock_mode
     global active_model_path, model_load_error
+    global lookup_load_error
+    if isinstance(decompiler, PersistentModelWorker):
+        decompiler.close()
     mock_mode = use_mock
     active_model_path = None
     model_load_error = None
     model_config_dict = {}
+    lookup_load_error = None
     _reset_warmup_state()
     start = time.time()
 
@@ -1618,11 +1520,14 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
             )
     except Exception as e:
         logger.error("Failed to load TAC lookup DB: %s", e)
+        lookup_load_error = str(e)
         tac_lookup = None  # type: ignore[assignment]
 
     if use_mock:
         logger.info("🧪 MOCK MODE — using MockDecompiler (no GPU required)")
-        decompiler = MockDecompiler()  # type: ignore[assignment]
+        decompiler = PersistentModelWorker(None, factory=MockDecompiler)
+        decompiler.initialize()
+        atexit.register(decompiler.close)
         model_config_dict = {
             "model_name": "MockDecompiler (E2E testing)",
             "mock_mode": True,
@@ -1646,15 +1551,10 @@ def load_model(use_mock: bool = False, model_path: str | None = None):
 
     logger.info("Loading trained model from %s …", resolved_model_path)
     try:
-        decompiler = SmartContractDecompiler(resolved_model_path)
-        # Read the saved model config for display in the UI
-        import json
-
-        config_path = os.path.join(resolved_model_path, "model_config.json")
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                model_config_dict = json.load(f)
-        model_config_dict["model_path"] = resolved_model_path
+        decompiler = PersistentModelWorker(resolved_model_path)
+        decompiler.initialize()
+        atexit.register(decompiler.close)
+        model_config_dict = shared_load_model_config(resolved_model_path)
         elapsed = time.time() - start
         logger.info("Model loaded successfully in %.1f seconds", elapsed)
         _warm_model()
@@ -1945,6 +1845,39 @@ def api_decompile():
         """Format a single SSE message."""
         payload = dict(data)
         payload.setdefault("request_id", request_id)
+        if event == "result":
+            analysis = payload.get("analysis", {})
+            hits = analysis.get("lookup_hits", 0)
+            payload.setdefault("lookup", {
+                "enabled": bool(lookup_config.get("enabled")),
+                "available": bool(tac_lookup is not None and tac_lookup.available),
+                "hits": hits,
+                "misses": max(0, len(payload.get("tac_per_function", {})) - hits),
+                "provenance": analysis.get("lookup_provenance", {}),
+                "status": "invalid" if lookup_load_error else "ready" if tac_lookup is not None and tac_lookup.available else "unavailable",
+                "error": lookup_load_error,
+            })
+            payload.setdefault("validation", {})
+            payload.setdefault("function_validation", {})
+            payload.setdefault("generation_config", generation_config)
+            payload.setdefault("model_config", model_config_dict)
+            analysis.setdefault("analyzer_status", trace.get("analysis", {}).get("analyzer_status", {}))
+            analysis.setdefault("tac_schema_version", analysis["analyzer_status"].get("schema_version"))
+            payload.setdefault("analysis_status", analysis["analyzer_status"])
+            payload.setdefault("tac_schema_version", analysis["tac_schema_version"])
+            compatibility = trace.get("analysis", {}).get("model_tac_compatibility", {"status": "not_used"})
+            analysis.setdefault("model_tac_compatibility", compatibility)
+            payload.setdefault("model_tac_compatibility", compatibility)
+            payload.setdefault("selector_context", selector_context_provenance(model_config_dict))
+            payload.setdefault("timeout_enforcement", {
+                "model": "spawn_worker" if isinstance(decompiler, PersistentModelWorker) else "cooperative",
+                "analysis": "cooperative",
+            })
+        elif event == "error":
+            payload.setdefault("success", False)
+            payload.setdefault("partial_success", False)
+            payload.setdefault("stage_status", "failed")
+            payload.setdefault("decompilation_status", payload.get("status", "failed"))
         return f"event: {event}\ndata: {_json.dumps(payload, default=str)}\n\n"
 
     def _check_timeout() -> None:
@@ -2036,19 +1969,29 @@ def api_decompile():
                 )
             _check_timeout()
             trace["analysis"] = {
+                "analyzer_status": analyzer_status(analyzer),
                 "num_instructions": num_instructions,
                 "num_basic_blocks": num_blocks,
                 "num_functions": num_functions,
                 "tac_generation_time_s": round(tac_time, 3),
             }
+            trace["analysis"]["tac_schema_version"] = getattr(
+                analyzer, "tac_schema_version", analyzer_status(analyzer).get("schema_version")
+            )
+            if analyzer_status(analyzer)["status"] in {"degraded", "failed"}:
+                lookup_config["enabled"] = False
+                lookup_config["disabled_reason"] = "analyzer_" + analyzer_status(analyzer)["status"]
+                trace["lookup_config"] = dict(lookup_config)
 
             # ---- Resolve function selectors ----
-            resolver = get_resolver(use_remote=ENABLE_REMOTE_SELECTOR_LOOKUP)
-            selector_results = _blocking_call(
-                lambda: resolver.resolve_function_names(func_names),
-                "selector resolution",
-            )
-            selector_map = {fname: res.to_dict() for fname, res in selector_results.items()}
+            selector_map = saved_selector_results(func_names, analyzer, model_config_dict)
+            if selector_map is None:
+                resolver = get_resolver(use_remote=ENABLE_REMOTE_SELECTOR_LOOKUP)
+                selector_results = _blocking_call(
+                    lambda: resolver.resolve_function_names(func_names),
+                    "selector resolution",
+                )
+                selector_map = {fname: res.to_dict() for fname, res in selector_results.items()}
             for fname in func_names:
                 abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
                 if abi_fact:
@@ -2333,6 +2276,8 @@ def api_decompile():
                             "request_id": request_id,
                             "success": False,
                             "partial_success": False,
+                            "stage_status": "failed",
+                            "decompilation_status": "failed",
                             "tac": combined_tac,
                             "tac_per_function": func_tac_map,
                             "solidity": "",
@@ -2356,6 +2301,9 @@ def api_decompile():
 
             else:
                 # LLM inference for unresolved functions only
+                trace["analysis"]["model_tac_compatibility"] = model_tac_compatibility(
+                    model_config_dict, trace["analysis"].get("tac_schema_version")
+                )
                 yield _sse(
                     "progress",
                     {
@@ -2736,16 +2684,15 @@ def api_decompile():
             )
             failure_count = len(function_errors)
             validation_failed = not bool(validation.get("valid"))
-            success = (
-                failure_count == 0
-                and not validation_failed
-                and not (decompiler is None and unresolved_fnames)
+            outcome = inference_outcome(
+                function_sources, function_errors, validation,
+                degraded=analyzer_status(analyzer)["status"] in {"degraded", "failed"},
+                conflicts=bool(reconstruction_plan.get("reconciliation", {}).get("conflicts")),
             )
-            partial_success = (failure_count > 0 or validation_failed) and any(
-                source != "error" for source in function_sources.values()
-            )
+            success, partial_success = outcome["success"], outcome["partial_success"]
 
             analysis = {
+                "analyzer_status": analyzer_status(analyzer),
                 "num_instructions": num_instructions,
                 "num_basic_blocks": num_blocks,
                 "num_functions": num_functions,
@@ -2793,8 +2740,7 @@ def api_decompile():
                 "result",
                 {
                     "request_id": request_id,
-                    "success": success,
-                    "partial_success": partial_success,
+                    **outcome,
                     "tac": combined_tac,
                     "tac_per_function": func_tac_map,
                     "solidity": assembled,
@@ -2852,6 +2798,7 @@ def api_decompile():
                 "error",
                 {
                     "error": f"Decompilation failed: {e}",
+                    "status": "incompatible_tac_schema" if isinstance(e, InferenceCompatibilityError) else "failed",
                     "trace_path": _relative_project_path(trace_path),
                 },
             )

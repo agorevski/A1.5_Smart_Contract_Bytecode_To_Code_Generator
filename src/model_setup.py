@@ -49,10 +49,12 @@ from peft import (
 from datasets import Dataset as HFDataset
 import numpy as np
 from tqdm import tqdm
+from src.tac_schema import TAC_SCHEMA_VERSION
+from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-TOKENIZATION_CACHE_VERSION = 2
+TOKENIZATION_CACHE_VERSION = 3
 DEFAULT_REPETITION_PENALTY = 1.05
 
 SOLIDITY_RESERVED_WORDS = {
@@ -137,11 +139,16 @@ class ModelConfig:
     gradient_checkpointing: bool = True
     include_bytecode_metadata: bool = True
     include_selector_signature_metadata: bool = True
+    selector_context: Optional[Dict[str, Any]] = None
+    tac_schema_version: Optional[int] = TAC_SCHEMA_VERSION
     include_compiler_metadata: bool = False  # Deprecated; ignored for prompt safety.
     report_to: Union[str, List[str]] = "none"
 
     def __post_init__(self):
         self.include_compiler_metadata = False
+        if self.selector_context is not None:
+            from src.selector_resolver import validate_selector_context
+            self.selector_context = copy.deepcopy(validate_selector_context(self.selector_context))
         self.precision = str(self.precision or "auto").lower()
         if self.precision not in {"auto", "bf16", "fp16", "fp32"}:
             raise ValueError("precision must be one of: auto, bf16, fp16, fp32")
@@ -179,6 +186,8 @@ class ModelConfig:
             "gradient_checkpointing": self.gradient_checkpointing,
             "include_bytecode_metadata": self.include_bytecode_metadata,
             "include_selector_signature_metadata": self.include_selector_signature_metadata,
+            "selector_context": self.selector_context,
+            "tac_schema_version": self.tac_schema_version,
             "report_to": self.report_to,
         }
 
@@ -203,10 +212,13 @@ class ModelConfig:
             "gradient_checkpointing",
             "include_bytecode_metadata",
             "include_selector_signature_metadata",
+            "selector_context",
+            "tac_schema_version",
             "include_compiler_metadata",
             "report_to",
         }
         filtered = {k: v for k, v in d.items() if k in known_keys}
+        filtered.setdefault("tac_schema_version", None)
         return cls(**filtered)
 
 
@@ -392,7 +404,8 @@ def extract_bytecode_selector(
         for line in str(tac_input).splitlines():
             if "selector" not in line.lower() and "function_0x" not in line.lower():
                 continue
-            selector = _normalize_selector(line)
+            safe_name = re.search(r"\bfunction_(0x[0-9a-fA-F]{8})\b", line)
+            selector = _normalize_selector(safe_name.group(1) if safe_name else line)
             if selector:
                 return selector
 
@@ -494,11 +507,16 @@ def _format_count_part(label: str, value: Optional[int]) -> Optional[str]:
     return f"{label}={value}"
 
 
-def resolve_selector_signature_for_prompt(selector: Optional[str]) -> Optional[str]:
+def resolve_selector_signature_for_prompt(
+    selector: Optional[str], selector_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Resolve a selector locally for prompt context without remote lookups."""
     normalized = _normalize_selector(selector)
     if not normalized:
         return None
+    if selector_context is not None:
+        from src.selector_resolver import resolve_selector_from_context
+        return resolve_selector_from_context(normalized, selector_context)
     try:
         from src.selector_resolver import get_resolver
 
@@ -526,6 +544,7 @@ def format_prompt_metadata(
     include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool = False,
     tac_input: Optional[str] = None,
+    selector_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Format compact bytecode-derived metadata for prompt context.
 
@@ -542,9 +561,10 @@ def format_prompt_metadata(
     if selector:
         metadata_parts.append(f"selector={selector}")
         if include_selector_signature_metadata:
-            selector_signature = resolve_selector_signature_for_prompt(selector)
+            selector_signature = resolve_selector_signature_for_prompt(selector, selector_context)
             if selector_signature:
                 metadata_parts.append(f"selector_signature={selector_signature}")
+                metadata_parts.append("selector_signature_evidence=inferred")
 
     tac_blocks = (stats.get("tac_blocks", 0) if has_tac else 0) or _metadata_nonnegative_int(
         metadata,
@@ -620,12 +640,14 @@ def build_training_prompt_for_length(
     include_selector_signature_metadata: bool = True,
     include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
+    selector_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build the exact training prompt text used for sequence-length detection."""
     dataset = SmartContractDataset.__new__(SmartContractDataset)
     dataset.template_format = template_format
     dataset.include_bytecode_metadata = include_bytecode_metadata
     dataset.include_selector_signature_metadata = include_selector_signature_metadata
+    dataset.selector_context = selector_context
     dataset.include_compiler_metadata = False
     return dataset._format_prompt(
         item.get("input", ""),
@@ -916,8 +938,18 @@ def detect_max_sequence_length(
     include_bytecode_metadata: bool = True,
     include_compiler_metadata: bool = False,
     template_format: str = "alpaca",
+    include_selector_signature_metadata: bool = True,
+    selector_context: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Detect max sequence length from actual tokenizer counts, rounded to pow2."""
+    if include_bytecode_metadata and include_selector_signature_metadata:
+        from src.selector_resolver import snapshot_local_selector_context, validate_selector_context
+        selector_context = (
+            validate_selector_context(selector_context)
+            if selector_context is not None else snapshot_local_selector_context()
+        )
+    else:
+        selector_context = None
     lengths: List[int] = []
     with open(dataset_path, "r") as f:
         for line in f:
@@ -928,6 +960,8 @@ def detect_max_sequence_length(
             prompt = build_training_prompt_for_length(
                 item,
                 include_bytecode_metadata=include_bytecode_metadata,
+                include_selector_signature_metadata=include_selector_signature_metadata,
+                selector_context=selector_context,
                 template_format=template_format,
             )
             lengths.append(len(_tokenize_to_ids(tokenizer, prompt)))
@@ -1056,6 +1090,8 @@ class SmartContractDataset(Dataset):
         include_selector_signature_metadata: bool = True,
         include_compiler_metadata: bool = False,
         tokenization_cache: Optional[Union[TokenizationCacheConfig, str, Path, bool]] = None,
+        selector_context: Optional[Dict[str, Any]] = None,
+        require_current_tac_schema: bool = False,
     ):
         """Initialize the dataset with training data.
 
@@ -1073,6 +1109,10 @@ class SmartContractDataset(Dataset):
                 never included in prompts.
             tokenization_cache: Optional cache config/path. Disabled by default
                 to preserve existing lazy tokenization behavior.
+            selector_context: Validated local selector snapshot shared with preflight
+                and saved-model inference. Captured locally when not supplied.
+            require_current_tac_schema: Reject stale/unversioned TAC and labels
+                even when the CLI preflight was skipped.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -1080,9 +1120,37 @@ class SmartContractDataset(Dataset):
         self.augment_names = augment_names
         self.include_bytecode_metadata = include_bytecode_metadata
         self.include_selector_signature_metadata = include_selector_signature_metadata
+        if include_bytecode_metadata and include_selector_signature_metadata:
+            from src.selector_resolver import snapshot_local_selector_context, validate_selector_context
+            self.selector_context = copy.deepcopy(
+                validate_selector_context(selector_context)
+                if selector_context is not None else snapshot_local_selector_context()
+            )
+        else:
+            self.selector_context = None
         self.include_compiler_metadata = False
         self.AUGMENT_RATE = 0.3
         self.data = self._load_data(data_path)
+        if require_current_tac_schema:
+            for index, item in enumerate(self.data, 1):
+                if (item.get("metadata") or {}).get("tac_schema_version") != TAC_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"{data_path}:{index}: stale or missing TAC schema; regenerate the dataset "
+                        "from bytecode with the current analyzer, then regenerate splits and caches."
+                    )
+                if (item.get("metadata") or {}).get("label_schema_version") != LABEL_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"{data_path}:{index}: stale or missing label schema; regenerate the dataset "
+                        "with current AST-aligned labels, then regenerate splits and caches."
+                    )
+                analysis_status = (item.get("metadata") or {}).get("analysis_status")
+                if analysis_status is not None and (
+                    not isinstance(analysis_status, dict) or analysis_status.get("status") != "ok"
+                ):
+                    raise ValueError(
+                        f"{data_path}:{index}: non-ok bytecode analysis; regenerate the dataset "
+                        "after resolving analyzer issues instead of training on degraded TAC."
+                    )
         self._tokenized_cache: Optional[List[Dict[str, List[Any]]]] = None
 
         cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
@@ -1106,12 +1174,17 @@ class SmartContractDataset(Dataset):
     def _cache_metadata(self, data_path: str) -> Dict[str, Any]:
         return {
             "cache_version": TOKENIZATION_CACHE_VERSION,
+            "tac_schema_version": TAC_SCHEMA_VERSION,
+            "label_schema_version": LABEL_SCHEMA_VERSION,
             "dataset_fingerprint": _sha256_file(data_path),
             "tokenizer": tokenizer_cache_identity(self.tokenizer),
             "template_format": self.template_format,
             "include_bytecode_metadata": bool(self.include_bytecode_metadata),
             "include_selector_signature_metadata": bool(
                 self.include_selector_signature_metadata
+            ),
+            "selector_context_digest": (
+                self.selector_context["digest"] if self.selector_context is not None else None
             ),
             "augment_names": bool(self.augment_names),
             "max_length": int(self.max_length),
@@ -1289,6 +1362,7 @@ class SmartContractDataset(Dataset):
                     True,
                 ),
                 tac_input=tac_text,
+                selector_context=getattr(self, "selector_context", None),
             )
             if metadata_line:
                 metadata_str = f"{metadata_line}\n\n"
@@ -1315,6 +1389,7 @@ class SmartContractDataset(Dataset):
                     True,
                 ),
                 tac_input=tac_text,
+                selector_context=getattr(self, "selector_context", None),
             )
             metadata_str = ""
             if metadata_line:
@@ -1488,6 +1563,16 @@ class SmartContractDataset(Dataset):
         return {
             "row_count": len(self.data),
             "max_sequence_length": int(self.max_length),
+            "prompt_identity": {
+                "tac_schema_version": TAC_SCHEMA_VERSION,
+                "label_schema_version": LABEL_SCHEMA_VERSION,
+                "template_format": self.template_format,
+                "include_bytecode_metadata": self.include_bytecode_metadata,
+                "include_selector_signature_metadata": self.include_selector_signature_metadata,
+                "selector_context_digest": (
+                    self.selector_context["digest"] if self.selector_context else None
+                ),
+            },
             "sample_count": sample_count,
             "max_examples": int(max_examples),
             "sample_strategy": "all" if sample_count == len(self.data) else "linspace",
@@ -2218,7 +2303,12 @@ class SmartContractModelTrainer:
     ) -> Dict[str, Any]:
         manifest: Dict[str, Any] = {
             "manifest_kind": "training_inputs",
-            "schema_version": 1,
+            "schema_version": 2,
+            "tac_schema_version": TAC_SCHEMA_VERSION,
+            "label_schema_version": LABEL_SCHEMA_VERSION,
+            "selector_context_digest": (
+                self.config.selector_context["digest"] if self.config.selector_context else None
+            ),
             "status": status,
             "created_at": _utc_now_iso(),
             "seed": int(seed),
@@ -2236,6 +2326,7 @@ class SmartContractModelTrainer:
                 ),
             },
             "model_config": self.config.to_dict(),
+            "provenance": self.training_provenance,
             "datasets": {
                 "train": {
                     "artifact": _artifact_for_path(train_dataset_path, jsonl=True),
@@ -2294,6 +2385,45 @@ class SmartContractModelTrainer:
     ) -> str:
         """Train the model on the smart contract decompilation dataset."""
         _set_global_training_seed(seed)
+        if self.config.tac_schema_version != TAC_SCHEMA_VERSION:
+            raise ValueError("Stale TAC model configuration; regenerate datasets and start a new training run.")
+        previous = None
+        if resume_from_checkpoint:
+            checkpoint = Path(resume_from_checkpoint)
+            candidates = (
+                checkpoint / "training_input_manifest.json",
+                checkpoint.parent / "training_input_manifest.json",
+            )
+            saved = next((path for path in candidates if path.exists()), None)
+            previous = json.loads(saved.read_text(encoding="utf-8")) if saved else {}
+            if previous.get("tac_schema_version") != TAC_SCHEMA_VERSION:
+                raise ValueError(
+                    "Checkpoint uses stale or unversioned TAC; regenerate the dataset from bytecode "
+                    "and start a new training run without --resume."
+                )
+            if previous.get("label_schema_version") != LABEL_SCHEMA_VERSION:
+                raise ValueError(
+                    "Checkpoint uses stale or unversioned labels; regenerate AST-aligned datasets "
+                    "and start a new training run without --resume."
+                )
+            previous_config = ModelConfig.from_dict(previous.get("model_config", {}))
+            if previous_config.tac_schema_version != TAC_SCHEMA_VERSION:
+                raise ValueError("Checkpoint model configuration has stale TAC; regenerate data and start without --resume.")
+            for flag in ("include_bytecode_metadata", "include_selector_signature_metadata"):
+                if getattr(previous_config, flag) != getattr(self.config, flag):
+                    raise ValueError(f"Resume prompt mismatch for {flag}; use the checkpoint settings or start a new run.")
+            if previous_config.include_bytecode_metadata and previous_config.include_selector_signature_metadata:
+                if previous_config.selector_context is None:
+                    raise ValueError("Checkpoint has no frozen selector context; start a new training run.")
+                if self.config.selector_context is not None and (
+                    self.config.selector_context["digest"] != previous_config.selector_context["digest"]
+                ):
+                    raise ValueError("Resume selector context mismatch; restore the checkpoint context or start a new run.")
+                self.config.selector_context = previous_config.selector_context
+        if self.config.include_bytecode_metadata and self.config.include_selector_signature_metadata:
+            if self.config.selector_context is None:
+                from src.selector_resolver import snapshot_local_selector_context
+                self.config.selector_context = snapshot_local_selector_context()
         tokenizer, peft_model = self.setup_model(use_deepspeed=deepspeed_config is not None)
         tokenization_cache_config = TokenizationCacheConfig.from_value(tokenization_cache)
         instrumentation = TrainingInstrumentationConfig.from_value(instrumentation_config)
@@ -2304,6 +2434,9 @@ class SmartContractModelTrainer:
             tokenizer,
             max_length=self.config.max_sequence_length,
             include_bytecode_metadata=self.config.include_bytecode_metadata,
+            include_selector_signature_metadata=self.config.include_selector_signature_metadata,
+            selector_context=self.config.selector_context,
+            require_current_tac_schema=True,
             tokenization_cache=tokenization_cache_config,
         )
 
@@ -2321,6 +2454,9 @@ class SmartContractModelTrainer:
                 tokenizer,
                 max_length=self.config.max_sequence_length,
                 include_bytecode_metadata=self.config.include_bytecode_metadata,
+                include_selector_signature_metadata=self.config.include_selector_signature_metadata,
+                selector_context=self.config.selector_context,
+                require_current_tac_schema=True,
                 tokenization_cache=tokenization_cache_config,
             )
             if len(eval_dataset) == 0:
@@ -2345,6 +2481,13 @@ class SmartContractModelTrainer:
                 )
 
         do_eval = eval_dataset is not None
+        from src.evaluation_identity import build_training_provenance
+        self.training_provenance = build_training_provenance(
+            train_dataset_path,
+            eval_dataset_path if do_eval else None,
+            ancestor_manifest=previous,
+            continuation=bool(resume_from_checkpoint),
+        )
 
         # Custom data collator that properly pads input_ids, attention_mask, and labels
         def custom_data_collator(features):
@@ -2578,6 +2721,29 @@ class SmartContractModelTrainer:
             with open(config_path, "r") as f:
                 config_dict = json.load(f)
             self.config = ModelConfig.from_dict(config_dict)
+        else:
+            for manifest_path in (
+                load_path / "training_input_manifest.json",
+                load_path.parent / "training_input_manifest.json",
+            ):
+                if manifest_path.exists():
+                    with open(manifest_path, "r", encoding="utf-8") as handle:
+                        config_dict = json.load(handle).get("model_config")
+                    if config_dict:
+                        self.config = ModelConfig.from_dict(config_dict)
+                        break
+
+        if (
+            self.config.include_bytecode_metadata
+            and self.config.include_selector_signature_metadata
+            and self.config.selector_context is None
+        ):
+            logger.warning(
+                "Model %s has no saved selector context snapshot; selector-signature prompts "
+                "depend on the current local registry and are not reproducible. Regenerate "
+                "training artifacts and retrain to persist the selector mapping.",
+                load_path,
+            )
 
         hf_token = self._get_hf_token()
 
@@ -2815,6 +2981,7 @@ class SmartContractDecompiler:
                 True,
             ),
             tac_input=tac_input,
+            selector_context=getattr(self.config, "selector_context", None),
         )
         if metadata_line:
             metadata_str = f"{metadata_line}\n\n"

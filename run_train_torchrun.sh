@@ -25,7 +25,7 @@ echo "  Report to:            ${REPORT_TO}"
 echo "  Post-train eval:      $([ "${SKIP_EVAL}" = "true" ] || [ "${SKIP_EVAL}" = "1" ] && echo disabled || echo enabled)"
 echo ""
 
-uv run torchrun \
+uv run --extra training torchrun \
     --nproc_per_node="${NGPUS}" \
     train.py \
     --skip-collection \

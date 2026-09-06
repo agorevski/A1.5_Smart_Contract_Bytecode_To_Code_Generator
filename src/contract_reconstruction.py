@@ -19,7 +19,6 @@ _CALL_RE = re.compile(r"\b(?:delegatecall|staticcall|callcode|call)\s*\(", re.IG
 _LOG_RE = re.compile(r"\blog[0-4]\s*\(", re.IGNORECASE)
 _BRANCH_RE = re.compile(r"\b(?:goto|jump|jumpi)\b", re.IGNORECASE)
 _SELECTOR_RE = re.compile(r"(?:0x)?([0-9a-fA-F]{8})")
-_CONTRACT_DECL_RE = re.compile(r"\b(?:abstract\s+)?contract\s+[A-Za-z_][A-Za-z0-9_]*[^{]*\{")
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 _RESERVED_IDENTIFIERS = {
@@ -381,6 +380,10 @@ def build_reconstruction_plan(
     body = bytecode[2:] if str(bytecode).lower().startswith("0x") else str(bytecode)
     detected_interfaces = _detect_interfaces(selectors)
     contract_facts = {
+        "analysis_status": (
+            analyzer.get_analysis_status() if callable(getattr(analyzer, "get_analysis_status", None))
+            else getattr(analyzer, "analysis_status", {"status": "ok", "issues": []})
+        ),
         "bytecode_sha256": _sha256_text(str(bytecode).lower()),
         "bytecode_hex_length": len(body),
         "bytecode_byte_length": len(body) // 2,
@@ -413,7 +416,7 @@ def build_reconstruction_plan(
             "llm_contract_synthesis": False,
             "validation_steps": [
                 "selector_coverage",
-                "storage_access_consistency",
+                "shared_symbol_declaration_consistency",
                 "function_scaffold_validation",
                 "whole_contract_validation",
             ],
@@ -464,7 +467,10 @@ def build_function_quality(
     else:
         severity = "ok"
 
-    deployable = bool(validation_valid and compiler_checked and not error)
+    deployable = bool(
+        validation_valid and compiler_checked and not error
+        and validation.get("deployable", True)
+    )
     confidence_score = 1.0
     if error or not validation_valid:
         confidence_score = 0.0
@@ -506,9 +512,20 @@ def build_contract_quality(
     if not isinstance(contract_facts, Mapping):
         contract_facts = {}
 
+    reconciliation = reconstruction_plan.get("reconciliation", {})
+    analysis_status = contract_facts.get("analysis_status", {"status": "ok", "issues": []})
+    analysis_reliable = analysis_status.get("status") not in {"degraded", "failed"}
+    conflicts = reconciliation.get("conflicts", [])
+    unresolved_helpers = reconciliation.get("unresolved_helpers", [])
+    storage_unverified = reconciliation.get("storage_consistency") == "unverified" and bool(
+        reconciliation.get("state_symbols")
+        or contract_facts.get("storage_reads") or contract_facts.get("storage_writes")
+    )
     compiler_checked = bool(validation.get("compiler_checked"))
-    validation_valid = bool(validation.get("valid"))
-    deployable = bool(validation_valid and compiler_checked)
+    validation_valid = bool(validation.get("valid")) and not conflicts
+    deployable = bool(
+        validation_valid and compiler_checked and validation.get("deployable", True)
+    )
     scaffold_only = validation_valid and not compiler_checked
     unresolved = [
         str(item.get("name"))
@@ -536,6 +553,14 @@ def build_contract_quality(
     actions: list[str] = []
     if unresolved:
         actions.append("Resolve failed chunks before using the reconstructed contract.")
+    if conflicts:
+        actions.append("Resolve conflicting contract-wide declarations; no conflicting declaration was silently discarded.")
+    if unresolved_helpers:
+        actions.append("Resolve helper references or confirm them with compiler validation.")
+    if storage_unverified:
+        actions.append("Verify generated state-variable ordering and types against bytecode storage slots.")
+    if not analysis_reliable:
+        actions.append("Resolve analyzer degradation before treating reconstructed behavior as reliable.")
     if not validation_valid:
         actions.append("Fix Solidity validation errors and rerun compiler validation.")
     if scaffold_only:
@@ -545,9 +570,9 @@ def build_contract_quality(
     if selector_coverage is not None and selector_coverage < 1.0:
         actions.append("Provide a verified ABI or selector manifest to improve name/signature coverage.")
 
-    if unresolved or not validation_valid:
+    if unresolved or not validation_valid or analysis_status.get("status") == "failed":
         severity = "error"
-    elif scaffold_only or truncated or (selector_coverage is not None and selector_coverage < 1.0):
+    elif not analysis_reliable or scaffold_only or truncated or storage_unverified or unresolved_helpers or (selector_coverage is not None and selector_coverage < 1.0):
         severity = "warning"
     else:
         severity = "ok"
@@ -572,6 +597,11 @@ def build_contract_quality(
         "lookup_hits": int(source_summary.get("exact_match") or 0),
         "model_generated": int(source_summary.get("model_inference") or 0),
         "semantic_chunk_count": int(reconstruction_plan.get("chunk_count") or 0),
+        "analysis_reliable": analysis_reliable,
+        "analysis_status": analysis_status,
+        "reconstruction_conflicts": conflicts,
+        "unresolved_helpers": unresolved_helpers,
+        "storage_consistency": reconciliation.get("storage_consistency", "unverified"),
         "proxy_like": bool(
             isinstance(contract_facts.get("proxy"), Mapping)
             and contract_facts["proxy"].get("is_proxy_like")
@@ -593,27 +623,32 @@ def _strip_markdown_fence(source: str) -> str:
 
 
 def _extract_contract_body(source: str) -> str | None:
-    match = _CONTRACT_DECL_RE.search(source)
-    if not match:
+    tokens = list(_solidity_tokens(source))
+    contract_index = next((i for i, token in enumerate(tokens) if token[0] == "contract"), None)
+    if contract_index is None:
         return None
-    open_index = source.find("{", match.start())
-    if open_index < 0:
+    open_index = next(
+        (start for token, start, _ in tokens[contract_index:] if token == "{"), None
+    )
+    if open_index is None:
         return None
     depth = 0
-    for idx in range(open_index, len(source)):
-        char = source[idx]
-        if char == "{":
+    for token, start, end in tokens:
+        if start < open_index:
+            continue
+        if token == "{":
             depth += 1
-        elif char == "}":
+        elif token == "}":
             depth -= 1
             if depth == 0:
-                return source[open_index + 1 : idx].strip()
+                return source[open_index + 1 : start].strip()
     return None
 
 
 def _normalise_generated_fragment(source: str) -> str:
     text = _strip_markdown_fence(str(source or ""))
-    body = _extract_contract_body(text)
+    contract_count = sum(token == "contract" for token, _, _ in _solidity_tokens(text))
+    body = _extract_contract_body(text) if contract_count <= 1 else None
     if body is not None:
         text = body
     kept = []
@@ -646,6 +681,183 @@ def _chunk_by_name(reconstruction_plan: Mapping[str, Any] | None) -> dict[str, M
     }
 
 
+def _solidity_tokens(source):
+    pattern = r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[A-Za-z_$][\w$]*|0x[0-9a-fA-F]+|\d+|=>|==|!=|<=|>=|&&|\|\||[^\s]'
+    for match in re.finditer(pattern, source):
+        if not match.group().startswith(("//", "/*")):
+            yield match.group(), match.start(), match.end()
+
+
+def _contract_members(source):
+    """Split only at contract scope, ignoring braces in strings/comments."""
+    tokens = list(_solidity_tokens(source))
+    depth = parens = brackets = 0
+    start = 0
+    for index, (token, _, end) in enumerate(tokens):
+        depth += (token == "{") - (token == "}")
+        parens += (token == "(") - (token == ")")
+        brackets += (token == "[") - (token == "]")
+        if depth == parens == brackets == 0 and token in {";", "}"}:
+            # Struct/enum/function bodies end at }; state initializers may not.
+            leading = tokens[start][0] if start < len(tokens) else ""
+            if token == "}" and leading not in {"function", "modifier", "constructor", "fallback", "receive", "struct", "enum"}:
+                continue
+            yield source[tokens[start][1]:end], [item[0] for item in tokens[start:index + 1]]
+            start = index + 1
+    if start < len(tokens):
+        yield source[tokens[start][1]:], [item[0] for item in tokens[start:]]
+
+
+def _parsed_contract_members(source):
+    """Use an installed solc parser, without compiling or downloading a compiler."""
+    try:
+        import solcx
+    except ImportError:
+        return None
+    versions = solcx.get_installed_solc_versions()
+    if not versions:
+        return None
+    wrapped = "contract Reconstructed {\n" + source + "\n}"
+    try:
+        output = solcx.compile_standard(
+            {
+                "language": "Solidity",
+                "sources": {"Reconstructed.sol": {"content": wrapped}},
+                "settings": {"stopAfter": "parsing", "outputSelection": {"*": {"": ["ast"]}}},
+            },
+            solc_version=max(versions),
+        )
+        ast = output["sources"]["Reconstructed.sol"]["ast"]
+        contract = next(node for node in ast["nodes"] if node.get("nodeType") == "ContractDefinition")
+        encoded = wrapped.encode("utf-8")
+        members = []
+        for node in contract["nodes"]:
+            start, length, _ = map(int, node["src"].split(":"))
+            member = encoded[start:start + length].decode("utf-8")
+            if node.get("nodeType") in {"VariableDeclaration", "EventDefinition", "ErrorDefinition", "UsingForDirective"} and not member.rstrip().endswith(";"):
+                member += ";"
+            members.append((member, [token for token, _, _ in _solidity_tokens(member)]))
+        return members
+    except Exception:
+        # Invalid fragments remain visible and are checked by final validation.
+        return None
+
+
+def _member_key(tokens):
+    if not tokens:
+        return None
+    kind = tokens[0]
+    if kind in {"function", "event", "error", "modifier", "constructor", "fallback", "receive"}:
+        name = tokens[1] if tokens[1] != "(" else kind
+        if "(" not in tokens:
+            return kind, name
+        begin = tokens.index("(")
+        depth = 0
+        params, param = [], []
+        for token in tokens[begin + 1:]:
+            if token == ")" and depth == 0:
+                if param:
+                    params.append(param)
+                break
+            if token == "," and depth == 0:
+                params.append(param)
+                param = []
+                continue
+            depth += (token == "(") - (token == ")")
+            param.append(token)
+        types = []
+        for param in params:
+            param = [t for t in param if t not in {"memory", "storage", "calldata", "indexed"}]
+            if len(param) > 1 and _IDENT_RE.match(param[-1]) and param[-1] != "payable":
+                param = param[:-1]
+            types.append("".join({"uint": "uint256", "int": "int256"}.get(t, t) for t in param))
+        return kind, name + "(" + ",".join(types) + ")"
+    if kind in {"struct", "enum"}:
+        return kind, tokens[1]
+    if tokens[-1] == ";" and kind not in {"using", "import", "pragma"}:
+        declaration = tokens[:tokens.index("=")] if "=" in tokens else tokens[:-1]
+        names = [token for token in declaration if _IDENT_RE.match(token)]
+        if names:
+            return "state", names[-1]
+    return None
+
+
+def reconcile_contract_symbols(function_solidity):
+    """Merge identical declarations; preserve and report incompatible definitions."""
+    seen, fragments, conflicts, duplicates = {}, {}, [], []
+    declared, calls = set(), set()
+    ast_chunks = []
+    state_order = {}
+    for chunk, source in function_solidity.items():
+        fragment = _normalise_generated_fragment(source)
+        if sum(token == "contract" for token, _, _ in _solidity_tokens(fragment)) > 1:
+            conflicts.append({"kind": "multiple_contracts", "symbol": chunk, "chunks": [chunk]})
+        members = _parsed_contract_members(fragment)
+        if members is not None:
+            ast_chunks.append(chunk)
+        else:
+            members = list(_contract_members(fragment))
+        kept = []
+        chunk_states = []
+        for member, tokens in members:
+            key = _member_key(tokens)
+            if key:
+                if key[0] == "state" and not {"constant", "immutable"}.intersection(tokens):
+                    chunk_states.append(key[1])
+                declared.add(key[1].split("(")[0])
+                canonical = tuple(tokens)
+                if key in seen:
+                    previous, previous_chunk = seen[key]
+                    if previous == canonical:
+                        duplicates.append({"symbol": key[1], "chunk": chunk, "shared_with": previous_chunk})
+                        continue
+                    conflicts.append({"kind": key[0], "symbol": key[1], "chunks": [previous_chunk, chunk]})
+                else:
+                    seen[key] = canonical, chunk
+            # Assembly has its own symbol namespace and is left intact.
+            assembly_depth = None
+            depth = 0
+            for index, token in enumerate(tokens):
+                if token == "assembly":
+                    assembly_depth = depth
+                if token == "{":
+                    depth += 1
+                elif token == "}":
+                    depth -= 1
+                    if assembly_depth is not None and depth == assembly_depth:
+                        assembly_depth = None
+                if assembly_depth is not None:
+                    continue
+                if index + 1 < len(tokens) and tokens[index + 1] == "(" and _IDENT_RE.match(token):
+                    if index and tokens[index - 1] in {".", "function", "event", "error", "modifier", "new"}:
+                        continue
+                    calls.add(token)
+            kept.append(member)
+        for left_index, left in enumerate(chunk_states):
+            for right in chunk_states[left_index + 1:]:
+                if left == right:
+                    continue
+                if (right, left) in state_order:
+                    conflicts.append({
+                        "kind": "storage_layout", "symbol": f"{left}, {right}",
+                        "chunks": [state_order[right, left], chunk],
+                    })
+                state_order.setdefault((left, right), chunk)
+        fragments[chunk] = "\n".join(kept) if members else fragment
+    builtins = {"if", "for", "while", "returns", "return", "require", "assert", "revert", "keccak256", "sha256", "ripemd160", "ecrecover", "addmod", "mulmod", "selfdestruct", "suicide", "blockhash", "gasleft", "type", "abi", "address", "payable", "bool", "string", "bytes", "mapping", "unchecked", "catch", "fallback", "receive", "constructor"}
+    unresolved = sorted(name for name in calls - declared - builtins if not re.fullmatch(r"(?:u?int|bytes)\d*", name))
+    return fragments, {
+        "method": "compiler_ast_and_tokenized_members" if ast_chunks else "tokenized_contract_members",
+        "compiler_ast_chunks": ast_chunks,
+        "duplicate_declarations_merged": duplicates,
+        "conflicts": conflicts,
+        "unresolved_helpers": unresolved,
+        "state_symbols": sorted(key[1] for key in seen if key[0] == "state"),
+        "storage_consistency": "conflict" if any(c["kind"] in {"state", "storage_layout"} for c in conflicts) else "unverified",
+        "storage_note": "Shared declarations are reconciled; generated variable-to-bytecode-slot correspondence is not proven.",
+    }
+
+
 def assemble_reconstructed_contract(
     function_solidity: Mapping[str, str],
     analyzer: Any,
@@ -662,6 +874,9 @@ def assemble_reconstructed_contract(
     chunk_lookup = _chunk_by_name(plan)
     detected_interfaces = facts.get("detected_interfaces") if isinstance(facts, Mapping) else []
     proxy = facts.get("proxy") if isinstance(facts, Mapping) else {}
+    function_solidity, reconciliation = reconcile_contract_symbols(function_solidity)
+    if isinstance(plan, dict):
+        plan["reconciliation"] = reconciliation
 
     lines = [
         "// SPDX-License-Identifier: UNKNOWN",
@@ -673,6 +888,10 @@ def assemble_reconstructed_contract(
     if plan.get("strategy"):
         lines.append(f"/// @dev Reconstruction strategy: {plan['strategy']}.")
     lines.append(f"contract {contract_name} {{")
+    for conflict in reconciliation["conflicts"]:
+        lines.append(f"    // RECONSTRUCTION CONFLICT: {conflict['kind']} {conflict['symbol']}")
+    for helper in reconciliation["unresolved_helpers"]:
+        lines.append(f"    // UNRESOLVED HELPER: {helper}")
 
     lines.extend(
         [

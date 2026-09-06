@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 logger = logging.getLogger(__name__)
 
 from .abi_enrichment import PANIC_CODES, ERROR_SELECTORS
+from .tac_schema import TAC_SCHEMA_VERSION
 
 # ---------------------------------------------------------------------------
 # Enums & Data Classes
@@ -45,6 +46,7 @@ class TACOperationType(Enum):
     HALT = "halt"
     LOG = "log"
     NOP = "nop"
+    PHI = "phi"
 
 
 @dataclass
@@ -93,6 +95,7 @@ class Function:
 # ---------------------------------------------------------------------------
 
 _RAW_OPCODE_NAMES: Dict[int, str] = {
+    0xFE: "INVALID",
     0x49: "BLOBHASH",
     0x4A: "BLOBBASEFEE",
     0x5C: "TLOAD",
@@ -104,6 +107,10 @@ _RAW_OPCODE_NAMES: Dict[int, str] = {
 # EVM opcode stack effects: (pops, pushes) for opcodes handled by the
 # generic fallback in the stack simulator and TAC converter.
 _EVM_STACK_EFFECTS: Dict[str, Tuple[int, int]] = {
+    "MLOAD": (1, 1), "SLOAD": (1, 1),
+    "MSTORE": (2, 0), "SSTORE": (2, 0),
+    "JUMP": (1, 0), "JUMPI": (2, 0),
+    "RETURN": (2, 0), "REVERT": (2, 0),
     # Environmental / context opcodes  (0 pops, 1 push)
     "ADDRESS": (0, 1), "ORIGIN": (0, 1), "CALLER": (0, 1),
     "CALLVALUE": (0, 1), "CALLDATASIZE": (0, 1), "CODESIZE": (0, 1),
@@ -174,6 +181,56 @@ def _stack_pop(stack: List[str]) -> str:
     return stack.pop() if stack else "stack_underflow"
 
 
+def _evm_binary(name: str, first: int, second: int) -> int:
+    """Evaluate a binary opcode in EVM pop order with 256-bit word semantics."""
+    mask = (1 << 256) - 1
+    first, second = first & mask, second & mask
+    signed = lambda n: n - (1 << 256) if n >> 255 else n
+    a, b = signed(first), signed(second)
+    if name == "ADD":
+        result = first + second
+    elif name == "SUB":
+        result = first - second
+    elif name == "MUL":
+        result = first * second
+    elif name == "DIV":
+        result = first // second if second else 0
+    elif name == "MOD":
+        result = first % second if second else 0
+    elif name == "SDIV":
+        result = (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1) if b else 0
+    elif name == "SMOD":
+        result = (abs(a) % abs(b)) * (-1 if a < 0 else 1) if b else 0
+    elif name == "EXP":
+        result = pow(first, second, 1 << 256)
+    elif name in ("LT", "GT", "SLT", "SGT", "EQ"):
+        result = {"LT": first < second, "GT": first > second,
+                  "SLT": a < b, "SGT": a > b, "EQ": first == second}[name]
+    elif name == "AND":
+        result = first & second
+    elif name == "OR":
+        result = first | second
+    elif name == "XOR":
+        result = first ^ second
+    elif name == "BYTE":
+        result = (second >> (8 * (31 - first))) & 255 if first < 32 else 0
+    elif name == "SIGNEXTEND":
+        if first >= 32:
+            result = second
+        else:
+            low_mask = (1 << (8 * first + 8)) - 1
+            result = second | (mask ^ low_mask) if second & (1 << (8 * first + 7)) else second & low_mask
+    elif name == "SHL":
+        result = second << first if first < 256 else 0
+    elif name == "SHR":
+        result = second >> first if first < 256 else 0
+    elif name == "SAR":
+        result = b >> min(first, 256)
+    else:
+        raise ValueError(f"Unsupported binary opcode: {name}")
+    return int(result) & mask
+
+
 def _opcode_as_int(instr: Any) -> Optional[int]:
     """Return a raw opcode byte for dict or evmdasm instructions when available."""
     raw = instr.get("opcode") if isinstance(instr, dict) else getattr(instr, "opcode", None)
@@ -237,11 +294,28 @@ class BytecodeAnalyzer:
         self.variable_counter: int = 0
         self.logger = logging.getLogger(__name__)
         self.abi_enricher = abi_enricher  # Optional ABIEnricher for custom error decoding
+        self.tac_schema_version = TAC_SCHEMA_VERSION
+        self.analysis_status: Dict[str, Any] = {
+            "status": "ok", "issues": [], "schema_version": TAC_SCHEMA_VERSION,
+        }
 
         # Pre-built lookup: PC → instruction index (populated after parsing)
         self._pc_to_index: Dict[int, int] = {}
 
         self._parse_bytecode()
+
+    def _record_issue(self, code: str, *, failed: bool = False, **context: Any) -> None:
+        issue = {"code": code, **context}
+        if issue not in self.analysis_status["issues"]:
+            self.analysis_status["issues"].append(issue)
+        if failed or self.analysis_status["status"] != "failed":
+            self.analysis_status["status"] = "failed" if failed else "degraded"
+
+    def get_analysis_status(self) -> Dict[str, Any]:
+        """Return a serialization-safe snapshot, independently of TAC text."""
+        return {**self.analysis_status, "issues": [
+            dict(issue) for issue in self.analysis_status["issues"]
+        ]}
 
     # ------------------------------------------------------------------ #
     #  Bytecode Parsing
@@ -258,6 +332,7 @@ class BytecodeAnalyzer:
                     "Run: uv sync"
                 )
             clean = self.bytecode[2:] if self.bytecode.startswith("0x") else self.bytecode
+            bytes.fromhex(clean)
             evm = EvmBytecode(clean)
             self.instructions = list(evm.disassemble())
 
@@ -267,6 +342,7 @@ class BytecodeAnalyzer:
             logger.info("Parsed %d instructions from bytecode", len(self.instructions))
         except Exception as e:
             logger.error("Failed to parse bytecode: %s", e)
+            self._record_issue("parse_error", failed=True, message=str(e))
             self.instructions = []
 
     # ------------------------------------------------------------------ #
@@ -355,6 +431,7 @@ class BytecodeAnalyzer:
             return blocks
         except Exception as e:
             logger.error("Control flow analysis failed: %s", e)
+            self._record_issue("fallback", phase="control_flow", message=str(e))
             return self._fallback_control_flow_analysis()
 
     # ------------------------------------------------------------------ #
@@ -552,16 +629,21 @@ class BytecodeAnalyzer:
         last = raw[-1]
         last_name = self._get_instruction_name(last)
         last_pc = self._get_pc(last, block.end_address)
+        jump_destinations = {
+            pc: bid for pc, bid in pc_to_block.items()
+            if all_blocks[bid].metadata.get("raw_instructions")
+            and self._get_instruction_name(all_blocks[bid].metadata["raw_instructions"][0]) == "JUMPDEST"
+        }
 
         if last_name == "JUMP":
             for t in self._get_jump_targets_from_block(raw):
-                if t in pc_to_block:
-                    self._add_edge(block.id, pc_to_block[t], all_blocks)
+                if t in jump_destinations:
+                    self._add_edge(block.id, jump_destinations[t], all_blocks)
 
         elif last_name == "JUMPI":
             for t in self._get_jump_targets_from_block(raw):
-                if t in pc_to_block:
-                    self._add_edge(block.id, pc_to_block[t], all_blocks)
+                if t in jump_destinations:
+                    self._add_edge(block.id, jump_destinations[t], all_blocks)
             ft = self._get_next_instruction_pc(last_pc)
             if ft is not None and ft in pc_to_block:
                 self._add_edge(block.id, pc_to_block[ft], all_blocks)
@@ -572,16 +654,12 @@ class BytecodeAnalyzer:
                 self._add_edge(block.id, pc_to_block[ft], all_blocks)
 
     def _get_jump_targets_from_block(self, instructions: List) -> set:
-        """Return the nearest PUSH operand preceding the terminating jump."""
-        targets: set = set()
-        for i in range(len(instructions) - 2, -1, -1):
-            instr = instructions[i]
-            if self._get_instruction_name(instr).startswith("PUSH"):
-                val = self._parse_operand_as_int(self._get_operand(instr))
-                if val is not None:
-                    targets.add(val)
-                break
-        return targets
+        """Resolve a local jump destination by executing stack effects."""
+        simulator = self._StackSimulator()
+        for index, instr in enumerate(instructions[:-1]):
+            simulator.process_instruction(instr, index)
+        target = simulator.get_stack_top_value()
+        return {target} if target is not None else set()
 
     def _get_next_instruction_pc(self, current_pc: int) -> Optional[int]:
         """Return the PC of the instruction after *current_pc* (O(1) lookup)."""
@@ -734,6 +812,8 @@ class BytecodeAnalyzer:
 
             fname = f"function_{selector}"
             entry = self._block_at_address(jump_target) or f"block_{jump_target:04x}"
+            if entry in self.basic_blocks and self.basic_blocks[entry].metadata.get("is_dead_code"):
+                continue
             functions[fname] = Function(
                 name=fname, selector=selector, basic_blocks=[], entry_block=entry,
             )
@@ -1005,8 +1085,8 @@ class BytecodeAnalyzer:
                 continue
 
             if name == "DIV":
-                divisor = const_value(pop())
                 value = pop()
+                divisor = const_value(pop())
                 stack.append(("selector",) if value == ("calldata_word_0",) and is_selector_divisor(divisor) else ("unknown",))
                 continue
 
@@ -1125,6 +1205,14 @@ class BytecodeAnalyzer:
     ) -> Union[TACInstruction, List[TACInstruction], None]:
         """Convert a single EVM instruction to TAC, updating *stack* in place."""
         name = self._get_instruction_name(instr)
+        required = self._required_stack_depth(name)
+        if len(stack) < required:
+            self._record_issue(
+                "stack_underflow", pc=self._get_pc(instr, -1),
+                opcode=name, required=required, available=len(stack),
+            )
+        if len(stack) >= 1024 and (name.startswith(("PUSH", "DUP")) or name in _ENV_OPS):
+            self._record_issue("stack_overflow", pc=self._get_pc(instr, -1), opcode=name)
 
         # -- No-ops --
         if name == "JUMPDEST":
@@ -1166,22 +1254,27 @@ class BytecodeAnalyzer:
 
         # -- Binary ops --
         if name in _BINARY_OPS:
-            right = _stack_pop(stack)
-            left = _stack_pop(stack)
+            first = _stack_pop(stack)
+            second = _stack_pop(stack)
+            # EVM arithmetic consumes top-first; shifts use top as shift count.
+            left, right = ((second, first) if name in ("SHL", "SHR", "SAR")
+                           else (first, second))
             tmp = self._generate_temp_var()
             stack.append(tmp)
             return TACInstruction(
                 TACOperationType.BINARY_OP, result=tmp,
                 operand1=left, operand2=right, operator=_BINARY_OPS[name],
-                metadata={"original_op": name},
+                metadata={"original_op": name, "word_bits": 256,
+                          "signed": name in ("SDIV", "SMOD", "SLT", "SGT", "SAR"),
+                          "zero_divisor_result": 0 if name in ("DIV", "SDIV", "MOD", "SMOD") else None},
             )
 
         # -- Ternary: ADDMOD / MULMOD --
         if name in ("ADDMOD", "MULMOD"):
             sym = "addmod" if name == "ADDMOD" else "mulmod"
-            modulus = _stack_pop(stack)
-            right = _stack_pop(stack)
             left = _stack_pop(stack)
+            right = _stack_pop(stack)
+            modulus = _stack_pop(stack)
             tmp = self._generate_temp_var()
             stack.append(tmp)
             return TACInstruction(
@@ -1564,6 +1657,20 @@ class BytecodeAnalyzer:
 
     # -- small helpers used by the converter --
 
+    @staticmethod
+    def _required_stack_depth(name: str) -> int:
+        if name.startswith("DUP"):
+            return int(name[3:])
+        if name.startswith("SWAP"):
+            return int(name[4:]) + 1
+        if name in _BINARY_OPS:
+            return 2
+        if name in ("ADDMOD", "MULMOD"):
+            return 3
+        if name in ("ISZERO", "NOT"):
+            return 1
+        return _EVM_STACK_EFFECTS.get(name, (0, 0))[0]
+
     def _tac_unary(self, stack: List[str], operator: str, name: str) -> TACInstruction:
         """Emit a unary-op TAC instruction (1-pop, 1-push)."""
         arg = _stack_pop(stack)
@@ -1576,6 +1683,7 @@ class BytecodeAnalyzer:
 
     def _tac_fallback(self, name: str, instr: Any, stack: List[str]) -> TACInstruction:
         """Emit a best-effort ASSIGN for an unhandled opcode."""
+        self._record_issue("unsupported_opcode", opcode=name, pc=self._get_pc(instr, -1))
         effects = _EVM_STACK_EFFECTS.get(name)
         if effects is not None:
             pops, pushes = effects
@@ -1641,18 +1749,23 @@ class BytecodeAnalyzer:
                     self.stack[-1], self.stack[-1 - d] = self.stack[-1 - d], self.stack[-1]
 
             elif name in ("ADDMOD", "MULMOD"):
-                for _ in range(min(3, len(self.stack))):
-                    self.stack.pop()
-                self.stack.append(None)
+                args = [self.stack.pop() if self.stack else None for _ in range(3)]
+                if all(value is not None for value in args):
+                    a, b, modulus = args
+                    self.stack.append(((a + b if name == "ADDMOD" else a * b) % modulus) if modulus else 0)
+                else:
+                    self.stack.append(None)
 
             elif name in ("ISZERO", "NOT"):
-                if self.stack:
-                    self.stack[-1] = None
+                value = self.stack.pop() if self.stack else None
+                self.stack.append(None if value is None else
+                                  int(value == 0) if name == "ISZERO" else value ^ ((1 << 256) - 1))
 
             elif name in _BINARY_OPS:
-                if len(self.stack) >= 2:
-                    self.stack.pop()
-                    self.stack[-1] = None
+                first = self.stack.pop() if self.stack else None
+                second = self.stack.pop() if self.stack else None
+                self.stack.append(_evm_binary(name, first, second)
+                                  if first is not None and second is not None else None)
 
             else:
                 effects = _EVM_STACK_EFFECTS.get(name)
@@ -1706,6 +1819,8 @@ class BytecodeAnalyzer:
 
         lines: List[str] = []
         lines.append(f"function {func.name}:")
+        lines.append(f"  // TAC schema: {TAC_SCHEMA_VERSION}; 256-bit EVM words; zero division yields 0")
+        lines.append(f"  // Analysis status: {self.analysis_status['status']}")
         if func.selector:
             lines.append(f"  // Function selector: {func.selector}")
         lines.append(f"  // Entry block: {func.entry_block}")
@@ -1724,6 +1839,8 @@ class BytecodeAnalyzer:
 
         def _walk(bid: str) -> None:
             if bid in reachable_ids or bid not in self.basic_blocks:
+                return
+            if self.basic_blocks[bid].metadata.get("is_dead_code"):
                 return
             reachable_ids.add(bid)
             for s in self.basic_blocks[bid].successors:
@@ -1778,35 +1895,93 @@ class BytecodeAnalyzer:
             return self._format_integrated_tac_output()
         except Exception as e:
             logger.error("TAC generation failed: %s", e)
+            self._record_issue("fallback", phase="tac", message=str(e))
             return self._generate_fallback_tac()
 
     def _convert_and_integrate_tac(self) -> None:
-        """Convert raw instructions in each block to TAC and attach metadata."""
+        """Solve symbolic stacks to a fixed point, including loop backedges."""
         entry_heights = self._compute_block_entry_stack_heights()
         exit_stacks: Dict[str, List[str]] = {}
         actual_entries = set(self._entry_blocks(self.basic_blocks))
-
-        for bid, block in sorted(self.basic_blocks.items(), key=lambda item: item[1].start_address):
+        ordered = sorted(entry_heights, key=lambda bid: self.basic_blocks[bid].start_address)
+        for bid, block in self.basic_blocks.items():
+            block.metadata["is_reachable"] = bid in entry_heights
+            block.metadata["is_dead_code"] = bid not in entry_heights
+            if bid not in entry_heights:
+                block.instructions = []
+                block.metadata["entry_stack"] = []
+                block.metadata["exit_stack"] = []
+                self._add_control_flow_metadata_to_block(block)
+        bases: Dict[str, int] = {}
+        next_counter = 0
+        for bid in ordered:
+            bases[bid] = next_counter
+            next_counter += len(self.basic_blocks[bid].metadata.get("raw_instructions", []))
+        worklist = list(ordered)
+        iterations = 0
+        while worklist and iterations < max(1, len(ordered) * 128):
+            iterations += 1
+            bid = worklist.pop(0)
+            block = self.basic_blocks[bid]
+            # Stable SSA identities are essential for convergence around loops.
+            self.variable_counter = bases[bid]
             tac_list: List[TACInstruction] = []
             stack = self._entry_stack_for_block(bid, block, exit_stacks, entry_heights, actual_entries)
-
+            block.metadata["entry_stack"] = list(stack)
             for instr in block.metadata.get("raw_instructions", []):
                 result = self._convert_instruction_to_tac(instr, stack)
                 if result:
-                    if isinstance(result, list):
-                        tac_list.extend(result)
-                    else:
-                        tac_list.append(result)
+                    tac_list.extend(result if isinstance(result, list) else [result])
+            block.instructions = tac_list
+            if exit_stacks.get(bid) != stack:
+                for succ in block.successors:
+                    if succ in self.basic_blocks and succ not in worklist:
+                        worklist.append(succ)
+            exit_stacks[bid] = list(stack)
+        if worklist:
+            self._record_issue("dataflow_nonconvergence", phase="values")
+        self.variable_counter = next_counter
 
-            for t in tac_list:
-                if not t.metadata:
+        for bid in ordered:
+            block = self.basic_blocks[bid]
+            phis = []
+            entry = block.metadata["entry_stack"]
+            for index, value in enumerate(entry):
+                if value != f"phi_{bid}_{index}":
+                    continue
+                incoming = {
+                    pred: exit_stacks[pred][len(exit_stacks[pred]) - len(entry) + index]
+                    if pred in exit_stacks and len(exit_stacks[pred]) >= len(entry)
+                    else f"unresolved_{pred}_{index}"
+                    for pred in sorted(block.predecessors) if pred in entry_heights
+                }
+                if bid in actual_entries:
+                    incoming["entry"] = f"unresolved_entry_{index}"
+                if not incoming or any(v.startswith("unresolved_") for v in incoming.values()):
+                    self._record_issue("unresolved_edge", block_id=bid, slot=index)
+                phis.append(TACInstruction(
+                    TACOperationType.PHI, result=value,
+                    metadata={"incoming": incoming, "stack_slot": index},
+                ))
+            block.instructions = phis + block.instructions
+            block.metadata["exit_stack"] = exit_stacks.get(bid, [])
+            for t in block.instructions:
+                if t.metadata is None:
                     t.metadata = {}
                 t.metadata.update(block_id=bid, block_start=block.start_address, block_end=block.end_address)
-
-            block.instructions = tac_list
+            raw = block.metadata.get("raw_instructions", [])
+            if raw and self._get_instruction_name(raw[-1]) in ("JUMP", "JUMPI"):
+                targets = self._get_jump_targets_from_block(raw)
+                valid = {b.start_address for b in self.basic_blocks.values()
+                         if b.metadata.get("raw_instructions") and
+                         self._get_instruction_name(b.metadata["raw_instructions"][0]) == "JUMPDEST"}
+                if not targets or not targets.issubset(valid):
+                    self._record_issue("unresolved_jump", block_id=bid,
+                                       pc=self._get_pc(raw[-1], block.end_address))
             self._add_control_flow_metadata_to_block(block)
             block.metadata["is_entry_block"] = bid in actual_entries
-            exit_stacks[bid] = list(stack)
+        for block in self.basic_blocks.values():
+            block.metadata["analysis_status"] = self.get_analysis_status()
 
     def _compute_block_entry_stack_heights(self) -> Dict[str, int]:
         """Compute conservative incoming stack heights for each reachable block."""
@@ -1829,15 +2004,51 @@ class BytecodeAnalyzer:
             )
             for succ in block.successors:
                 if succ not in self.basic_blocks:
+                    self._record_issue("unresolved_edge", block_id=bid, successor=succ)
                     continue
-                merged = max(heights.get(succ, 0), exit_height)
-                if succ not in heights or merged != heights[succ]:
-                    heights[succ] = min(merged, 1024)
+                terminal_depth = self._terminal_stack_suffix_depth(self.basic_blocks[succ])
+                # A halting block may discard arbitrary untouched stack prefixes.
+                incoming_height = (min(exit_height, terminal_depth)
+                                   if terminal_depth is not None else exit_height)
+                if succ in heights and heights[succ] != incoming_height:
+                    self._record_issue("inconsistent_stack_height", block_id=succ,
+                                       predecessor=bid, expected=heights[succ], actual=incoming_height)
+                if succ not in heights:
+                    heights[succ] = min(incoming_height, 1024)
                     if succ not in worklist:
                         worklist.append(succ)
                         worklist.sort(key=lambda item: self.basic_blocks[item].start_address)
 
+        if worklist:
+            self._record_issue("dataflow_nonconvergence", phase="heights")
         return heights
+
+    def _terminal_stack_suffix_depth(self, block: BasicBlock) -> Optional[int]:
+        """Depth of the incoming suffix consumed before a guaranteed local halt."""
+        raw = block.metadata.get("raw_instructions", [])
+        if (block.successors or not raw or self._get_instruction_name(raw[-1])
+                not in ("RETURN", "REVERT", "STOP", "SELFDESTRUCT", "INVALID")):
+            return None
+        required, delta = 0, 0
+        for instr in raw:
+            name = self._get_instruction_name(instr)
+            required = max(required, self._required_stack_depth(name) - delta)
+            if name.startswith(("PUSH", "DUP")):
+                delta += 1
+            elif name.startswith("SWAP") or name == "JUMPDEST":
+                continue
+            elif name in _BINARY_OPS:
+                delta -= 1
+            elif name in ("ADDMOD", "MULMOD"):
+                delta -= 2
+            elif name in ("ISZERO", "NOT"):
+                continue
+            elif name in _EVM_STACK_EFFECTS:
+                pops, pushes = _EVM_STACK_EFFECTS[name]
+                delta += pushes - pops
+            else:
+                return None
+        return required
 
     def _simulate_block_stack_height(self, raw_instructions: List[Any], entry_height: int) -> int:
         """Apply EVM stack effects to a height without creating TAC temps."""
@@ -1934,31 +2145,27 @@ class BytecodeAnalyzer:
         actual_entries: set,
     ) -> List[str]:
         """Merge predecessor exit stacks into a deterministic block entry stack."""
-        if bid in actual_entries:
+        if bid in actual_entries and entry_heights.get(bid, 0) == 0:
             return []
 
         available_predecessors = [
             (pred, exit_stacks[pred])
             for pred in block.predecessors
-            if pred in exit_stacks
+            if pred in exit_stacks and pred in entry_heights
         ]
+        reachable_predecessors = [pred for pred in block.predecessors if pred in entry_heights]
         predecessor_stacks = [stack for _, stack in available_predecessors]
         expected_height = entry_heights.get(bid, 0)
 
         if not predecessor_stacks:
             return [f"phi_{bid}_{i}" for i in range(expected_height)]
 
-        height = max([expected_height] + [len(s) for s in predecessor_stacks])
+        height = expected_height
         merged: List[str] = []
         for i in range(height):
-            values = [
-                s[i] if i < len(s) else f"missing_{pred}_{i}"
-                for pred, s in available_predecessors
-            ]
-            if values and all(v == values[0] for v in values) and len(predecessor_stacks) == len(block.predecessors):
-                merged.append(values[0])
-            elif len(predecessor_stacks) == 1 and i < len(predecessor_stacks[0]) and len(block.predecessors) == 1:
-                merged.append(predecessor_stacks[0][i])
+            if (bid not in actual_entries and len(predecessor_stacks) == 1
+                    and height <= len(predecessor_stacks[0]) and len(reachable_predecessors) == 1):
+                merged.append(predecessor_stacks[0][len(predecessor_stacks[0]) - height + i])
             else:
                 merged.append(f"phi_{bid}_{i}")
         return merged
@@ -1993,6 +2200,8 @@ class BytecodeAnalyzer:
         lines: List[str] = [
             "// Three-Address Code Representation with Control Flow Analysis",
             "// Generated from comprehensive EVM bytecode analysis",
+            f"// TAC schema: {TAC_SCHEMA_VERSION}; words are modulo 2^256; division by zero yields 0",
+            f"// Analysis status: {self.analysis_status['status']}",
             "",
             "// Analysis Summary:",
             f"//   Total instructions: {len(self.instructions)}",
@@ -2056,6 +2265,7 @@ class BytecodeAnalyzer:
 
     def _generate_fallback_tac(self) -> str:
         logger.warning("Using fallback TAC generation")
+        self._record_issue("fallback", phase="tac")
         lines: List[str] = [
             "// Three-Address Code Representation (Fallback Mode)",
             "// Basic analysis due to errors in comprehensive mode",
@@ -2072,6 +2282,7 @@ class BytecodeAnalyzer:
                         lines.append(f"  {self._format_tac_instruction(t)}")
         except Exception as e:
             logger.error("Fallback TAC generation also failed: %s", e)
+            self._record_issue("fallback_failed", failed=True, message=str(e))
             lines.append("// Error: Unable to generate TAC representation")
             lines.append(f"// {e}")
         return "\n".join(lines)
@@ -2086,10 +2297,16 @@ class BytecodeAnalyzer:
         op = instr.operation
         meta = instr.metadata or {}
 
+        if op == TACOperationType.PHI:
+            incoming = ", ".join(f"{pred}: {value}" for pred, value in meta.get("incoming", {}).items())
+            return f"{instr.result} = phi({incoming})"
+
         if op == TACOperationType.ASSIGN:
             return f"{instr.result} = {instr.operand1 or '<unknown>'}"
 
         if op == TACOperationType.BINARY_OP:
+            if instr.operator in ("byte", "signextend", "sar"):
+                return f"{instr.result} = {instr.operator}({instr.operand1}, {instr.operand2})"
             if instr.operand2:
                 return f"{instr.result} = {instr.operand1} {instr.operator} {instr.operand2}"
             return f"{instr.result} = {instr.operand1}"
@@ -2107,7 +2324,14 @@ class BytecodeAnalyzer:
 
         if op == TACOperationType.CALL:
             op_name = meta.get("original_op", "call").lower()
-            return f"{instr.result} = {op_name}({instr.operand1})"
+            if op_name in ("create", "create2"):
+                return f"{instr.result} = {instr.operand1}"
+            args = [f"gas={meta.get('gas', '<unknown>')}", f"address={instr.operand1}"]
+            if op_name in ("call", "callcode"):
+                args.append(f"value={instr.operand2}")
+            args.extend(f"{key}={meta.get(key, '<unknown>')}"
+                        for key in ("args_offset", "args_length", "ret_offset", "ret_length"))
+            return f"{instr.result} = {op_name}({', '.join(args)})"
 
         if op == TACOperationType.JUMP:
             return f"goto {instr.target}"

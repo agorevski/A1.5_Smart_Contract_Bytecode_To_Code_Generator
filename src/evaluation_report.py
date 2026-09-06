@@ -376,7 +376,9 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
     bytecode_score = metric("bytecode_semantic_score_mean")
     bytecode_deployable = metric("bytecode_deployable_mean")
     runtime_checked = metric("bytecode_runtime_checked_mean")
-    runtime_match = metric("bytecode_runtime_match_mean")
+    runtime_match = metric("bytecode_runtime_match_checked_mean")
+    if runtime_match is None and runtime_checked and metric("bytecode_runtime_match_mean") is not None:
+        runtime_match = min(1.0, metric("bytecode_runtime_match_mean") / runtime_checked)
     if bytecode_checked is not None and bytecode_checked < 0.95:
         issues.append(
             _diagnostic_issue(
@@ -409,7 +411,7 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                 issue_id="bytecode_semantic_gap",
                 category="model_behavior",
                 severity="high" if bytecode_score < 0.60 else "medium",
-                title="Bytecode-grounded behavior does not match reference behavior often enough.",
+                title="Structural bytecode proxy facts do not match the reference often enough (not execution equivalence).",
                 evidence=[
                     _target_evidence("bytecode_semantic_score_mean", bytecode_score, ">=", 0.80)
                 ],
@@ -467,7 +469,7 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                 title="Generated runtime bytecode does not match the reference runtime when checked.",
                 evidence=[
                     _target_evidence(
-                        "bytecode_runtime_match_mean", runtime_match, ">=", 0.95, percent=True
+                        "bytecode_runtime_match_checked_mean", runtime_match, ">=", 0.95, percent=True
                     ),
                     _diagnostic_metric_text(
                         "bytecode_runtime_checked_mean", runtime_checked, percent=True
@@ -482,7 +484,7 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                         "runtime-diff-triage",
                         "Compare normalized runtime diffs for the lowest bytecode_semantic_score samples.",
                         "model/evaluation",
-                        "bytecode_runtime_match_mean improves on checked rows",
+                        "bytecode_runtime_match_checked_mean improves on checked rows",
                     )
                 ],
             )
@@ -687,6 +689,7 @@ def format_latest_results_report(
             "",
             "Quality Summary",
             "---------------",
+            f"Evaluator version: {summary.get('evaluator_version', 'historical/unversioned; recompute before gating')}",
             f"Examples evaluated: {_metric(summary, 'num_evaluated', integer=True)}",
             f"Examples attempted: {_metric(summary, 'num_attempted', integer=True)}",
             f"Examples succeeded: {_metric(summary, 'num_succeeded', integer=True)}",
@@ -736,11 +739,11 @@ def format_latest_results_report(
     ):
         lines.extend(
             [
-                f"Bytecode semantic score mean: {_metric(summary, 'bytecode_semantic_score_mean')}",
-                f"Bytecode semantic checked outputs: {_percent_metric(summary, 'bytecode_semantic_checked_mean')}",
+                f"Bytecode structural proxy mean (not execution equivalence): {_metric(summary, 'bytecode_semantic_score_mean')}",
+                f"Bytecode evidence coverage: {_percent_metric(summary, 'bytecode_semantic_checked_mean')}",
                 f"Bytecode deployable outputs: {_percent_metric(summary, 'bytecode_deployable_mean')}",
                 f"Runtime bytecode checked outputs: {_percent_metric(summary, 'bytecode_runtime_checked_mean')}",
-                f"Runtime bytecode matches: {_percent_metric(summary, 'bytecode_runtime_match_mean')}",
+                f"Runtime bytecode matches among checked outputs: {_runtime_checked_match(summary)}",
             ]
         )
 
@@ -1142,6 +1145,17 @@ def _percent_metric(summary: Mapping[str, Any], key: str) -> str:
     return f"{float(value) * 100:.2f}%"
 
 
+def _runtime_checked_match(summary: Mapping[str, Any]) -> str:
+    conditional = summary.get("bytecode_runtime_match_checked_mean")
+    if isinstance(conditional, (int, float)):
+        return _percent_metric({"value": conditional}, "value")
+    checked = summary.get("bytecode_runtime_checked_mean")
+    matched = summary.get("bytecode_runtime_match_mean")
+    if isinstance(checked, (int, float)) and checked > 0 and isinstance(matched, (int, float)):
+        return _percent_metric({"value": min(1.0, matched / checked)}, "value")
+    return "n/a"
+
+
 def _format_number(value: Any) -> str:
     if not isinstance(value, (int, float)) or math.isnan(float(value)):
         return "n/a"
@@ -1462,7 +1476,7 @@ def _add_missing_metric_caveats(summary: Mapping[str, Any], caveats: list[str]) 
         ),
         (
             ("bytecode_semantic_checked_mean",),
-            "Bytecode-grounded metrics are missing; semantic conclusions rely mainly on text similarity.",
+            "Bytecode structural proxy metrics are missing; these metrics are not execution-equivalence evidence.",
         ),
     ]
     for keys, caveat in checks:
@@ -1782,7 +1796,7 @@ def _append_benchmark_suite_report(
         return
     lines.extend(["", "Benchmark Suites", "----------------"])
     lines.append(
-        "suite | count | semantic | edit distance | replication F1 | bytecode semantic | Solidity valid"
+        "suite | count | semantic | edit distance | replication F1 | bytecode structural proxy | Solidity valid"
     )
     lines.append("--- | ---: | ---: | ---: | ---: | ---: | ---:")
     for suite, suite_summary in sorted(benchmark_suites.items()):

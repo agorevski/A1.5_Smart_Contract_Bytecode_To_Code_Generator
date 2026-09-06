@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
@@ -148,6 +149,8 @@ class ReplicationEvaluation:
 def extract_solidity_facts(solidity_code: str) -> FactMap:
     """Extract comparable semantic facts from a Solidity function or contract."""
     facts: FactMap = {}
+    if not solidity_code or not solidity_code.strip():
+        return facts
     code = _strip_comments(solidity_code or "")
     masked_code = _mask_string_literals(code)
 
@@ -161,12 +164,12 @@ def extract_solidity_facts(solidity_code: str) -> FactMap:
     }
 
     _add_signature_facts(facts, signature)
-    _add_event_facts(facts, masked_code)
-    _add_call_facts(facts, body, signature.get("function_name"))
+    _add_event_facts(facts, masked_code, aliases)
+    _add_call_facts(facts, body, signature.get("function_name"), aliases)
     _add_guard_facts(facts, body, aliases)
     _add_state_write_facts(facts, body, non_state_names, aliases)
     _add_return_facts(facts, body, aliases)
-    _add_control_flow_facts(facts, body)
+    _add_control_flow_facts(facts, body, aliases)
 
     return facts
 
@@ -252,10 +255,23 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
     hallucination_counts: Dict[str, int] = {}
     candidate_fact_total = 0
     groundedness_scores: List[float] = []
+    evaluator_errors = 0
+    generation_errors = 0
+    unclassified_errors = 0
+    missing_payloads = 0
 
     for row in metric_rows:
         replication = _replication_payload(row)
+        error_metadata = row.get("metadata") or {}
+        if error_metadata.get("error"):
+            if error_metadata.get("error_kind") == "evaluator":
+                evaluator_errors += 1
+            elif error_metadata.get("error_kind") == "generation":
+                generation_errors += 1
+            else:
+                unclassified_errors += 1
         if not replication:
+            missing_payloads += 1
             continue
 
         overall = replication.get("overall", {})
@@ -279,7 +295,16 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
                     values
                 )
 
-    if overall_counts["tp"] or overall_counts["fp"] or overall_counts["fn"]:
+    summary["evaluator_error_count"] = evaluator_errors
+    summary["generation_error_count"] = generation_errors
+    summary["unclassified_error_count"] = unclassified_errors
+    summary["missing_replication_payload_count"] = missing_payloads
+    summary["replication_payload_coverage"] = (len(metric_rows) - missing_payloads) / len(metric_rows)
+    if missing_payloads:
+        # A reference is unavailable at this layer; a micro score that silently
+        # drops these failures would be misleading. Fail closed instead.
+        summary["micro_incomplete"] = True
+    if not missing_payloads:
         summary["micro"] = PrecisionRecallF1.from_counts(
             overall_counts["tp"],
             overall_counts["fp"],
@@ -431,12 +456,19 @@ def _add_fact(facts: FactMap, category: str, value: str):
 
 
 def _strip_comments(code: str) -> str:
-    code = re.sub(r"//.*", "", code)
-    return re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+    return re.sub(
+        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|//[^\n]*|/\*.*?\*/',
+        lambda match: match.group(1) or "",
+        code, flags=re.DOTALL,
+    )
 
 
 def _mask_string_literals(code: str) -> str:
-    return re.sub(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', '""', code)
+    return re.sub(
+        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')',
+        lambda match: "literal_" + hashlib.sha256(match.group().encode()).hexdigest()[:16],
+        code,
+    )
 
 
 def _extract_function_signature(code: str) -> Dict[str, Any]:
@@ -622,12 +654,18 @@ def _extract_local_variable_names(body: str) -> Set[str]:
     return names
 
 
-def _add_event_facts(facts: FactMap, body: str):
-    for event_name in re.findall(r"\bemit\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+def _add_event_facts(facts: FactMap, body: str, aliases: Mapping[str, str]):
+    for match in re.finditer(r"\bemit\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+        event_name = match.group(1)
         _add_fact(facts, "event", _normalize_identifier(event_name))
+        start = body.find("(", match.start())
+        end = _find_matching_paren(body, start)
+        if end is not None:
+            args = body[start + 1:end]
+            _add_fact(facts, "event", f"{_normalize_identifier(event_name)}({_normalize_expression(args, aliases)})")
 
 
-def _add_call_facts(facts: FactMap, body: str, function_name: Optional[str]):
+def _add_call_facts(facts: FactMap, body: str, function_name: Optional[str], aliases: Mapping[str, str]):
     for method in re.findall(r"\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
         _add_fact(facts, "member_call", _normalize_identifier(method))
 
@@ -643,6 +681,47 @@ def _add_call_facts(facts: FactMap, body: str, function_name: Optional[str]):
         if function_name and normalized == _normalize_identifier(function_name):
             continue
         _add_fact(facts, "call", normalized)
+        open_paren = body.find("(", match.start())
+        close_paren = _find_matching_paren(body, open_paren)
+        if close_paren is not None:
+            args = _normalize_expression(body[open_paren + 1:close_paren], aliases)
+            receiver = _call_receiver(body, match.start())
+            target = f"{_normalize_expression(receiver, aliases)}." if receiver else ""
+            _add_fact(facts, "call", f"{target}{normalized}({args})")
+    for match in re.finditer(r"\b(\w+)\s*\{([^{}]*)\}\s*\(", body):
+        method, options = match.group(1), match.group(2)
+        receiver = _call_receiver(body, match.start())
+        if not receiver:
+            continue
+        start = body.find("(", match.end() - 1)
+        end = _find_matching_paren(body, start)
+        if end is not None:
+            target = _normalize_expression(receiver, aliases)
+            args = _normalize_expression(body[start + 1:end], aliases)
+            _add_fact(facts, "member_call", _normalize_identifier(method))
+            _add_fact(facts, "call", _normalize_identifier(method))
+            _add_fact(facts, "call", f"{target}.{_normalize_identifier(method)}{{{_normalize_expression(options, aliases)}}}({args})")
+
+
+def _call_receiver(body: str, method_start: int) -> str:
+    prefix = body[:method_start].rstrip()
+    if not prefix.endswith("."):
+        return ""
+    prefix = prefix[:-1].rstrip()
+    depth = 0
+    start = len(prefix)
+    for index in range(len(prefix) - 1, -1, -1):
+        char = prefix[index]
+        if char in ")]":
+            depth += 1
+        elif char in "([":
+            if not depth:
+                break
+            depth -= 1
+        elif depth == 0 and not (char.isalnum() or char in "_."):
+            break
+        start = index
+    return prefix[start:]
 
 
 def _is_event_emit_invocation(body: str, call_start: int) -> bool:
@@ -699,7 +778,7 @@ def _add_state_write_facts(
     assignment_re = re.compile(
         r"\b([A-Za-z_][A-Za-z0-9_]*"
         r"(?:(?:\s*\[[^;\n=]+\])|\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*"
-        r"(\+\+|--|\+=|-=|\*=|/=|%=|=(?!=))"
+        r"(\+\+|--|<<=|>>=|&=|\|=|\^=|\+=|-=|\*=|/=|%=|=(?!=))"
     )
     for match in assignment_re.finditer(body):
         lhs = match.group(1)
@@ -710,7 +789,29 @@ def _add_state_write_facts(
         normalized_root = _normalize_identifier(root_name)
         if root_name in non_state_names or normalized_root in _RESERVED_IDENTIFIERS:
             continue
-        _add_fact(facts, "state_write", _normalize_state_reference(lhs, aliases))
+        target = _normalize_state_reference(lhs, aliases)
+        _add_fact(facts, "state_write", target)
+        operator = match.group(2)
+        if operator in ("++", "--"):
+            value = f"{target}{operator[0]}1"
+        else:
+            rhs = re.split(r"[;{}]", body[match.end():], maxsplit=1)[0]
+            value = _normalize_expression(rhs, aliases)
+            if operator != "=":
+                value = f"{target}{operator[:-1]}{value}"
+        _add_fact(facts, "state_write", f"{target}={value}")
+    for match in re.finditer(r"(?<![+\-])(\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*(?:\[[^\];]+\]|\.\w+)*)", body):
+        lhs = match.group(2)
+        if re.match(r"\w+", lhs).group() not in non_state_names:
+            target = _normalize_state_reference(lhs, aliases)
+            _add_fact(facts, "state_write", target)
+            _add_fact(facts, "state_write", f"{target}={target}{match.group(1)[0]}1")
+    for match in re.finditer(r"\bdelete\s+([A-Za-z_][A-Za-z0-9_]*(?:\[[^\];]+\]|\.\w+)*)", body):
+        lhs = match.group(1)
+        if re.match(r"\w+", lhs).group() not in non_state_names:
+            target = _normalize_state_reference(lhs, aliases)
+            _add_fact(facts, "state_write", target)
+            _add_fact(facts, "state_write", f"delete:{target}")
 
 
 def _add_return_facts(facts: FactMap, body: str, aliases: Mapping[str, str]):
@@ -720,11 +821,13 @@ def _add_return_facts(facts: FactMap, body: str, aliases: Mapping[str, str]):
             _add_fact(facts, "return", _normalize_expression(expression, aliases))
 
 
-def _add_control_flow_facts(facts: FactMap, body: str):
+def _add_control_flow_facts(facts: FactMap, body: str, aliases: Mapping[str, str]):
     for keyword in _CONTROL_KEYWORDS:
         count = len(re.findall(rf"\b{keyword}\s*\(", body))
         if count:
             _add_fact(facts, "control_flow", f"{keyword}_count:{count}")
+        for condition in _extract_call_arguments(body, keyword):
+            _add_fact(facts, "control_flow", f"{keyword}_condition:{_normalize_expression(condition, aliases)}")
 
 
 def _normalize_identifier(identifier: str) -> str:

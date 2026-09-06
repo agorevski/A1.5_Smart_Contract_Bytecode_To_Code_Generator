@@ -11,40 +11,40 @@ This script provides a single command to:
 
 Usage:
     # Full pipeline
-    python train.py
+    uv run --extra training train.py
 
     # Quick test (fewer contracts, 1 epoch)
-    python train.py --small
+    uv run --extra training train.py --small
 
     # Skip data collection, use existing dataset
-    python train.py --skip-collection --dataset data/train_dataset.jsonl
+    uv run --extra training train.py --skip-collection --dataset data/train_dataset.jsonl
 
     # Only build dataset, no training
-    python train.py --dataset-only
+    uv run --extra training train.py --dataset-only
 
     # Use a specific contract addresses file
-    python train.py --addresses data/contract_addresses.txt
+    uv run --extra training train.py --addresses data/contract_addresses.txt
 
     # Evaluate a previously trained model (auto-detects data/test_dataset.jsonl)
-    python train.py --eval-only --model-path models/smart_contract_decompiler
+    uv run --extra evaluation train.py --eval-only --model-path models/smart_contract_decompiler
 
     # Evaluate with a specific test dataset
-    python train.py --eval-only --model-path models/smart_contract_decompiler --test-dataset data/test_dataset.jsonl --eval-batch-size 4
+    uv run --extra evaluation train.py --eval-only --model-path models/smart_contract_decompiler --test-dataset data/test_dataset.jsonl --eval-batch-size 4 --eval-output results/heldout.json
 
     # Evaluate after re-splitting a source dataset
-    python train.py --eval-only --model-path models/smart_contract_decompiler --dataset data/my_dataset.jsonl
+    uv run --extra evaluation train.py --eval-only --model-path models/smart_contract_decompiler --dataset data/my_dataset.jsonl
 
     # Train with safe bytecode/TAC-derived prompt metadata (default)
-    python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --max-steps 300
+    uv run --extra training train.py --skip-collection --dataset data/hf_training_dataset.jsonl --max-steps 300
 
     # Resume the latest checkpoint under --output-dir and persist a manifest
-    python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --resume auto
+    uv run --extra training train.py --skip-collection --dataset data/hf_training_dataset.jsonl --resume auto
 
     # Multi-GPU evaluation with torchrun (shards test data across GPUs)
-    torchrun --nproc_per_node=4 train.py --eval-only --model-path models/smart_contract_decompiler
+    uv run --extra evaluation torchrun --nproc_per_node=4 train.py --eval-only --model-path models/smart_contract_decompiler
 
     # Override the default 4-GPU LoRA/Qwen recipe
-    python train.py --config training_config.yaml --num-gpus 1 --quantization
+    uv run --extra quantization train.py --config training_config.yaml --num-gpus 1 --quantization
 """
 
 import argparse
@@ -89,7 +89,7 @@ SPLIT_ARTIFACT_FILENAMES = {
     "test_dataset.jsonl",
 }
 SPLIT_CACHE_SCHEMA_VERSION = 2
-PREFLIGHT_CACHE_SCHEMA_VERSION = 2
+PREFLIGHT_CACHE_SCHEMA_VERSION = 3
 DEFAULT_MIN_SPLIT_TARGET_RATIO = 0.5
 DEFAULT_MAX_COMPONENT_TARGET_RATIO = 1.0
 DEFAULT_QUALITY_THRESHOLDS = {
@@ -1464,6 +1464,7 @@ def _preflight_prompt_parts(
     include_bytecode_metadata: bool,
     include_selector_signature_metadata: bool,
     template_format: str,
+    selector_context: dict | None = None,
 ) -> tuple[str, str, str]:
     from src.model_setup import SmartContractDataset
 
@@ -1471,12 +1472,37 @@ def _preflight_prompt_parts(
     dataset.template_format = template_format
     dataset.include_bytecode_metadata = include_bytecode_metadata
     dataset.include_selector_signature_metadata = include_selector_signature_metadata
+    dataset.selector_context = selector_context
     dataset.include_compiler_metadata = False
     return dataset._format_prompt_parts(
         item.get("input", ""),
         item.get("output", ""),
         item.get("metadata", {}) or {},
     )
+
+
+def _saved_prompt_config(model_path: str | Path | None) -> dict:
+    """Read the prompt contract from a final model or its checkpoint run manifest."""
+    if not model_path:
+        return {}
+    model = Path(model_path)
+    config_path = model / "model_config.json"
+    if config_path.exists():
+        return _load_json(config_path)
+    for path in (model / "training_input_manifest.json", model.parent / "training_input_manifest.json"):
+        if path.exists():
+            return _load_json(path).get("model_config", {})
+    return {}
+
+
+def _freeze_prompt_context(
+    *, enabled: bool, model_path: str | Path | None = None,
+) -> dict | None:
+    if not enabled:
+        return None
+    from src.selector_resolver import snapshot_local_selector_context, validate_selector_context
+    context = _saved_prompt_config(model_path).get("selector_context")
+    return validate_selector_context(context) if context is not None else snapshot_local_selector_context()
 
 
 def validate_jsonl_schema_and_lengths(
@@ -1491,15 +1517,24 @@ def validate_jsonl_schema_and_lengths(
     fail_on_context_overlength: bool = True,
     allow_legacy_metadata_schema: bool = False,
     max_errors: int = 50,
+    selector_context: dict | None = None,
 ) -> dict:
     """Validate JSONL schema and token lengths before training/evaluation."""
     from src.model_setup import _tokenize_to_ids
+    from src.tac_schema import TAC_SCHEMA_VERSION
+    from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
     from src.dataset_pipeline import (
         TRAINING_ROW_SCHEMA_VERSION,
         validate_training_metadata_schema,
     )
 
     path = Path(dataset_path)
+    if include_bytecode_metadata and include_selector_signature_metadata:
+        from src.selector_resolver import snapshot_local_selector_context, validate_selector_context
+        selector_context = (
+            validate_selector_context(selector_context)
+            if selector_context is not None else snapshot_local_selector_context()
+        )
     tokenizer = tokenizer or _WhitespacePreflightTokenizer()
     report = {
         "path": str(path),
@@ -1513,6 +1548,8 @@ def validate_jsonl_schema_and_lengths(
             "schema_version": TRAINING_ROW_SCHEMA_VERSION,
             "allow_legacy": bool(allow_legacy_metadata_schema),
             "validator": "src.dataset_pipeline.validate_training_metadata_schema",
+            "tac_schema_version": TAC_SCHEMA_VERSION,
+            "label_schema_version": LABEL_SCHEMA_VERSION,
         },
         "error_counts": Counter(),
         "errors": [],
@@ -1611,7 +1648,39 @@ def validate_jsonl_schema_and_lengths(
                     max_errors,
                 )
 
+            if isinstance(metadata, dict) and (
+                not allow_legacy_metadata_schema or "tac_schema_version" in metadata
+            ) and metadata.get("tac_schema_version") != TAC_SCHEMA_VERSION:
+                row_has_error = True
+                _record_preflight_error(
+                    report, line_number, "stale_tac_schema",
+                    "Stale or missing TAC schema. Regenerate the dataset from bytecode with "
+                    "the current analyzer, then regenerate splits and tokenization/preflight caches.",
+                    max_errors,
+                )
+
             if isinstance(metadata, dict):
+                analysis_status = metadata.get("analysis_status")
+                if analysis_status is not None and (
+                    not isinstance(analysis_status, dict) or analysis_status.get("status") != "ok"
+                ):
+                    row_has_error = True
+                    _record_preflight_error(
+                        report, line_number, "non_ok_analysis",
+                        "Non-ok bytecode analysis. Resolve analyzer issues and regenerate the "
+                        "dataset instead of training on degraded TAC.",
+                        max_errors,
+                    )
+                if (
+                    not allow_legacy_metadata_schema or "label_schema_version" in metadata
+                ) and metadata.get("label_schema_version") != LABEL_SCHEMA_VERSION:
+                    row_has_error = True
+                    _record_preflight_error(
+                        report, line_number, "stale_label_schema",
+                        "Stale or missing label schema. Regenerate the dataset with current "
+                        "AST-aligned labels, then regenerate splits and caches.",
+                        max_errors,
+                    )
                 metadata_validation = validate_training_metadata_schema(
                     metadata,
                     allow_legacy=allow_legacy_metadata_schema,
@@ -1638,6 +1707,7 @@ def validate_jsonl_schema_and_lengths(
                     item,
                     include_bytecode_metadata=include_bytecode_metadata,
                     include_selector_signature_metadata=include_selector_signature_metadata,
+                    selector_context=selector_context,
                     template_format=template_format,
                 )
                 context_tokens = len(_tokenize_to_ids(tokenizer, prefix))
@@ -1771,11 +1841,22 @@ def run_data_preflight(
     cache_dir: str | Path | None = None,
     overwrite_cache: bool = False,
     allow_legacy_metadata_schema: bool = False,
+    selector_context: dict | None = None,
 ) -> dict:
     """Run schema and token-length preflight over one or more JSONL datasets."""
+    from src.tac_schema import TAC_SCHEMA_VERSION
+    from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
     if skip:
         return {"status": "skipped", "reason": "skip_data_preflight"}
 
+    if include_bytecode_metadata and include_selector_signature_metadata:
+        from src.selector_resolver import snapshot_local_selector_context, validate_selector_context
+        selector_context = (
+            validate_selector_context(selector_context)
+            if selector_context is not None else snapshot_local_selector_context()
+        )
+    else:
+        selector_context = None
     tokenizer, tokenizer_info = _load_preflight_tokenizer(
         tokenizer_source,
         allow_download=allow_tokenizer_download,
@@ -1798,6 +1879,8 @@ def run_data_preflight(
             path_obj = Path(path)
             cache_metadata = {
                 "schema_version": PREFLIGHT_CACHE_SCHEMA_VERSION,
+                "tac_schema_version": TAC_SCHEMA_VERSION,
+                "label_schema_version": LABEL_SCHEMA_VERSION,
                 "dataset_sha256": _sha256_file(path_obj),
                 "dataset_path": str(path_obj),
                 "tokenizer": tokenizer_info,
@@ -1807,6 +1890,7 @@ def run_data_preflight(
                     include_selector_signature_metadata
                 ),
                 "include_compiler_metadata": False,
+                "selector_context_digest": selector_context["digest"] if selector_context else None,
                 "template_format": "alpaca",
                 "allow_legacy_metadata_schema": bool(allow_legacy_metadata_schema),
             }
@@ -1830,6 +1914,7 @@ def run_data_preflight(
             include_bytecode_metadata=include_bytecode_metadata,
             include_selector_signature_metadata=include_selector_signature_metadata,
             allow_legacy_metadata_schema=allow_legacy_metadata_schema,
+            selector_context=selector_context,
         )
         if cache_dir and cache_metadata:
             report.setdefault("cache", {}).update(
@@ -1853,6 +1938,9 @@ def run_data_preflight(
         "failed_datasets": sorted(failed),
         "cache_dir": str(cache_dir) if cache_dir else None,
         "allow_legacy_metadata_schema": bool(allow_legacy_metadata_schema),
+        "selector_context_digest": selector_context["digest"] if selector_context else None,
+        "tac_schema_version": TAC_SCHEMA_VERSION,
+        "label_schema_version": LABEL_SCHEMA_VERSION,
     }
 
 
@@ -2870,6 +2958,7 @@ def train_model(
     gradient_checkpointing: bool = DEFAULT_GRADIENT_CHECKPOINTING,
     seed: int = DEFAULT_GLOBAL_SEED,
     report_to: str = "none",
+    selector_context: dict | None = None,
 ) -> str:
     """Fine-tune the model and return path to saved model."""
     # When launched WITHOUT torchrun/accelerate (no LOCAL_RANK set),
@@ -2917,6 +3006,7 @@ def train_model(
         gradient_checkpointing=gradient_checkpointing,
         include_bytecode_metadata=include_bytecode_metadata,
         include_selector_signature_metadata=include_selector_signature_metadata,
+        selector_context=selector_context,
         report_to=report_to,
     )
 
@@ -2970,6 +3060,39 @@ def train_model(
     return model_path
 
 
+def _evaluation_provenance(model_path: str, test_path: str, settings: dict, decompiler: Any) -> dict:
+    from src.tac_schema import TAC_SCHEMA_VERSION
+    from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
+
+    model = Path(model_path)
+    artifacts = {}
+    if model.is_dir():
+        for path in sorted(model.iterdir()):
+            if path.is_file() and (
+                path.suffix in {".safetensors", ".bin"}
+                or path.name in {
+                    "model_config.json", "adapter_config.json", "config.json",
+                    "tokenizer.json", "tokenizer_config.json", "training_input_manifest.json",
+                }
+            ):
+                artifacts[path.name] = _sha256_file(path)
+    config = getattr(decompiler, "config", None)
+    context = getattr(config, "selector_context", None)
+    return {
+        "schema_version": 1,
+        "dataset_path": str(Path(test_path).resolve()),
+        "dataset_sha256": _sha256_file(Path(test_path)),
+        "model_path": str(model.resolve()),
+        "model_artifacts": artifacts,
+        "model_identity_sha256": _stable_json_digest(artifacts) if artifacts else None,
+        "tac_schema_version": TAC_SCHEMA_VERSION,
+        "model_tac_schema_version": getattr(config, "tac_schema_version", None),
+        "label_schema_version": LABEL_SCHEMA_VERSION,
+        "selector_context_digest": context["digest"] if context else None,
+        "evaluation_settings": settings,
+    }
+
+
 def evaluate_model(
     model_path: str,
     test_path: str,
@@ -2985,6 +3108,9 @@ def evaluate_model(
     baseline_tolerance: float = 0.0,
     quality_gate_config: dict | None = None,
     include_selector_signature_metadata: bool | None = None,
+    output_path: str | Path | None = None,
+    include_bytecode_metadata: bool | None = None,
+    selector_context: dict | None = None,
 ) -> dict:
     """Evaluate the trained model on the test set.
 
@@ -2992,6 +3118,10 @@ def evaluate_model(
     the model onto its assigned GPU, evaluates a shard of the test data, and
     rank 0 gathers all results for aggregation and saving.
     """
+    if output_path is not None and Path(output_path).exists():
+        raise FileExistsError(
+            f"Evaluation output already exists: {output_path}. Choose a new --eval-output-json path."
+        )
     from src.training_pipeline import (
         SmartContractEvaluator,
         aggregate_prompt_diagnostics,
@@ -3091,6 +3221,9 @@ def evaluate_model(
 
     # Initialize model on this rank's GPU
     decompiler = SmartContractDecompiler(model_path)
+    decompiler_config = getattr(decompiler, "config", None)
+    if include_bytecode_metadata is not None and decompiler_config is not None:
+        decompiler_config.include_bytecode_metadata = bool(include_bytecode_metadata)
     if include_selector_signature_metadata is not None:
         decompiler_config = getattr(decompiler, "config", None)
         if decompiler_config is not None:
@@ -3101,6 +3234,12 @@ def evaluate_model(
             decompiler.include_selector_signature_metadata = bool(
                 include_selector_signature_metadata
             )
+    if decompiler_config is not None and getattr(decompiler_config, "include_bytecode_metadata", True) and _decompiler_selector_signature_metadata(decompiler):
+        from src.selector_resolver import validate_selector_context
+        decompiler_config.selector_context = (
+            validate_selector_context(selector_context) if selector_context is not None
+            else _freeze_prompt_context(enabled=True, model_path=model_path)
+        )
     evaluator = SmartContractEvaluator()
 
     results = []
@@ -3116,6 +3255,7 @@ def evaluate_model(
             torch.cuda.synchronize()
 
     generation_config = {
+        "do_sample": False,
         "max_new_tokens": int(eval_max_new_tokens),
         "eval_batch_size": eval_batch_size,
         "repetition_penalty": float(eval_repetition_penalty),
@@ -3180,21 +3320,22 @@ def evaluate_model(
             )
         return metadata
 
-    def _zero_metrics(error: Exception | None = None) -> dict:
-        metadata = {
-            "quality_issue": "evaluation_error",
-            "replication": {
-                "overall": {
-                    "true_positives": 0,
-                    "false_positives": 0,
-                    "false_negatives": 0,
-                    "precision": 0.0,
-                    "recall": 0.0,
-                    "f1": 0.0,
-                },
-                "by_category": {},
-            },
-        }
+    def _zero_metrics(
+        item: dict, error: Exception | None = None, *, error_kind: str = "generation",
+    ) -> dict:
+        from src.replication_metrics import evaluate_replication
+
+        try:
+            failed = asdict(evaluator.evaluate_function(
+                item.get("output", ""), "", _evaluation_metadata(item),
+            ))
+            metadata = dict(failed.get("metadata") or {})
+        except Exception as metric_error:
+            metadata = {"metric_error": str(metric_error)}
+        if not metadata.get("replication"):
+            metadata["replication"] = evaluate_replication(item.get("output", ""), "").to_dict()
+        metadata["quality_issue"] = "evaluation_error"
+        metadata["error_kind"] = error_kind
         if error is not None:
             metadata["error"] = str(error)
             metadata["error_type"] = error.__class__.__name__
@@ -3370,12 +3511,13 @@ def evaluate_model(
         decompiled: str = "",
         elapsed_s: float | None = None,
         generation_mode: str = "single",
+        error_kind: str = "generation",
     ) -> None:
         results.append(
             _detail_record(
                 item,
                 decompiled,
-                _zero_metrics(error),
+                _zero_metrics(item, error, error_kind=error_kind),
                 item_number,
                 success=False,
                 elapsed_s=elapsed_s,
@@ -3394,7 +3536,14 @@ def evaluate_model(
         generation_mode: str = "single",
     ) -> None:
         metric_start = time.time()
-        metrics = evaluator.evaluate_function(item["output"], decompiled, _evaluation_metadata(item))
+        try:
+            metrics = evaluator.evaluate_function(item["output"], decompiled, _evaluation_metadata(item))
+        except Exception as error:
+            _record_failure(
+                item, item_number, error, decompiled=decompiled,
+                elapsed_s=elapsed_s, generation_mode=generation_mode, error_kind="evaluator",
+            )
+            return
         metrics_dict = _complete_quality_metrics(asdict(metrics), success=True)
         results.append(
             _detail_record(
@@ -3614,6 +3763,17 @@ def evaluate_model(
                 "error": "No successful evaluations",
             }
 
+        summary["provenance"] = _evaluation_provenance(
+            model_path, test_path,
+            {
+                "eval_seed": eval_seed,
+                "sample_indices": sampled_indices,
+                "sampling_strategy": sampling_strategy,
+                "generation_config": generation_config,
+                "include_selector_signature_metadata": _decompiler_selector_signature_metadata(decompiler),
+            },
+            decompiler,
+        )
         baseline_summary = _load_baseline_summary(baseline_results_path)
         if baseline_results_path:
             summary["baseline_results_path"] = baseline_results_path
@@ -3632,12 +3792,31 @@ def evaluate_model(
             summary["quality_gate"] = evaluate_quality_gate(summary, quality_gate_config)
 
         # Save
-        results_path = Path(results_dir) / f"eval_{int(time.time())}.json"
+        results_path = Path(output_path) if output_path else Path(results_dir) / f"eval_{time.time_ns()}.json"
+        results_path.parent.mkdir(parents=True, exist_ok=True)
         if latest_results_path:
             summary["latest_results_path"] = latest_results_path
         summary["results_path"] = str(results_path)
-        with open(results_path, "w") as f:
-            json.dump({"summary": summary, "details": results}, f, indent=2)
+        from src.evaluation_identity import bind_evaluation_payload
+        payload = bind_evaluation_payload(
+            {"summary": summary, "details": results},
+            test_path,
+            {
+                **summary["provenance"]["evaluation_settings"],
+                "include_bytecode_metadata": getattr(
+                    getattr(decompiler, "config", None), "include_bytecode_metadata", True
+                ),
+                "selector_context_digest": summary["provenance"]["selector_context_digest"],
+                "tac_schema_version": summary["provenance"]["tac_schema_version"],
+                "model_tac_schema_version": summary["provenance"]["model_tac_schema_version"],
+                "label_schema_version": summary["provenance"]["label_schema_version"],
+                "template_format": "alpaca",
+            },
+            model_path=model_path,
+        )
+        serialized = json.dumps(payload, indent=2, allow_nan=False)
+        with open(results_path, "x", encoding="utf-8") as f:
+            f.write(serialized)
 
         if latest_results_path:
             latest_path = write_latest_results_report(
@@ -3981,6 +4160,14 @@ def main():
         type=str,
         default="latest_results.txt",
         help="Path for the human-readable latest evaluation report",
+    )
+    parser.add_argument(
+        "--eval-output",
+        "--eval-output-json",
+        "--eval_output_json",
+        type=str,
+        default=None,
+        help="Exact JSON path for this evaluation (default: a unique results/eval_<id>.json)",
     )
     parser.add_argument(
         "--eval-limit",
@@ -4417,12 +4604,26 @@ def main():
                 manifest["datasets"]["test_lineage"] = test_lineage
             if getattr(split_dataset, "last_status", None):
                 manifest["datasets"]["split_cache"] = split_dataset.last_status
+            saved_prompt_config = _saved_prompt_config(args.model_path)
+            selector_metadata_enabled = (
+                bool(saved_prompt_config.get("include_selector_signature_metadata", True))
+                and not args.no_selector_signature_metadata
+            )
+            bytecode_metadata_enabled = (
+                bool(saved_prompt_config.get("include_bytecode_metadata", True))
+                and not args.no_bytecode_metadata
+            )
+            selector_context = _freeze_prompt_context(
+                enabled=bytecode_metadata_enabled and selector_metadata_enabled,
+                model_path=args.model_path,
+            )
             preflight = run_data_preflight(
                 {"test": test_path},
                 tokenizer_source=args.model_path,
                 max_seq_length=args.max_seq_length,
-                include_bytecode_metadata=not args.no_bytecode_metadata,
-                include_selector_signature_metadata=not args.no_selector_signature_metadata,
+                include_bytecode_metadata=bytecode_metadata_enabled,
+                include_selector_signature_metadata=selector_metadata_enabled,
+                selector_context=selector_context,
                 skip=args.skip_data_preflight,
                 allow_tokenizer_download=args.preflight_tokenizer_download,
                 allow_whitespace_fallback=args.allow_whitespace_preflight_fallback,
@@ -4449,7 +4650,10 @@ def main():
                 baseline_results_path=args.baseline_results,
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
-                include_selector_signature_metadata=not args.no_selector_signature_metadata,
+                include_selector_signature_metadata=False if args.no_selector_signature_metadata else None,
+                output_path=args.eval_output,
+                include_bytecode_metadata=False if args.no_bytecode_metadata else None,
+                selector_context=selector_context,
             )
             manifest["evaluation"] = {
                 "summary": summary,
@@ -4460,7 +4664,8 @@ def main():
                     "eval_batch_size": args.eval_batch_size,
                     "eval_max_new_tokens": args.eval_max_new_tokens,
                     "eval_repetition_penalty": args.eval_repetition_penalty,
-                    "include_selector_signature_metadata": not args.no_selector_signature_metadata,
+                    "include_selector_signature_metadata": selector_metadata_enabled,
+                    "output_path": args.eval_output,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
                     "baseline_tolerance": args.baseline_tolerance,
@@ -4591,11 +4796,20 @@ def main():
             if isinstance(demo_payload, dict) and demo_payload.get("demo_fallback"):
                 manifest["datasets"]["demo_fallback"] = demo_payload
 
+        resume_from = resolve_resume_checkpoint(
+            args.resume, args.output_dir, deepspeed=bool(args.deepspeed),
+        )
+        selector_context = _freeze_prompt_context(
+            enabled=not args.no_bytecode_metadata and not args.no_selector_signature_metadata,
+            model_path=resume_from,
+        )
         preflight = run_data_preflight(
             {"train": train_path, "val": val_path, "test": test_path},
             tokenizer_source=args.model_name,
             max_seq_length=args.max_seq_length,
             include_bytecode_metadata=not args.no_bytecode_metadata,
+            include_selector_signature_metadata=not args.no_selector_signature_metadata,
+            selector_context=selector_context,
             skip=args.skip_data_preflight,
             allow_tokenizer_download=args.preflight_tokenizer_download,
             allow_whitespace_fallback=args.allow_whitespace_preflight_fallback,
@@ -4619,11 +4833,6 @@ def main():
         # ── Step 2: Training ─────────────────────────────────────────
         # Disable quantization for tiny smoke runs.
         use_quant = bool(args.use_quantization and not args.tiny)
-        resume_from = resolve_resume_checkpoint(
-            args.resume,
-            args.output_dir,
-            deepspeed=bool(args.deepspeed),
-        )
         tokenization_cache_config = None
         if (
             args.tokenization_cache
@@ -4672,6 +4881,7 @@ def main():
                 "gradient_accumulation_steps": args.gradient_accumulation_steps,
                 "include_bytecode_metadata": not args.no_bytecode_metadata,
                 "include_selector_signature_metadata": not args.no_selector_signature_metadata,
+                "selector_context_digest": selector_context["digest"] if selector_context else None,
                 "max_steps": args.max_steps,
                 "tokenization_cache": tokenization_cache_config,
                 "train_eval_strategy": args.train_eval_strategy,
@@ -4718,6 +4928,7 @@ def main():
             global_batch_size=args.global_batch_size,
             include_bytecode_metadata=not args.no_bytecode_metadata,
             include_selector_signature_metadata=not args.no_selector_signature_metadata,
+            selector_context=selector_context,
             max_steps=args.max_steps,
             tokenization_cache=tokenization_cache_config,
             instrumentation_config=instrumentation_config,
@@ -4775,6 +4986,9 @@ def main():
                 baseline_tolerance=args.baseline_tolerance,
                 quality_gate_config=quality_gate_config,
                 include_selector_signature_metadata=not args.no_selector_signature_metadata,
+                output_path=args.eval_output,
+                include_bytecode_metadata=not args.no_bytecode_metadata,
+                selector_context=selector_context,
             )
             manifest["evaluation"] = {
                 "summary": summary,
@@ -4786,6 +5000,7 @@ def main():
                     "eval_max_new_tokens": args.eval_max_new_tokens,
                     "eval_repetition_penalty": args.eval_repetition_penalty,
                     "include_selector_signature_metadata": not args.no_selector_signature_metadata,
+                    "output_path": args.eval_output,
                     "latest_results_path": args.latest_results,
                     "baseline_results": args.baseline_results,
                     "baseline_tolerance": args.baseline_tolerance,

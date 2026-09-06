@@ -49,6 +49,8 @@ from src.local_compiler import (
     _normalize_version,
 )
 from src.tac_lookup import TACLookupBuilder, hash_normalized_tac
+from src.tac_schema import TAC_SCHEMA_VERSION
+from src.dataset_export_primitives import LABEL_SCHEMA_VERSION, match_functions_by_selector
 from web3 import Web3
 
 # ---------------------------------------------------------------------------
@@ -250,7 +252,10 @@ def _compile_one(
                 comp = compile_multi_file(source_files, solc_version, opt_enabled, runs)
             else:
                 first_src = next(iter(source_files.values()))
-                comp = compile_source(first_src, solc_version, opt_enabled, runs)
+                comp = compile_source(
+                    first_src, solc_version, opt_enabled, runs,
+                    source_filename=next(iter(source_files)),
+                )
         except Exception:
             return "error", []
 
@@ -272,70 +277,15 @@ def _compile_one(
                 continue
 
             # Match by selector
-            sol_by_sel = {
-                f["selector"]: f for f in solidity_functions
-                if f.get("selector") and f.get("contract_name", "") == cname
-            }
-            if not sol_by_sel:
-                sol_by_sel = {
-                    f["selector"]: f for f in solidity_functions
-                    if f.get("selector")
-                }
-
-            bc_by_sel = {
-                f.selector: f for f in bytecode_functions.values()
-                if f.selector
-            }
-
-            for selector, sol_func in sol_by_sel.items():
-                if selector not in bc_by_sel:
-                    continue
-
-                bc_func = bc_by_sel[selector]
-
-                # Extract TAC
-                try:
-                    tac_lines: List[str] = []
-                    tac_lines.append(f"function {bc_func.name}:")
-                    if bc_func.selector:
-                        tac_lines.append(f"  // Selector: {bc_func.selector}")
-                    tac_lines.append(f"  // Entry block: {bc_func.entry_block}")
-
-                    blocks = bc_func.basic_blocks or []
-                    if not blocks and bc_func.entry_block in analyzer.basic_blocks:
-                        visited: Set[str] = set()
-                        block_list: list = []
-
-                        def traverse(bid: str):
-                            if bid in visited or bid not in analyzer.basic_blocks:
-                                return
-                            visited.add(bid)
-                            block_list.append(analyzer.basic_blocks[bid])
-                            for s in analyzer.basic_blocks[bid].successors:
-                                traverse(s)
-
-                        traverse(bc_func.entry_block)
-                        blocks = block_list
-
-                    for block in blocks:
-                        tac_lines.append(f"  {block.id}:")
-                        if block.predecessors:
-                            tac_lines.append(
-                                f"    // Predecessors: {', '.join(block.predecessors)}"
-                            )
-                        if block.successors:
-                            tac_lines.append(
-                                f"    // Successors: {', '.join(block.successors)}"
-                            )
-                        for instr in block.instructions:
-                            tac_lines.append(
-                                f"    {analyzer._format_tac_instruction(instr)}"
-                            )
-                        tac_lines.append("")
-
-                    tac = "\n".join(tac_lines)
-                except Exception:
-                    continue
+            if getattr(compiled, "label_resolution_error", ""):
+                continue
+            matches = match_functions_by_selector(
+                getattr(compiled, "effective_functions", []), bytecode_functions, analyzer
+            )
+            for match in matches:
+                selector = match["selector"]
+                sol_func = match["solidity_function"]
+                tac = match["tac"]
 
                 if not tac or len(tac.strip()) < 10:
                     continue
@@ -469,6 +419,8 @@ def build_lookup_db(
     ) -> None:
         manifest = {
             "schema_version": 1,
+            "tac_schema_version": TAC_SCHEMA_VERSION,
+            "label_schema_version": LABEL_SCHEMA_VERSION,
             "build_id": build_id,
             "generated_at": _utc_now_iso(),
             "dataset_revision": _git_revision(),

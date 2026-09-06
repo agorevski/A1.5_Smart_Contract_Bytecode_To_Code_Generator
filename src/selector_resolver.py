@@ -12,6 +12,7 @@ lookups are instant.
 """
 
 import json
+import hashlib
 import logging
 import os
 import sqlite3
@@ -197,6 +198,91 @@ def _db_confidence(occurrences: int) -> float:
 _DEFAULT_DB_PATH = Path("data/contracts.db")
 _DEFAULT_JSON_PATH = Path("data/selectors.json")
 
+SELECTOR_CONTEXT_VERSION = 1
+
+
+def _selector_context_digest(context: dict) -> str:
+    payload = {key: context[key] for key in ("version", "mapping")}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_selector_context(context: dict) -> dict:
+    """Validate a saved prompt context, failing closed rather than consulting local state."""
+    if (
+        not isinstance(context, dict)
+        or context.get("version") != SELECTOR_CONTEXT_VERSION
+        or not isinstance(context.get("mapping"), dict)
+        or context.get("digest") != _selector_context_digest(context)
+    ):
+        raise ValueError("Invalid selector context snapshot; restore the original model_config.json or regenerate training artifacts.")
+    for selector, entry in context["mapping"].items():
+        if (
+            not isinstance(selector, str)
+            or len(selector) != 10
+            or not selector.startswith("0x")
+            or any(char not in "0123456789abcdef" for char in selector[2:])
+            or not isinstance(entry, dict)
+            or not isinstance(entry.get("signature"), str)
+            or not entry["signature"].strip()
+            or entry.get("source") not in {"builtin", "db", "json"}
+            or not isinstance(entry.get("confidence"), (int, float))
+            or not 0.8 <= entry["confidence"] <= 1.0
+        ):
+            raise ValueError("Invalid selector mapping in saved model; restore the original selector context.")
+    return context
+
+
+def resolve_selector_from_context(selector: str, context: dict) -> Optional[str]:
+    """Resolve only from an already validated snapshot; unknowns never fall back."""
+    entry = context["mapping"].get(selector.lower())
+    return entry["signature"] if entry else None
+
+
+def snapshot_local_selector_context(
+    *, db_path: Optional[Path] = None, json_path: Optional[Path] = None,
+) -> dict:
+    """Freeze effective local candidates without remote lookups or cache writeback.
+
+    This is selector-keyed public signature inference, not per-example source labels.
+    Capture the DB in one read so a training run never mixes mutable registry states.
+    """
+    resolver = SelectorResolver(use_remote=False, db_path=db_path, json_path=json_path)
+    mapping = {}
+    for selector in sorted(resolver._json_selectors):
+        candidates = resolver._query_json(selector)
+        if candidates:
+            best = candidates[0]
+            mapping[selector] = {
+                "signature": best.signature, "confidence": best.confidence, "source": "json",
+            }
+    if resolver.db_path.exists():
+        with resolver._db_conn() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='selector_registry'"
+            ).fetchone()
+            if exists:
+                rows = conn.execute(
+                    "SELECT selector, signature, occurrences FROM selector_registry "
+                    "ORDER BY selector, occurrences DESC, signature ASC"
+                ).fetchall()
+                seen = set()
+                for selector, signature, occurrences in rows:
+                    if selector in seen:
+                        continue
+                    seen.add(selector)
+                    mapping[selector] = {
+                        "signature": signature, "confidence": _db_confidence(occurrences),
+                        "source": "db",
+                    }
+    for selector, signature in _BUILTIN_SELECTORS.items():
+        mapping[selector] = {"signature": signature, "confidence": 0.97, "source": "builtin"}
+    context = {"version": SELECTOR_CONTEXT_VERSION, "mapping": mapping}
+    context["digest"] = _selector_context_digest(context)
+    return validate_selector_context(context)
+
+
 class SelectorResolver:
     """Resolve EVM function selectors to human-readable signatures.
 
@@ -373,7 +459,7 @@ class SelectorResolver:
                 rows = conn.execute(
                     "SELECT signature, source, occurrences "
                     "FROM selector_registry WHERE selector = ? "
-                    "ORDER BY occurrences DESC",
+                    "ORDER BY occurrences DESC, signature ASC",
                     (selector,),
                 ).fetchall()
 

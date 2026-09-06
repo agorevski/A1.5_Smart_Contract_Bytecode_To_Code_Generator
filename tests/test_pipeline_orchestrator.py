@@ -150,7 +150,8 @@ class TestPipelineExecution:
         config = PipelineConfig(stages=[PipelineStage.DECOMPILE])
         orch = PipelineOrchestrator(config)
         result = orch.analyze(MINIMAL_BYTECODE)
-        assert "decompile" in result.stages_completed
+        assert result.stage_results["decompile"]["status"] == "skipped"
+        assert "decompile" not in result.stages_completed
         assert result.decompiled_source is None
         assert result.tac is not None
         assert result.decompilation_status == "tac_only_no_model"

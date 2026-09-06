@@ -1,6 +1,8 @@
 """Focused tests for evaluation quality metrics and reporting helpers."""
 
 import difflib
+import subprocess
+import sys
 
 import pytest
 
@@ -17,6 +19,58 @@ from src.training_pipeline import (
     validate_generated_solidity,
 )
 from src.replication_metrics import evaluate_replication
+
+
+def test_solidity_validation_does_not_require_evaluation_nlp_extras():
+    code = r'''
+import importlib.abc
+import importlib.util
+import sys
+blocked = {"nltk", "rouge_score", "sentence_transformers", "sklearn", "scipy"}
+find_spec = importlib.util.find_spec
+importlib.util.find_spec = lambda name, *a, **kw: (
+    None if name.split(".")[0] in blocked else find_spec(name, *a, **kw)
+)
+class MissingEvaluationExtras(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in blocked:
+            raise ModuleNotFoundError("evaluation-only dependency: " + fullname)
+sys.meta_path.insert(0, MissingEvaluationExtras())
+from src.training_pipeline import validate_generated_solidity
+result = validate_generated_solidity("function f() public { return; }", allow_compiler=False)
+assert result.valid and result.method == "scaffold"
+'''
+    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_malformed_output_preserves_reference_false_negatives():
+    from src.training_pipeline import SmartContractEvaluator
+    evaluator = SmartContractEvaluator.__new__(SmartContractEvaluator)
+    result = evaluator.evaluate_function("function f() public { count = 1; }", "")
+    replication = result.metadata["replication"]
+    assert replication["overall"]["false_negatives"] == replication["reference_fact_count"] > 0
+    assert replication["overall"]["true_positives"] == 0
+
+
+def test_sload_evidence_does_not_require_state_write():
+    from src.training_pipeline import evaluate_bytecode_semantics
+    source = "function f() public view returns (uint) { return count; }"
+    result = evaluate_bytecode_semantics(
+        source, source, {"input": "v1 = SLOAD 0"},
+        solidity_validity=validate_generated_solidity(source, allow_compiler=False),
+    )
+    assert "storage_write_mismatch" not in result.mismatch_buckets
+
+
+def test_runtime_match_aggregate_is_conditional_on_checked_rows():
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    results = [{"metrics": {"bytecode_runtime_checked": index == 0,
+                            "bytecode_runtime_match": index == 0}} for index in range(10)]
+    stats = pipeline._compute_aggregate_statistics(results)
+    assert stats["bytecode_runtime_checked"]["mean"] == pytest.approx(0.1)
+    assert stats["bytecode_runtime_match_checked"]["mean"] == 1.0
+    assert stats["bytecode_runtime_match_checked"]["count"] == 1
 
 
 def test_normalized_edit_distance_uses_true_levenshtein_not_sequence_matcher():
@@ -410,14 +464,14 @@ def test_grounded_hallucination_buckets_are_distinct_from_missing_facts_by_segme
     compiler_metrics = segmented["segments"]["compiler_version"]["0.8.20"][
         "replication_metrics"
     ]
-    assert compiler_metrics["hallucination_buckets"]["unsupported_calls"] == 1
+    assert compiler_metrics["hallucination_buckets"]["unsupported_calls"] == 2
     assert compiler_metrics["hallucination_rate_by_bucket"]["invented_guards"] > 0
     assert segmented["segments"]["opcode_group"]["delegatecall"]["replication_metrics"][
         "hallucination_buckets"
-    ]["unsupported_calls"] == 1
+    ]["unsupported_calls"] == 2
     assert segmented["segments"]["bytecode_length_bucket"]["tiny"]["replication_metrics"][
         "hallucination_buckets"
-    ]["invented_state_writes"] == 1
+    ]["invented_state_writes"] == 2
 
 
 def test_grounding_facts_prevent_supported_extra_facts_from_being_hallucinations():
@@ -438,7 +492,7 @@ def test_grounding_facts_prevent_supported_extra_facts_from_being_hallucinations
     evaluation = evaluate_replication(
         reference,
         candidate,
-        grounding_facts={"call": ["_afterApprove"]},
+        grounding_facts={"call": ["_afterApprove", "_afterApprove(param_0,param_1)"]},
     )
 
     assert "_afterapprove" in evaluation.extra_facts["call"]

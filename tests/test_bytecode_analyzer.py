@@ -23,6 +23,7 @@ from src.bytecode_analyzer import (
     Function,
     analyze_bytecode_to_tac,
     _EVM_STACK_EFFECTS,
+    _BINARY_OPS,
 )
 
 # ---------------------------------------------------------------------------
@@ -303,7 +304,7 @@ class TestFunctionIdentification:
 
     def test_legacy_div_dispatcher_identifies_selector(self):
         divisor = "01" + ("00" * 28)
-        bytecode = "0x6000357c" + divisor + "0480631234567814602c575b00"
+        bytecode = "0x7c" + divisor + "6000350480631234567814602c575b00"
         analyzer = BytecodeAnalyzer(bytecode)
         analyzer.analyze_control_flow()
         functions = analyzer.identify_functions()
@@ -393,8 +394,8 @@ class TestTACConversion:
     def test_sub(self):
         tac, _ = self._convert_single("SUB", stack=["a", "b"])
         assert tac.operator == "-"
-        assert tac.operand1 == "a"
-        assert tac.operand2 == "b"
+        assert tac.operand1 == "b"
+        assert tac.operand2 == "a"
 
     def test_mul(self):
         tac, _ = self._convert_single("MUL", stack=["a", "b"])
@@ -484,13 +485,13 @@ class TestTACConversion:
         tac, stack = self._convert_single("ADDMOD", stack=["a", "b", "c"])
         assert tac.operation == TACOperationType.BINARY_OP
         assert "addmod" in tac.operand1
-        assert tac.operand1 == "addmod(a, b, c)"
+        assert tac.operand1 == "addmod(c, b, a)"
         assert len(stack) == 1  # 3 popped, 1 pushed
 
     def test_mulmod(self):
         tac, stack = self._convert_single("MULMOD", stack=["a", "b", "c"])
         assert "mulmod" in tac.operand1
-        assert tac.operand1 == "mulmod(a, b, c)"
+        assert tac.operand1 == "mulmod(c, b, a)"
         assert len(stack) == 1
 
     @pytest.mark.parametrize(
@@ -508,7 +509,8 @@ class TestTACConversion:
         analyzer = BytecodeAnalyzer("0x60056002" + opcode + "00")
         tac = analyzer.convert_to_tac()
         formatted = [analyzer._format_tac_instruction(t) for t in tac]
-        assert f"temp_3 = temp_1 {operator} temp_2" in formatted
+        left, right = ("temp_1", "temp_2") if opcode in ("1b", "1c") else ("temp_2", "temp_1")
+        assert f"temp_3 = {left} {operator} {right}" in formatted
 
     # --- Memory ops ---
     def test_mload(self):
@@ -1007,7 +1009,10 @@ class TestEndToEnd:
         analyzer = BytecodeAnalyzer("0x60056005565b60020300")
         output = analyzer.generate_tac_representation()
         assert "stack_underflow - stack_underflow" not in output
-        assert "temp_4 = temp_1 - temp_3" in output
+        subtraction = next(t for b in analyzer.basic_blocks.values()
+                           for t in b.instructions if t.operator == "-")
+        assert subtraction.operand1 != subtraction.operand2
+        assert subtraction.operand2 == "temp_1"
 
     def test_stack_merge_uses_phi_for_conflicting_predecessors(self):
         bytecode = "0x600a6001600e57506002600e56005b60010100"
@@ -1015,6 +1020,13 @@ class TestEndToEnd:
         output = analyzer.generate_tac_representation()
         assert "stack_underflow" not in output
         assert "phi_block_000e_0" in output
+        phi = next(t for t in analyzer.basic_blocks["block_000e"].instructions
+                   if t.operation == TACOperationType.PHI)
+        assert set(phi.metadata["incoming"]) == {"block_0000", "block_0007"}
+        assert len(set(phi.metadata["incoming"].values())) == 2
+        definitions = {t.result for b in analyzer.basic_blocks.values()
+                       for t in b.instructions if t.result}
+        assert set(phi.metadata["incoming"].values()) <= definitions
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1074,232 @@ class TestEdgeCases:
         assert "from eth_utils import to_hex" not in source
         assert "from web3 import Web3" not in source
 
+
+class TestFaithfulEVMSemantics:
+    # solc 0.8.20, optimizer enabled (200 runs), including original CBOR metadata.
+    @pytest.mark.parametrize("contract,bytecode,expected_functions", [
+        ("Base",
+         "6080604052348015600e575f80fd5b50600436106026575f3560e01c806326121ff014602a575b5f80fd"
+         "5b600160405190815260200160405180910390f3fea2646970667358221220bb33626db79f71555b404882"
+         "13b2791252bdbc90761389bf6f590b8e8c150c4a64736f6c63430008140033",
+         [("f", "0x26121ff0", "Base", "function f() public pure virtual returns (uint) { return 1; }")]),
+        ("Derived",
+         "6080604052348015600e575f80fd5b50600436106030575f3560e01c806326121ff0146034578063e2179b8e"
+         "146049575b5f80fd5b60015b60405190815260200160405180910390f35b6003603756fea264697066735822"
+         "122013c372b4a92ee7478c8923b107cde3cffcdac64f38605135558f432434d5d64b64736f6c63430008140033",
+         [("f", "0x26121ff0", "Base", "function f() public pure virtual returns (uint) { return 1; }"),
+          ("g", "0xe2179b8e", "Derived", "function g() public pure returns (uint) { return 3; }")]),
+        ("Other",
+         "6080604052348015600e575f80fd5b50600436106026575f3560e01c806326121ff014602a575b5f80fd"
+         "5b600260405190815260200160405180910390f3fea2646970667358221220f396cc60c9f133d3a10f2c4aad"
+         "87d60608775be3a61a82085a232ed72b04a8b564736f6c63430008140033",
+         [("f", "0x26121ff0", "Other", "function f() public pure returns (uint) { return 2; }")]),
+    ])
+    def test_compiled_inheritance_runtime_survives_strict_matching(self, contract, bytecode, expected_functions):
+        from src.dataset_export_primitives import match_functions_by_selector
+
+        analyzer = BytecodeAnalyzer(bytecode)
+        analyzer.analyze_control_flow()
+        functions = analyzer.identify_functions()
+        labels = [{"name": name, "selector": selector, "contract_name": declaring, "body": body}
+                  for name, selector, declaring, body in expected_functions]
+        matches = match_functions_by_selector(labels, functions, analyzer)
+        assert analyzer.analysis_status == {"status": "ok", "issues": [], "schema_version": 2}, contract
+        assert len(matches) == len(expected_functions) >= 1
+        assert {m["selector"]: m["solidity_function"]["body"] for m in matches} == {
+            selector: body for _, selector, _, body in expected_functions
+        }
+        assert all(m["tac"] for m in matches)
+        dead = [b for b in analyzer.basic_blocks.values() if b.metadata["is_dead_code"]]
+        assert dead
+        assert all(not b.instructions for b in dead)
+
+    def test_terminal_join_keeps_common_top_suffix_not_unused_prefix(self):
+        analyzer = BytecodeAnalyzer("6001600c5760aa60bb6012565b60cc6012565b5100")
+        analyzer.generate_tac_representation()
+        assert analyzer.analysis_status["status"] == "ok"
+        terminal = analyzer.basic_blocks["block_0012"]
+        phi = next(t for t in terminal.instructions if t.operation == TACOperationType.PHI)
+        values = {t.result: t.operand1 for b in analyzer.basic_blocks.values()
+                  for t in b.instructions if t.operation == TACOperationType.ASSIGN}
+        assert {int(values[v], 16) for v in phi.metadata["incoming"].values()} == {0xBB, 0xCC}
+        load = next(t for t in terminal.instructions if t.operation == TACOperationType.LOAD)
+        assert load.operand1 == phi.result
+
+    @pytest.mark.parametrize("bytecode", ["00a201fe", "fea201"])
+    def test_unreachable_metadata_is_not_executed(self, bytecode):
+        analyzer = BytecodeAnalyzer(bytecode)
+        analyzer.generate_tac_representation()
+        assert analyzer.analysis_status["status"] == "ok"
+        assert all(not b.instructions for b in analyzer.basic_blocks.values()
+                   if b.metadata["is_dead_code"])
+
+    def test_reachable_unknown_opcode_remains_degraded(self):
+        analyzer = BytecodeAnalyzer("0c00")
+        analyzer.generate_tac_representation()
+        assert analyzer.analysis_status["status"] == "degraded"
+        assert "unsupported_opcode" in {i["code"] for i in analyzer.analysis_status["issues"]}
+
+    def test_terminal_join_with_missing_used_suffix_is_degraded(self):
+        # One predecessor supplies MLOAD's address, the other does not.
+        analyzer = BytecodeAnalyzer("6001600a5760bb600e565b600e565b5100")
+        analyzer.generate_tac_representation()
+        assert analyzer.analysis_status["status"] == "degraded"
+        assert {"inconsistent_stack_height", "unresolved_edge"} & {
+            i["code"] for i in analyzer.analysis_status["issues"]
+        }
+
+    @pytest.mark.parametrize("opcode", list(_BINARY_OPS) + ["ADDMOD", "MULMOD"])
+    def test_stack_simulator_matches_py_evm(self, opcode):
+        arithmetic = pytest.importorskip("eth.vm.logic.arithmetic")
+        from eth.vm.logic import comparison
+        from eth.vm.stack import Stack
+        from types import SimpleNamespace
+        from random import Random
+
+        aliases = {"AND": "and_op", "OR": "or_op", "BYTE": "byte_op"}
+        reference = getattr(arithmetic, opcode.lower(), None)
+        if reference is None:
+            reference = getattr(comparison, aliases.get(opcode, opcode.lower()))
+        random = Random(73)
+        values = [0, 1, 31, 32, 255, 256, 1 << 255, (1 << 256) - 1]
+        values.extend(random.getrandbits(256) for _ in range(8))
+        for first in values:
+            for second in values:
+                inputs = [second, first]
+                if opcode in ("ADDMOD", "MULMOD"):
+                    inputs.insert(0, values[(first + second) % len(values)])
+                reference_stack = Stack()
+                for value in inputs:
+                    reference_stack.push_int(value)
+                computation = SimpleNamespace(
+                    stack_pop_ints=reference_stack.pop_ints,
+                    stack_push_int=reference_stack.push_int,
+                    consume_gas=lambda *args, **kwargs: None,
+                )
+                if opcode == "EXP":
+                    reference(computation, gas_per_byte=50)
+                else:
+                    reference(computation)
+                simulator = BytecodeAnalyzer._StackSimulator()
+                simulator.stack = inputs
+                simulator.process_instruction({"name": opcode}, 0)
+                assert simulator.stack == [reference_stack.pop1_int()], (opcode, first, second)
+
+    @pytest.mark.parametrize("opcode,first,second,expected", [
+        ("SUB", 2, 5, (1 << 256) - 3),
+        ("DIV", 8, 3, 2),
+        ("DIV", 8, 0, 0),
+        ("MOD", 8, 3, 2),
+        ("SDIV", (1 << 256) - 8, 3, (1 << 256) - 2),
+        ("SDIV", 1 << 255, (1 << 256) - 1, 1 << 255),
+        ("SMOD", (1 << 256) - 8, 3, (1 << 256) - 2),
+        ("EXP", 3, 2, 9),
+        ("LT", 2, 5, 1),
+        ("GT", 2, 5, 0),
+        ("SLT", (1 << 256) - 1, 0, 1),
+        ("SGT", (1 << 256) - 1, 0, 0),
+        ("SHL", 2, 5, 20),
+        ("SHL", 256, 5, 0),
+        ("SHR", 2, 20, 5),
+        ("SAR", 2, (1 << 256) - 8, (1 << 256) - 2),
+        ("SAR", 256, 1 << 255, (1 << 256) - 1),
+        ("BYTE", 31, 0x1234, 0x34),
+        ("BYTE", 32, 0x1234, 0),
+        ("SIGNEXTEND", 0, 0x80, (1 << 256) - 128),
+        ("SIGNEXTEND", 32, 0x80, 0x80),
+        ("ADD", (1 << 256) - 1, 1, 0),
+    ])
+    def test_evm_reference_vectors(self, opcode, first, second, expected):
+        simulator = BytecodeAnalyzer._StackSimulator()
+        simulator.stack = [second, first]
+        simulator.process_instruction({"name": opcode}, 0)
+        assert simulator.stack == [expected]
+        analyzer = BytecodeAnalyzer("")
+        tac = analyzer._convert_instruction_to_tac({"name": opcode}, ["second", "first"])
+        expected_operands = ("second", "first") if opcode in ("SHL", "SHR", "SAR") else ("first", "second")
+        assert (tac.operand1, tac.operand2) == expected_operands
+        assert tac.metadata["word_bits"] == 256
+
+    @pytest.mark.parametrize("opcode,stack,expected", [
+        ("ADDMOD", [7, 5, 6], 4),
+        ("MULMOD", [7, 5, 6], 2),
+        ("ADDMOD", [0, 5, 6], 0),
+        ("MULMOD", [7, (1 << 256) - 1, (1 << 256) - 1],
+         (((1 << 256) - 1) ** 2) % 7),
+    ])
+    def test_modular_arithmetic_uses_third_pop_modulus(self, opcode, stack, expected):
+        simulator = BytecodeAnalyzer._StackSimulator()
+        simulator.stack = list(stack)
+        simulator.process_instruction({"name": opcode}, 0)
+        assert simulator.stack == [expected]
+
+    @pytest.mark.parametrize("opcode", ["CALL", "CALLCODE", "STATICCALL", "DELEGATECALL"])
+    def test_call_formatter_preserves_all_arguments(self, opcode):
+        analyzer = BytecodeAnalyzer("")
+        stack = ["return_length", "return_offset", "input_length", "input_offset"]
+        if opcode in ("CALL", "CALLCODE"):
+            stack.append("amount")
+        stack.extend(["callee", "gas_limit"])
+        tac = analyzer._convert_instruction_to_tac({"name": opcode}, stack)
+        text = analyzer._format_tac_instruction(tac)
+        assert f"{opcode.lower()}(" in text
+        for expected in ["gas=gas_limit", "address=callee", "args_offset=input_offset",
+                         "args_length=input_length", "ret_offset=return_offset",
+                         "ret_length=return_length"]:
+            assert expected in text
+        assert ("value=amount" in text) == (opcode in ("CALL", "CALLCODE"))
+        assert stack == [tac.result]
+
+    def test_loop_phi_contains_forward_and_backedge_definitions(self):
+        # Counter at loop header pc=5 is updated and carried through the backedge.
+        analyzer = BytecodeAnalyzer("0x60016005565b6001018060055700")
+        analyzer.generate_tac_representation()
+        header = analyzer.basic_blocks["block_0005"]
+        phi = next(t for t in header.instructions if t.operation == TACOperationType.PHI)
+        assert set(phi.metadata["incoming"]) == {"block_0000", "block_0005"}
+        definitions = {t.result for b in analyzer.basic_blocks.values() for t in b.instructions if t.result}
+        assert set(phi.metadata["incoming"].values()) <= definitions
+        assert analyzer.analysis_status["status"] == "ok"
+        first = analyzer.generate_tac_representation()
+        assert first == analyzer.generate_tac_representation()
+
+    def test_reverse_address_predecessor_is_propagated(self):
+        # Execution: block 0 -> block 8 -> block 3; not address order.
+        analyzer = BytecodeAnalyzer("0x6008565b600103005b6005600356")
+        output = analyzer.generate_tac_representation()
+        block = analyzer.basic_blocks["block_0003"]
+        assert "unresolved_" not in output
+        assert block.metadata["entry_stack"] == analyzer.basic_blocks["block_0008"].metadata["exit_stack"]
+        assert analyzer.analysis_status["status"] == "ok"
+
+    @pytest.mark.parametrize("bytecode,code", [
+        ("0x50", "stack_underflow"),
+        ("0x90", "stack_underflow"),
+        ("0x60003556", "unresolved_jump"),
+        ("0x6000600056", "unresolved_jump"),
+        ("ZZZZ", "parse_error"),
+    ])
+    def test_degradation_is_structured(self, bytecode, code):
+        analyzer = BytecodeAnalyzer(bytecode)
+        analyzer.generate_tac_representation()
+        status = analyzer.get_analysis_status()
+        assert status["status"] in ("degraded", "failed")
+        assert code in {issue["code"] for issue in status["issues"]}
+        assert status["schema_version"] == analyzer.tac_schema_version == 2
+
+    def test_inconsistent_loop_height_is_reported(self):
+        analyzer = BytecodeAnalyzer("0x6003565b6001600356")
+        analyzer.generate_tac_representation()
+        assert "inconsistent_stack_height" in {i["code"] for i in analyzer.analysis_status["issues"]}
+
+    def test_fallback_is_not_success(self, monkeypatch):
+        analyzer = BytecodeAnalyzer(MINIMAL_BYTECODE)
+        def fail():
+            raise RuntimeError("analysis unavailable")
+        monkeypatch.setattr(analyzer, "_convert_and_integrate_tac", fail)
+        assert "Fallback" in analyzer.generate_tac_representation()
+        assert analyzer.analysis_status["status"] == "degraded"
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

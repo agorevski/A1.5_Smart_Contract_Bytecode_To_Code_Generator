@@ -44,7 +44,7 @@ if [ -z "${MAX_SEQ_LEN:-}" ] && [ "${THROUGHPUT_SWEEP_DEFAULTS}" = "true" ]; the
 elif [ -z "${MAX_SEQ_LEN:-}" ]; then
     echo "Auto-detecting optimal max sequence length from tokenizer counts..."
     SEQ_LEN_CACHE="${SEQ_LEN_CACHE:-./data/preflight_cache/sequence_lengths.json}"
-    MAX_SEQ_LEN=$(DATASET="${DATASET}" MODEL="${MODEL}" SEQ_LEN_CACHE="${SEQ_LEN_CACHE}" MAX_SEQ_LEN_CAP="${MAX_SEQ_LEN_CAP}" uv run python - <<'PY'
+    MAX_SEQ_LEN=$(DATASET="${DATASET}" MODEL="${MODEL}" SEQ_LEN_CACHE="${SEQ_LEN_CACHE}" MAX_SEQ_LEN_CAP="${MAX_SEQ_LEN_CAP}" SELECTOR_SIGNATURE_METADATA="${SELECTOR_SIGNATURE_METADATA}" uv run --extra training python - <<'PY'
 import hashlib
 import json
 import os
@@ -53,15 +53,33 @@ import sys
 
 from transformers import AutoTokenizer
 
-from src.model_setup import detect_max_sequence_length
+from src.model_setup import (
+    TOKENIZATION_CACHE_VERSION,
+    detect_max_sequence_length,
+    tokenizer_cache_identity,
+)
+from src.selector_resolver import snapshot_local_selector_context
+from src.tac_schema import TAC_SCHEMA_VERSION
+from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
 
 dataset = os.environ["DATASET"]
 model = os.environ["MODEL"]
 cache_path = Path(os.environ["SEQ_LEN_CACHE"])
 max_length = int(os.environ.get("MAX_SEQ_LEN_CAP", "8192"))
+include_selectors = os.environ.get("SELECTOR_SIGNATURE_METADATA", "true").lower() not in ("false", "0")
+selector_context = snapshot_local_selector_context() if include_selectors else None
 kwargs = {"trust_remote_code": True}
 if os.environ.get("HF_TOKEN"):
     kwargs["token"] = os.environ["HF_TOKEN"]
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model, **kwargs)
+except Exception as exc:
+    print(
+        f"Failed to load tokenizer for MAX_SEQ_LEN detection from {model}: {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 digest = hashlib.sha256()
 with open(dataset, "rb") as f:
@@ -74,6 +92,14 @@ cache_key = json.dumps(
         "percentile": 0.99,
         "max_length": max_length,
         "detector": "src.model_setup.detect_max_sequence_length",
+        "tac_schema_version": TAC_SCHEMA_VERSION,
+        "label_schema_version": LABEL_SCHEMA_VERSION,
+        "include_selector_signature_metadata": include_selectors,
+        "selector_context_digest": selector_context["digest"] if selector_context else None,
+        "tokenization_cache_version": TOKENIZATION_CACHE_VERSION,
+        "tokenizer": tokenizer_cache_identity(tokenizer),
+        "template_format": "alpaca",
+        "include_bytecode_metadata": True,
     },
     sort_keys=True,
 )
@@ -88,16 +114,11 @@ if cache_path.exists():
     except Exception:
         pass
 
-try:
-    tokenizer = AutoTokenizer.from_pretrained(model, **kwargs)
-except Exception as exc:
-    print(
-        f"Failed to load tokenizer for MAX_SEQ_LEN detection from {model}: {exc}",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-
-detected = detect_max_sequence_length(dataset, tokenizer, max_length=max_length)
+detected = detect_max_sequence_length(
+    dataset, tokenizer, max_length=max_length,
+    include_selector_signature_metadata=include_selectors,
+    selector_context=selector_context,
+)
 try:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}

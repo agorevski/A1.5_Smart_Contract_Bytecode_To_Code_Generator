@@ -79,7 +79,7 @@ fi
 mkdir -p "${DATA_DIR}" "${SPLIT_DIR}" "${OUTPUT_DIR}"
 
 echo "Preparing overfit dataset and identical train/val/test split files."
-uv run python - "${SOURCE_DATASET}" "${SAMPLED_DATASET}" "${SPLIT_DIR}" "${SAMPLE_COUNT}" "${SEED}" "${SPLIT_SEED}" "${SELECTION_STRATEGY}" "${RECREATE_DATASET}" <<'PY'
+uv run --extra quantization python - "${SOURCE_DATASET}" "${SAMPLED_DATASET}" "${SPLIT_DIR}" "${SAMPLE_COUNT}" "${SEED}" "${SPLIT_SEED}" "${SELECTION_STRATEGY}" "${RECREATE_DATASET}" <<'PY'
 import json
 import random
 import sys
@@ -214,7 +214,7 @@ if [[ "${SELECTOR_SIGNATURE_METADATA}" == "false" || "${SELECTOR_SIGNATURE_METAD
 fi
 
 TRAIN_CMD=(
-    uv run torchrun
+    uv run --extra quantization torchrun
     --nproc_per_node="${NUM_GPUS}"
     train.py
     --skip-collection

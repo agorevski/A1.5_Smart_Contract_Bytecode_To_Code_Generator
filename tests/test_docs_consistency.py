@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_project_file(relative_path: str) -> str:
-    return (ROOT / relative_path).read_text()
+    return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
 def test_pytest_workflow_disables_unrelated_web3_plugin():
@@ -71,3 +71,25 @@ def test_test_inventory_docs_do_not_hard_code_stale_counts():
     assert "across 8 files" not in readme
     assert "~380" not in runbook
     assert "across 8 files" not in runbook
+
+
+def test_supported_python_and_cpu_profiles_are_consistent():
+    pyproject = read_project_file("pyproject.toml")
+    workflow = read_project_file(".github/workflows/data-quality.yml")
+    readme = read_project_file("README.md")
+    runbook = read_project_file("docs/runbook.md")
+
+    assert 'requires-python = ">=3.10,<3.13"' in pyproject
+    assert 'python-version: ["3.10", "3.12"]' in workflow
+    assert "3.10\u20133.12" in readme
+    assert "3.10\u20133.12" in runbook
+    assert ">=3.13,<3.14" not in runbook
+    assert 'extra = "cpu"' in pyproject
+    assert 'url = "https://download.pytorch.org/whl/cpu"' in pyproject
+    assert 'url = "https://download.pytorch.org/whl/cu130"' in pyproject
+    assert 'conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]' in pyproject
+    assert "assert torch.version.cuda is None" in workflow
+    assert "--extra training --extra web --extra analysis --extra cpu pytest" in workflow
+    core_dependencies = pyproject.split("dependencies = [", 1)[1].split("]", 1)[0]
+    for optional in ("torch", "bitsandbytes", "flask", "lightgbm"):
+        assert f'"{optional}' not in core_dependencies

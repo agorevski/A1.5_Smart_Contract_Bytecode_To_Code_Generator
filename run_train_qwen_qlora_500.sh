@@ -69,7 +69,7 @@ mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}"
 
 if [[ ! -s "${SAMPLED_DATASET}" || "${RECREATE_DATASET}" == "true" || "${RECREATE_DATASET}" == "1" ]]; then
     echo "Sampling ${SAMPLE_COUNT} rows from ${SOURCE_DATASET} -> ${SAMPLED_DATASET}"
-    uv run python - "${SOURCE_DATASET}" "${SAMPLED_DATASET}" "${SAMPLE_COUNT}" "${SEED}" <<'PY'
+    uv run --extra quantization python - "${SOURCE_DATASET}" "${SAMPLED_DATASET}" "${SAMPLE_COUNT}" "${SEED}" <<'PY'
 import json
 import random
 import sys
@@ -115,7 +115,7 @@ if [[ "${SELECTOR_SIGNATURE_METADATA}" == "false" || "${SELECTOR_SIGNATURE_METAD
 fi
 
 TRAIN_CMD=(
-    uv run torchrun
+    uv run --extra quantization torchrun
     --nproc_per_node="${NUM_GPUS}"
     train.py
     --skip-collection

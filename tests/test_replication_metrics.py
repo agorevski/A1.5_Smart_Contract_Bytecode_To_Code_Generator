@@ -34,11 +34,13 @@ class TestSolidityFactExtraction:
         assert "param_type:1:uint256" in facts["abi"]
         assert "return_type:0:bool" in facts["abi"]
         assert facts["visibility"] == {"public"}
-        assert facts["event"] == {"transfer"}
+        assert facts["event"] == {"transfer", "transfer(msg.sender,param_0,param_1)"}
         assert "require:param_0!=address(0)" in facts["guard"]
         assert facts["state_write"] == {
             "balances[msg.sender]",
             "balances[param_0]",
+            "balances[msg.sender]=balances[msg.sender]-param_1",
+            "balances[param_0]=balances[param_0]+param_1",
         }
 
     def test_extracts_nested_mapping_state_writes(self):
@@ -55,6 +57,8 @@ class TestSolidityFactExtraction:
         assert facts["state_write"] == {
             "allowed[msg.sender][param_0]",
             "freemintaddresses[addresses[i]]",
+            "allowed[msg.sender][param_0]=param_1",
+            "freemintaddresses[addresses[i]]=true",
         }
 
     def test_parameter_renames_do_not_penalize_guard_matching(self):
@@ -99,8 +103,8 @@ class TestReplicationEvaluation:
         evaluation = evaluate_replication(reference, candidate)
         state_write_score = evaluation.by_category["state_write"]
 
-        assert state_write_score.true_positives == 1
-        assert state_write_score.false_negatives == 1
+        assert state_write_score.true_positives == 2
+        assert state_write_score.false_negatives == 2
         assert state_write_score.recall == 0.5
         assert "balances[param_0]" in evaluation.missing_facts["state_write"]
 
@@ -122,8 +126,8 @@ class TestReplicationEvaluation:
         evaluation = evaluate_replication(reference, candidate)
         call_score = evaluation.by_category["call"]
 
-        assert call_score.true_positives == 1
-        assert call_score.false_positives == 1
+        assert call_score.true_positives == 2
+        assert call_score.false_positives == 2
         assert call_score.precision == 0.5
         assert "_afterapprove" in evaluation.extra_facts["call"]
 
@@ -187,9 +191,9 @@ class TestAggregateReplicationScores:
         assert summary["precision_mean"] == 1.0
         assert 0 < summary["recall_mean"] < 1.0
         assert 0 < summary["f1_mean"] < 1.0
-        assert summary["micro"]["false_negatives"] == 1
-        assert summary["fact_error_totals"] == {"matched": 10, "extra": 0, "missing": 1}
-        assert summary["by_category_micro"]["state_write"]["false_negatives"] == 1
+        assert summary["micro"]["false_negatives"] == 2
+        assert summary["fact_error_totals"] == {"matched": 12, "extra": 0, "missing": 2}
+        assert summary["by_category_micro"]["state_write"]["false_negatives"] == 2
         assert summary["category_gap_summary"][0]["category"] == "state_write"
         assert summary["category_gap_summary"][0]["primary_error"] == "recall"
 
@@ -210,8 +214,8 @@ class TestAggregateReplicationScores:
             ]
         )
 
-        assert summary["hallucination_buckets"]["invented_state_writes"] == 1
-        assert summary["hallucination_buckets"]["invented_events"] == 1
+        assert summary["hallucination_buckets"]["invented_state_writes"] == 2
+        assert summary["hallucination_buckets"]["invented_events"] == 2
         assert summary["hallucination_rate"] > 0
 
 

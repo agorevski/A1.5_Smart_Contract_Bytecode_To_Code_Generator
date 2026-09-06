@@ -55,7 +55,7 @@ def test_select_curriculum_rows_focuses_calls_and_excludes_identities(tmp_path):
 
     assert [candidate.identity for candidate in selected] == [row_identity(source_rows[1])]
     assert selected[0].source_index == 2
-    assert selected[0].focus_counts == {"call": 2, "member_call": 2}
+    assert selected[0].focus_counts == {"call": 4, "member_call": 2}
 
 
 def test_write_curriculum_outputs_dataset_and_manifest(tmp_path):

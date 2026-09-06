@@ -69,7 +69,8 @@ block_success:
 
     assert line == (
         "Bytecode metadata: selector=0xa9059cbb, "
-        "selector_signature=transfer(address,uint256), tac_blocks=2, tac_ops=6, "
+        "selector_signature=transfer(address,uint256), selector_signature_evidence=inferred, "
+        "tac_blocks=2, tac_ops=6, "
         "branches=1, storage_reads=1, storage_writes=1, external_calls=1, "
         "logs=1, reverts=1, bytecode_len=512, bytecode_instructions=123, "
         "functions=4"

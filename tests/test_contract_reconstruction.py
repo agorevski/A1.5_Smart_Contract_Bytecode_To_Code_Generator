@@ -74,3 +74,69 @@ def test_quality_labels_scaffold_only_as_non_deployable():
     assert contract_quality["scaffold_only"] is True
     assert contract_quality["deployable"] is False
     assert contract_quality["truncated_functions"] == ["func_00000000"]
+
+
+def test_reconciles_shared_state_and_identical_helpers():
+    plan = {}
+    source = assemble_reconstructed_contract(
+        {
+            "a": "contract A { uint256 private balance; function helper() internal {} function a() public { balance = 1; helper(); } }",
+            "b": "contract B { uint256 private balance; function helper() internal {} function b() public { balance = 2; helper(); } }",
+        },
+        SimpleNamespace(), reconstruction_plan=plan,
+    )
+    assert source.count("uint256 private balance;") == 1
+    assert source.count("function helper()") == 1
+    assert "function a()" in source and "function b()" in source
+    assert len(plan["reconciliation"]["duplicate_declarations_merged"]) == 2
+    assert plan["reconciliation"]["storage_consistency"] == "unverified"
+
+
+def test_preserves_conflicting_state_and_function_bodies():
+    plan = {}
+    source = assemble_reconstructed_contract(
+        {
+            "a": "uint256 value; function helper() internal { value = 1; }",
+            "b": "address value; function helper() internal { revert(); }",
+        },
+        SimpleNamespace(), reconstruction_plan=plan,
+    )
+    assert "uint256 value;" in source and "address value;" in source
+    assert source.count("function helper() internal") == 2
+    assert len(plan["reconciliation"]["conflicts"]) == 2
+    assert plan["reconciliation"]["storage_consistency"] == "conflict"
+    quality = build_contract_quality({"valid": True, "compiler_checked": True}, reconstruction_plan=plan)
+    assert quality["deployable"] is False
+
+
+def test_assembly_strings_overloads_and_unresolved_helpers():
+    plan = {}
+    source = assemble_reconstructed_contract(
+        {
+            "a": 'contract A { function f(uint x) public { assembly { mstore(0, x) } missing(x); string memory s = "}"; } }',
+            "b": "function f(address x) public { assembly { sstore(0, x) } }",
+        },
+        SimpleNamespace(), reconstruction_plan=plan,
+    )
+    assert "sstore(0, x)" in source and "mstore(0, x)" in source
+    assert 'string memory s = "}"' in source
+    assert plan["reconciliation"]["conflicts"] == []
+    assert plan["reconciliation"]["unresolved_helpers"] == ["missing"]
+
+
+def test_conflicting_storage_order_is_not_silently_accepted():
+    plan = {}
+    assemble_reconstructed_contract(
+        {"a": "uint a; uint b;", "b": "uint b; uint a;"},
+        SimpleNamespace(), reconstruction_plan=plan,
+    )
+    assert plan["reconciliation"]["storage_consistency"] == "conflict"
+    assert plan["reconciliation"]["conflicts"][0]["kind"] == "storage_layout"
+
+
+def test_contract_text_inside_comments_does_not_replace_real_body():
+    source = assemble_reconstructed_contract(
+        {"a": "// contract Decoy { }\ncontract Real { function f() public {} }"},
+        SimpleNamespace(),
+    )
+    assert "function f()" in source

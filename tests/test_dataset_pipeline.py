@@ -572,7 +572,10 @@ class TestCollectAndCompileContracts:
                 success=True,
                 errors=[],
                 contracts={
-                    "Test": SimpleNamespace(runtime_bytecode="6000"),
+                    "Test": SimpleNamespace(
+                        runtime_bytecode="6000",
+                        effective_functions=SolidityParser().extract_functions(source),
+                    ),
                 },
             )
 

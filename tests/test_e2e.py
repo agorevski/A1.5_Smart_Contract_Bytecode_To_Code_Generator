@@ -179,12 +179,16 @@ class TestE2EPipelineOrchestrator:
 
         assert result.contract_address == "0xTest"
         assert "classify" in result.stages_completed
-        assert "decompile" in result.stages_completed
+        assert "decompile" not in result.stages_completed
+        assert result.stage_results["decompile"]["status"] == "partial"
+        assert result.analysis_status["status"] == "degraded"
+        assert result.analysis_status["issues"]
         assert "detect_vulnerabilities" in result.stages_completed
 
         # Result should be serializable
         d = result.to_dict()
-        assert d["success"] or len(d["stages_failed"]) > 0
+        assert d["success"] is False
+        assert d["stage_results"]["decompile"]["status"] == "partial"
 
     def test_pipeline_minimal_stages(self):
         """Pipeline with only decompile stage."""
@@ -194,7 +198,9 @@ class TestE2EPipelineOrchestrator:
         assert result.tac is not None
         assert result.decompiled_source is None
         assert result.decompilation_status == "tac_only_no_model"
-        assert "decompile" in result.stages_completed
+        assert "decompile" not in result.stages_completed
+        assert result.stage_results["decompile"]["status"] == "skipped"
+        assert result.analysis_status["status"] == "ok"
 
     def test_pipeline_batch(self):
         """Batch analysis through orchestrator."""

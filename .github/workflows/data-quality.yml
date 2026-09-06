@@ -17,6 +17,10 @@ jobs:
   data-quality-and-quality-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
     env:
       CUDA_VISIBLE_DEVICES: ""
       HF_HUB_OFFLINE: "1"
@@ -30,7 +34,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - uses: astral-sh/setup-uv@v5
         with:
@@ -40,19 +44,17 @@ jobs:
       - name: Install CPU test environment
         run: |
           mkdir -p "$TMPDIR"
-          uv sync --dev --frozen
+          uv sync --dev --extra training --extra web --extra analysis --extra cpu --frozen
+          uv run --frozen --extra training --extra web --extra analysis --extra cpu \
+            python -c "import torch; assert torch.version.cuda is None, 'CI must use CPU-only PyTorch'"
 
-      - name: Run CPU-only data-quality regression tests
+      - name: Run CPU-only regression suite
         run: |
-          uv run --frozen pytest \
-            tests/test_dataset_quality_issues.py \
-            tests/test_data_generation_export_issues.py \
-            tests/test_model_training_issues.py \
-            tests/test_train_cli_issues.py
+          uv run --frozen --extra training --extra web --extra analysis --extra cpu pytest
 
       - name: Run deterministic quality-gate report smoke
         run: |
-          uv run --frozen python - <<'PY'
+          uv run --frozen --extra training --extra web --extra analysis --extra cpu python - <<'PY'
           import json
           from pathlib import Path
 

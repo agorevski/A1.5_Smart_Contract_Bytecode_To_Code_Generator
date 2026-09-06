@@ -27,13 +27,6 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-# NLP and evaluation metrics
-import nltk
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from rouge_score import rouge_scorer
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-
 # Our modules
 from .bytecode_analyzer import BytecodeAnalyzer
 from .model_setup import SmartContractModelTrainer, ModelConfig, SmartContractDecompiler
@@ -42,6 +35,8 @@ from .replication_metrics import (
     evaluate_replication,
     extract_solidity_facts,
 )
+from .evaluation_identity import EVALUATOR_VERSION, BYTECODE_SCORE_KIND, bind_evaluation_payload
+from .runtime_equivalence import execute_equivalence_subset
 
 try:
     from .dataset_pipeline import DatasetBuilder
@@ -308,6 +303,8 @@ _OPCODE_GROUP_RULES = (
     ("selfdestruct", {"SELFDESTRUCT"}),
     ("push0", {"PUSH0"}),
     ("storage", {"SLOAD", "SSTORE"}),
+    ("storage_read", {"SLOAD"}),
+    ("storage_write", {"SSTORE"}),
     ("event_log", {"LOG0", "LOG1", "LOG2", "LOG3", "LOG4"}),
     ("control_flow", {"JUMP", "JUMPI", "JUMPDEST"}),
     ("revert", {"REVERT", "INVALID"}),
@@ -379,7 +376,7 @@ class SolidityValidityResult:
 
 @dataclass(frozen=True)
 class BytecodeSemanticResult:
-    """Bytecode-grounded semantic/deployability checks for one generated output."""
+    """Structural proxy and separately reported bytecode/deployability checks."""
 
     checked: bool
     score: float
@@ -390,9 +387,13 @@ class BytecodeSemanticResult:
     opcode_groups: List[str] = field(default_factory=list)
     control_flow_buckets: List[str] = field(default_factory=list)
     mismatch_buckets: Dict[str, List[str]] = field(default_factory=dict)
+    executed_equivalence: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "evaluator_version": EVALUATOR_VERSION,
+            "score_kind": BYTECODE_SCORE_KIND,
+            "executed_equivalence": self.executed_equivalence,
             "checked": self.checked,
             "score": self.score,
             "deployability_checked": self.deployability_checked,
@@ -459,7 +460,7 @@ def evaluate_bytecode_semantics(
     solidity_validity: Optional[SolidityValidityResult] = None,
     replication: Optional[Any] = None,
 ) -> BytecodeSemanticResult:
-    """Evaluate generated Solidity against bytecode-grounded semantic signals.
+    """Evaluate a structural proxy, not execution equivalence.
 
     The check is deterministic without solc: it uses bytecode/TAC opcode evidence
     from metadata plus structured Solidity facts. When local solc compilation is
@@ -511,8 +512,8 @@ def evaluate_bytecode_semantics(
     )
 
     opcode_groups = set(opcode_slices["opcode_groups"])
-    if "storage" in opcode_groups and not candidate_facts.get("state_write"):
-        mismatch_buckets["storage_write_mismatch"].append("bytecode_has_storage_access")
+    if "storage_write" in opcode_groups and not candidate_facts.get("state_write"):
+        mismatch_buckets["storage_write_mismatch"].append("bytecode_has_storage_write")
     if "event_log" in opcode_groups and not candidate_facts.get("event"):
         mismatch_buckets["event_mismatch"].append("bytecode_has_log_opcode")
     if "revert" in opcode_groups and not candidate_facts.get("guard"):
@@ -574,6 +575,12 @@ def evaluate_bytecode_semantics(
         or solidity_validity.bytecode_checked
     )
     deployable = bool(solidity_validity.deployable)
+    executed_equivalence = {"checked": False, "reason": "requires_explicit_fixtures_and_local_compilation"}
+    if expected_runtime and solidity_validity.compiled_runtime_bytecode and metadata.get("execution_test_calldata"):
+        executed_equivalence = execute_equivalence_subset(
+            expected_runtime, solidity_validity.compiled_runtime_bytecode,
+            metadata["execution_test_calldata"],
+        )
 
     return BytecodeSemanticResult(
         checked=checked,
@@ -587,6 +594,7 @@ def evaluate_bytecode_semantics(
         opcode_groups=opcode_slices["opcode_groups"],
         control_flow_buckets=opcode_slices["control_flow"],
         mismatch_buckets={key: sorted(set(values)) for key, values in mismatch_buckets.items()},
+        executed_equivalence=executed_equivalence,
     )
 
 
@@ -1777,6 +1785,10 @@ class SmartContractEvaluator:
         Raises:
             Exception: If sentence transformer model fails to load.
         """
+        import nltk
+        from rouge_score import rouge_scorer
+        from sentence_transformers import SentenceTransformer
+
         self.logger = logging.getLogger(__name__)
 
         # Initialize evaluation models
@@ -1803,6 +1815,8 @@ class SmartContractEvaluator:
             identical semantic meaning.
         """
         try:
+            from sklearn.metrics.pairwise import cosine_similarity
+
             # Encode both texts
             embeddings = self.semantic_model.encode([original, decompiled])
 
@@ -1845,6 +1859,8 @@ class SmartContractEvaluator:
             BLEU score between 0 and 1, where 1 indicates perfect match.
         """
         try:
+            from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+
             # Tokenize
             reference = [original.split()]
             candidate = decompiled.split()
@@ -2131,6 +2147,8 @@ class SmartContractEvaluator:
                     "decompiled_metadata": {},
                     "function_metadata": metadata,
                     "quality_issue": "malformed_input_output",
+                    "replication": evaluate_replication(original or "", "").to_dict(),
+                    "evaluator_version": EVALUATOR_VERSION,
                     "evaluation_time": 0.0,
                 },
             )
@@ -2204,6 +2222,7 @@ class SmartContractEvaluator:
                     "function_metadata": metadata,
                     "enhanced_structural_preservation": enhanced_structural_preservation,
                     "replication": replication.to_dict(),
+                    "evaluator_version": EVALUATOR_VERSION,
                     "solidity_validity": solidity_validity.to_dict(),
                     "bytecode_semantics": bytecode_semantics.to_dict(),
                     "evaluation_time": evaluation_time,
@@ -2239,6 +2258,9 @@ class SmartContractEvaluator:
                     "decompiled_metadata": {},
                     "function_metadata": metadata,
                     "error": str(e),
+                    "error_kind": "evaluator",
+                    "replication": evaluate_replication(original or "", "").to_dict(),
+                    "evaluator_version": EVALUATOR_VERSION,
                     "traceback": traceback.format_exc(),
                     "evaluation_time": evaluation_time,
                 },
@@ -2436,7 +2458,7 @@ class SmartContractTrainingPipeline:
         logger.info(f"Model training completed. Model saved to {model_path}")
         return model_path
 
-    def evaluate_model(self, model_path: str, test_path: str) -> Dict[str, Any]:
+    def evaluate_model(self, model_path: str, test_path: str, *, output_path: Optional[str] = None) -> Dict[str, Any]:
         """Comprehensive evaluation of the trained model.
 
         Loads the trained model, runs inference on test samples, and
@@ -2504,7 +2526,7 @@ class SmartContractTrainingPipeline:
         # Evaluate each function
         results = []
 
-        for item in tqdm(test_data, desc="Evaluating functions"):
+        for dataset_index, item in tqdm(list(zip(sampled_indices, test_data)), desc="Evaluating functions"):
             try:
                 # Generate decompiled code
                 decompiled = decompiler.decompile_tac_to_solidity(
@@ -2518,6 +2540,7 @@ class SmartContractTrainingPipeline:
 
                 results.append(
                     {
+                        "dataset_index": dataset_index,
                         "original": item["output"],
                         "decompiled": decompiled,
                         "input": item.get("input", ""),
@@ -2532,6 +2555,7 @@ class SmartContractTrainingPipeline:
                 # Add error information to continue evaluation
                 results.append(
                     {
+                        "dataset_index": dataset_index,
                         "original": item.get("output", ""),
                         "decompiled": "",
                         "input": item.get("input", ""),
@@ -2556,7 +2580,12 @@ class SmartContractTrainingPipeline:
                             "bytecode_deployable": False,
                             "bytecode_runtime_checked": False,
                             "bytecode_runtime_match": False,
-                            "metadata": {"error": str(e), "traceback": traceback.format_exc()},
+                            "metadata": {
+                                "error": str(e), "traceback": traceback.format_exc(),
+                                "error_kind": "generation",
+                                "replication": evaluate_replication(item.get("output", ""), "").to_dict(),
+                                "evaluator_version": EVALUATOR_VERSION,
+                            },
                         },
                         "metadata": item.get("metadata", {}),
                     }
@@ -2573,11 +2602,18 @@ class SmartContractTrainingPipeline:
         }
 
         # Save detailed results
-        results_path = Path(self.config.results_dir) / f"evaluation_results_{int(time.time())}.json"
-        with open(results_path, "w") as f:
-            json.dump(
-                {"aggregate_statistics": aggregate_stats, "detailed_results": results}, f, indent=2
-            )
+        results_path = Path(output_path) if output_path else Path(self.config.results_dir) / f"evaluation_results_{time.time_ns()}.json"
+        payload = bind_evaluation_payload(
+            {"aggregate_statistics": aggregate_stats, "detailed_results": results,
+             "summary": {**flatten_numeric_metrics(aggregate_stats), "num_evaluated": len(results)}},
+            test_path,
+            {"max_new_tokens": 1024, "evaluation_seed": self.config.evaluation_seed,
+             "generation_config": getattr(getattr(decompiler, "config", None), "generation_config", None)},
+            model_path,
+        )
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(results_path, "x", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, allow_nan=False)
 
         logger.info(f"Evaluation completed. Results saved to {results_path}")
         return aggregate_stats
@@ -2663,6 +2699,19 @@ class SmartContractTrainingPipeline:
         )
         if replication_stats:
             stats["replication_metrics"] = replication_stats
+        checked = [
+            float(bool(row["metrics"].get("bytecode_runtime_match")))
+            for row in results if row["metrics"].get("bytecode_runtime_checked")
+        ]
+        stats["bytecode_runtime_match_checked"] = {
+            "mean": float(np.mean(checked)) if checked else None,
+            "count": len(checked),
+        }
+        stats["evaluator_error_count"] = sum(
+            bool((row.get("metrics", {}).get("metadata") or {}).get("error"))
+            and (row.get("metrics", {}).get("metadata") or {}).get("error_kind") == "evaluator"
+            for row in results
+        )
 
         stats["metadata_segments"] = compute_metadata_segment_metrics(results)
         stats["benchmark_suites"] = compute_benchmark_suite_metrics(results)
