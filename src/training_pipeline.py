@@ -27,13 +27,6 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-# NLP and evaluation metrics
-import nltk
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from rouge_score import rouge_scorer
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-
 # Our modules
 from .bytecode_analyzer import BytecodeAnalyzer
 from .model_setup import SmartContractModelTrainer, ModelConfig, SmartContractDecompiler
@@ -42,6 +35,8 @@ from .replication_metrics import (
     evaluate_replication,
     extract_solidity_facts,
 )
+from .evaluation_identity import EVALUATOR_VERSION, BYTECODE_SCORE_KIND, bind_evaluation_payload
+from .runtime_equivalence import execute_equivalence_subset
 
 try:
     from .dataset_pipeline import DatasetBuilder
@@ -308,6 +303,8 @@ _OPCODE_GROUP_RULES = (
     ("selfdestruct", {"SELFDESTRUCT"}),
     ("push0", {"PUSH0"}),
     ("storage", {"SLOAD", "SSTORE"}),
+    ("storage_read", {"SLOAD"}),
+    ("storage_write", {"SSTORE"}),
     ("event_log", {"LOG0", "LOG1", "LOG2", "LOG3", "LOG4"}),
     ("control_flow", {"JUMP", "JUMPI", "JUMPDEST"}),
     ("revert", {"REVERT", "INVALID"}),
@@ -397,9 +394,13 @@ class BytecodeSemanticResult:
     opcode_groups: List[str] = field(default_factory=list)
     control_flow_buckets: List[str] = field(default_factory=list)
     mismatch_buckets: Dict[str, List[str]] = field(default_factory=dict)
+    executed_equivalence: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "evaluator_version": EVALUATOR_VERSION,
+            "bytecode_score_kind": BYTECODE_SCORE_KIND,
+            "executed_equivalence": self.executed_equivalence,
             "checked": self.checked,
             "checked_kind": "reference_bytecode_or_opcode_evidence",
             "score": self.score,
@@ -476,7 +477,7 @@ def evaluate_bytecode_semantics(
 
     This is not a bytecode equivalence or execution test: the primary score
     compares facts extracted from reference and generated Solidity. Without
-    reference bytecode/opcode evidence, the score is zero and unchecked. When
+    reference bytecode/opcode evidence, the score is zero and unchecked.
     Runtime comparison is opt-in for full contracts with verified reference
     bytecode and matching local compiler settings; fragments remain unchecked.
     """
@@ -526,8 +527,8 @@ def evaluate_bytecode_semantics(
     )
 
     opcode_groups = set(opcode_slices["opcode_groups"])
-    if "storage" in opcode_groups and not candidate_facts.get("state_write"):
-        mismatch_buckets["storage_write_mismatch"].append("bytecode_has_storage_access")
+    if "storage_write" in opcode_groups and not candidate_facts.get("state_write"):
+        mismatch_buckets["storage_write_mismatch"].append("bytecode_has_storage_write")
     if "event_log" in opcode_groups and not candidate_facts.get("event"):
         mismatch_buckets["event_mismatch"].append("bytecode_has_log_opcode")
     if "revert" in opcode_groups and not candidate_facts.get("guard"):
@@ -575,6 +576,31 @@ def evaluate_bytecode_semantics(
     if not checked:
         score = 0.0
     deployable = bool(solidity_validity.deployable)
+    executed_equivalence = {
+        "checked": False, "reason": "requires_verified_full_contract_runtime_and_explicit_fixtures"
+    }
+    if runtime_checked and "execution_test_calldata" in metadata:
+        expected_runtime = _first_bytecode_value(
+            metadata, ("runtime_bytecode", "deployed_bytecode")
+        ) or metadata.get("bytecode")
+        settings = metadata["runtime_comparison"]
+        candidate_runtime, candidate_reason = _compile_named_runtime(
+            candidate_code,
+            settings["contract_name"],
+            settings["compiler_version"],
+            settings["optimizer_enabled"],
+            settings["optimizer_runs"],
+            settings.get("source_name", "contract.sol"),
+        )
+        if candidate_runtime is None:
+            executed_equivalence = {
+                "checked": False, "reason": f"candidate_{candidate_reason}"
+            }
+        else:
+            executed_equivalence = execute_equivalence_subset(
+                _exact_evm_bytecode(expected_runtime), candidate_runtime,
+                metadata["execution_test_calldata"],
+            )
 
     return BytecodeSemanticResult(
         checked=checked,
@@ -589,6 +615,7 @@ def evaluate_bytecode_semantics(
         opcode_groups=opcode_slices["opcode_groups"],
         control_flow_buckets=opcode_slices["control_flow"],
         mismatch_buckets={key: sorted(set(values)) for key, values in mismatch_buckets.items()},
+        executed_equivalence=executed_equivalence,
     )
 
 
@@ -1944,6 +1971,10 @@ class SmartContractEvaluator:
         Raises:
             Exception: If sentence transformer model fails to load.
         """
+        import nltk
+        from rouge_score import rouge_scorer
+        from sentence_transformers import SentenceTransformer
+
         self.logger = logging.getLogger(__name__)
 
         # Initialize evaluation models
@@ -1970,6 +2001,8 @@ class SmartContractEvaluator:
             identical semantic meaning.
         """
         try:
+            from sklearn.metrics.pairwise import cosine_similarity
+
             # Encode both texts
             embeddings = self.semantic_model.encode([original, decompiled])
 
@@ -2012,6 +2045,8 @@ class SmartContractEvaluator:
             BLEU score between 0 and 1, where 1 indicates perfect match.
         """
         try:
+            from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+
             # Tokenize
             reference = [original.split()]
             candidate = decompiled.split()
@@ -2298,6 +2333,8 @@ class SmartContractEvaluator:
                     "decompiled_metadata": {},
                     "function_metadata": metadata,
                     "quality_issue": "malformed_input_output",
+                    "replication": evaluate_replication(original or "", "").to_dict(),
+                    "evaluator_version": EVALUATOR_VERSION,
                     "evaluation_time": 0.0,
                 },
             )
@@ -2371,6 +2408,7 @@ class SmartContractEvaluator:
                     "function_metadata": metadata,
                     "enhanced_structural_preservation": enhanced_structural_preservation,
                     "replication": replication.to_dict(),
+                    "evaluator_version": EVALUATOR_VERSION,
                     "solidity_validity": solidity_validity.to_dict(),
                     "bytecode_semantics": bytecode_semantics.to_dict(),
                     "evaluation_time": evaluation_time,
@@ -2406,6 +2444,8 @@ class SmartContractEvaluator:
                     "decompiled_metadata": {},
                     "function_metadata": metadata,
                     "error": str(e),
+                    "error_kind": "evaluator",
+                    "evaluator_version": EVALUATOR_VERSION,
                     "traceback": traceback.format_exc(),
                     "evaluation_time": evaluation_time,
                 },
@@ -2608,7 +2648,7 @@ class SmartContractTrainingPipeline:
         logger.info(f"Model training completed. Model saved to {model_path}")
         return model_path
 
-    def evaluate_model(self, model_path: str, test_path: str) -> Dict[str, Any]:
+    def evaluate_model(self, model_path: str, test_path: str, *, output_path: Optional[str] = None) -> Dict[str, Any]:
         """Comprehensive evaluation of the trained model.
 
         Loads the trained model, runs inference on test samples, and
@@ -2676,7 +2716,7 @@ class SmartContractTrainingPipeline:
         # Evaluate each function
         results = []
 
-        for item in tqdm(test_data, desc="Evaluating functions"):
+        for dataset_index, item in tqdm(list(zip(sampled_indices, test_data)), desc="Evaluating functions"):
             try:
                 # Generate decompiled code
                 decompiled = decompiler.decompile_tac_to_solidity(
@@ -2690,6 +2730,7 @@ class SmartContractTrainingPipeline:
 
                 results.append(
                     {
+                        "dataset_index": dataset_index,
                         "original": item["output"],
                         "decompiled": decompiled,
                         "input": item.get("input", ""),
@@ -2704,6 +2745,7 @@ class SmartContractTrainingPipeline:
                 # Add error information to continue evaluation
                 results.append(
                     {
+                        "dataset_index": dataset_index,
                         "original": item.get("output", ""),
                         "decompiled": "",
                         "input": item.get("input", ""),
@@ -2728,7 +2770,12 @@ class SmartContractTrainingPipeline:
                             "bytecode_deployable": False,
                             "bytecode_runtime_checked": False,
                             "bytecode_runtime_match": False,
-                            "metadata": {"error": str(e), "traceback": traceback.format_exc()},
+                            "metadata": {
+                                "error": str(e), "traceback": traceback.format_exc(),
+                                "error_kind": "generation",
+                                "replication": evaluate_replication(item.get("output", ""), "").to_dict(),
+                                "evaluator_version": EVALUATOR_VERSION,
+                            },
                         },
                         "metadata": item.get("metadata", {}),
                     }
@@ -2745,11 +2792,18 @@ class SmartContractTrainingPipeline:
         }
 
         # Save detailed results
-        results_path = Path(self.config.results_dir) / f"evaluation_results_{int(time.time())}.json"
-        with open(results_path, "w") as f:
-            json.dump(
-                {"aggregate_statistics": aggregate_stats, "detailed_results": results}, f, indent=2
-            )
+        results_path = Path(output_path) if output_path else Path(self.config.results_dir) / f"evaluation_results_{time.time_ns()}.json"
+        payload = bind_evaluation_payload(
+            {"aggregate_statistics": aggregate_stats, "detailed_results": results,
+             "summary": {**flatten_numeric_metrics(aggregate_stats), "num_evaluated": len(results)}},
+            test_path,
+            {"max_new_tokens": 1024, "evaluation_seed": self.config.evaluation_seed,
+             "generation_config": getattr(getattr(decompiler, "config", None), "generation_config", None)},
+            model_path,
+        )
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(results_path, "x", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, allow_nan=False)
 
         logger.info(f"Evaluation completed. Results saved to {results_path}")
         return aggregate_stats
@@ -2838,6 +2892,27 @@ class SmartContractTrainingPipeline:
             "skip_reasons": dict(sorted(runtime_skip_reasons.items())),
             "scope": "exact_full_contract_runtime_bytecode_not_deployment_or_behavior",
         }
+        execution_checks = []
+        for row in results:
+            metadata = row.get("metrics", {}).get("metadata")
+            bytecode_details = (
+                metadata.get("bytecode_semantics")
+                if isinstance(metadata, Mapping) else None
+            )
+            execution_checks.append(
+                bytecode_details.get("executed_equivalence")
+                if isinstance(bytecode_details, Mapping) else None
+            )
+        checked_executions = [
+            check for check in execution_checks
+            if isinstance(check, Mapping) and check.get("checked") is True
+        ]
+        stats["executed_equivalence"] = {
+            "checked_n": len(checked_executions),
+            "matched_n": sum(check.get("match") is True for check in checked_executions),
+            "total_n": len(results),
+            "scope": "bounded_stateless_explicit_calldata_fixtures_not_general_equivalence",
+        }
 
         # Add paper-specific metrics
         if "semantic_similarity" in metrics_data:
@@ -2865,6 +2940,19 @@ class SmartContractTrainingPipeline:
         )
         if replication_stats:
             stats["replication_metrics"] = replication_stats
+        checked = [
+            float(bool(row["metrics"].get("bytecode_runtime_match")))
+            for row in results if row["metrics"].get("bytecode_runtime_checked")
+        ]
+        stats["bytecode_runtime_match_checked"] = {
+            "mean": float(np.mean(checked)) if checked else None,
+            "count": len(checked),
+        }
+        stats["evaluator_error_count"] = sum(
+            bool((row.get("metrics", {}).get("metadata") or {}).get("error"))
+            and (row.get("metrics", {}).get("metadata") or {}).get("error_kind") == "evaluator"
+            for row in results
+        )
 
         stats["metadata_segments"] = compute_metadata_segment_metrics(results)
         stats["benchmark_suites"] = compute_benchmark_suite_metrics(results)

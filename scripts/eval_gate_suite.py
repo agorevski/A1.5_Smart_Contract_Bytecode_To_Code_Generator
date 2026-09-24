@@ -19,6 +19,7 @@ def evaluate_gate_suite(
     pairs: list[dict[str, Any]],
     *,
     tolerance: float = 0.0,
+    improvement_margin: float = 0.005,
 ) -> dict[str, Any]:
     comparisons = []
     for pair in pairs:
@@ -27,22 +28,44 @@ def evaluate_gate_suite(
             pair["candidate"],
             min_rows=int(pair.get("min_rows", 30)),
             tolerance=tolerance,
+            improvement_margin=improvement_margin,
         )
         comparison["name"] = pair["name"]
+        comparison["diagnostic_only"] = bool(pair.get("diagnostic_only", False))
         comparisons.append(comparison)
 
-    decisions = [comparison["decision"] for comparison in comparisons]
-    trustworthy = [comparison for comparison in comparisons if comparison["paired_rows"] >= 30]
-    if "reject" in decisions:
+    required = [comparison for comparison in comparisons if not comparison["diagnostic_only"]]
+    decisions = [comparison["decision"] for comparison in required]
+    all_decisions = [comparison["decision"] for comparison in comparisons]
+    trustworthy = [
+        comparison for comparison in required
+        if comparison["decision"] == "keep_candidate"
+        and comparison.get("independent_units", 0)
+        >= comparison.get("gate_settings", {}).get("min_independent_units", 30)
+    ]
+    mixed_models = any(
+        len({((comparison.get(key) or {}).get("model_path"),
+              (comparison.get(key) or {}).get("training_manifest_sha256"))
+             for comparison in comparisons}) > 1
+        for key in ("baseline_model_provenance", "candidate_model_provenance")
+    )
+    if "reject" in all_decisions:
         suite_decision = "reject"
-        reason = "one or more required comparisons regressed"
+        reason = "one or more comparisons regressed"
+    elif not decisions or "inconclusive" in all_decisions or mixed_models:
+        suite_decision = "inconclusive"
+        reason = "missing required evidence or incompatible/incomplete evaluation/model identities"
     elif "smoke_only" in decisions:
         suite_decision = "smoke_only"
         reason = "one or more required comparisons has too few rows"
-    elif not trustworthy:
+    elif not required or not any(
+        comparison.get("independent_units", 0)
+        >= comparison.get("gate_settings", {}).get("min_independent_units", 30)
+        for comparison in required
+    ):
         suite_decision = "smoke_only"
-        reason = "no comparison has at least 30 paired rows"
-    elif any(comparison["decision"] == "keep_candidate" for comparison in trustworthy):
+        reason = "no required comparison has enough independent paired units"
+    elif trustworthy:
         suite_decision = "keep_candidate"
         reason = "all required comparisons passed and at least one 30+ row comparison improved"
     else:
@@ -116,12 +139,20 @@ def main() -> None:
         help="Required comparison pair and its minimum trustworthy row count",
     )
     parser.add_argument("--tolerance", type=float, default=0.0)
+    parser.add_argument("--improvement-margin", type=float, default=0.005)
+    parser.add_argument("--diagnostic", action="append", default=[], help="Pair name used only as a regression diagnostic")
     parser.add_argument("--json-output", help="Optional machine-readable gate output")
     parser.add_argument("--markdown-output", help="Optional markdown gate report")
     args = parser.parse_args()
 
     pairs = [_parse_pair(pair) for pair in args.pair]
-    suite = evaluate_gate_suite(pairs, tolerance=args.tolerance)
+    if len({pair["name"] for pair in pairs}) != len(pairs):
+        parser.error("Pair names must be unique")
+    if not set(args.diagnostic) <= {pair["name"] for pair in pairs}:
+        parser.error("Unknown diagnostic pair")
+    for pair in pairs:
+        pair["diagnostic_only"] = pair["name"] in args.diagnostic
+    suite = evaluate_gate_suite(pairs, tolerance=args.tolerance, improvement_margin=args.improvement_margin)
     if args.json_output:
         output = Path(args.json_output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +165,7 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(report, encoding="utf-8")
     print(report, end="")
+    raise SystemExit(0 if suite["decision"] in ("keep_candidate", "no_change") else 1)
 
 
 if __name__ == "__main__":

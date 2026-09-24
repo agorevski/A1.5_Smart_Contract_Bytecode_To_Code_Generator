@@ -37,6 +37,7 @@ from tqdm import tqdm
 
 from .bytecode_analyzer import BytecodeAnalyzer, analyze_bytecode_to_tac
 from .local_compiler import (
+    strip_solidity_comments,
     compile_source,
     compile_multi_file,
     parse_etherscan_source,
@@ -45,9 +46,12 @@ from .local_compiler import (
     install_solc_version,
     _normalize_version,
 )
+from .tac_schema import TAC_SCHEMA_VERSION
 from .abi_enrichment import canonicalize_abi_type, normalize_hex
 import yaml
 from .dataset_export_primitives import (
+    LABEL_SCHEMA_VERSION,
+    analysis_status_snapshot,
     TRAINING_ROW_SCHEMA_VERSION,
     _collapse_whitespace,
     _md5,
@@ -1235,8 +1239,6 @@ class DatasetBuilder:
                 }
                 return result
 
-            solidity_with_selectors = self._add_selectors_to_solidity_functions(solidity_functions)
-
             for cfg in configs:
                 ver = cfg["version"]
                 opt = cfg["optimizer_enabled"]
@@ -1270,7 +1272,10 @@ class DatasetBuilder:
                     comp = compile_multi_file(source_files, ver, opt, runs)
                 else:
                     first_source = next(iter(source_files.values()))
-                    comp = compile_source(first_source, ver, opt, runs)
+                    comp = compile_source(
+                        first_source, ver, opt, runs,
+                        source_filename=next(iter(source_files)),
+                    )
 
                 if not comp.success:
                     logger.warning(
@@ -1311,9 +1316,16 @@ class DatasetBuilder:
                         )
                         continue
 
-                    contract_sol_funcs = [
-                        f for f in solidity_with_selectors if f.get("contract_name", "") == cname
-                    ] or solidity_with_selectors
+                    contract_sol_funcs = getattr(compiled, "effective_functions", [])
+                    if getattr(compiled, "label_resolution_error", "") or not contract_sol_funcs:
+                        address_failures.append(("unresolved_ast_implementation", cname))
+                        add_diagnostic(
+                            stage="match", contract_address=addr, compiler_version=ver,
+                            status="unresolved_ast_implementation",
+                            error=getattr(compiled, "label_resolution_error", "") or
+                            "no solc AST-resolved implementations",
+                        )
+                        continue
 
                     ambiguous_selectors: set[str] = set()
                     matched = self._match_functions_by_selector(
@@ -1594,8 +1606,20 @@ class DatasetBuilder:
 
             solidity_with_selectors = self._add_selectors_to_solidity_functions(solidity_functions)
 
-            matched_pairs = self._match_functions_by_selector(
-                solidity_with_selectors, bytecode_functions, analyzer
+            # This legacy on-chain path has no compiled artifact identity.
+            # Without it, multiple contracts/inheritance cannot be resolved
+            # safely; use collect_and_compile_contracts for full labels.
+            source_contracts = re.findall(
+                r"\b(?:contract|library|interface)\s+\w+", strip_solidity_comments(source_code)
+            )
+            has_inheritance = re.search(
+                r"\bcontract\s+\w+\s+is\b", strip_solidity_comments(source_code)
+            )
+            matched_pairs = (
+                self._match_functions_by_selector(
+                    solidity_with_selectors, bytecode_functions, analyzer
+                )
+                if len(source_contracts) == 1 and not has_inheritance else []
             )
 
             logger.info(f"Matched {len(matched_pairs)} functions for {address}")
@@ -1728,6 +1752,9 @@ class DatasetBuilder:
                     contract_address=address,
                     metadata={
                         "partial": True,
+                        "analysis_status": analysis_status_snapshot(analyzer),
+                        "tac_schema_version": TAC_SCHEMA_VERSION,
+                        "label_schema_version": None,
                         "selector": func.selector,
                         "block_count": n_blocks,
                     },
@@ -1998,6 +2025,13 @@ class DatasetBuilder:
                 "contract_name": sol_func.get("contract_name"),
                 "selector": match["selector"],
                 "matched_by_selector": True,
+                "analysis_status": match.get("analysis_status"),
+                "tac_schema_version": TAC_SCHEMA_VERSION,
+                "label_schema_version": LABEL_SCHEMA_VERSION if sol_func.get("ast_id") is not None else None,
+                "source_file": sol_func.get("source_file"),
+                "ast_id": sol_func.get("ast_id"),
+                "declaring_contract_id": sol_func.get("declaring_contract_id"),
+                "compiled_contract_id": sol_func.get("compiled_contract_id"),
             },
         )
 
@@ -2470,6 +2504,8 @@ class DatasetBuilder:
             manifest = {
                 "manifest_kind": "etherscan_dataset_export",
                 "manifest_schema_version": 1,
+                "generator_tac_schema_version": TAC_SCHEMA_VERSION,
+                "generator_label_schema_version": LABEL_SCHEMA_VERSION,
                 "training_row_schema_version": TRAINING_ROW_SCHEMA_VERSION,
                 "run_id": self.run_id,
                 "generated_at": _utc_now_iso(),

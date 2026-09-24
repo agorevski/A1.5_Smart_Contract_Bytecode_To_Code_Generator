@@ -51,6 +51,442 @@ class _CharacterTokenizer:
         return {"input_ids": list(range(len(text)))}
 
 
+def _inheritance_ast(order=("Base", "Derived", "Unrelated"), override=False):
+    sources = {}
+    output = {"sources": {}, "contracts": {}}
+    ids = {"Base": 10, "Derived": 20, "Unrelated": 30}
+    for file_id, name in enumerate(order):
+        function = (
+            f"function value() public view returns (uint256) {{ return {ids[name]}; }}"
+            if name != "Derived" or override else ""
+        )
+        source = f"// café\ncontract {name} {{ {function} }}"
+        path = f"{name}.sol"
+        sources[path] = source
+        encoded = source.encode()
+        nodes = []
+        if function:
+            start = encoded.index(b"function")
+            body_start = encoded.index(b"{", start)
+            body_end = encoded.index(b"}", body_start) + 1
+            nodes.append({
+                "nodeType": "FunctionDefinition", "id": ids[name] + 1,
+                "name": "value", "visibility": "public", "stateMutability": "view",
+                "functionSelector": "12345678",
+                "src": f"{start}:{len(function.encode())}:{file_id}",
+                "body": {"src": f"{body_start}:{body_end - body_start}:{file_id}"},
+            })
+        output["sources"][path] = {
+            "id": file_id,
+            "ast": {"nodes": [{
+                "nodeType": "ContractDefinition", "id": ids[name], "name": name,
+                "linearizedBaseContracts": [20, 10] if name == "Derived" else [ids[name]],
+                "nodes": nodes,
+            }]},
+        }
+        output["contracts"][path] = {name: {
+            "evm": {"deployedBytecode": {"object": "6001600055"},
+                    "methodIdentifiers": {"value()": "12345678"}}
+        }}
+    return output, sources
+
+
+@pytest.mark.parametrize("order", [
+    ("Base", "Derived", "Unrelated"), ("Unrelated", "Derived", "Base"),
+])
+@pytest.mark.parametrize("override", [False, True])
+def test_ast_effective_implementation_is_inherited_or_overridden_not_unrelated(order, override):
+    from src.local_compiler import resolve_effective_functions
+
+    output, sources = _inheritance_ast(order, override)
+    functions = resolve_effective_functions(output, sources, "Derived.sol", "Derived")
+    assert len(functions) == 1
+    expected = "Derived" if override else "Base"
+    assert functions[0]["source_file"] == f"{expected}.sol"
+    assert functions[0]["contract_name"] == expected
+    assert functions[0]["body"].startswith("function value()")
+    assert f"return {20 if override else 10};" in functions[0]["body"]
+
+
+def test_ast_uses_solc_linearization_not_source_declaration_order():
+    from src.local_compiler import resolve_effective_functions
+
+    output, sources = _inheritance_ast()
+    derived = output["sources"]["Derived.sol"]["ast"]["nodes"][0]
+    # Treat the second base as the rightmost base in multiple inheritance.
+    derived["linearizedBaseContracts"] = [20, 30, 10]
+    assert resolve_effective_functions(
+        output, sources, "Derived.sol", "Derived"
+    )[0]["declaring_contract_id"] == 30
+
+
+def test_ast_rejects_missing_identity_and_duplicate_local_selector():
+    from src.local_compiler import resolve_effective_functions
+
+    output, sources = _inheritance_ast()
+    with pytest.raises(ValueError, match="identity"):
+        resolve_effective_functions(output, sources, "missing.sol", "Derived")
+    base = output["sources"]["Base.sol"]["ast"]["nodes"][0]
+    base["nodes"].append(dict(base["nodes"][0], id=99))
+    with pytest.raises(ValueError, match="ambiguous selector"):
+        resolve_effective_functions(output, sources, "Derived.sol", "Derived")
+
+
+def test_compiler_requests_ast_and_quarantines_missing_ast(monkeypatch):
+    from src import local_compiler
+
+    output, sources = _inheritance_ast()
+    captured = {}
+
+    def compile_standard(value, **kwargs):
+        captured.update(value)
+        return output
+
+    monkeypatch.setattr(local_compiler, "install_solc_version", lambda _: True)
+    monkeypatch.setattr(local_compiler.solcx, "compile_standard", compile_standard)
+    result = local_compiler.compile_multi_file(sources, "0.8.20")
+    assert result.success
+    assert captured["settings"]["outputSelection"]["*"][""] == ["ast"]
+    assert result.contracts["Derived"].effective_functions[0]["contract_name"] == "Base"
+    output["sources"] = {}
+    result = local_compiler.compile_multi_file(sources, "0.8.20")
+    assert result.contracts["Derived"].effective_functions == []
+    assert "AST identity" in result.contracts["Derived"].label_resolution_error
+
+
+def test_single_source_compiler_preserves_original_filename(monkeypatch):
+    from src import local_compiler
+
+    output, sources = _inheritance_ast(("Base",))
+    captured = {}
+
+    def compile_standard(value, **kwargs):
+        captured.update(value)
+        return output
+
+    monkeypatch.setattr(local_compiler, "install_solc_version", lambda _: True)
+    monkeypatch.setattr(local_compiler.solcx, "compile_standard", compile_standard)
+    result = local_compiler.compile_source(
+        sources["Base.sol"], "0.8.20", source_filename="Base.sol"
+    )
+    assert set(captured["sources"]) == {"Base.sol"}
+    assert result.contracts["Base"].effective_functions[0]["source_file"] == "Base.sol"
+
+
+def test_ast_same_contract_name_in_other_file_does_not_overwrite_artifact():
+    from src.local_compiler import _compiled_contracts
+
+    output, sources = _inheritance_ast(("Base", "Unrelated"))
+    source = sources.pop("Unrelated.sol").replace("Unrelated", "Base")
+    sources["Other.sol"] = source
+    info = output["sources"].pop("Unrelated.sol")
+    info["ast"]["nodes"][0]["name"] = "Base"
+    # The shorter contract name changes the function source offsets.
+    node = info["ast"]["nodes"][0]["nodes"][0]
+    for span in (node, node["body"]):
+        start, length, file_id = map(int, span["src"].split(":"))
+        span["src"] = f"{start - 5}:{length}:{file_id}"
+    output["sources"]["Other.sol"] = info
+    output["contracts"]["Other.sol"] = {"Base": output["contracts"].pop("Unrelated.sol")["Unrelated"]}
+    contracts = _compiled_contracts(output, sources)
+    assert set(contracts) == {"Base.sol:Base", "Other.sol:Base"}
+    assert contracts["Base.sol:Base"].effective_functions[0]["source_file"] == "Base.sol"
+    assert "return 30;" in contracts["Other.sol:Base"].effective_functions[0]["body"]
+
+
+@pytest.mark.parametrize("generator", ["hf", "lookup"])
+def test_generation_uses_compiled_ast_labels_not_source_selector_fallback(monkeypatch, generator):
+    from types import SimpleNamespace
+    from src.local_compiler import _compiled_contracts
+    import download_hf_contracts as hf
+    from scripts import build_lookup_db as lookup
+
+    output, sources = _inheritance_ast()
+    compiled = _compiled_contracts(output, sources)
+    compilation = SimpleNamespace(success=True, contracts=compiled, errors=[])
+
+    class Analyzer:
+        def __init__(self, bytecode):
+            self.basic_blocks = {}
+
+        def analyze_control_flow(self):
+            pass
+
+        def identify_functions(self):
+            return {"value": SimpleNamespace(
+                selector="0x12345678", entry_block="block_0",
+                basic_blocks=[SimpleNamespace(
+                    id="block_0", instructions=["return 10"], predecessors=[], successors=[],
+                )],
+            )}
+
+        def _format_tac_instruction(self, instruction):
+            return instruction
+
+    module = hf if generator == "hf" else lookup
+    monkeypatch.setattr(module, "install_solc_version", lambda _: True)
+    monkeypatch.setattr(module, "compile_multi_file", lambda *args: compilation)
+    monkeypatch.setattr(module, "BytecodeAnalyzer", Analyzer)
+    poison = [{"selector": "0x12345678", "body": "unrelated wrong label"}]
+    if generator == "hf":
+        monkeypatch.setattr(hf, "is_trivial_function", lambda _: False)
+        result = hf._compile_one_job("0x" + "1" * 40, sources, poison, "0.8.20",
+                                     False, 200, 0, "Derived")
+        assert result["status"] == "processed"
+        assert len(result["pairs"]) == 1
+        assert "return 10;" in result["pairs"][0]["solidity_code"]
+        assert json.loads(result["pairs"][0]["metadata"])["declaring_contract_id"] == 10
+        compiled["Derived"].effective_functions = []
+        result = hf._compile_one_job("0x" + "1" * 40, sources, poison, "0.8.20",
+                                     False, 200, 0, "Derived")
+        assert result["pairs"] == []
+        assert result["drop_counts"]["unresolved_ast_implementation"] == 1
+        Analyzer.analysis_status = {"status": "degraded", "issues": [{"code": "stack_underflow"}]}
+        result = hf._compile_one_job("0x" + "1" * 40, sources, poison, "0.8.20",
+                                     False, 200, 0, "Derived")
+        assert result["pairs"] == []
+        assert result["drop_counts"]["tac_analysis_degraded"] == 1
+    else:
+        status, pairs = lookup._compile_one("address", sources, poison, "0.8.20", False, 200)
+        assert status == "ok"
+        assert len(pairs) == 3
+        assert all("wrong label" not in pair["solidity_code"] for pair in pairs)
+        Analyzer.analysis_status = {"status": "failed", "issues": [{"code": "parse_error"}]}
+        status, pairs = lookup._compile_one("address", sources, poison, "0.8.20", False, 200)
+        assert status == "no_pairs"
+        assert pairs == []
+
+
+@pytest.mark.parametrize("status", ["degraded", "failed"])
+def test_uncertain_analysis_never_becomes_exact_training_label(status):
+    from types import SimpleNamespace
+    from src.dataset_export_primitives import extract_tac_for_function, match_functions_by_selector
+
+    analyzer = SimpleNamespace(analysis_status={"status": status, "issues": []})
+    function = SimpleNamespace(selector="0x12345678")
+    source = [{"selector": "0x12345678", "body": "wrong label"}]
+    assert extract_tac_for_function(function, analyzer) == ""
+    assert match_functions_by_selector(source, {"value": function}, analyzer) == []
+
+
+def test_analysis_metadata_is_an_independent_snapshot():
+    from types import SimpleNamespace
+    from src.dataset_export_primitives import analysis_status_snapshot
+
+    analyzer = SimpleNamespace(analysis_status={"status": "ok", "issues": []})
+    snapshot = analysis_status_snapshot(analyzer)
+    analyzer.analysis_status["issues"].append({"code": "fallback"})
+    analyzer.analysis_status["status"] = "degraded"
+    assert snapshot == {"status": "ok", "issues": []}
+
+
+def test_selector_matcher_rejects_ambiguous_candidates_in_either_order():
+    from types import SimpleNamespace
+    from src.dataset_export_primitives import match_functions_by_selector
+
+    analyzer = SimpleNamespace()
+    candidates = [{"selector": "0x12345678", "body": "one"},
+                  {"selector": "0x12345678", "body": "two"}]
+    bytecode = {"value": SimpleNamespace(selector="0x12345678")}
+    assert match_functions_by_selector(candidates, bytecode, analyzer) == []
+    assert match_functions_by_selector(list(reversed(candidates)), bytecode, analyzer) == []
+
+
+@pytest.mark.parametrize("version", [None, 1, 999])
+def test_lookup_rejects_unversioned_or_stale_db_without_relabeling(tmp_path, version):
+    from src.tac_lookup import TACLookup, TACLookupBuilder
+
+    path = tmp_path / "lookup.db"
+    TACLookupBuilder(str(path))
+    with sqlite3.connect(path) as conn:
+        if version is None:
+            conn.execute("DROP TABLE lookup_manifest")
+        else:
+            conn.execute("UPDATE lookup_manifest SET value_json = ?", (
+                json.dumps({"tac_schema_version": version, "label_schema_version": 2}),
+            ))
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="Incompatible TAC lookup schema"):
+        TACLookup(str(path))
+    with pytest.raises(ValueError, match="Incompatible TAC lookup schema"):
+        TACLookupBuilder(str(path))
+    assert path.read_bytes() == before
+
+
+def test_new_lookup_and_legacy_row_metadata_versions(tmp_path):
+    from src.tac_lookup import TACLookup, TACLookupBuilder
+    from src.tac_schema import TAC_SCHEMA_VERSION
+    from src.dataset_export_primitives import normalize_training_metadata
+
+    path = tmp_path / "lookup.db"
+    builder = TACLookupBuilder(str(path))
+    builder.record_manifest({"build_id": "example"})
+    builder.insert_pair("return 1", "function value() public { return 1; }")
+    lookup = TACLookup(str(path))
+    assert lookup.available
+    assert lookup.manifest()["tac_schema_version"] == TAC_SCHEMA_VERSION
+    assert lookup.manifest()["label_schema_version"] == 2
+    assert lookup.query("return 1")["solidity"] == "function value() public { return 1; }"
+    lookup.close()
+    legacy = normalize_training_metadata({})
+    assert legacy["tac_schema_version"] is None
+    assert legacy["label_schema_version"] is None
+
+
+def _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion, cap="1", seed="42", recreate=""):
+    import os
+    import sys
+    script = Path("run_train_qwen_qlora_full_body_balanced.sh").read_text(encoding="utf-8")
+    materializer = script[script.index('python - "${SOURCE_DATASET}"'):]
+    python = materializer.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    monkeypatch.setattr(sys, "argv", [
+        "-", str(source), str(output), str(manifest), cap, seed, "",
+        os.path.relpath(exclusion), recreate,
+    ])
+    exec(compile(python, "<balanced-materializer>", "exec"), {})
+
+
+def _balanced_files(tmp_path):
+    source, output, manifest, exclusion = [
+        tmp_path / name for name in ("source.jsonl", "balanced.jsonl", "manifest.json", "eval.jsonl")
+    ]
+    source.write_text(json.dumps({
+        "input": "return 1", "output": "function value() public { return 1; }",
+        "metadata": {"body_hash": "one"},
+    }) + "\n", encoding="utf-8")
+    exclusion.write_text(json.dumps({
+        "input": "unrelated", "output": "function elsewhere() public { return 9; }",
+    }) + "\n", encoding="utf-8")
+    return source, output, manifest, exclusion
+
+
+@pytest.mark.parametrize("change", ["source", "cap", "seed", "exclusion", "manifest"])
+def test_balanced_reuse_rejects_changed_inputs(tmp_path, monkeypatch, change):
+    source, output, manifest, exclusion = _balanced_files(tmp_path)
+    _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion)
+    cap, seed = "1", "42"
+    if change == "source":
+        source.write_text(source.read_text() + "\n", encoding="utf-8")
+    elif change == "cap":
+        cap = "2"
+    elif change == "seed":
+        seed = "7"
+    elif change == "exclusion":
+        exclusion.write_text('{"input": "different", "output": "different"}\n', encoding="utf-8")
+    else:
+        manifest.unlink()
+    with pytest.raises(ValueError, match="unverified or stale"):
+        _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion, cap, seed)
+
+
+def test_balanced_reuse_verifies_output_and_independent_eval_overlap(tmp_path, monkeypatch):
+    source, output, manifest, exclusion = _balanced_files(tmp_path)
+    heldout = {"input": "heldout", "output": "function heldout() public { return 2; }"}
+    exclusion.write_text(json.dumps(heldout) + "\n", encoding="utf-8")
+    _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion)
+    with pytest.raises(SystemExit) as exit_info:
+        _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion)
+    assert exit_info.value.code == 0
+    output.write_text(output.read_text() + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unverified or stale"):
+        _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion)
+    source.write_text(json.dumps(heldout) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="All source rows overlap"):
+        _run_balanced_materializer(monkeypatch, source, output, manifest, exclusion, recreate="1")
+
+
+@pytest.mark.parametrize("mode", ["success", "preflight_failure", "existing_gate_dir"])
+def test_balanced_post_training_uses_shared_gate_and_bound_diagnostic_outputs(tmp_path, mode):
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("Bash is required to exercise the Bash runner")
+    script = Path("run_train_qwen_qlora_full_body_balanced.sh").read_text(encoding="utf-8")
+    tail = script[script.index("# Use the same fail-closed"):]
+    assert "newest_eval_json" not in tail
+    assert "--skip-data-preflight" not in tail
+    assert "scripts/eval_gate_suite.py" not in tail
+    assert "large192_baseline" not in tail
+    forwarded = [
+        "MODEL_PATH", "GATE_DIR", "NUM_GPUS", "EVAL_BATCH_SIZE",
+        "EVAL_MAX_NEW_TOKENS", "EVAL_REPETITION_PENALTY",
+        "BROAD_DATASET", "CALLS_DATASET", "STATE_DATASET", "HOLDOUT64_DATASET",
+        "PURE_NEGATIVE_DATASET", "LARGE192_DATASET", "BROAD_BASELINE", "CALLS_BASELINE",
+        "STATE_BASELINE", "HOLDOUT64_BASELINE", "PURE_NEGATIVE_BASELINE", "LARGE192_BASELINE",
+    ]
+    child = """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${TEST_GATE_MODE}" == "preflight_failure" ]]; then exit 17; fi
+mkdir "${GATE_DIR}"
+printf '{}' > "${GATE_DIR}/gate_suite.json"
+: > "${GATE_DIR}/eval_paths.tsv"
+"""
+    child += "\n".join(f'printf \'%s\\n\' "${{{name}}}" >> forwarded.txt' for name in forwarded)
+    (tmp_path / "run_eval_gate_suite_for_model.sh").write_bytes(child.encode())
+    if mode == "existing_gate_dir":
+        (tmp_path / "gates").mkdir()
+        (tmp_path / "gates" / "gate_suite.json").write_text("stale")
+    prefix = """set -euo pipefail
+SCRIPT_DIR="$PWD"
+OUTPUT_DIR="$PWD/model"
+FINAL_MODEL="${OUTPUT_DIR}/final_model"
+DATA_DIR="$PWD/data"
+GATE_DIR="$PWD/gates"
+NUM_GPUS=3
+EVAL_BATCH_SIZE=2
+EVAL_MAX_NEW_TOKENS=123
+EVAL_REPETITION_PENALTY=1.2
+DEFAULT_EVAL_EXCLUDE_DATASETS=eval-gates.jsonl
+python() {
+    if [[ "$1" == "-m" && "$2" == "scripts.gate_dataset" && "$3" == "verify-model" ]]; then
+        printf '%s\\n' "$PWD/train.jsonl"
+    else
+        return 0
+    fi
+}
+uv() {
+    printf '%s\\n' "$@" > diagnostic_args.txt
+    while [[ "$#" -gt 0 ]]; do
+        if [[ "$1" == "--eval-output-json" ]]; then
+            shift
+            printf '{}' > "$1"
+        fi
+        shift
+    done
+}
+"""
+    prefix += f"export TEST_GATE_MODE={mode}\n"
+    prefix += "\n".join(f"{name}={name}-override" for name in forwarded[6:]) + "\n"
+    result = subprocess.run(
+        [bash], input=(prefix + tail).encode(), cwd=tmp_path,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    if mode != "success":
+        assert result.returncode != 0
+        assert not (tmp_path / "diagnostic_args.txt").exists()
+        if mode == "preflight_failure":
+            assert result.returncode == 17
+        else:
+            assert (tmp_path / "gates" / "gate_suite.json").read_text() == "stale"
+        return
+    assert result.returncode == 0, result.stderr.decode()
+    values = (tmp_path / "forwarded.txt").read_text().splitlines()
+    assert values[0].endswith("/model/final_model")
+    assert values[1].endswith("/gates")
+    assert values[2:6] == ["3", "2", "123", "1.2"]
+    assert values[6:] == [f"{name}-override" for name in forwarded[6:]]
+    args = (tmp_path / "diagnostic_args.txt").read_text().splitlines()
+    assert args[:3] == ["run", "--extra", "quantization"]
+    assert "--eval-output-json" in args
+    assert args[args.index("--eval-limit") + 1] == "30"
+    assert "--eval-first-n" in args
+    assert (tmp_path / "gates" / "eval_train_first30.json").is_file()
+    mapping = (tmp_path / "gates" / "eval_paths.tsv").read_text()
+    assert mapping.startswith("train_first30\t")
+
+
 def _make_pair(download_hf_contracts, idx, body):
     tac = f"function same:\n  block_{idx}:\n    temp = {idx}"
     return {
@@ -240,7 +676,10 @@ def test_download_contracts_streams_parquet_batches_without_full_dataframe(tmp_p
     assert "read_parquet" not in inspect.getsource(download_hf_contracts.download_contracts)
     manifest = json.loads(manifest_path.read_text())
     assert manifest["parameters"]["parquet_batch_size"] == 2
-    assert manifest["performance"]["max_rss_mb"] > 0
+    if download_hf_contracts.resource is None:
+        assert manifest["performance"]["max_rss_mb"] == 0
+    else:
+        assert manifest["performance"]["max_rss_mb"] > 0
     assert manifest["performance"]["parquet_streams"][0]["batch_size"] == 2
     assert manifest["drop_counts"]["non_solidity"] == 1
 
@@ -400,6 +839,7 @@ def test_hf_compile_quarantines_ambiguous_selector_alignment(monkeypatch):
                 "Derived": SimpleNamespace(
                     runtime_bytecode="6000600055",
                     abi=[{"name": "transferFrom", "type": "function"}],
+                    effective_functions=source_functions,
                 )
             },
         ),
@@ -477,7 +917,13 @@ def test_etherscan_compile_records_ambiguous_selector_diagnostic(tmp_path, monke
         "compile_source",
         lambda *_args, **_kwargs: SimpleNamespace(
             success=True,
-            contracts={"Derived": SimpleNamespace(runtime_bytecode="6000600055", abi=[])},
+            contracts={"Derived": SimpleNamespace(
+                runtime_bytecode="6000600055", abi=[],
+                effective_functions=[
+                    {"name": "transferFrom", "selector": "0x23b872dd", "body": "ERC20 body"},
+                    {"name": "transferFrom", "selector": "0x23b872dd", "body": "ERC721 body"},
+                ],
+            )},
         ),
     )
     outcome = builder._collect_compile_address(
@@ -1139,10 +1585,15 @@ def test_record_quality_report_flags_selector_mismatch_and_bad_outputs():
     assert "output_missing_solidity_entrypoint" in report["reasons"]
 
 
-def test_data_quality_ci_workflow_runs_regression_subset():
+def test_data_quality_ci_workflow_runs_full_regression_suite():
+    import yaml
+
     workflow = Path(".github/workflows/data-quality.yml")
     assert workflow.exists()
     text = workflow.read_text()
-    assert "tests/test_dataset_quality_issues.py" in text
-    assert "tests/test_data_generation_export_issues.py" in text
+    config = yaml.safe_load(text)
+    steps = config["jobs"]["data-quality-and-quality-gate"]["steps"]
+    regression = next(step for step in steps if step.get("name") == "Run CPU-only regression suite")
+    assert regression["run"].strip().endswith("pytest")
+    assert "--extra cpu" in regression["run"]
     assert "pull_request" in text

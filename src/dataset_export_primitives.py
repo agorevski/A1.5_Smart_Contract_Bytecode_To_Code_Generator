@@ -8,6 +8,7 @@ checks, and final-row de-duplication stay identical across export paths.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import hashlib
@@ -16,6 +17,7 @@ import re
 
 
 TRAINING_ROW_SCHEMA_VERSION = 1
+LABEL_SCHEMA_VERSION = 2
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -221,6 +223,9 @@ def parse_metadata_object(metadata: Any) -> Dict[str, Any]:
 def normalize_training_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized = dict(metadata or {})
     normalized.setdefault("schema_version", TRAINING_ROW_SCHEMA_VERSION)
+    # Exporting a legacy row cannot establish which analyzer generated it.
+    normalized.setdefault("tac_schema_version", None)
+    normalized.setdefault("label_schema_version", None)
     return normalized
 
 
@@ -730,6 +735,19 @@ def ensure_tac_integrated(analyzer: Any) -> None:
         converter()
 
 
+def analysis_quality_reject_reasons(analyzer: Any) -> List[str]:
+    """Do not turn explicitly uncertain analysis into exact training labels."""
+    status = getattr(analyzer, "analysis_status", None)
+    if isinstance(status, dict) and status.get("status") != "ok":
+        return [f"tac_analysis_{status.get('status', 'unknown')}"]
+    return []
+
+
+def analysis_status_snapshot(analyzer: Any) -> Optional[Dict[str, Any]]:
+    status = getattr(analyzer, "analysis_status", None)
+    return deepcopy(status) if isinstance(status, dict) else None
+
+
 def collect_blocks(entry_block_id: str, all_blocks: Dict[str, Any]) -> List[Any]:
     if entry_block_id not in all_blocks:
         return []
@@ -768,6 +786,8 @@ def extract_tac_for_function(
     lines: List[str] = []
     try:
         ensure_tac_integrated(analyzer)
+        if analysis_quality_reject_reasons(analyzer):
+            return ""
         lines.append(f"function {_safe_tac_function_name(bytecode_function)}:")
         if getattr(bytecode_function, "selector", None):
             lines.append(f"  // Selector: {bytecode_function.selector}")
@@ -806,6 +826,8 @@ def match_functions_by_selector(
 ) -> List[Dict[str, Any]]:
     """Match only selectors with an unambiguous Solidity target and runtime entry."""
     ensure_tac_integrated(analyzer)
+    if analysis_quality_reject_reasons(analyzer):
+        return []
     sol_by_sel: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for function in solidity_functions:
         if function.get("selector"):
@@ -846,6 +868,7 @@ def match_functions_by_selector(
                 "bytecode_function": bytecode_func,
                 "tac": tac,
                 "selector": selector,
+                "analysis_status": analysis_status_snapshot(analyzer),
             }
         )
     return matches

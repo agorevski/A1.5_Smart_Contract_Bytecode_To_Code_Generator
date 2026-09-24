@@ -21,7 +21,7 @@ source "${SCRIPT_DIR}/train_common.sh"
 # ── DeepSpeed-specific configuration ─────────────────────────
 DS_CONFIG="${DS_CONFIG:-ds_config.json}"
 
-PRECISION_MODE=$(uv run python - <<'PY'
+PRECISION_MODE=$(uv run --extra training python - <<'PY'
 import torch
 
 if not torch.cuda.is_available():

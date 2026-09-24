@@ -97,7 +97,7 @@ if [[ "${SELECTOR_SIGNATURE_METADATA}" == "false" || "${SELECTOR_SIGNATURE_METAD
 fi
 
 TRAIN_CMD=(
-    uv run torchrun
+    uv run --extra quantization torchrun
     --nproc_per_node="${NUM_GPUS}"
     train.py
     --skip-collection

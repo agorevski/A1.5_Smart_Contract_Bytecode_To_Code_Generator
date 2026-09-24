@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 import train
+from src.tac_schema import TAC_SCHEMA_VERSION
+from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
 
 
 def _write_jsonl(path: Path, rows):
@@ -292,29 +294,29 @@ def test_jsonl_preflight_reports_schema_and_token_length_errors(tmp_path):
     dataset_path.write_text(
         "\n".join(
             [
-                json.dumps({"input": "ok", "output": "ok", "metadata": {"schema_version": 1}}),
+                json.dumps({"input": "ok", "output": "ok", "metadata": {"schema_version": 1, "tac_schema_version": TAC_SCHEMA_VERSION, "label_schema_version": LABEL_SCHEMA_VERSION}}),
                 "{not valid json}",
-                json.dumps({"output": "missing input", "metadata": {"schema_version": 1}}),
+                json.dumps({"output": "missing input", "metadata": {"schema_version": 1, "tac_schema_version": TAC_SCHEMA_VERSION, "label_schema_version": LABEL_SCHEMA_VERSION}}),
                 json.dumps({"input": "has bad metadata", "output": "ok", "metadata": []}),
                 json.dumps(
                     {
                         "input": "has empty output",
                         "output": "   ",
-                        "metadata": {"schema_version": 1},
+                        "metadata": {"schema_version": 1, "tac_schema_version": TAC_SCHEMA_VERSION, "label_schema_version": LABEL_SCHEMA_VERSION},
                     }
                 ),
                 json.dumps(
                     {
                         "input": " ".join(["context"] * 40),
                         "output": "ok",
-                        "metadata": {"schema_version": 1},
+                        "metadata": {"schema_version": 1, "tac_schema_version": TAC_SCHEMA_VERSION, "label_schema_version": LABEL_SCHEMA_VERSION},
                     }
                 ),
                 json.dumps(
                     {
                         "input": "ok",
                         "output": " ".join(["target"] * 40),
-                        "metadata": {"schema_version": 1},
+                        "metadata": {"schema_version": 1, "tac_schema_version": TAC_SCHEMA_VERSION, "label_schema_version": LABEL_SCHEMA_VERSION},
                     }
                 ),
             ]
@@ -345,7 +347,14 @@ def test_jsonl_preflight_counts_training_eos_token(tmp_path):
         def __call__(self, text, **_kwargs):
             return {"input_ids": list(range(len(str(text).split())))}
 
-    row = {"input": "tac", "output": "target", "metadata": {"schema_version": 1}}
+    from src.tac_schema import TAC_SCHEMA_VERSION
+    from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
+
+    row = {"input": "tac", "output": "target", "metadata": {
+        "schema_version": 1,
+        "tac_schema_version": TAC_SCHEMA_VERSION,
+        "label_schema_version": LABEL_SCHEMA_VERSION,
+    }}
     dataset_path = tmp_path / "eos.jsonl"
     _write_jsonl(dataset_path, [row])
     prefix, target, suffix = train._preflight_prompt_parts(row, True, True, "alpaca")
@@ -470,6 +479,22 @@ def test_jsonl_preflight_legacy_schema_requires_explicit_compatibility(tmp_path)
     assert legacy["metadata_schema"]["allow_legacy"] is True
 
 
+def test_preflight_rejects_stale_tac_even_with_legacy_override(tmp_path):
+    dataset = tmp_path / "stale.jsonl"
+    _write_jsonl(dataset, [{
+        "input": "old tac", "output": "function result() {}", "metadata": {
+            "schema_version": 1, "tac_schema_version": TAC_SCHEMA_VERSION - 1,
+        },
+    }])
+    report = train.validate_jsonl_schema_and_lengths(
+        dataset, tokenizer=TinyTokenizer(), max_seq_length=128,
+        allow_legacy_metadata_schema=True,
+    )
+    assert report["status"] == "failed"
+    assert report["error_counts"]["stale_tac_schema"] == 1
+    assert "Regenerate the dataset from bytecode" in report["errors"][0]["message"]
+
+
 @dataclass
 class FakeMetrics:
     semantic_similarity: float = 1.0
@@ -574,6 +599,7 @@ def test_evaluate_model_uses_decompile_batch_chunks(tmp_path, monkeypatch):
         eval_batch_size=2,
         eval_max_new_tokens=77,
         eval_repetition_penalty=1.05,
+        output_path=tmp_path / "explicit" / "evaluation.json",
     )
 
     assert [call[0] for call in FakeDecompiler.batch_calls] == [["tac0", "tac1"], ["tac2"]]
@@ -585,9 +611,22 @@ def test_evaluate_model_uses_decompile_batch_chunks(tmp_path, monkeypatch):
     assert summary["eval_repetition_penalty"] == 1.05
     assert summary["selector_signature_prompt_policy"] == "bundled_only_v1"
     assert summary["num_evaluated"] == 3
-    assert json.loads(Path(summary["results_path"]).read_text())["summary"][
-        "selector_signature_prompt_policy"
-    ] == "bundled_only_v1"
+    assert Path(summary["results_path"]).exists()
+    assert Path(summary["results_path"]) == tmp_path / "explicit" / "evaluation.json"
+    assert summary["provenance"]["dataset_sha256"] == train._sha256_file(dataset_path)
+    assert summary["provenance"]["evaluation_settings"]["eval_seed"] == train.DEFAULT_EVAL_SEED
+    persisted = json.loads(Path(summary["results_path"]).read_text())
+    assert persisted["summary"]["selector_signature_prompt_policy"] == "bundled_only_v1"
+    assert persisted["summary"]["provenance"] == summary["provenance"]
+    assert persisted["evaluator_version"]
+    assert persisted["dataset_content_sha256"] == train._sha256_file(dataset_path)
+    assert persisted["evaluation_config"]["eval_seed"] == train.DEFAULT_EVAL_SEED
+    assert all(detail["row_content_sha256"] for detail in persisted["details"])
+    before = Path(summary["results_path"]).read_bytes()
+    with pytest.raises(FileExistsError, match="Choose a new"):
+        train.evaluate_model("fake-model", str(dataset_path), output_path=summary["results_path"])
+    assert Path(summary["results_path"]).read_bytes() == before
+    assert len(FakeDecompiler.batch_calls) == 2
 
 
 def test_evaluate_model_batch_oom_falls_back_to_single_examples(tmp_path, monkeypatch):
@@ -669,7 +708,7 @@ def test_evaluate_model_records_failed_rows_and_traceable_details(tmp_path, monk
             },
             {
                 "input": "bad tac",
-                "output": "sol bad",
+                "output": "function bad() public { balances[msg.sender] = 1; }",
                 "metadata": {"function_name": "bad"},
             },
         ],
@@ -696,8 +735,50 @@ def test_evaluate_model_records_failed_rows_and_traceable_details(tmp_path, monk
     assert failed["metadata"]["function_name"] == "bad"
     assert failed["metrics"]["semantic_similarity"] == 0.0
     assert failed["metrics"]["normalized_edit_distance"] == 1.0
+    assert failed["metrics"]["metadata"]["replication"]["overall"]["false_negatives"] > 0
+    assert failed["metrics"]["metadata"]["error"] == "generation failed"
+    assert failed["metrics"]["metadata"]["error_kind"] == "generation"
     assert failed["error"]["type"] == "RuntimeError"
     assert summary["worst_samples"]["failed"][0]["dataset_index"] == 1
+
+
+@pytest.mark.parametrize("metric_failure", ["exception", "nonfinite"])
+def test_evaluator_errors_are_distinct_and_nonfinite_outputs_are_not_written(
+    tmp_path, monkeypatch, metric_failure,
+):
+    from src import training_pipeline
+
+    class Decompiler:
+        def __init__(self, _model_path):
+            pass
+
+        def decompile_tac_to_solidity(self, *_args, **_kwargs):
+            return "function generated() public {}"
+
+    class Evaluator:
+        def evaluate_function(self, *_args, **_kwargs):
+            if metric_failure == "exception":
+                raise RuntimeError("metric crashed")
+            return FakeMetrics(semantic_similarity=float("nan"))
+
+    _patch_evaluation_dependencies(monkeypatch, Decompiler)
+    monkeypatch.setattr(training_pipeline, "SmartContractEvaluator", Evaluator)
+    dataset = tmp_path / "data.jsonl"
+    _write_jsonl(dataset, [{
+        "input": "tac", "output": "function expected() public { balances[msg.sender] = 1; }",
+        "metadata": {},
+    }])
+    output = tmp_path / "evaluation.json"
+    if metric_failure == "nonfinite":
+        with pytest.raises(ValueError, match="Out of range float"):
+            train.evaluate_model("fake-model", str(dataset), output_path=output, latest_results_path=None)
+        assert not output.exists()
+    else:
+        train.evaluate_model("fake-model", str(dataset), output_path=output, latest_results_path=None)
+        failed = json.loads(output.read_text())["details"][0]
+        assert failed["success"] is False
+        assert failed["metrics"]["metadata"]["error_kind"] == "evaluator"
+        assert failed["metrics"]["metadata"]["replication"]["overall"]["false_negatives"] > 0
 
 
 def test_evaluate_model_persists_prompt_truncation_diagnostics(tmp_path, monkeypatch):
@@ -983,7 +1064,7 @@ def test_resolve_resume_checkpoint_detects_deepspeed_layout_without_flag(tmp_pat
     report = train._checkpoint_validation_report(checkpoint)
     assert report["uses_deepspeed_layout"] is True
     assert report["deepspeed_layout"]["model_state_shards"] == [
-        "global_step14/mp_rank_00_model_states.pt"
+        str(Path("global_step14") / "mp_rank_00_model_states.pt")
     ]
 
 
@@ -1336,7 +1417,11 @@ def test_preflight_tokenizer_failure_fails_closed_and_override_is_explicit(tmp_p
     dataset_path = tmp_path / "dataset.jsonl"
     _write_jsonl(
         dataset_path,
-        [{"input": "tac", "output": "sol", "metadata": {"schema_version": 1}}],
+        [{"input": "tac", "output": "sol", "metadata": {
+            "schema_version": 1,
+            "tac_schema_version": TAC_SCHEMA_VERSION,
+            "label_schema_version": LABEL_SCHEMA_VERSION,
+        }}],
     )
 
     class FailingAutoTokenizer:

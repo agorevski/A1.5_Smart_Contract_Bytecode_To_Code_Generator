@@ -6,10 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import queue
 import re
 import sys
-import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
@@ -26,6 +24,9 @@ from src.contract_reconstruction import (
 from src.inference import (
     DEFAULT_GENERATION_CONFIG,
     InferenceWorkLimitError,
+    InferenceCompatibilityError,
+    PersistentModelWorker,
+    _load_model_config as shared_load_model_config,
     run_bytecode_inference,
 )
 
@@ -134,26 +135,9 @@ def _run_with_deadline(
             f"decompile timed out after {timeout_seconds:g} seconds before {description}"
         )
 
-    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def target() -> None:
-        try:
-            result_queue.put((True, operation()))
-        except BaseException as exc:  # pragma: no cover - defensive handoff
-            result_queue.put((False, exc))
-
-    worker = threading.Thread(target=target, daemon=True)
-    worker.start()
-    worker.join(remaining)
-    if worker.is_alive():
-        raise DecompileTimeoutError(
-            f"decompile timed out after {timeout_seconds:g} seconds during {description}"
-        )
-
-    ok, payload = result_queue.get_nowait()
-    if ok:
-        return payload
-    raise payload
+    result = operation()
+    _check_deadline(deadline, timeout_seconds, description)
+    return result
 
 
 def _normalize_bytecode(raw: str) -> str:
@@ -203,15 +187,7 @@ def _metadata_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _load_model_config(model_path: str) -> Dict[str, Any]:
-    config_path = Path(model_path) / "model_config.json"
-    if not config_path.exists():
-        return {"model_path": model_path}
-    try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"model_path": model_path, "config_error": str(exc)}
-    data["model_path"] = model_path
-    return data
+    return shared_load_model_config(model_path)
 
 
 def _validate_solidity(source_code: str, metadata: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -337,10 +313,20 @@ def _function_results(
 def _run_model_inference(
     args: argparse.Namespace, bytecode: str, metadata: Dict[str, Any]
 ) -> Dict[str, Any]:
-    model_path = _resolve_model_path(args.model_path)
+    model_path = (
+        _resolve_model_path(args.model_path)
+        if args.model_path or os.environ.get("WEB_MODEL_PATH") else None
+    )
     deadline = _deadline_from_timeout(args.timeout_seconds)
-
-    from src.model_setup import SmartContractDecompiler
+    analyzed = _run_with_deadline(
+        lambda: _analyze_tac(bytecode), deadline, args.timeout_seconds, "bytecode analysis"
+    )
+    if len(analyzed[1]) > args.max_functions:
+        raise DecompileWorkLimitError(
+            f"too many functions detected ({len(analyzed[1])}); maximum is {args.max_functions}"
+        )
+    model_path = model_path or _resolve_model_path(args.model_path)
+    worker = PersistentModelWorker(str(model_path))
 
     generation = {
         "max_new_tokens": args.max_new_tokens,
@@ -348,16 +334,17 @@ def _run_model_inference(
         "do_sample": args.do_sample,
         "repetition_penalty": args.repetition_penalty,
     }
-    runner = lambda operation, description: _run_with_deadline(
-        operation,
-        deadline,
-        args.timeout_seconds,
-        description,
-    )
+    def runner(operation, description):
+        try:
+            if description.startswith("model "):
+                return worker.run(operation, _remaining_seconds(deadline))
+            return _run_with_deadline(operation, deadline, args.timeout_seconds, description)
+        except TimeoutError as exc:
+            raise DecompileTimeoutError(str(exc)) from exc
     try:
-        return run_bytecode_inference(
+        result = run_bytecode_inference(
             bytecode,
-            decompiler_factory=lambda: SmartContractDecompiler(str(model_path)),
+            decompiler=worker,
             model_path=str(model_path),
             model_config=_load_model_config(str(model_path)),
             metadata=metadata,
@@ -365,12 +352,18 @@ def _run_model_inference(
             lookup_config={"enabled": False, "benchmark_mode": False},
             max_functions=args.max_functions,
             operation_runner=runner,
-            analyze_tac_fn=_analyze_tac,
+            analyze_tac_fn=lambda _: analyzed,
             fatal_exceptions=(DecompileCliError,),
             request_id="cli",
         )
+        result["timeout_enforcement"] = {
+            "model": "spawn_worker", "analysis": "cooperative", "seconds": args.timeout_seconds,
+        }
+        return result
     except InferenceWorkLimitError as exc:
         raise DecompileWorkLimitError(str(exc)) from exc
+    finally:
+        worker.close()
 
 
 def _run_tac_only(
@@ -450,7 +443,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
         help=(
-            "Wall-clock deadline for analysis/model work; 0 disables "
+            "Hard model-worker deadline; CPU analysis checks the deadline cooperatively; 0 disables "
             f"(default: WEB_DECOMPILE_TIMEOUT_SECONDS or {DEFAULT_TIMEOUT_SECONDS:g})"
         ),
     )
@@ -467,7 +460,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _error_result(status: str, message: str) -> Dict[str, Any]:
-    return {"success": False, "decompilation_status": status, "error": message}
+    return {
+        "success": False, "partial_success": False, "stage_status": "failed",
+        "decompilation_status": status, "error": message,
+    }
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -493,6 +489,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             result = _run_tac_only(args, bytecode, metadata)
         else:
             result = _run_model_inference(args, bytecode, metadata)
+    except InferenceCompatibilityError as exc:
+        result = _error_result("incompatible_tac_schema", str(exc))
+        if args.format == "json":
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 2
     except DecompileCliError as exc:
         result = _error_result(exc.status, str(exc))
         if args.format == "json":

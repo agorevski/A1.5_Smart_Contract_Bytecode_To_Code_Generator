@@ -75,7 +75,8 @@ block_success:
 
     assert line == (
         "Bytecode metadata: selector=0xa9059cbb, "
-        "selector_signature=transfer(address,uint256), tac_blocks=2, tac_ops=6, "
+        "selector_signature=transfer(address,uint256), selector_signature_evidence=inferred, "
+        "tac_blocks=2, tac_ops=6, "
         "branches=1, storage_reads=1, storage_writes=1, external_calls=1, "
         "logs=1, reverts=1, bytecode_len=512, bytecode_instructions=123, "
         "functions=4"
@@ -106,9 +107,14 @@ def test_prompt_ignores_unshipped_heldout_signatures_in_local_registry(tmp_path,
 
     assert resolve_selector_signature_for_prompt(selector) is None
     assert resolve_selector_signature_for_prompt("0xa9059cbb") == "transfer(address,uint256)"
+    from src.selector_resolver import snapshot_local_selector_context
+    snapshot = snapshot_local_selector_context(db_path=db_path, json_path=tmp_path / "absent-selectors.json")
+    assert resolve_selector_signature_for_prompt(selector, snapshot) is None
+    assert resolve_selector_signature_for_prompt("0xa9059cbb", snapshot) == "transfer(address,uint256)"
     prompt_metadata = format_prompt_metadata(
         {"selector": selector, "function_signature": "emergencyWithdraw(uint256)"},
         tac_input=f"function function_{selector}:\nblock_entry:\n  return",
+        selector_context=snapshot,
     )
     assert f"selector={selector}" in prompt_metadata
     assert "selector_signature=" not in prompt_metadata

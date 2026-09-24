@@ -2,6 +2,7 @@
 
 import difflib
 import logging
+import subprocess
 import sys
 
 import pytest
@@ -21,6 +22,58 @@ from src.training_pipeline import (
     validate_generated_solidity,
 )
 from src.replication_metrics import evaluate_replication
+
+
+def test_solidity_validation_does_not_require_evaluation_nlp_extras():
+    code = r'''
+import importlib.abc
+import importlib.util
+import sys
+blocked = {"nltk", "rouge_score", "sentence_transformers", "sklearn", "scipy"}
+find_spec = importlib.util.find_spec
+importlib.util.find_spec = lambda name, *a, **kw: (
+    None if name.split(".")[0] in blocked else find_spec(name, *a, **kw)
+)
+class MissingEvaluationExtras(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in blocked:
+            raise ModuleNotFoundError("evaluation-only dependency: " + fullname)
+sys.meta_path.insert(0, MissingEvaluationExtras())
+from src.training_pipeline import validate_generated_solidity
+result = validate_generated_solidity("function f() public { return; }", allow_compiler=False)
+assert result.valid and result.method == "scaffold"
+'''
+    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_malformed_output_preserves_reference_false_negatives():
+    from src.training_pipeline import SmartContractEvaluator
+    evaluator = SmartContractEvaluator.__new__(SmartContractEvaluator)
+    result = evaluator.evaluate_function("function f() public { count = 1; }", "")
+    replication = result.metadata["replication"]
+    assert replication["overall"]["false_negatives"] == replication["reference_fact_count"] > 0
+    assert replication["overall"]["true_positives"] == 0
+
+
+def test_sload_evidence_does_not_require_state_write():
+    from src.training_pipeline import evaluate_bytecode_semantics
+    source = "function f() public view returns (uint) { return count; }"
+    result = evaluate_bytecode_semantics(
+        source, source, {"input": "v1 = SLOAD 0"},
+        solidity_validity=validate_generated_solidity(source, allow_compiler=False),
+    )
+    assert "storage_write_mismatch" not in result.mismatch_buckets
+
+
+def test_runtime_match_aggregate_is_conditional_on_checked_rows():
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    results = [{"metrics": {"bytecode_runtime_checked": index == 0,
+                            "bytecode_runtime_match": index == 0}} for index in range(10)]
+    stats = pipeline._compute_aggregate_statistics(results)
+    assert stats["bytecode_runtime_checked"]["mean"] == pytest.approx(0.1)
+    assert stats["bytecode_runtime_match_checked"]["mean"] == 1.0
+    assert stats["bytecode_runtime_match_checked"]["count"] == 1
 
 
 def test_normalized_edit_distance_uses_true_levenshtein_not_sequence_matcher():
@@ -207,6 +260,37 @@ def test_runtime_comparison_checks_exact_named_full_contract(local_reference_con
     assert wrong.runtime_bytecode_checked is True
     assert wrong.runtime_bytecode_match is False
     assert wrong.mismatch_buckets["runtime_bytecode_mismatch"] == ["compiled_runtime_differs"]
+
+
+def test_execution_fixtures_require_verified_full_contract_runtime(
+    local_reference_contract, monkeypatch,
+):
+    import src.training_pipeline as training_pipeline
+
+    source, metadata, _ = local_reference_contract
+    calls = []
+
+    def executed(reference_runtime, candidate_runtime, fixtures):
+        calls.append((reference_runtime, candidate_runtime, fixtures))
+        return {"checked": True, "match": True, "case_count": len(fixtures)}
+
+    monkeypatch.setattr(training_pipeline, "execute_equivalence_subset", executed)
+    with_fixtures = {**metadata, "execution_test_calldata": [""]}
+    checked = evaluate_bytecode_semantics(source, source, with_fixtures)
+    assert checked.runtime_bytecode_checked is True
+    assert checked.executed_equivalence == {
+        "checked": True, "match": True, "case_count": 1,
+    }
+    assert calls == [(metadata["bytecode"][2:], metadata["bytecode"][2:], [""])]
+
+    for unchecked_metadata in (
+        {**with_fixtures, "bytecode": "0x6000"},
+        {**with_fixtures, "runtime_comparison": None},
+        {key: value for key, value in with_fixtures.items() if key != "runtime_comparison"},
+    ):
+        unchecked = evaluate_bytecode_semantics(source, source, unchecked_metadata)
+        assert unchecked.executed_equivalence["checked"] is False
+    assert len(calls) == 1
 
 
 def test_runtime_comparison_rejects_unverified_reference_or_compiler_settings(
@@ -606,6 +690,26 @@ def test_runtime_aggregate_reports_checked_count_and_equality_among_checked_only
     assert no_checks["skip_reasons"] == {"not_opted_in": 1}
 
 
+def test_execution_aggregate_counts_only_executed_stateless_fixtures():
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    results = [
+        {"metrics": {"metadata": {"bytecode_semantics": {
+            "executed_equivalence": {"checked": True, "match": True},
+        }}}},
+        {"metrics": {"metadata": {"bytecode_semantics": {
+            "executed_equivalence": {"checked": True, "match": False},
+        }}}},
+        {"metrics": {"metadata": {"bytecode_semantics": {
+            "executed_equivalence": {"checked": False, "reason": "unsupported_opcode"},
+        }}}},
+    ]
+    execution = pipeline._compute_aggregate_statistics(results)["executed_equivalence"]
+    assert execution == {
+        "checked_n": 2, "matched_n": 1, "total_n": 3,
+        "scope": "bounded_stateless_explicit_calldata_fixtures_not_general_equivalence",
+    }
+
+
 def test_curated_evaluation_benchmarks_include_expected_facts_and_failures():
     suites = load_curated_evaluation_benchmarks("test_data/evaluation")
 
@@ -730,14 +834,14 @@ def test_grounded_hallucination_buckets_are_distinct_from_missing_facts_by_segme
     compiler_metrics = segmented["segments"]["compiler_version"]["0.8.20"][
         "replication_metrics"
     ]
-    assert compiler_metrics["hallucination_buckets"]["unsupported_calls"] == 1
+    assert compiler_metrics["hallucination_buckets"]["unsupported_calls"] == 2
     assert compiler_metrics["hallucination_rate_by_bucket"]["invented_guards"] > 0
     assert segmented["segments"]["opcode_group"]["delegatecall"]["replication_metrics"][
         "hallucination_buckets"
-    ]["unsupported_calls"] == 1
+    ]["unsupported_calls"] == 2
     assert segmented["segments"]["bytecode_length_bucket"]["tiny"]["replication_metrics"][
         "hallucination_buckets"
-    ]["invented_state_writes"] == 1
+    ]["invented_state_writes"] == 2
 
 
 def test_grounding_facts_prevent_supported_extra_facts_from_being_hallucinations():
@@ -758,7 +862,7 @@ def test_grounding_facts_prevent_supported_extra_facts_from_being_hallucinations
     evaluation = evaluate_replication(
         reference,
         candidate,
-        grounding_facts={"call": ["_afterApprove"]},
+        grounding_facts={"call": ["_afterApprove", "_afterApprove(param_0,param_1)"]},
     )
 
     assert "_afterapprove" in evaluation.extra_facts["call"]

@@ -56,6 +56,7 @@ class PipelineResult:
     bytecode: str = ""
     stages_completed: List[str] = field(default_factory=list)
     stages_failed: List[str] = field(default_factory=list)
+    stage_results: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     # Stage outputs
     decompiled_source: Optional[str] = None
@@ -66,6 +67,8 @@ class PipelineResult:
     function_results: List[Dict[str, Any]] = field(default_factory=list)
     source_summary: Dict[str, Any] = field(default_factory=dict)
     decompilation_status: Optional[str] = None
+    analysis_status: Dict[str, Any] = field(default_factory=dict)
+    tac_schema_version: Optional[int] = None
     validation: Dict[str, Any] = field(default_factory=dict)
     function_validation: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     selector_map: Dict[str, Any] = field(default_factory=dict)
@@ -82,7 +85,9 @@ class PipelineResult:
 
     @property
     def success(self) -> bool:
-        return len(self.stages_failed) == 0
+        return not self.stages_failed and all(
+            item["status"] in {"completed", "skipped"} for item in self.stage_results.values()
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -90,6 +95,7 @@ class PipelineResult:
             "success": self.success,
             "stages_completed": self.stages_completed,
             "stages_failed": self.stages_failed,
+            "stage_results": self.stage_results,
         }
         if self.decompiled_source:
             result["decompiled_source_preview"] = self.decompiled_source[:500]
@@ -107,6 +113,10 @@ class PipelineResult:
             result["source_summary"] = self.source_summary
         if self.decompilation_status:
             result["decompilation_status"] = self.decompilation_status
+        if self.analysis_status:
+            result["analysis_status"] = self.analysis_status
+        if self.tac_schema_version is not None:
+            result["tac_schema_version"] = self.tac_schema_version
         if self.validation:
             result["validation"] = self.validation
         if self.function_validation:
@@ -211,10 +221,15 @@ class PipelineOrchestrator:
         for stage in self.config.stages:
             try:
                 self._execute_stage(stage, bytecode, contract_address, result)
-                result.stages_completed.append(stage.value)
+                outcome = result.stage_results.setdefault(stage.value, {"status": "completed"})
+                if outcome["status"] == "completed":
+                    result.stages_completed.append(stage.value)
+                elif outcome["status"] == "failed":
+                    result.stages_failed.append(stage.value)
             except Exception as e:
                 logger.error("Stage %s failed: %s", stage.value, e)
                 result.stages_failed.append(stage.value)
+                result.stage_results[stage.value] = {"status": "failed", "error": str(e)}
                 result.metadata[f"{stage.value}_error"] = str(e)
 
         return result
@@ -241,6 +256,7 @@ class PipelineOrchestrator:
     ) -> None:
         """Run malicious contract classification."""
         if self._classifier is None:
+            result.stage_results["classify"] = {"status": "skipped", "reason": "not configured"}
             return
         classification = self._classifier.classify_from_bytecode(bytecode, contract_address)
         result.classification_result = classification
@@ -259,6 +275,7 @@ class PipelineOrchestrator:
         """Run bytecode decompilation."""
         if result.metadata.get("decompilation_skipped"):
             result.decompilation_status = "skipped_malicious"
+            result.stage_results["decompile"] = {"status": "skipped", "reason": "malicious"}
             return
 
         from .inference import run_bytecode_inference
@@ -301,6 +318,12 @@ class PipelineOrchestrator:
         result.tac_per_function = decompile_result.get("tac_per_function", {})
         result.tac = decompile_result.get("tac") or "\n\n".join(result.tac_per_function.values())
         analysis = decompile_result.get("analysis", {})
+        result.analysis_status = decompile_result.get(
+            "analysis_status", analysis.get("analyzer_status", {})
+        )
+        result.tac_schema_version = decompile_result.get(
+            "tac_schema_version", analysis.get("tac_schema_version")
+        )
         result.function_errors = analysis.get(
             "function_errors", decompile_result.get("function_errors", {})
         )
@@ -318,6 +341,19 @@ class PipelineOrchestrator:
         result.trace = decompile_result.get("trace", {})
         result.trace_path = decompile_result.get("trace_path")
         result.metadata["decompilation_status"] = result.decompilation_status
+        status = decompile_result.get("stage_status")
+        if status is None:
+            status = (
+                "completed" if decompile_result.get("success", False)
+                else "partial" if decompile_result.get("partial_success", False)
+                else "failed"
+            )
+        result.stage_results["decompile"] = {
+            "status": status,
+            "decompilation_status": result.decompilation_status,
+            "success": bool(decompile_result.get("success")),
+            "partial_success": bool(decompile_result.get("partial_success")),
+        }
         result.metadata["decompilation_analysis"] = analysis
         result.metadata["tac_length"] = len(result.tac or "")
         result.metadata["function_results"] = result.function_results
@@ -338,6 +374,7 @@ class PipelineOrchestrator:
     ) -> None:
         """Run vulnerability detection."""
         if self._vulnerability_detector is None:
+            result.stage_results["detect_vulnerabilities"] = {"status": "skipped", "reason": "not configured"}
             return
         vuln_report = self._vulnerability_detector.scan_from_bytecode(bytecode, contract_address)
         result.vulnerability_report = vuln_report
@@ -349,6 +386,7 @@ class PipelineOrchestrator:
     ) -> None:
         """Generate audit report (may re-run detection if needed)."""
         if self._report_generator is None:
+            result.stage_results["audit_report"] = {"status": "skipped", "reason": "not configured"}
             return
         audit = self._report_generator.generate_report(
             bytecode,

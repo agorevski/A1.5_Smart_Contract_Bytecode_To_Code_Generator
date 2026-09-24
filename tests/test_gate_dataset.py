@@ -42,7 +42,7 @@ BASELINE_VARS = (
 def _row(name, *, output=None, **metadata):
     return {
         "input": f"tac {name}",
-        "output": output or f"function {name}() external {{ return; }}",
+        "output": output or f'function {name}() external {{ revert("{name}"); }}',
         "metadata": metadata,
     }
 
@@ -55,7 +55,7 @@ def test_gate_exclusion_uses_recomputed_body_with_missing_and_stale_hashes():
     gate = _row("shared", body_hash="declared-gate-hash")
     duplicate = _row(
         "different",
-        output="FUNCTION shared() external { /*comment*/ return; }",
+        output='FUNCTION shared() external { /*comment*/ revert("shared"); }',
     )
     stale = _row("shared", body_hash="different-stale-hash")
     variant = _row("variant", body_hash="declared-gate-hash")
@@ -67,6 +67,17 @@ def test_gate_exclusion_uses_recomputed_body_with_missing_and_stale_hashes():
     assert count == 3
     assert body_identity(duplicate) == body_identity(gate)
     assert body_identity(variant) != body_identity(gate)
+
+
+def test_gate_exclusion_matches_evaluation_body_across_different_function_names():
+    gate = _row("gate", output="function gate() external { return; }")
+    alias = _row("alias", output="function alias() external { return; }")
+    assert body_identity(gate) != body_identity(alias)
+
+    selected, count = exclude_eval_rows([alias], [gate])
+
+    assert selected == []
+    assert count == 1
 
 
 def test_gate_exclusion_keeps_colliding_metadata_namespaces_separate():
@@ -87,6 +98,17 @@ def test_gate_exclusion_matches_contract_and_exact_input_without_body_hash():
     selected, count = exclude_eval_rows([same_address, same_input, _row("clean")], [gate])
     assert selected == [_row("clean")]
     assert count == 2
+
+
+def test_gate_exclusion_respects_evaluation_body_identity_across_function_names():
+    gate = _row("alpha", output="function alpha() external { return 1; }")
+    same_body = _row("beta", output="function beta() external { return 1; }")
+    assert body_identity(gate) != body_identity(same_body)
+
+    selected, count = exclude_eval_rows([same_body, _row("other")], [gate])
+
+    assert selected == [_row("other")]
+    assert count == 1
 
 
 def test_canonicalized_rows_keep_missing_hash_duplicates_together_in_split():
@@ -199,7 +221,7 @@ def test_model_gate_check_rejects_eval_overlap_in_any_split(tmp_path):
         splits[leaking_split] = [
             _row(
                 "heldout",
-                output="FUNCTION heldout() external { /* same */ return; }",
+                output='FUNCTION heldout() external { /* same */ revert("heldout"); }',
                 body_hash="missing-or-stale",
             )
         ]
@@ -377,6 +399,68 @@ def test_full_runner_rejects_missing_baseline_before_materializing_training_data
 
     assert result.returncode != 0
     assert "Required broad30 baseline eval not found" in result.stderr
+    assert not data_dir.exists()
+    assert not output_dir.exists()
+
+
+def test_full_runner_rejects_baselines_without_current_provenance_before_training(tmp_path):
+    source = tmp_path / "source.jsonl"
+    gate = tmp_path / "gate.jsonl"
+    baseline = tmp_path / "baseline.json"
+    row = _row("gate")
+    _write_jsonl(source, [_row("train"), _row("other")])
+    _write_jsonl(gate, [row])
+    baseline.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "model_path": str(tmp_path / "old-model"),
+                    "test_dataset": str(gate),
+                    "eval_max_new_tokens": 512,
+                    "eval_repetition_penalty": 1.05,
+                    "num_evaluated": 1,
+                    "selector_signature_prompt_policy": "bundled_only_v1",
+                    "prompt_truncation_count": 0,
+                    "replication_f1_micro": 0.5,
+                    "replication_behavior_only_f1_micro": 0.4,
+                    "bytecode_semantic_score_mean": 0.3,
+                    "semantic_similarity_mean": 0.6,
+                    "solidity_valid_mean": 1.0,
+                },
+                "details": [
+                    {
+                        "dataset_index": 0,
+                        "input_hash": hashlib.sha256(row["input"].encode()).hexdigest(),
+                        "output_hash": hashlib.sha256(row["output"].encode()).hexdigest(),
+                        "metadata": row["metadata"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "training"
+    output_dir = tmp_path / "model"
+    env = {
+        **os.environ,
+        "SOURCE_DATASET": str(source),
+        "DATA_DIR": str(data_dir),
+        "OUTPUT_DIR": str(output_dir),
+        "RUN_GATES": "1",
+        "DRY_RUN": "0",
+        **{key: str(gate) for key in GATE_VARS},
+        **{key: str(baseline) for key in BASELINE_VARS},
+    }
+    result = subprocess.run(
+        ["bash", str(ROOT / "run_train_qwen_qlora_full_body_balanced.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "evaluator_version" in result.stderr
     assert not data_dir.exists()
     assert not output_dir.exists()
 

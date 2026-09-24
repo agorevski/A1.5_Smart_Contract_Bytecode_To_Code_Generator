@@ -1,9 +1,9 @@
 import json
 import inspect
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-
 import pytest
 
 import train
@@ -608,7 +608,7 @@ def test_train_common_wrapper_uses_tokenizer_detection():
     assert "/ 3.5" not in wrapper
     assert "REPORT_TO" in wrapper
     assert "SKIP_EVAL" in wrapper
-    assert "--skip-eval" not in torchrun_wrapper.split("uv run torchrun", 1)[1]
+    assert "--skip-eval" not in torchrun_wrapper.split("uv run --extra training torchrun", 1)[1]
     assert "--skip-eval" not in deepspeed_wrapper.split("uv run --extra deepspeed deepspeed", 1)[1]
 
 
@@ -648,6 +648,9 @@ def test_training_pipeline_writes_standard_val_dataset_filename(tmp_path):
             }
         )
     dataset_path = tmp_path / "dataset.jsonl"
+    for row in rows:
+        row["metadata"]["tac_schema_version"] = model_setup.TAC_SCHEMA_VERSION
+        row["metadata"]["label_schema_version"] = model_setup.LABEL_SCHEMA_VERSION
     _write_jsonl(dataset_path, rows)
 
     data_dir = tmp_path / "pipeline-data"
@@ -929,20 +932,28 @@ def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprin
     assert len(after_dataset_change_files) == len(after_augment_flag_files) + 1
 
 
-def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_path, monkeypatch):
+@pytest.mark.parametrize("selector_enabled", [False, True])
+def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_path, monkeypatch, selector_enabled):
     train_path = tmp_path / "train.jsonl"
     val_path = tmp_path / "val.jsonl"
     _write_jsonl(
         train_path,
         [
-            {"input": f"train tac {i}", "output": f"train sol {i}", "metadata": {"id": i}}
+            {"input": f"train tac {i}", "output": f"train sol {i}", "metadata": {
+                "id": i, "selector": "0xa9059cbb", "tac_schema_version": model_setup.TAC_SCHEMA_VERSION,
+                "label_schema_version": model_setup.LABEL_SCHEMA_VERSION,
+                "function_signature": "oracleSecret()", "compiler_version": "0.8.20",
+            }}
             for i in range(6)
         ],
     )
     _write_jsonl(
         val_path,
         [
-            {"input": f"val tac {i}", "output": f"val sol {i}", "metadata": {"id": i}}
+            {"input": f"val tac {i}", "output": f"val sol {i}", "metadata": {
+                "id": i, "selector": "0xa9059cbb", "tac_schema_version": model_setup.TAC_SCHEMA_VERSION,
+                "label_schema_version": model_setup.LABEL_SCHEMA_VERSION,
+            }}
             for i in range(10)
         ],
     )
@@ -956,11 +967,17 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
 
     class FakeTrainer:
         def __init__(self, **kwargs):
-            captured["eval_ids"] = [row["metadata"]["id"] for row in kwargs["eval_dataset"].data]
             captured["prompt_flags"] = {
                 split: getattr(kwargs[f"{split}_dataset"], "include_selector_signature_metadata")
+                if kwargs[f"{split}_dataset"] is not None else None
                 for split in ("train", "eval")
             }
+            captured["eval_ids"] = (
+                [row["metadata"]["id"] for row in kwargs["eval_dataset"].data]
+                if kwargs["eval_dataset"] is not None else []
+            )
+            captured["train_dataset"] = kwargs["train_dataset"]
+            captured["eval_dataset"] = kwargs["eval_dataset"]
             self.state = SimpleNamespace(log_history=[{"loss": 0.5, "step": 1}])
 
         def train(self, **_kwargs):
@@ -986,9 +1003,8 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
 
     trainer = SmartContractModelTrainer(
         ModelConfig(
-            max_sequence_length=128,
-            use_quantization=False,
-            include_selector_signature_metadata=False,
+            max_sequence_length=128, use_quantization=False,
+            include_selector_signature_metadata=selector_enabled,
         ),
         output_dir=str(tmp_path / "models"),
     )
@@ -1016,13 +1032,210 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
 
     assert captured["eval_ids"] == expected_indices
     assert captured["eval_ids"] != [0, 1, 2, 3]
-    assert captured["prompt_flags"] == {"train": False, "eval": False}
+    assert captured["prompt_flags"] == {
+        "train": selector_enabled, "eval": selector_enabled,
+    }
     assert manifest["status"] == "completed"
     assert manifest["seed"] == 123
     assert manifest["datasets"]["train"]["artifact"]["row_count"] == 6
     assert manifest["datasets"]["eval"]["sample_indices"] == expected_indices
     assert manifest["datasets"]["train"]["tokenization"]["max_sequence_length"] == 128
     assert manifest["training_args"]["gradient_accumulation_steps"] == 1
+    saved = ModelConfig.from_dict(json.loads((Path(model_path) / "model_config.json").read_text()))
+    assert saved.include_selector_signature_metadata is selector_enabled
+    assert manifest["model_config"]["include_selector_signature_metadata"] is selector_enabled
+    assert manifest["tac_schema_version"] == model_setup.TAC_SCHEMA_VERSION
+    assert manifest["selector_signature_prompt_policy"] == "bundled_only_v1"
+    assert manifest["provenance"]["complete"] is True
+    assert [item["role"] for item in manifest["provenance"]["datasets"]] == ["train", "selection"]
+    assert manifest["provenance"]["datasets"][0]["content_sha256"] == model_setup._sha256_file(train_path)
+    assert manifest["provenance"]["datasets"][0]["row_identities"][0]["body_content_sha256"]
+    assert bool(manifest["selector_context_digest"]) is selector_enabled
+    decompiler = SmartContractDecompiler.__new__(SmartContractDecompiler)
+    decompiler.config = saved
+    decompiler.tokenizer = NumericTokenizer()
+    for dataset in (captured["train_dataset"], captured["eval_dataset"]):
+        assert dataset.include_selector_signature_metadata is selector_enabled
+        item = dataset.data[0]
+        prefix, _, _ = dataset._format_prompt_parts(item["input"], item["output"], item["metadata"])
+        preflight_prefix, _, _ = train._preflight_prompt_parts(
+            item, True, selector_enabled, "alpaca", selector_context=saved.selector_context,
+        )
+        assert preflight_prefix == prefix
+        assert decompiler._build_prompt(item["input"], item["metadata"], max_new_tokens=1) == prefix
+        assert ("selector_signature=" in prefix) is selector_enabled
+        assert "oracleSecret" not in prefix
+
+    continued_path = trainer.train(
+        str(train_path), resume_from_checkpoint=model_path,
+        train_eval_strategy="no", max_steps=1, tokenization_cache=False,
+    )
+    continued = json.loads((Path(continued_path) / "training_input_manifest.json").read_text())
+    assert continued["provenance"]["complete"] is True
+    assert continued["provenance"]["ancestors"][0]["provenance"] == manifest["provenance"]
+
+
+def test_selector_snapshot_invalidates_cache_and_preserves_saved_prompt(tmp_path, monkeypatch):
+    import sqlite3
+    from src.selector_resolver import snapshot_local_selector_context
+
+    db = tmp_path / "selectors.db"
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "CREATE TABLE selector_registry (selector TEXT, signature TEXT, occurrences INTEGER)"
+        )
+        connection.execute("INSERT INTO selector_registry VALUES ('0x12345678', 'oldGuess()', 2)")
+    first = snapshot_local_selector_context(db_path=db, json_path=tmp_path / "absent.json")
+    path = tmp_path / "data.jsonl"
+    row = {"input": "function function_0x12345678:\n  stop", "output": "function answer() {}", "metadata": {}}
+    _write_jsonl(path, [row])
+    original = SmartContractDataset(
+        str(path), CountingTokenizer(), tokenization_cache=tmp_path / "cache",
+        selector_context=first,
+    )
+    old_prompt = original._format_prompt(row["input"], row["output"], {})
+    with sqlite3.connect(db) as connection:
+        connection.execute("UPDATE selector_registry SET signature='newGuess()'")
+    second = snapshot_local_selector_context(db_path=db, json_path=tmp_path / "absent.json")
+    assert first["digest"] != second["digest"]
+    current = SmartContractDataset(
+        str(path), CountingTokenizer(), tokenization_cache=tmp_path / "cache",
+        selector_context=second,
+    )
+    assert len(list((tmp_path / "cache").glob("*.meta.json"))) == 2
+    assert original._format_prompt(row["input"], row["output"], {}) == old_prompt
+    assert "selector_signature=" not in old_prompt
+    assert current._format_prompt(row["input"], row["output"], {}) == old_prompt
+
+    monkeypatch.setattr(train, "_load_preflight_tokenizer", lambda *_a, **_k: (CountingTokenizer(), {"name": "stable"}))
+    reports = [
+        train.run_data_preflight(
+            {"train": str(path)}, tokenizer_source="fake", max_seq_length=2048,
+            selector_context=context, cache_dir=tmp_path / "preflight",
+            allow_legacy_metadata_schema=True,
+        )
+        for context in (first, first, second)
+    ]
+    assert [report["datasets"]["train"]["cache"]["hit"] for report in reports] == [False, True, False]
+    assert reports[0]["selector_context_digest"] != reports[2]["selector_context_digest"]
+
+    saved = ModelConfig.from_dict(json.loads(json.dumps(ModelConfig(selector_context=first).to_dict())))
+    inference = SmartContractDecompiler.__new__(SmartContractDecompiler)
+    inference.config = saved
+    inference.tokenizer = NumericTokenizer()
+    prompt = inference._build_prompt(row["input"], {}, max_new_tokens=1)
+    assert "oldGuess()" not in prompt and "newGuess()" not in prompt
+    assert "selector_signature=" not in prompt
+    assert model_setup.resolve_selector_signature_for_prompt("0xffffffff", saved.selector_context) is None
+    tampered = json.loads(json.dumps(saved.to_dict()))
+    tampered["selector_context"]["mapping"]["0x12345678"]["signature"] = "oracle()"
+    with pytest.raises(ValueError, match="Invalid selector context"):
+        ModelConfig.from_dict(tampered)
+
+
+def test_trainer_rejects_stale_checkpoint_before_loading_model(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    trainer = SmartContractModelTrainer(ModelConfig(), output_dir=str(tmp_path / "model"))
+    monkeypatch.setattr(trainer, "setup_model", lambda **_kwargs: pytest.fail("must fail before model load"))
+    with pytest.raises(ValueError, match="without --resume"):
+        trainer.train("unused.jsonl", resume_from_checkpoint=str(checkpoint))
+
+
+def test_trainer_rejects_checkpoint_with_unknown_selector_prompt_policy(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "training_input_manifest.json").write_text(json.dumps({
+        "tac_schema_version": model_setup.TAC_SCHEMA_VERSION,
+        "label_schema_version": model_setup.LABEL_SCHEMA_VERSION,
+        "model_config": ModelConfig().to_dict(),
+    }), encoding="utf-8")
+    trainer = SmartContractModelTrainer(ModelConfig(), output_dir=str(tmp_path / "model"))
+    monkeypatch.setattr(trainer, "setup_model", lambda **_kwargs: pytest.fail("must fail before model load"))
+    with pytest.raises(ValueError, match="selector prompt policy differs"):
+        trainer.train("unused.jsonl", resume_from_checkpoint=str(checkpoint))
+
+
+def test_training_dataset_rejects_stale_tac_with_regeneration_instructions(tmp_path):
+    path = tmp_path / "old.jsonl"
+    _write_jsonl(path, [{"input": "tac", "output": "sol", "metadata": {"tac_schema_version": 1}}])
+    with pytest.raises(ValueError, match="regenerate the dataset"):
+        SmartContractDataset(
+            str(path), CountingTokenizer(), include_selector_signature_metadata=False,
+            require_current_tac_schema=True,
+        )
+
+
+def test_training_dataset_rejects_stale_labels_even_with_current_tac(tmp_path):
+    path = tmp_path / "stale_labels.jsonl"
+    _write_jsonl(path, [{"input": "tac", "output": "sol", "metadata": {
+        "tac_schema_version": model_setup.TAC_SCHEMA_VERSION,
+        "label_schema_version": model_setup.LABEL_SCHEMA_VERSION - 1,
+    }}])
+    with pytest.raises(ValueError, match="AST-aligned labels"):
+        SmartContractDataset(
+            str(path), CountingTokenizer(), include_selector_signature_metadata=False,
+            require_current_tac_schema=True,
+        )
+
+
+@pytest.mark.parametrize("status", ["degraded", "failed"])
+def test_training_and_preflight_reject_explicit_non_ok_analysis(tmp_path, status):
+    path = tmp_path / "bad_analysis.jsonl"
+    _write_jsonl(path, [{"input": "tac", "output": "sol", "metadata": {
+        "schema_version": 1,
+        "tac_schema_version": model_setup.TAC_SCHEMA_VERSION,
+        "label_schema_version": model_setup.LABEL_SCHEMA_VERSION,
+        "analysis_status": {"status": status, "issues": [{"code": "stack_underflow"}]},
+    }}])
+    with pytest.raises(ValueError, match="non-ok bytecode analysis"):
+        SmartContractDataset(
+            str(path), CountingTokenizer(), include_selector_signature_metadata=False,
+            require_current_tac_schema=True,
+        )
+    report = train.validate_jsonl_schema_and_lengths(
+        path, tokenizer=CountingTokenizer(), max_seq_length=2048,
+        allow_legacy_metadata_schema=True,
+    )
+    assert report["status"] == "failed"
+    assert report["error_counts"]["non_ok_analysis"] == 1
+
+
+@pytest.mark.parametrize("snapshot_present", [False, True])
+def test_load_model_restores_checkpoint_prompt_context_and_warns_for_legacy(
+    tmp_path, monkeypatch, caplog, snapshot_present,
+):
+    from src.selector_resolver import snapshot_local_selector_context
+
+    capture_logger = logging.Logger("test.selector_snapshot_load", level=logging.WARNING)
+    capture_logger.addHandler(caplog.handler)
+    monkeypatch.setattr(model_setup, "logger", capture_logger)
+    caplog.set_level(logging.WARNING)
+
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    context = snapshot_local_selector_context(
+        db_path=tmp_path / "absent.db", json_path=tmp_path / "absent.json",
+    ) if snapshot_present else None
+    config = ModelConfig(selector_context=context)
+    (tmp_path / "training_input_manifest.json").write_text(
+        json.dumps({"model_config": config.to_dict()}), encoding="utf-8",
+    )
+    trainer = SmartContractModelTrainer(ModelConfig(), output_dir=str(tmp_path / "model"))
+
+    def stop_before_model_load():
+        raise RuntimeError("stop before model initialization")
+
+    monkeypatch.setattr(trainer, "_get_hf_token", stop_before_model_load)
+    with pytest.raises(RuntimeError, match="stop before model initialization"):
+        trainer.load_model(str(checkpoint))
+    assert trainer.config.selector_context == context
+    warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "no saved selector context snapshot" in record.getMessage()
+    ]
+    assert len(warnings) == (0 if snapshot_present else 1)
 
 
 def test_non_quantized_ddp_setup_loads_without_device_map_and_moves_to_local_rank(

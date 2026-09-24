@@ -52,9 +52,12 @@ from tqdm import tqdm
 from web3 import Web3
 
 from src.bytecode_analyzer import BytecodeAnalyzer
+from src.tac_schema import TAC_SCHEMA_VERSION
 from src.dataset_pipeline import SolidityParser
 from src.dataset_export_primitives import (
     TRAINING_ROW_SCHEMA_VERSION,
+    LABEL_SCHEMA_VERSION,
+    analysis_quality_reject_reasons,
     _collapse_whitespace,
     _md5,
     _safe_tac_function_name,
@@ -259,6 +262,8 @@ def _base_manifest(
     """Common manifest envelope for download/compile/export stages."""
     return {
         "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "generator_tac_schema_version": TAC_SCHEMA_VERSION,
+        "generator_label_schema_version": LABEL_SCHEMA_VERSION,
         "manifest_kind": kind,
         "status": status,
         "generated_at": _now_utc_iso(),
@@ -1491,7 +1496,10 @@ def _compile_one_job(
                 comp = compile_multi_file(source_files, solc_version, opt_enabled, runs)
             else:
                 first_src = next(iter(source_files.values()))
-                comp = compile_source(first_src, solc_version, opt_enabled, runs)
+                comp = compile_source(
+                    first_src, solc_version, opt_enabled, runs,
+                    source_filename=next(iter(source_files)),
+                )
         except Exception as e:
             return {"pairs": [], "status": "compile_failed", "error": str(e)}
 
@@ -1508,9 +1516,20 @@ def _compile_one_job(
         ambiguous_selector_values: Set[str] = set()
         compiled_contract_counts: Counter = Counter()
         target_name = str(target_contract_name or "").strip()
+        target_candidates = [
+            name for name, artifact in comp.contracts.items()
+            if (f"{getattr(artifact, 'source_file', '')}:{getattr(artifact, 'name', name)}" == target_name
+                if ":" in target_name else contract_names_match(target_name, name))
+        ] if target_name else []
+        if len(target_candidates) > 1:
+            return {
+                "pairs": [], "status": "ambiguous_target_contract",
+                "error": "target contract name identifies multiple source artifacts",
+                "drop_counts": {"ambiguous_target_contract": 1},
+            }
         for cname, compiled in comp.contracts.items():
             if target_name:
-                if contract_names_match(target_name, cname):
+                if cname in target_candidates:
                     compiled_contract_counts["target_contracts_analyzed"] += 1
                 else:
                     compiled_contract_counts["auxiliary_contracts_skipped"] += 1
@@ -1528,13 +1547,19 @@ def _compile_one_job(
                 analyzer = BytecodeAnalyzer(bytecode_hex)
                 analyzer.analyze_control_flow()
                 bytecode_functions = analyzer.identify_functions()
+                ensure_tac_integrated(analyzer)
+                analysis_reasons = analysis_quality_reject_reasons(analyzer)
+                if analysis_reasons:
+                    drop_counts.update(analysis_reasons)
+                    continue
             except Exception as e:
                 analysis_errors.append(str(e))
                 continue
 
-            contract_sol_funcs = [
-                f for f in solidity_functions if f.get("contract_name", "") == cname
-            ] or solidity_functions
+            contract_sol_funcs = getattr(compiled, "effective_functions", [])
+            if getattr(compiled, "label_resolution_error", "") or not contract_sol_funcs:
+                drop_counts["unresolved_ast_implementation"] += 1
+                continue
 
             ambiguous_selectors: Set[str] = set()
             matches = _match_functions(
@@ -2164,6 +2189,13 @@ def _build_pair(
                 "optimizer_runs": optimizer_runs,
                 "compiled_contract": compiled_contract,
                 "source": "huggingface",
+                "analysis_status": match.get("analysis_status"),
+                "tac_schema_version": TAC_SCHEMA_VERSION,
+                "label_schema_version": LABEL_SCHEMA_VERSION if sol_func.get("ast_id") is not None else None,
+                "source_file": sol_func.get("source_file"),
+                "ast_id": sol_func.get("ast_id"),
+                "declaring_contract_id": sol_func.get("declaring_contract_id"),
+                "compiled_contract_id": sol_func.get("compiled_contract_id"),
             }
         ),
         "hash": _md5(tac + sol_func["body"]),

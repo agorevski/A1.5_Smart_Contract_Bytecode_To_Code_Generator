@@ -11,7 +11,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
-from statistics import mean
+from statistics import mean, stdev
 from typing import Any, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +22,8 @@ from scripts.analyze_eval_failures import (  # noqa: E402
     hallucination_buckets,
     missing_fact_categories,
 )
+from src.evaluation_identity import EVALUATOR_VERSION, BYTECODE_SCORE_KIND, content_sha256
+from src.replication_metrics import BEHAVIOR_FACT_CATEGORIES
 
 
 SUMMARY_GATE_METRICS = (
@@ -64,26 +66,27 @@ def load_eval(path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{path} does not contain a JSON object")
     details = payload.get("details") or payload.get("detailed_results")
-    if not isinstance(details, list) or any(not isinstance(item, Mapping) for item in details):
+    if not isinstance(details, list):
         raise ValueError(f"{path} does not contain details/detailed_results")
     summary = payload.get("summary") or payload.get("aggregate_statistics") or {}
     if not isinstance(summary, Mapping):
         summary = {}
-    return {"summary": dict(summary), "details": details}
+    return {**payload, "summary": dict(summary), "details": details}
 
 
 def _numeric(value: Any) -> float | None:
-    if not isinstance(value, (int, float, bool)):
-        return None
-    number = float(value)
-    return number if math.isfinite(number) else None
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
 
 
 def _detail_metric(detail: Mapping[str, Any], metric: str) -> float | None:
     metrics = detail.get("metrics")
     if not isinstance(metrics, Mapping):
         return None
-    return _numeric(metrics.get(metric))
+    value = metrics.get(metric)
+    # Validity is a boolean measurement, unlike continuous scores.
+    if metric == "solidity_valid" and type(value) is bool:
+        return float(value)
+    return _numeric(value)
 
 
 def _details_by_index(
@@ -92,6 +95,9 @@ def _details_by_index(
     indexed: dict[int, Mapping[str, Any]] = {}
     errors: list[str] = []
     for position, detail in enumerate(details):
+        if not isinstance(detail, Mapping):
+            errors.append(f"{label} detail {position}: malformed evaluation detail")
+            continue
         dataset_index = detail.get("dataset_index")
         if type(dataset_index) is not int or dataset_index < 0:
             errors.append(f"{label} detail {position}: missing or invalid dataset_index")
@@ -154,6 +160,20 @@ def _comparability_errors(
             summary["prompt_truncation_count"] != 0
         ):
             errors.append(f"{label}: prompt truncation must be measured and zero")
+        prompt_summary = summary.get("prompt_diagnostics")
+        if not isinstance(prompt_summary, Mapping) or (
+            type(prompt_summary.get("num_details")) is not int
+            or prompt_summary["num_details"] != len(details)
+            or type(prompt_summary.get("truncated_count")) is not int
+            or prompt_summary["truncated_count"] != summary.get("prompt_truncation_count")
+        ):
+            errors.append(f"{label}: incomplete prompt truncation diagnostic coverage")
+        for position, detail in enumerate(details):
+            diagnostics = detail.get("prompt_diagnostics")
+            if not isinstance(diagnostics, Mapping) or type(diagnostics.get("tac_truncated")) is not bool:
+                errors.append(f"{label} detail {position}: missing prompt truncation measurement")
+            elif diagnostics["tac_truncated"] is True:
+                errors.append(f"{label} detail {position}: prompt truncation observed")
         for metric in gate_metrics:
             value = summary.get(metric)
             if (
@@ -193,6 +213,162 @@ def _comparability_errors(
     return errors, matched
 
 
+def _validate_pair(baseline, candidate, gate_metrics, paired_metrics):
+    for key in ("evaluator_version", "bytecode_score_kind", "dataset_content_sha256",
+                "cohort_content_sha256", "evaluation_config"):
+        if not baseline.get(key) or baseline.get(key) != candidate.get(key):
+            raise ValueError(f"Missing or incompatible {key}")
+    if baseline["evaluator_version"] != EVALUATOR_VERSION:
+        raise ValueError("Historical evaluator version is not eligible for acceptance")
+    if baseline["bytecode_score_kind"] != BYTECODE_SCORE_KIND:
+        raise ValueError("Incompatible bytecode score definition")
+    if not isinstance(baseline["evaluation_config"], Mapping):
+        raise ValueError("Evaluation configuration must be a settings object")
+    try:
+        json.dumps(baseline["evaluation_config"], allow_nan=False)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Evaluation configuration must contain finite JSON settings") from exc
+    indexed = []
+    for label, run in (("baseline", baseline), ("candidate", candidate)):
+        provenance = run.get("model_provenance") or {}
+        audit = provenance.get("overlap_audit") or {}
+        if (audit.get("overlap_checked") is not True or audit.get("overlap_rows") != 0
+                or not provenance.get("training_manifest_sha256")
+                or provenance["training_manifest_sha256"] != audit.get("training_manifest_sha256")
+                or audit.get("dataset_content_sha256") != run["dataset_content_sha256"]):
+            raise ValueError(f"{label} lacks clean content-bound model lineage overlap proof")
+        rows, row_errors = _details_by_index(run["details"], label)
+        if row_errors:
+            raise ValueError("; ".join(row_errors))
+        if not rows:
+            raise ValueError("Empty evaluation cohort")
+        if type(run["summary"].get("num_evaluated")) is not int or run["summary"]["num_evaluated"] != len(rows):
+            raise ValueError(f"{label} num_evaluated disagrees with detail coverage")
+        aggregate = run["summary"].get("aggregate_statistics")
+        evaluator_errors = (
+            aggregate.get("evaluator_error_count") if isinstance(aggregate, Mapping) else None
+        )
+        if (
+            type(run["summary"].get("num_failed")) is not int
+            or run["summary"]["num_failed"] != 0
+            or type(run["summary"].get("num_succeeded")) is not int
+            or run["summary"]["num_succeeded"] != len(rows)
+            or _numeric(run["summary"].get("failure_rate")) != 0.0
+            or type(evaluator_errors) is not int
+            or evaluator_errors != 0
+        ):
+            raise ValueError(f"{label} contains incomplete or failed evaluation rows")
+        for metric in gate_metrics:
+            value = _numeric(run["summary"].get(metric))
+            if value is None or not 0 <= value <= 1:
+                raise ValueError(f"{label} missing/nonfinite/invalid mandatory metric: {metric}")
+        identities = []
+        totals = [0, 0, 0]
+        behavior_totals = [0, 0, 0]
+        for index, row in rows.items():
+            if row.get("success") is not True or row.get("error"):
+                raise ValueError(f"{label} dataset_index {index}: evaluation failed")
+            for key in ("row_content_sha256", "body_content_sha256", "independent_unit"):
+                if not isinstance(row.get(key), str) or not row[key]:
+                    raise ValueError(f"Missing content-bound row identity: {key}")
+            identities.append((index, row["row_content_sha256"]))
+            for metric in paired_metrics:
+                value = _detail_metric(row, metric)
+                if value is None or not 0 <= value <= 1:
+                    raise ValueError(f"{label} incomplete mandatory detail metric: {metric}")
+            error_metadata = row.get("metrics", {}).get("metadata") or {}
+            if error_metadata.get("error") or error_metadata.get("error_kind"):
+                raise ValueError(f"{label} contains evaluator errors")
+            replication = (row.get("metrics", {}).get("metadata") or {}).get("replication") or {}
+            counts = replication.get("overall") or {}
+            row_counts = []
+            for position, key in enumerate(("true_positives", "false_positives", "false_negatives")):
+                count = counts.get(key)
+                if type(count) is not int or count < 0:
+                    raise ValueError(f"{label} missing/invalid replication count coverage")
+                totals[position] += count
+                row_counts.append(count)
+            if not math.isclose(
+                _f1_from_counts(*row_counts), row["metrics"]["replication_f1"], abs_tol=1e-7
+            ):
+                raise ValueError(f"{label} dataset_index {index}: replication F1 disagrees with counts")
+            by_category = replication.get("by_category")
+            if not isinstance(by_category, Mapping) or not by_category:
+                raise ValueError(f"{label} missing behavior category count coverage")
+            category_totals = [0, 0, 0]
+            for category, values in by_category.items():
+                if not isinstance(values, Mapping):
+                    raise ValueError(f"{label} invalid replication category {category}")
+                for position, key in enumerate(("true_positives", "false_positives", "false_negatives")):
+                    value = values.get(key)
+                    if type(value) is not int or value < 0:
+                        raise ValueError(f"{label} invalid replication category counts: {category}")
+                    category_totals[position] += value
+                    if category in BEHAVIOR_FACT_CATEGORIES:
+                        behavior_totals[position] += value
+            if category_totals != row_counts:
+                raise ValueError(f"{label} replication category counts disagree with overall")
+        if content_sha256(sorted(identities)) != run["cohort_content_sha256"]:
+            raise ValueError("Cohort content digest mismatch")
+        if len({row["row_content_sha256"] for row in rows.values()}) != len(rows):
+            raise ValueError("Duplicate content identities")
+        if not math.isclose(
+            _f1_from_counts(*totals), run["summary"]["replication_f1_micro"], abs_tol=1e-7
+        ):
+            raise ValueError(f"{label} replication micro disagrees with fact counts")
+        if not any(behavior_totals) or not math.isclose(
+            _f1_from_counts(*behavior_totals),
+            run["summary"]["replication_behavior_only_f1_micro"], abs_tol=1e-7,
+        ):
+            raise ValueError(
+                f"{label} replication_behavior_only_f1_micro disagrees with behavior fact counts"
+            )
+        for metric in paired_metrics:
+            summary_key = metric + "_mean"
+            if summary_key in gate_metrics:
+                actual = mean(_detail_metric(row, metric) for row in rows.values())
+                if not math.isclose(actual, run["summary"][summary_key], abs_tol=1e-7):
+                    raise ValueError(f"{label} summary/detail inconsistency: {summary_key}")
+        indexed.append(rows)
+    left, right = indexed
+    if set(left) != set(right):
+        raise ValueError("Evaluation cohorts differ")
+    for index in left:
+        if any(left[index][key] != right[index][key] for key in
+               ("row_content_sha256", "body_content_sha256", "independent_unit")):
+            raise ValueError("Paired row content/independent units differ")
+    errors, _ = _comparability_errors(
+        baseline["summary"], candidate["summary"],
+        baseline["details"], candidate["details"],
+        left, right, gate_metrics, paired_metrics,
+    )
+    if errors:
+        raise ValueError("; ".join(errors[:3]))
+
+
+def _f1_from_counts(tp: int, fp: int, fn: int) -> float:
+    return 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0
+
+
+def _paired_units(rows):
+    """Connected components prevent either shared bodies or contracts inflating n."""
+    parents = {}
+
+    def root(key):
+        parents.setdefault(key, key)
+        while parents[key] != key:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
+
+    for index, row in rows.items():
+        body = "body:" + row.get("body_content_sha256", str(index))
+        unit = row.get("independent_unit", body)
+        parents[root(body)] = root(unit)
+    return {index: root("body:" + row.get("body_content_sha256", str(index)))
+            for index, row in rows.items()}
+
+
 def _counter_delta(
     baseline_details: Sequence[Mapping[str, Any]],
     candidate_details: Sequence[Mapping[str, Any]],
@@ -223,13 +399,25 @@ def compare_eval_runs(
     paired_metrics: Sequence[str] = PAIRED_METRICS,
     min_rows: int = 30,
     tolerance: float = 0.0,
+    improvement_margin: float = 0.005,
 ) -> dict[str, Any]:
     baseline = load_eval(baseline_path)
     candidate = load_eval(candidate_path)
+    validation_error = None
+    try:
+        if type(min_rows) is not int or min_rows < 1:
+            raise ValueError("min_rows must be positive")
+        if _numeric(tolerance) is None or tolerance < 0 or _numeric(improvement_margin) is None or improvement_margin < 0:
+            raise ValueError("Margins must be finite and nonnegative")
+        if set(gate_metrics) != set(SUMMARY_GATE_METRICS) or set(paired_metrics) != set(PAIRED_METRICS):
+            raise ValueError("Acceptance requires all mandatory metrics")
+        _validate_pair(baseline, candidate, gate_metrics, paired_metrics)
+    except (ValueError, TypeError, KeyError) as exc:
+        validation_error = str(exc)
     baseline_summary = baseline["summary"]
     candidate_summary = candidate["summary"]
-    baseline_details = baseline["details"]
-    candidate_details = candidate["details"]
+    baseline_details = [d for d in baseline["details"] if isinstance(d, Mapping)]
+    candidate_details = [d for d in candidate["details"] if isinstance(d, Mapping)]
 
     summary_deltas = {}
     regressions = []
@@ -263,11 +451,17 @@ def compare_eval_runs(
         paired_metrics,
     )
     comparable_errors = baseline_errors + candidate_errors + comparable_errors
+    if validation_error:
+        comparable_errors.append(validation_error)
+    units_by_index = _paired_units(candidate_by_index)
     paired_results = {}
     row_deltas = []
+    independent_units = set()
+    confident_improvements = []
     for metric in paired_metrics:
         deltas = []
         improved = regressed = unchanged = 0
+        unit_deltas = {}
         for index in paired_indices:
             baseline_value = _detail_metric(baseline_by_index[index], metric)
             candidate_value = _detail_metric(candidate_by_index[index], metric)
@@ -275,6 +469,9 @@ def compare_eval_runs(
                 continue
             delta = candidate_value - baseline_value
             deltas.append(delta)
+            unit = units_by_index[index]
+            independent_units.add(unit)
+            unit_deltas.setdefault(unit, []).append(delta)
             if delta > tolerance:
                 improved += 1
             elif delta < -tolerance:
@@ -291,8 +488,20 @@ def compare_eval_runs(
                         "function_signature": _function_signature(candidate_by_index[index]),
                     }
                 )
+        independent_deltas = [mean(values) for values in unit_deltas.values()]
+        # Paired contract/body units, not optimizer variants. A conservative
+        # normal approximation is only used above the minimum 30-unit floor.
+        half_width = (2.05 * stdev(independent_deltas) / math.sqrt(len(independent_deltas))
+                      if len(independent_deltas) >= 30 else None)
+        lower = mean(independent_deltas) - half_width if half_width is not None else None
+        if lower is not None and lower > improvement_margin:
+            confident_improvements.append(metric)
         paired_results[metric] = {
             "paired_count": len(deltas),
+            "independent_count": len(independent_deltas),
+            "independent_mean_delta": mean(independent_deltas) if independent_deltas else None,
+            "delta_ci95_lower": lower,
+            "delta_ci95_upper": mean(independent_deltas) + half_width if half_width is not None else None,
             "mean_delta": mean(deltas) if deltas else None,
             "improved_count": improved,
             "regressed_count": regressed,
@@ -303,28 +512,37 @@ def compare_eval_runs(
     candidate_rows = len(candidate_details)
     baseline_rows = len(baseline_details)
     if comparable_errors:
-        decision = "reject"
+        decision = "inconclusive"
         reason = "incomparable evaluations: " + "; ".join(comparable_errors[:3])
-    elif candidate_rows < min_rows or baseline_rows < min_rows:
-        decision = "smoke_only"
-        reason = f"fewer than {min_rows} rows in baseline or candidate"
     elif regressions:
         decision = "reject"
         reason = "gate metric regression: " + ", ".join(regressions)
-    elif improvements:
+    elif len(independent_units) < max(30, min_rows):
+        decision = "smoke_only"
+        reason = f"fewer than {max(30, min_rows)} paired independent contract/body units"
+    elif any(values["delta_ci95_lower"] is None or values["delta_ci95_lower"] < -tolerance
+             for values in paired_results.values()):
+        decision = "inconclusive"
+        reason = "paired uncertainty does not establish non-regression within tolerance"
+    elif improvements and confident_improvements:
         decision = "keep_candidate"
         reason = "no gate regressions and at least one gate metric improved"
     else:
-        decision = "no_change"
-        reason = "no gate regressions, but no gate metric improved"
+        decision = "no_change" if not improvements else "inconclusive"
+        reason = "no improvement exceeds the paired uncertainty bound and practical margin"
 
     return {
         "baseline_eval": str(baseline_path),
         "candidate_eval": str(candidate_path),
+        "baseline_model_provenance": baseline.get("model_provenance"),
+        "candidate_model_provenance": candidate.get("model_provenance"),
         "baseline_rows": baseline_rows,
         "candidate_rows": candidate_rows,
         "paired_rows": len(paired_indices),
         "comparability_errors": comparable_errors,
+        "independent_units": len(independent_units),
+        "gate_settings": {"min_independent_units": max(30, min_rows), "regression_tolerance": tolerance,
+                          "improvement_margin": improvement_margin, "confidence": 0.95},
         "decision": decision,
         "decision_reason": reason,
         "summary_deltas": summary_deltas,
@@ -448,6 +666,7 @@ def main() -> None:
     parser.add_argument("--candidate", required=True, help="Candidate eval JSON")
     parser.add_argument("--min-rows", type=int, default=30)
     parser.add_argument("--tolerance", type=float, default=0.0)
+    parser.add_argument("--improvement-margin", type=float, default=0.005)
     parser.add_argument("--json-output", help="Optional machine-readable comparison output")
     parser.add_argument("--markdown-output", help="Optional markdown report output")
     args = parser.parse_args()
@@ -457,6 +676,7 @@ def main() -> None:
         args.candidate,
         min_rows=args.min_rows,
         tolerance=args.tolerance,
+        improvement_margin=args.improvement_margin,
     )
     if args.json_output:
         output = Path(args.json_output)
@@ -470,6 +690,7 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(report, encoding="utf-8")
     print(report, end="")
+    raise SystemExit(0 if comparison["decision"] in ("keep_candidate", "no_change") else 1)
 
 
 if __name__ == "__main__":

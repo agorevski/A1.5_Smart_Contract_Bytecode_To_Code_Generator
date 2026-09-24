@@ -401,6 +401,9 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
     runtime_checked = metric("bytecode_runtime_checked_mean")
     runtime_match = metric("bytecode_runtime_match_mean")
     runtime_match_rate = _checked_runtime_match_rate(runtime_checked, runtime_match)
+    conditional_match = metric("bytecode_runtime_match_checked_mean")
+    if runtime_checked is not None and runtime_checked > 0 and conditional_match is not None:
+        runtime_match_rate = conditional_match
     if runtime_match_rate is not None:
         metrics_used["bytecode_runtime_match_rate_checked"] = _json_safe_number(runtime_match_rate)
     if bytecode_score is not None:
@@ -754,6 +757,7 @@ def format_latest_results_report(
             "",
             "Quality Summary",
             "---------------",
+            f"Evaluator version: {summary.get('evaluator_version', 'historical/unversioned; recompute before gating')}",
             f"Examples evaluated: {_metric(summary, 'num_evaluated', integer=True)}",
             f"Examples attempted: {_metric(summary, 'num_attempted', integer=True)}",
             f"Examples succeeded: {_metric(summary, 'num_succeeded', integer=True)}",
@@ -822,6 +826,19 @@ def format_latest_results_report(
                     "Runtime equality is bytecode identity, not constructor, deployment, or behavioral equivalence.",
                 ]
             )
+        executed = _mapping_path_value(
+            summary, ("aggregate_statistics", "executed_equivalence")
+        )
+        if isinstance(executed, Mapping):
+            checked, matched = executed.get("checked_n"), executed.get("matched_n")
+            if type(checked) is int and type(matched) is int and 0 <= matched <= checked:
+                lines.append(
+                    f"Bounded stateless execution fixtures matched: "
+                    f"{matched} / {checked if checked else '0 (no comparisons)'}"
+                )
+                lines.append(
+                    "Fixture matches cover only the supplied calldata and supported stateless opcodes, not general equivalence."
+                )
 
     lines.extend(
         [
@@ -1226,7 +1243,8 @@ def _checked_runtime_match_rate(
 ) -> Optional[float]:
     if checked is None or checked <= 0 or matched is None:
         return None
-    return max(0.0, min(1.0, matched / checked))
+    rate = matched / checked
+    return rate if 0 <= rate <= 1 else None
 
 
 def _runtime_comparison_counts(
@@ -1257,10 +1275,19 @@ def _runtime_match_rate(summary: Mapping[str, Any]) -> str:
     checked = _coerce_float(summary.get("bytecode_runtime_checked_mean"))
     if checked == 0:
         return "n/a (no comparisons)"
-    rate = _checked_runtime_match_rate(
-        checked, _coerce_float(summary.get("bytecode_runtime_match_mean"))
-    )
+    rate = _coerce_float(summary.get("bytecode_runtime_match_checked_mean"))
+    if rate is None:
+        rate = _checked_runtime_match_rate(
+            checked, _coerce_float(summary.get("bytecode_runtime_match_mean"))
+        )
+    if rate is not None and not 0 <= rate <= 1:
+        rate = None
     return f"{rate * 100:.2f}%" if rate is not None else "n/a"
+
+
+def _runtime_checked_match(summary: Mapping[str, Any]) -> str:
+    rate = _runtime_match_rate(summary)
+    return "n/a" if rate == "n/a (no comparisons)" else rate
 
 
 def _format_number(value: Any) -> str:

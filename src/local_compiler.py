@@ -41,6 +41,123 @@ class CompiledContract:
     creation_bytecode: str
     abi: list
     source_file: str = ""
+    effective_functions: list = field(default_factory=list)
+    label_resolution_error: str = ""
+
+
+def resolve_effective_functions(output: dict, sources: Dict[str, str],
+                                source_file: str, contract_name: str) -> list:
+    """Resolve public implementations using solc identities and C3 linearization.
+
+    Source ranges are byte offsets, not Python character offsets. Missing AST
+    identity is an error: guessing from a selector can label unrelated code.
+    """
+    contracts = {}
+    source_ids = {}
+    for path, info in output.get("sources", {}).items():
+        source_ids[info.get("id")] = path
+        for node in info.get("ast", {}).get("nodes", []):
+            if node.get("nodeType") == "ContractDefinition":
+                contracts[node["id"]] = (path, node)
+    targets = [node for path, node in contracts.values()
+               if path == source_file and node.get("name") == contract_name]
+    if len(targets) != 1:
+        raise ValueError("missing or ambiguous solc contract AST identity")
+    lineage = targets[0].get("linearizedBaseContracts")
+    if not lineage or lineage[0] != targets[0]["id"]:
+        raise ValueError("missing solc linearized inheritance")
+    methods = output.get("contracts", {}).get(source_file, {}).get(
+        contract_name, {}).get("evm", {}).get("methodIdentifiers", {})
+
+    def source_slice(node):
+        start, length, file_id = map(int, node["src"].split(":"))
+        path = source_ids.get(file_id)
+        if path not in sources or start < 0 or length < 0:
+            raise ValueError("unresolved solc source range")
+        encoded = sources[path].encode("utf-8")
+        if start + length > len(encoded):
+            raise ValueError("solc source range exceeds source")
+        return encoded[start:start + length].decode("utf-8"), path
+
+    effective = {}
+    for contract_id in lineage:
+        if contract_id not in contracts:
+            raise ValueError("unresolved solc base contract identity")
+        _, contract = contracts[contract_id]
+        local_selectors = set()
+        for node in contract.get("nodes", []):
+            if node.get("nodeType") not in ("FunctionDefinition", "VariableDeclaration"):
+                continue
+            if node.get("visibility") not in ("public", "external"):
+                continue
+            selector = node.get("functionSelector")
+            if not selector and node.get("nodeType") == "FunctionDefinition":
+                types = []
+                for param in node.get("parameters", {}).get("parameters", []):
+                    value = param.get("typeDescriptions", {}).get("typeString", "")
+                    value = re.sub(r" (memory|storage|calldata)( ref| pointer)?$", "", value)
+                    value = value.replace("address payable", "address")
+                    if value.startswith("contract "):
+                        value = "address"
+                    types.append(value)
+                selector = methods.get(f"{node.get('name')}({','.join(types)})")
+            if not selector:
+                # Constructors/fallbacks have no selector. Unknown callable
+                # types must not allow a base implementation to win instead.
+                if (node.get("kind") in ("constructor", "fallback", "receive") or
+                        node.get("isConstructor") or not node.get("name")):
+                    continue
+                raise ValueError("unresolved public AST selector")
+            selector = "0x" + selector.removeprefix("0x").lower()
+            if selector in local_selectors:
+                raise ValueError("ambiguous selector in contract AST")
+            local_selectors.add(selector)
+            if selector in effective:
+                continue
+            effective[selector] = None
+            if node.get("nodeType") != "FunctionDefinition" or not node.get("body"):
+                continue
+            text, path = source_slice(node)
+            source_slice(node["body"])
+            # Signature ends at the body byte offset, not the first '{'
+            # (which may occur in comments or strings).
+            start = int(node["src"].split(":")[0])
+            body_start = int(node["body"]["src"].split(":")[0])
+            signature = text.encode("utf-8")[:body_start - start].decode("utf-8").strip()
+            effective[selector] = {
+                "name": node["name"], "selector": selector, "body": text,
+                "signature": signature, "visibility": node["visibility"],
+                "is_payable": node.get("stateMutability") == "payable",
+                "is_view": node.get("stateMutability") in ("view", "pure"),
+                "contract_name": contract["name"], "source_file": path,
+                "ast_id": node["id"], "declaring_contract_id": contract_id,
+                "compiled_contract_id": targets[0]["id"],
+            }
+    return [function for function in effective.values() if function is not None]
+
+
+def _compiled_contracts(output: dict, sources: Dict[str, str]) -> Dict[str, CompiledContract]:
+    result = {}
+    names = {}
+    for file_contracts in output.get("contracts", {}).values():
+        for name in file_contracts:
+            names[name] = names.get(name, 0) + 1
+    for path, file_contracts in output.get("contracts", {}).items():
+        for name, data in file_contracts.items():
+            evm = data.get("evm", {})
+            runtime = evm.get("deployedBytecode", {}).get("object", "")
+            if not runtime:
+                continue
+            compiled = CompiledContract(
+                name, runtime, evm.get("bytecode", {}).get("object", ""),
+                data.get("abi", []), path,
+            )
+            try:
+                compiled.effective_functions = resolve_effective_functions(output, sources, path, name)
+            except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+                compiled.label_resolution_error = str(exc)
+            result[name if names[name] == 1 else f"{path}:{name}"] = compiled
+    return result
 
 
 def get_installed_versions() -> List[str]:
@@ -326,6 +443,7 @@ def compile_source(
     optimizer_runs: int = 200,
     allow_paths: Optional[List[str]] = None,
     remappings: Optional[List[str]] = None,
+    source_filename: str = "contract.sol",
 ) -> CompilationResult:
     """Compile Solidity source code with a specific compiler version.
 
@@ -336,6 +454,7 @@ def compile_source(
         optimizer_runs: Number of optimization runs.
         allow_paths: Additional allowed paths for imports.
         remappings: Import remappings.
+        source_filename: Original source identity in solc output and AST ranges.
 
     Returns:
         CompilationResult with compiled contracts.
@@ -368,7 +487,7 @@ def compile_source(
         # Prepare input JSON for solc standard JSON input
         input_json = {
             "language": "Solidity",
-            "sources": {"contract.sol": {"content": source_code}},
+            "sources": {source_filename: {"content": source_code}},
             "settings": {
                 "optimizer": {
                     "enabled": optimizer_enabled,
@@ -380,7 +499,9 @@ def compile_source(
                             "abi",
                             "evm.bytecode.object",
                             "evm.deployedBytecode.object",
-                        ]
+                            "evm.methodIdentifiers",
+                        ],
+                        "": ["ast"],
                     }
                 },
             },
@@ -405,23 +526,7 @@ def compile_source(
         if result.errors:
             return result
 
-        # Extract compiled contracts
-        contracts_output = output.get("contracts", {})
-        for source_file, file_contracts in contracts_output.items():
-            for contract_name, contract_data in file_contracts.items():
-                evm = contract_data.get("evm", {})
-                runtime_bc = evm.get("deployedBytecode", {}).get("object", "")
-                creation_bc = evm.get("bytecode", {}).get("object", "")
-                abi = contract_data.get("abi", [])
-
-                if runtime_bc:  # Only include contracts with bytecode
-                    result.contracts[contract_name] = CompiledContract(
-                        name=contract_name,
-                        runtime_bytecode=runtime_bc,
-                        creation_bytecode=creation_bc,
-                        abi=abi,
-                        source_file=source_file,
-                    )
+        result.contracts = _compiled_contracts(output, {source_filename: source_code})
 
         result.success = bool(result.contracts)
 
@@ -493,7 +598,9 @@ def compile_multi_file(
                             "abi",
                             "evm.bytecode.object",
                             "evm.deployedBytecode.object",
-                        ]
+                            "evm.methodIdentifiers",
+                        ],
+                        "": ["ast"],
                     }
                 },
             },
@@ -516,22 +623,7 @@ def compile_multi_file(
         if result.errors:
             return result
 
-        contracts_output = output.get("contracts", {})
-        for source_file, file_contracts in contracts_output.items():
-            for contract_name, contract_data in file_contracts.items():
-                evm = contract_data.get("evm", {})
-                runtime_bc = evm.get("deployedBytecode", {}).get("object", "")
-                creation_bc = evm.get("bytecode", {}).get("object", "")
-                abi = contract_data.get("abi", [])
-
-                if runtime_bc:
-                    result.contracts[contract_name] = CompiledContract(
-                        name=contract_name,
-                        runtime_bytecode=runtime_bc,
-                        creation_bytecode=creation_bc,
-                        abi=abi,
-                        source_file=source_file,
-                    )
+        result.contracts = _compiled_contracts(output, sources)
 
         result.success = bool(result.contracts)
 

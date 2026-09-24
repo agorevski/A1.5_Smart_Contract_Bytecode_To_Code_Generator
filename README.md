@@ -28,10 +28,26 @@ The system implements four analysis pipelines coordinated by `PipelineOrchestrat
 ### 1. Install Dependencies
 
 ```bash
+# Core bytecode analysis and dataset preparation; no PyTorch/CUDA dependency
 uv sync
+
+# Model training and evaluation with CUDA 13 wheels
+uv sync --extra training --extra cuda
+
+# CPU-only development environment, including web and analysis features
+uv sync --dev --extra training --extra web --extra analysis --extra cpu
 ```
 
-> **Requirements:** Python 3.13.x, CUDA-compatible GPU with ≥ 4 GB VRAM (inference) / ≥ 16 GB (training). The locked training stack is validated on Linux x86_64 with CUDA 13 PyTorch wheels.
+> **Requirements:** Python 3.10–3.12. Python 3.11 is recommended on Windows because the current Web3 dependency stack has prebuilt native wheels for it. GPU workloads require a compatible PyTorch/CUDA installation and sufficient memory for the model. CPU-only inference and smoke training are available with `--extra cpu`; a 7B model generally needs substantially more memory than a tiny smoke model.
+
+Optional profiles are `inference`, `evaluation`, `training`, `quantization`,
+`web`, and `analysis`. Training includes evaluation and inference; quantization
+also adds bitsandbytes. Use `--extra quantization` for the QLoRA runners, and
+`--extra web` for the UI. Add `--extra cpu` to select the explicit CPU-only
+PyTorch index rather than merely hiding CUDA devices.
+`--extra cuda` selects CUDA 13 wheels explicitly and cannot be combined with
+`--extra cpu`. Without either accelerator extra, model profiles use PyPI's
+platform default (CUDA on Linux, CPU on Windows/macOS).
 
 ### 2. Download Training Data
 
@@ -62,20 +78,20 @@ uv run python download_hf_contracts.py --export-only        # Phase 3: Export JS
 
 ```bash
 # Train on the downloaded dataset (Qwen2.5-Coder-7B-Instruct with LoRA)
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
+uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
 
 # Quick test (1 epoch, small batch)
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
+uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
 
 # Fast E2E test with a tiny model (no GPU needed)
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
+uv run --extra training --extra cpu python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny
 
 # Full training with custom parameters
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
+uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
     --epochs 5 --batch-size 1 --lr 2e-4 --max-seq-length 8192
 
 # Force single-GPU or memory-saving quantized LoRA when needed
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
+uv run --extra quantization python train.py --skip-collection --dataset data/hf_training_dataset.jsonl \
     --num-gpus 1 --quantization
 ```
 
@@ -94,10 +110,10 @@ Use `--eval-batch-size N` and `--eval-max-new-tokens N` to control batched decom
 
 ```bash
 # Train and evaluate
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
+uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl
 
 # Train without evaluation
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --skip-eval
+uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --skip-eval
 ```
 
 ## End-to-End Example
@@ -107,7 +123,7 @@ uv run python train.py --skip-collection --dataset data/hf_training_dataset.json
 uv run python download_hf_contracts.py --limit 20
 
 # Step 2: Train the model on the downloaded data
-uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
+uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --small
 
 # Step 3: Check results
 ls results/
@@ -117,7 +133,7 @@ ls results/
 
 ```bash
 # Generate JSON with Solidity, TAC, timings, function errors, and model config
-uv run python scripts/decompile.py \
+uv run --extra inference python scripts/decompile.py \
   --model-path models/final_model \
   --bytecode 0x60806040... \
   --format json
@@ -148,7 +164,10 @@ For the full operator guide, including current-data sufficiency checks, data reg
 
 The pytest configuration disables Web3's unrelated `pytest_ethereum` entry
 point so repository tests collect consistently in supported `uv` environments.
-Install development dependencies with `uv sync --dev` before running tests.
+Install development dependencies with
+`uv sync --dev --extra training --extra web --extra analysis --extra cpu`
+before running tests. The CI matrix runs the complete offline CPU regression
+suite on Python 3.10 and 3.12.
 
 ```bash
 # Run all tests
@@ -357,7 +376,7 @@ script no longer creates a true compiler-metadata control.
 | `--temperature FLOAT` | `0.1` | Sampling temperature |
 | `--do-sample` | off | Enable stochastic sampling |
 | `--repetition-penalty FLOAT` | `1.15` | Repetition penalty |
-| `--timeout-seconds N` | `WEB_DECOMPILE_TIMEOUT_SECONDS` or `900` | Wall-clock timeout for analysis/model work; `0` disables |
+| `--timeout-seconds N` | `WEB_DECOMPILE_TIMEOUT_SECONDS` or `900` | Hard model-worker deadline; CPU analysis uses cooperative deadline checks; `0` disables |
 | `--max-functions N` | `WEB_MAX_DECOMPILE_FUNCTIONS` or `128` | Abort when more functions are detected |
 
 ## Environment Variables
@@ -373,7 +392,7 @@ script no longer creates a true compiler-metadata control.
 | `WEB_MAX_BYTECODE_HEX_LENGTH` | Optional | Max accepted bytecode hex characters (default 200000) |
 | `WEB_MAX_CONCURRENT_DECOMPILES` | Optional | Concurrent `/api/decompile` jobs (default 1) |
 | `WEB_MAX_DECOMPILE_FUNCTIONS` | Optional | Max functions per web decompile job (default 128) |
-| `WEB_DECOMPILE_TIMEOUT_SECONDS` | Optional | Hard request timeout for blocking analysis/model calls (default 900; `0` disables) |
+| `WEB_DECOMPILE_TIMEOUT_SECONDS` | Optional | Hard model-worker timeout, cooperative CPU analysis deadline (default 900; `0` disables) |
 | `WEB_MAX_NEW_TOKENS` | Optional | Upper bound for requested `generation.max_new_tokens` (default 4096) |
 | `WEB_DEFAULT_MAX_NEW_TOKENS` | Optional | Default web generation cap (default 1024) |
 | `WEB_DEFAULT_TEMPERATURE` | Optional | Default web generation temperature (default 0.1) |
@@ -397,6 +416,16 @@ CLI flags, not `src/settings.yaml`.
 `--host`, `--port`, `--debug`, `--mockmodel`, `--warmup`, and `--no-warmup`.
 `/api/health` reports the effective `limits`, `generation_defaults`, `tracing`,
 `warmup`, model readiness/path, and lookup status.
+
+Model inference runs in a persistent spawn worker that loads its own model,
+including on Windows. Timeout or cancellation terminates that worker before
+releasing model capacity; the next request starts a fresh worker. CPU analysis
+uses synchronous, cooperative deadline checks rather than abandoned background
+threads. Health and result payloads report the effective enforcement mode.
+
+CLI, web, and pipeline results distinguish completed, partial, failed, and
+skipped work. TAC-only analysis is not reported as completed model decompilation;
+degraded analysis and conflicting reconstructed declarations remain explicit.
 
 ## Model Details
 

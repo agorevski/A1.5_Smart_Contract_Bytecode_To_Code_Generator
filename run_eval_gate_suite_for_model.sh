@@ -22,6 +22,7 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
 EVAL_REPETITION_PENALTY="${EVAL_REPETITION_PENALTY:-1.05}"
 GATE_DIR="${GATE_DIR:-${SCRIPT_DIR}/models/eval_gate_${LABEL}_$(date +%Y%m%d-%H%M%S)}"
+cd "${SCRIPT_DIR}"
 
 BROAD_DATASET="${BROAD_DATASET:-${SCRIPT_DIR}/data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl}"
 CALLS_DATASET="${CALLS_DATASET:-${SCRIPT_DIR}/data/eval_failure_slices/broad30_reppenalty_1_05_fixed_extractor/calls.jsonl}"
@@ -56,36 +57,49 @@ if [[ -n "${TRAIN_DATASET:-}" && "$(realpath "${TRAIN_DATASET}")" != "$(realpath
 fi
 TRAIN_DATASET="${VERIFIED_TRAIN_DATASET}"
 
-mkdir -p "${GATE_DIR}"
+for label in BROAD CALLS STATE HOLDOUT64 PURE_NEGATIVE LARGE192; do
+    dataset_var="${label}_DATASET"
+    baseline_var="${label}_BASELINE"
+    python -m scripts.gate_dataset verify-baseline "${!baseline_var}" "${!dataset_var}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
+        --repetition-penalty "${EVAL_REPETITION_PENALTY}"
+done
+
+mkdir -p "$(dirname "${GATE_DIR}")"
+if ! mkdir "${GATE_DIR}"; then
+    echo "Gate output directory must be new (prevents concurrent/stale output reuse): ${GATE_DIR}" >&2
+    exit 1
+fi
+uv run --extra evaluation python scripts/evaluation_preflight.py --model "${MODEL_PATH}" \
+    --pair "${BROAD_DATASET}" "${BROAD_BASELINE}" \
+    --pair "${CALLS_DATASET}" "${CALLS_BASELINE}" \
+    --pair "${STATE_DATASET}" "${STATE_BASELINE}" \
+    --pair "${HOLDOUT64_DATASET}" "${HOLDOUT64_BASELINE}" \
+    --pair "${PURE_NEGATIVE_DATASET}" "${PURE_NEGATIVE_BASELINE}" \
+    --pair "${LARGE192_DATASET}" "${LARGE192_BASELINE}" \
+    --output "${GATE_DIR}/provenance_preflight.json"
 EVAL_MAP="${GATE_DIR}/eval_paths.tsv"
 : > "${EVAL_MAP}"
-
-newest_eval_json() {
-    find "${SCRIPT_DIR}/results" -maxdepth 1 -name 'eval_*.json' -printf '%T@ %p\n' \
-        | sort -n \
-        | tail -1 \
-        | cut -d' ' -f2-
-}
 
 run_eval() {
     local label="$1"
     local dataset_path="$2"
     local latest_path="$3"
     shift 3
+    local eval_json="${GATE_DIR}/eval_${label}.json"
     echo "=== Eval: ${label} ==="
-    uv run torchrun --nproc_per_node="${NUM_GPUS}" train.py --eval-only \
+    uv run --extra evaluation torchrun --nproc_per_node="${NUM_GPUS}" train.py --eval-only \
         --model-path "${MODEL_PATH}" \
         --test-dataset "${dataset_path}" \
         --eval-batch-size "${EVAL_BATCH_SIZE}" \
         --eval-max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
         --eval-repetition-penalty "${EVAL_REPETITION_PENALTY}" \
         --latest-results "${latest_path}" \
-        --skip-data-preflight \
+        --eval-output-json "${eval_json}" \
         "$@"
-    local eval_json
-    eval_json="$(newest_eval_json)"
     python -m scripts.gate_dataset verify-eval "${eval_json}" "${MODEL_PATH}" "${dataset_path}" \
         --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
+    test -s "${eval_json}"
     printf '%s\t%s\t%s\t%s\n' "${label}" "${MODEL_PATH}" "${dataset_path}" "${eval_json}" | tee -a "${EVAL_MAP}"
 }
 
@@ -96,7 +110,6 @@ echo "  eval max new tokens:    ${EVAL_MAX_NEW_TOKENS}"
 echo "  eval repetition penalty:${EVAL_REPETITION_PENALTY}"
 echo "  GPUs:                   ${NUM_GPUS}"
 
-run_eval "train_first30" "${TRAIN_DATASET}" "${GATE_DIR}/latest_results_train_first30.txt" --eval-limit 30 --eval-first-n
 run_eval "broad30" "${BROAD_DATASET}" "${GATE_DIR}/latest_results_broad30.txt"
 run_eval "calls23" "${CALLS_DATASET}" "${GATE_DIR}/latest_results_calls23.txt"
 run_eval "state17" "${STATE_DATASET}" "${GATE_DIR}/latest_results_state17.txt"
@@ -111,10 +124,11 @@ HOLDOUT64_EVAL="$(awk -F '\t' '$1=="holdout64"{print $4}' "${EVAL_MAP}")"
 PURE_NEGATIVE_EVAL="$(awk -F '\t' '$1=="pure_negative64"{print $4}' "${EVAL_MAP}")"
 LARGE192_EVAL="$(awk -F '\t' '$1=="large192"{print $4}' "${EVAL_MAP}")"
 
-uv run python scripts/eval_gate_suite.py \
+uv run --extra evaluation python scripts/eval_gate_suite.py \
     --pair broad30 "${BROAD_BASELINE}" "${BROAD_EVAL}" 30 \
-    --pair calls23 "${CALLS_BASELINE}" "${CALLS_EVAL}" 1 \
-    --pair state17 "${STATE_BASELINE}" "${STATE_EVAL}" 1 \
+    --pair calls23 "${CALLS_BASELINE}" "${CALLS_EVAL}" 30 \
+    --pair state17 "${STATE_BASELINE}" "${STATE_EVAL}" 30 \
+    --diagnostic calls23 --diagnostic state17 \
     --pair holdout64 "${HOLDOUT64_BASELINE}" "${HOLDOUT64_EVAL}" 30 \
     --pair pure_negative64 "${PURE_NEGATIVE_BASELINE}" "${PURE_NEGATIVE_EVAL}" 30 \
     --pair large192 "${LARGE192_BASELINE}" "${LARGE192_EVAL}" 30 \

@@ -95,7 +95,9 @@ class TACLookup:
     """Fast TAC hash → Solidity lookup backed by a SQLite database.
 
     Designed to be instantiated once at server startup and reused for
-    every inference request.
+    every inference request. Missing databases disable lookup; existing
+    unversioned/stale databases raise ValueError instead of serving old TAC.
+    Build a separate current database explicitly; no automatic migration runs.
     """
 
     def __init__(self, db_path: str = "data/tac_lookup.db"):
@@ -107,11 +109,20 @@ class TACLookup:
             return
 
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.row_factory = sqlite3.Row
 
-        self._ensure_optional_schema()
+        from .tac_schema import TAC_SCHEMA_VERSION
+        from .dataset_export_primitives import LABEL_SCHEMA_VERSION
+
+        manifest = self.manifest()
+        if (manifest.get("tac_schema_version") != TAC_SCHEMA_VERSION or
+                manifest.get("label_schema_version") != LABEL_SCHEMA_VERSION):
+            self.close()
+            raise ValueError(
+                "Incompatible TAC lookup schema (missing or stale version); "
+                "build a new database with scripts/build_lookup_db.py. "
+                "Existing artifacts are not upgraded automatically."
+            )
         count = self._conn.execute("SELECT COUNT(*) FROM tac_to_body").fetchone()[0]
         body_count = self._conn.execute("SELECT COUNT(*) FROM solidity_bodies").fetchone()[0]
         logger.info(
@@ -123,19 +134,6 @@ class TACLookup:
     def available(self) -> bool:
         """Whether the lookup database is loaded and ready."""
         return self._conn is not None
-
-    def _ensure_optional_schema(self) -> None:
-        """Create optional provenance tables for older lookup databases."""
-        if not self._conn:
-            return
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS lookup_manifest (
-                key        TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self._conn.commit()
 
     def manifest(self) -> Dict:
         """Return lookup build provenance recorded in the database."""
@@ -150,7 +148,8 @@ class TACLookup:
         if not row:
             return {}
         try:
-            return json.loads(row["value_json"])
+            value = json.loads(row["value_json"])
+            return value if isinstance(value, dict) else {}
         except (TypeError, json.JSONDecodeError):
             return {}
 
@@ -198,6 +197,8 @@ class TACLookup:
         }
         if manifest:
             provenance["build_id"] = manifest.get("build_id")
+            provenance["tac_schema_version"] = manifest.get("tac_schema_version")
+            provenance["label_schema_version"] = manifest.get("label_schema_version")
             provenance["dataset_revision"] = manifest.get("dataset_revision")
             provenance["source_db"] = manifest.get("source_db")
             provenance["source_table"] = manifest.get("source_table")
@@ -284,7 +285,13 @@ class TACLookupBuilder:
     def __init__(self, db_path: str = "data/tac_lookup.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = self.db_path.exists() and self.db_path.stat().st_size > 0
+        if existing:
+            check = TACLookup(str(self.db_path))
+            check.close()
         self._init_database()
+        if not existing:
+            self.record_manifest({})
 
     def _init_database(self):
         """Create the lookup database schema."""
@@ -583,6 +590,14 @@ class TACLookupBuilder:
 
     def record_manifest(self, manifest: Dict) -> None:
         """Persist lookup build provenance in the database."""
+        from .tac_schema import TAC_SCHEMA_VERSION
+        from .dataset_export_primitives import LABEL_SCHEMA_VERSION
+
+        manifest = {
+            **manifest,
+            "tac_schema_version": TAC_SCHEMA_VERSION,
+            "label_schema_version": LABEL_SCHEMA_VERSION,
+        }
         with _db_connection(self.db_path) as conn:
             conn.execute(
                 """

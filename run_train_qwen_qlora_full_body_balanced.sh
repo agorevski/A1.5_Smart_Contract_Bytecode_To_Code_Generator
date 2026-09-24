@@ -5,6 +5,8 @@
 # optimizer/compiler variants of the same Solidity body do not dominate the
 # training signal. By default it keeps one row per body, trains for one
 # epoch, then evaluates the resulting adapter against the current gate suite.
+# Reuse requires matching source/selection/exclusion fingerprints and a clean
+# overlap check. Set RECREATE_DATASET=1 to rebuild a stale artifact explicitly.
 #
 # Common overrides:
 #   DRY_RUN=1 ./run_train_qwen_qlora_full_body_balanced.sh
@@ -116,28 +118,43 @@ if [[ "${RUN_GATES}" != "false" && "${RUN_GATES}" != "0" &&
     require_baseline "holdout64" "${HOLDOUT64_BASELINE}" "${HOLDOUT64_DATASET}"
     require_baseline "pure_negative64" "${PURE_NEGATIVE_BASELINE}" "${PURE_NEGATIVE_DATASET}"
     require_baseline "large192" "${LARGE192_BASELINE}" "${LARGE192_DATASET}"
+    python - \
+        "${BROAD_DATASET}" "${BROAD_BASELINE}" \
+        "${CALLS_DATASET}" "${CALLS_BASELINE}" \
+        "${STATE_DATASET}" "${STATE_BASELINE}" \
+        "${HOLDOUT64_DATASET}" "${HOLDOUT64_BASELINE}" \
+        "${PURE_NEGATIVE_DATASET}" "${PURE_NEGATIVE_BASELINE}" \
+        "${LARGE192_DATASET}" "${LARGE192_BASELINE}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+from scripts.compare_eval_runs import (
+    PAIRED_METRICS, SUMMARY_GATE_METRICS, _validate_pair, load_eval,
+)
+
+for dataset, baseline_path in zip(sys.argv[1::2], sys.argv[2::2]):
+    baseline = load_eval(baseline_path)
+    _validate_pair(baseline, baseline, SUMMARY_GATE_METRICS, PAIRED_METRICS)
+    if baseline["dataset_content_sha256"] != hashlib.sha256(Path(dataset).read_bytes()).hexdigest():
+        raise ValueError(f"Baseline dataset content differs: {baseline_path}")
+    if len(baseline["details"]) != sum(
+        bool(line.strip()) for line in Path(dataset).read_text(encoding="utf-8").splitlines()
+    ):
+        raise ValueError(f"Baseline does not cover the entire gate dataset: {baseline_path}")
+print("All six bundled-only gate baselines have complete provenance and cohort coverage.")
+PY
 fi
 
 mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}"
 
-if [[ -e "${BALANCED_DATASET}" && "${RECREATE_DATASET}" != "true" && "${RECREATE_DATASET}" != "1" ]]; then
-    CACHE_ARGS=(--manifest "${BALANCED_MANIFEST}" --cap-per-body "${CAP_PER_BODY}" --seed "${SEED}")
-    if [[ -n "${MAX_ROWS}" ]]; then
-        CACHE_ARGS+=(--max-rows "${MAX_ROWS}")
-    fi
-    python -m scripts.gate_dataset verify-balanced-cache \
-        "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${EVAL_EXCLUDE_DATASETS}" "${CACHE_ARGS[@]}"
-    echo "Using verified body-balanced dataset: ${BALANCED_DATASET}"
-else
-    echo "Building body-balanced dataset from ${SOURCE_DATASET}"
-    echo "  cap per body_hash: ${CAP_PER_BODY}"
-    if [[ -n "${MAX_ROWS}" ]]; then
-        echo "  max selected rows: ${MAX_ROWS}"
-    fi
-    if [[ -n "${EVAL_EXCLUDE_DATASETS}" ]]; then
-        echo "  excluding eval datasets: ${EVAL_EXCLUDE_DATASETS}"
-    fi
-    python - "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${BALANCED_MANIFEST}" "${CAP_PER_BODY}" "${SEED}" "${MAX_ROWS}" "${EVAL_EXCLUDE_DATASETS}" <<'PY'
+echo "Preparing body-balanced dataset from ${SOURCE_DATASET}"
+echo "  cap per body_hash: ${CAP_PER_BODY}"
+if [[ -n "${MAX_ROWS}" ]]; then
+    echo "  max selected rows: ${MAX_ROWS}"
+fi
+echo "  excluding eval datasets: ${EVAL_EXCLUDE_DATASETS}"
+python - "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${BALANCED_MANIFEST}" "${CAP_PER_BODY}" "${SEED}" "${MAX_ROWS}" "${EVAL_EXCLUDE_DATASETS}" "${RECREATE_DATASET}" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -155,8 +172,10 @@ from scripts.gate_dataset import (
     exclude_eval_rows,
     file_sha256,
     load_jsonl,
+    row_keys,
     selection_fingerprint,
     selection_inputs,
+    verify_cache,
 )
 from src.replication_metrics import extract_solidity_facts
 
@@ -181,20 +200,41 @@ def fact_coverage(row: Mapping[str, Any]) -> dict[str, int]:
     return {category: len(values) for category, values in facts.items() if values}
 
 
-inputs = selection_inputs(source, exclude_paths, cap_per_body=cap_per_body, seed=seed, max_rows=max_rows)
+inputs = selection_inputs(
+    source, exclude_paths, cap_per_body=cap_per_body, seed=seed,
+    max_rows=max_rows, balance_policy="normalized_body_and_gate_keys_v2",
+)
 source_rows = load_jsonl(source)
 source_identity_counts: Counter[str] = Counter()
 for row in source_rows:
     source_identity_counts[body_identity(row)] += 1
 
-excluded_identities: set[str] = set()
 gate_rows: list[dict[str, Any]] = []
 excluded_dataset_rows = 0
 for exclude_path in exclude_paths:
-    for row in load_jsonl(exclude_path):
-        excluded_identities.add(body_identity(row))
-        gate_rows.append(row)
-        excluded_dataset_rows += 1
+    rows = load_jsonl(exclude_path)
+    gate_rows.extend(rows)
+    excluded_dataset_rows += len(rows)
+excluded_identities = {body_identity(row) for row in gate_rows}
+gate_keys = set().union(*(row_keys(row) for row in gate_rows))
+
+
+def validate_no_overlap(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        raise ValueError("Body-balanced dataset is empty")
+    for row in rows:
+        if row_keys(row) & gate_keys:
+            raise ValueError("Training/evaluation identity overlap detected before GPU launch")
+
+
+recreate = sys.argv[8].lower() in ("true", "1")
+if output.exists() and not recreate:
+    if not verify_cache(output, manifest_path, inputs):
+        raise ValueError("Body-balanced cache is unverified or stale; set RECREATE_DATASET=1")
+    cached_rows = load_jsonl(output)
+    validate_no_overlap(cached_rows)
+    print(f"Validated existing body-balanced dataset: {output}")
+    raise SystemExit(0)
 
 groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
 missing_body_hash_count = sum(
@@ -258,6 +298,7 @@ for row in selected:
         if metadata.get("visibility"):
             visibilities[str(metadata["visibility"])] += 1
 
+validate_no_overlap(clean_rows)
 output.parent.mkdir(parents=True, exist_ok=True)
 with output.open("w", encoding="utf-8") as handle:
     for row in clean_rows:
@@ -314,7 +355,6 @@ with manifest_path.open("w", encoding="utf-8") as handle:
 
 print(json.dumps(manifest, indent=2, sort_keys=True))
 PY
-fi
 
 if [[ "${GRADIENT_CHECKPOINTING}" == "false" || "${GRADIENT_CHECKPOINTING}" == "0" ]]; then
     GRADIENT_CHECKPOINTING_ARG="--no-gradient-checkpointing"
@@ -328,7 +368,7 @@ if [[ "${SELECTOR_SIGNATURE_METADATA}" == "false" || "${SELECTOR_SIGNATURE_METAD
 fi
 
 TRAIN_CMD=(
-    uv run torchrun
+    uv run --extra quantization torchrun
     --nproc_per_node="${NUM_GPUS}"
     train.py
     --skip-collection
@@ -424,70 +464,37 @@ if [[ ! -d "${FINAL_MODEL}" ]]; then
     exit 1
 fi
 
+# Use the same fail-closed provenance preflight, explicit result paths, and
+# diagnostic slice policy as standalone model evaluation. The shared runner
+# requires a new GATE_DIR and never manufactures a missing baseline implicitly.
+mkdir -p "$(dirname "${GATE_DIR}")"
+export MODEL_PATH="${FINAL_MODEL}" GATE_DIR NUM_GPUS
+export EVAL_BATCH_SIZE EVAL_MAX_NEW_TOKENS EVAL_REPETITION_PENALTY
+export BROAD_DATASET CALLS_DATASET STATE_DATASET HOLDOUT64_DATASET PURE_NEGATIVE_DATASET LARGE192_DATASET
+export BROAD_BASELINE CALLS_BASELINE STATE_BASELINE HOLDOUT64_BASELINE PURE_NEGATIVE_BASELINE LARGE192_BASELINE
+bash "${SCRIPT_DIR}/run_eval_gate_suite_for_model.sh"
+test -s "${GATE_DIR}/gate_suite.json"
+
+# Retain the historical training-set diagnostic outputs, but never use these
+# intentionally overlapping rows as held-out acceptance evidence.
 TRAIN_DATASET="$(python -m scripts.gate_dataset verify-model "${FINAL_MODEL}" "${DEFAULT_EVAL_EXCLUDE_DATASETS}")"
-mkdir -p "${GATE_DIR}"
 EVAL_MAP="${GATE_DIR}/eval_paths.tsv"
-: > "${EVAL_MAP}"
-
-newest_eval_json() {
-    find "${SCRIPT_DIR}/results" -maxdepth 1 -name 'eval_*.json' -printf '%T@ %p\n' \
-        | sort -n \
-        | tail -1 \
-        | cut -d' ' -f2-
-}
-
-run_eval() {
-    local label="$1"
-    local model_path="$2"
-    local dataset_path="$3"
-    local latest_path="$4"
-    shift 4
-    if [[ ! -f "${dataset_path}" ]]; then
-        echo "Eval dataset not found for ${label}: ${dataset_path}" >&2
-        exit 1
-    fi
-    echo "=== Eval: ${label} ==="
-    uv run torchrun --nproc_per_node="${NUM_GPUS}" train.py --eval-only \
-        --model-path "${model_path}" \
-        --test-dataset "${dataset_path}" \
-        --eval-batch-size "${EVAL_BATCH_SIZE}" \
-        --eval-max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
-        --eval-repetition-penalty "${EVAL_REPETITION_PENALTY}" \
-        --latest-results "${latest_path}" \
-        --skip-data-preflight \
-        "$@"
-    local eval_json
-    eval_json="$(newest_eval_json)"
-    python -m scripts.gate_dataset verify-eval "${eval_json}" "${model_path}" "${dataset_path}" \
-        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
-    printf '%s\t%s\t%s\t%s\n' "${label}" "${model_path}" "${dataset_path}" "${eval_json}" | tee -a "${EVAL_MAP}"
-}
-
-run_eval "train_first30" "${FINAL_MODEL}" "${TRAIN_DATASET}" "${GATE_DIR}/latest_results_train_first30.txt" --eval-limit 30 --eval-first-n
-run_eval "broad30" "${FINAL_MODEL}" "${BROAD_DATASET}" "${GATE_DIR}/latest_results_broad30.txt"
-run_eval "calls23" "${FINAL_MODEL}" "${CALLS_DATASET}" "${GATE_DIR}/latest_results_calls23.txt"
-run_eval "state17" "${FINAL_MODEL}" "${STATE_DATASET}" "${GATE_DIR}/latest_results_state17.txt"
-run_eval "holdout64" "${FINAL_MODEL}" "${HOLDOUT64_DATASET}" "${GATE_DIR}/latest_results_holdout64.txt"
-run_eval "pure_negative64" "${FINAL_MODEL}" "${PURE_NEGATIVE_DATASET}" "${GATE_DIR}/latest_results_pure_negative64.txt"
-run_eval "large192" "${FINAL_MODEL}" "${LARGE192_DATASET}" "${GATE_DIR}/latest_results_large192.txt"
-
-TRAIN_FIRST30_EVAL="$(awk -F '\t' '$1=="train_first30"{print $4}' "${EVAL_MAP}")"
-BROAD_EVAL="$(awk -F '\t' '$1=="broad30"{print $4}' "${EVAL_MAP}")"
-CALLS_EVAL="$(awk -F '\t' '$1=="calls23"{print $4}' "${EVAL_MAP}")"
-STATE_EVAL="$(awk -F '\t' '$1=="state17"{print $4}' "${EVAL_MAP}")"
-HOLDOUT64_EVAL="$(awk -F '\t' '$1=="holdout64"{print $4}' "${EVAL_MAP}")"
-PURE_NEGATIVE_EVAL="$(awk -F '\t' '$1=="pure_negative64"{print $4}' "${EVAL_MAP}")"
-LARGE192_EVAL="$(awk -F '\t' '$1=="large192"{print $4}' "${EVAL_MAP}")"
-
-uv run python scripts/eval_gate_suite.py \
-    --pair broad30 "${BROAD_BASELINE}" "${BROAD_EVAL}" 30 \
-    --pair calls23 "${CALLS_BASELINE}" "${CALLS_EVAL}" 1 \
-    --pair state17 "${STATE_BASELINE}" "${STATE_EVAL}" 1 \
-    --pair holdout64 "${HOLDOUT64_BASELINE}" "${HOLDOUT64_EVAL}" 30 \
-    --pair pure_negative64 "${PURE_NEGATIVE_BASELINE}" "${PURE_NEGATIVE_EVAL}" 30 \
-    --pair large192 "${LARGE192_BASELINE}" "${LARGE192_EVAL}" 30 \
-    --json-output "${GATE_DIR}/gate_suite.json" \
-    --markdown-output "${GATE_DIR}/gate_suite.md"
+TRAIN_FIRST30_EVAL="${GATE_DIR}/eval_train_first30.json"
+echo "=== Train-first-30 diagnostic only (not an acceptance gate) ==="
+uv run --extra quantization torchrun --nproc_per_node="${NUM_GPUS}" train.py --eval-only \
+    --model-path "${FINAL_MODEL}" \
+    --test-dataset "${TRAIN_DATASET}" \
+    --eval-batch-size "${EVAL_BATCH_SIZE}" \
+    --eval-max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
+    --eval-repetition-penalty "${EVAL_REPETITION_PENALTY}" \
+    --latest-results "${GATE_DIR}/latest_results_train_first30.txt" \
+    --eval-output-json "${TRAIN_FIRST30_EVAL}" \
+    --eval-limit 30 --eval-first-n
+test -s "${TRAIN_FIRST30_EVAL}"
+python -m scripts.gate_dataset verify-eval "${TRAIN_FIRST30_EVAL}" "${FINAL_MODEL}" "${TRAIN_DATASET}" \
+    --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
+printf '%s\t%s\t%s\t%s\n' "train_first30" "${FINAL_MODEL}" \
+    "${TRAIN_DATASET}" "${TRAIN_FIRST30_EVAL}" | tee -a "${EVAL_MAP}"
 
 echo ""
 echo "Gate eval map: ${EVAL_MAP}"

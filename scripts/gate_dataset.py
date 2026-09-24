@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.dataset_export_primitives import hash_normalized_body
+from src.evaluation_identity import row_identity as evaluation_row_identity
 
 Key = tuple[str, str | tuple[str, str]]
 
@@ -75,7 +76,10 @@ def canonicalize_body_hash(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def row_keys(row: Mapping[str, Any]) -> set[Key]:
-    keys: set[Key] = {("body_hash", body_identity(row))}
+    keys: set[Key] = {
+        ("body_hash", body_identity(row)),
+        ("evaluation_body_hash", evaluation_row_identity(row)["body_content_sha256"]),
+    }
     for category, names in (
         (
             "source_hash",
@@ -133,7 +137,7 @@ def selection_inputs(
     source: Path, exclude_paths: Sequence[Path], **parameters: Any
 ) -> dict[str, Any]:
     return {
-        "selection_schema_version": 2,
+        "selection_schema_version": 3,
         "source": {"path": str(source.resolve()), "sha256": file_sha256(source)},
         "exclusions": [
             {"path": str(path.resolve()), "sha256": file_sha256(path)} for path in exclude_paths

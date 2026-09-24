@@ -9,6 +9,18 @@ from src.evaluation_report import (
 )
 
 
+def test_runtime_match_diagnostic_uses_checked_denominator():
+    diagnostics = build_evaluation_diagnostics({
+        "bytecode_runtime_checked_mean": 0.1, "bytecode_runtime_match_mean": 0.1,
+    })
+    assert "runtime_bytecode_mismatch" not in {issue["id"] for issue in diagnostics["issues"]}
+    from src.evaluation_report import _runtime_checked_match
+    assert _runtime_checked_match({"bytecode_runtime_checked_mean": 0.1,
+                                   "bytecode_runtime_match_mean": 0.1}) == "100.00%"
+    assert _runtime_checked_match({"bytecode_runtime_checked_mean": 0,
+                                   "bytecode_runtime_match_mean": 0}) == "n/a"
+
+
 def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -56,7 +68,10 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
                 "equal_n": 0,
                 "total_n": 1,
                 "equality_rate_checked": 0.0,
-            }
+            },
+            "executed_equivalence": {
+                "checked_n": 1, "matched_n": 1, "total_n": 1,
+            },
         },
         "confidence_intervals": {
             "semantic_similarity_mean": {
@@ -158,6 +173,8 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
     assert "Exact full-contract runtime bytecode checked: 1 / 1" in report
     assert "Exact runtime bytecode equal (checked only): 0 / 1" in report
     assert "not constructor, deployment, or behavioral equivalence" in report
+    assert "Bounded stateless execution fixtures matched: 1 / 1" in report
+    assert "not general equivalence" in report
     assert "abi | 1.0000 | 0.5000 | 0.6667 | 1 | 0 | 1" in report
     assert "unsupported_calls | 2 | 66.67%" in report
     assert "Opcode and Control-Flow Coverage" in report

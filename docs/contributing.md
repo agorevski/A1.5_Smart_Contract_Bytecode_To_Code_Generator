@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/agorevski/A1.5_Smart_Contract_Bytecode_To_Code_Generator.git
 cd A1.5_Smart_Contract_Bytecode_To_Code_Generator
-uv sync --dev
+uv sync --dev --extra training --extra web --extra analysis --extra cpu
 ```
 
 ## Development Workflow
@@ -17,7 +17,14 @@ uv sync --dev
 5. Commit with conventional messages (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`)
 6. Push and open a pull request
 
-The data-quality GitHub Actions workflow runs targeted CPU regression checks, but contributors should still run the relevant local `uv` commands before opening a pull request.
+Use Python 3.10–3.12 (3.11 is recommended on Windows for native dependency
+wheels). The core `uv sync` profile is sufficient for bytecode analysis and data
+preparation, but not for all tests. The command above includes the optional model,
+web, and analysis features and selects CPU-only PyTorch.
+
+The data-quality GitHub Actions workflow runs the complete offline CPU regression
+suite on Python 3.10 and 3.12. Contributors should still run the relevant local
+tests before opening a pull request.
 
 ## Code Standards
 

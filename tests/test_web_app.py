@@ -117,7 +117,8 @@ def test_health_splits_liveness_readiness_and_redacts_public_details(client, mon
     assert "model_config" not in data
     assert data["warmup"]["status"] == "disabled"
     assert data["limits"]["max_bytecode_hex_length"] == web_app.MAX_BYTECODE_HEX_LENGTH
-    assert data["limits"]["timeout_enforcement"] in {"killable_worker_process", "daemon_thread"}
+    assert data["limits"]["timeout_enforcement"] == "cooperative"
+    assert data["limits"]["analysis_timeout_enforced"] is False
     assert data["generation_defaults"]["max_new_tokens"] >= 1
     assert ready["model_path"] == "models/missing"
     assert ready["model_error"] == "not found"
@@ -165,6 +166,28 @@ def _parse_sse_events(text):
         if event_type and data_lines:
             events.append((event_type, json.loads("\n".join(data_lines))))
     return events
+
+
+def test_web_function_metadata_uses_shared_training_compatible_counts():
+    from src.bytecode_analyzer import BytecodeAnalyzer
+    from src.inference import build_function_metadata
+
+    bytecode = "0x60003560e01c806312345678146010575b00"
+    analyzer = BytecodeAnalyzer(bytecode)
+    tac = analyzer.generate_per_function_tac()["function_0x12345678"]
+    metadata = web_app._safe_function_metadata(
+        bytecode, analyzer, "function_0x12345678", tac
+    )
+
+    assert all(
+        metadata[key] == value
+        for key, value in build_function_metadata(
+            bytecode, analyzer, "function_0x12345678", tac
+        ).items()
+    )
+    assert "function_count" not in metadata
+    assert "instruction_count" not in metadata
+    assert metadata["function_basic_block_count"] == 1
 
 
 def test_decompile_accepts_generation_controls_and_writes_trace(client, monkeypatch):
@@ -478,6 +501,7 @@ def test_decompile_stream_marks_rejected_selector_with_fallback_partial(client, 
             return "fallback() external {}"
 
     monkeypatch.setattr(web_app, "decompiler", FakeDecompiler())
+    monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", False)
     monkeypatch.setattr(web_app, "tac_lookup", None)
     monkeypatch.setattr(web_app, "_write_inference_trace", lambda trace: None)
     monkeypatch.setattr(
@@ -565,12 +589,19 @@ def test_cancel_endpoint_rejects_finished_jobs(client):
 
 
 def test_killable_timeout_drains_large_successful_result(monkeypatch):
+    from tests.test_inference import WorkerTestModel
+
     payload = "x" * (128 * 1024)
     monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", True)
-
-    result = web_app._run_killable_with_timeout(lambda: payload, 1.0, "large result")
-
-    assert result == payload
+    worker = web_app.PersistentModelWorker(None, factory=WorkerTestModel)
+    monkeypatch.setattr(web_app, "decompiler", worker)
+    try:
+        result = web_app._run_killable_with_timeout(
+            lambda: worker.decompile_tac_to_solidity("large"), 10.0, "large result"
+        )
+        assert result == payload
+    finally:
+        worker.close()
 
 
 def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
@@ -584,13 +615,6 @@ def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
 
         def generate_per_function_tac(self):
             return {"func_00000000": "func_00000000:\n  RETURN 0"}
-
-    class SlowDecompiler:
-        def decompile_tac_to_solidity(self, *args, **kwargs):
-            import time
-
-            time.sleep(0.5)
-            return "function late() public {}"
 
     class FakeResolver:
         def resolve_function_names(self, fnames):
@@ -607,7 +631,11 @@ def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
 
     monkeypatch.setattr(web_app, "BytecodeAnalyzer", FakeAnalyzer)
     monkeypatch.setattr(web_app, "get_resolver", lambda use_remote=False: FakeResolver())
-    monkeypatch.setattr(web_app, "decompiler", SlowDecompiler())
+    from tests.test_inference import WorkerTestModel
+
+    worker = web_app.PersistentModelWorker("slow", factory=WorkerTestModel)
+    worker.initialize()
+    monkeypatch.setattr(web_app, "decompiler", worker)
     monkeypatch.setattr(web_app, "DECOMPILE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(web_app, "tac_lookup", None)
     monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", True)
@@ -622,8 +650,40 @@ def test_decompile_hard_timeout_releases_semaphore(client, monkeypatch):
     assert any(event == "error" and "timed out" in data["error"] for event, data in events)
     assert any(event == "error" and data.get("status") == "timeout" for event, data in events)
     assert web_app._job_snapshot("timeout-test") is None
+    assert worker._process is None
     assert web_app.DECOMPILE_SEMAPHORE.acquire(blocking=False)
     web_app.DECOMPILE_SEMAPHORE.release()
+
+
+def test_killable_worker_rejects_unsafe_injected_model(monkeypatch):
+    monkeypatch.setattr(web_app, "decompiler", object())
+    monkeypatch.setattr(web_app, "KILLABLE_INFERENCE_WORKERS", True)
+    with pytest.raises(web_app.DecompileRequestError, match="PersistentModelWorker"):
+        web_app._run_killable_with_timeout(lambda: None, 1, "unsafe test")
+
+
+def test_incompatible_lookup_is_reported_without_using_old_database(monkeypatch):
+    def incompatible_lookup(path):
+        raise ValueError("Incompatible TAC lookup schema; build a new database.")
+
+    for name in (
+        "decompiler", "tac_lookup", "lookup_load_error", "active_model_path",
+        "model_config_dict", "mock_mode", "model_load_error",
+    ):
+        monkeypatch.setattr(web_app, name, getattr(web_app, name))
+    monkeypatch.setattr(web_app, "model_warmup_state", dict(web_app.model_warmup_state))
+    monkeypatch.setattr(web_app, "MODEL_WARMUP_ENABLED", False)
+    monkeypatch.setattr(web_app, "TACLookup", incompatible_lookup)
+    try:
+        web_app.load_model(use_mock=True)
+        status = web_app._lookup_stats()
+        assert status["status"] == "invalid"
+        assert status["available"] is False
+        assert "build a new database" in status["error"]
+        assert web_app.tac_lookup is None
+    finally:
+        if isinstance(web_app.decompiler, web_app.PersistentModelWorker):
+            web_app.decompiler.close()
 
 
 def test_model_warmup_state_is_reported(monkeypatch):

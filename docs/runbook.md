@@ -41,24 +41,65 @@ is intentionally too small for meaningful fine-tuning.
 
 ## Recommended path
 
+### Compatibility after TAC and evaluator corrections
+
+New training data must carry `metadata.tac_schema_version=2` and
+`metadata.label_schema_version=2`, produced by current bytecode analysis and
+AST/inheritance label resolution. Re-exporting an old database does **not**
+upgrade its TAC or labels. Regenerate affected pairs from source/bytecode into
+new artifacts, then create fresh splits. Preserve old artifacts for historical
+comparisons rather than manually changing their version fields.
+
+Existing exact-lookup databases without both current schema versions are
+disabled with a rebuild instruction. Build a new lookup database with
+`scripts/build_lookup_db.py --source-db ... --lookup-db ...`; do not append to an
+old database. Degraded or unresolved analysis is quarantined instead of being
+treated as an exact label or lookup match.
+
+Training snapshots the effective local selector registry into model
+configuration and binds its digest to tokenization, preflight, and sequence-length
+caches. Loaded models reuse that snapshot; legacy models without one emit a
+reproducibility warning. `--no-selector-signature-metadata` now applies to
+training, validation, and inference consistently.
+
+The evaluator version is `behavior-facts-v2`. Old evaluation JSON and model
+artifacts without complete training/selection ancestry are not promotion-gate
+evidence. Regenerate reserved holdouts and both baseline/candidate evaluations
+under the current evaluator and matching settings. Use `--eval-output-json PATH`
+for an explicit new output file. Gate runs require a new `GATE_DIR`, validate
+lineage before model loading, and return nonzero on rejection or insufficient
+evidence. Calls/state slices are regression diagnostics, not small-sample proof
+of improvement.
+
+For the body-balanced runner, changed source data, selection settings, exclusions,
+or output content invalidate reuse. Set `RECREATE_DATASET=1` to rebuild explicitly;
+the runner still independently checks reserved-data overlap before training.
+
 | Goal | Data | Command pattern |
 |------|------|-----------------|
-| Verify the pipeline quickly | Existing JSONL or small generated set | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
-| Train a baseline with current data | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
-| Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `uv run python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` or `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
+| Verify the pipeline quickly | Existing JSONL or small generated set | `uv run --extra training --extra cpu python train.py --skip-collection --dataset data/hf_training_dataset.jsonl --tiny --skip-eval` |
+| Train a baseline with current data | `data/hf_training_dataset.jsonl` | `uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` |
+| Train faster on multiple GPUs | `data/hf_training_dataset.jsonl` | `uv run --extra training python train.py --skip-collection --dataset data/hf_training_dataset.jsonl` or `NGPUS=4 DATASET=./data/hf_training_dataset.jsonl ./run_train_torchrun.sh` |
 | Build more data first | Hugging Face verified contracts | `uv run python download_hf_contracts.py --limit 1000` |
 | Rebuild exact-match lookup | `data/contracts.db` | `uv run python scripts/build_lookup_db.py --source-db data/contracts.db --lookup-db data/tac_lookup.db` |
-| Evaluate an existing local model | `models/final_model_378/` and `data/test_dataset.jsonl` | `uv run python train.py --eval-only --model-path models/final_model_378 --test-dataset data/test_dataset.jsonl --eval-limit 3` |
-| Run the local UI/API | Bytecode and optional model artifact | `WEB_MODEL_PATH=models/final_model_378 uv run python web/app.py` |
+| Evaluate an existing local model | `models/final_model_378/` and `data/test_dataset.jsonl` | `uv run --extra evaluation python train.py --eval-only --model-path models/final_model_378 --test-dataset data/test_dataset.jsonl --eval-limit 3` |
+| Run the local UI/API | Bytecode and optional model artifact | `WEB_MODEL_PATH=models/final_model_378 uv run --extra web python web/app.py` |
 | Reproduce paper-scale intent | Large generated dataset | Scale `download_hf_contracts.py` until exported row counts approach the target, then train/evaluate |
 
 ## 1. Install and configure
 
 ```bash
+# Core bytecode analysis and data preparation
 uv sync
 
-# Include pytest/black/flake8/mypy when running tests or docs checks
-uv sync --dev
+# Model training, including evaluation and inference, with CUDA 13 wheels
+uv sync --extra training --extra cuda
+
+# CPU-only contributor environment, including pytest/black/flake8/mypy
+uv sync --dev --extra training --extra web --extra analysis --extra cpu
+
+# Quantized GPU training
+uv sync --extra quantization
 
 # Optional only when using the DeepSpeed wrapper
 uv sync --extra deepspeed
@@ -68,13 +109,23 @@ Requirements:
 
 | Resource | Minimum | Notes |
 |----------|---------|-------|
-| Python | 3.13.x | Project metadata targets `>=3.13,<3.14` for the validated Linux/GPU training stack |
+| Python | 3.10–3.12 | Project metadata targets `>=3.10,<3.13`; use 3.11 on Windows for prebuilt Web3 native dependencies |
 | GPU for training | CUDA GPU, 16 GB+ VRAM recommended | `--tiny` can run CPU-only but is only a smoke test |
 | GPU for inference | CUDA GPU, 4 GB+ VRAM recommended | CPU works but is slow |
 | Disk | 10 GB+ | Allow much more for full downloads, checkpoints, traces, and caches |
 
-The locked training stack is validated on Linux x86_64 with NVIDIA driver 580
-and CUDA 13 PyTorch wheels. On Quadro RTX 8000 / compute capability 7.5,
+The default core install does not include PyTorch, bitsandbytes, web serving,
+or optional classifier/explainability packages. Select `inference`, `evaluation`,
+`training`, `quantization`, `web`, or `analysis` extras for those workloads.
+`training` includes `evaluation` and `inference`; `quantization` includes
+`training`. Add `--extra cpu` to select actual CPU-only PyTorch wheels for
+development, rather than just setting `CUDA_VISIBLE_DEVICES`. `--extra cuda`
+selects CUDA 13 wheels explicitly; `cpu` and `cuda` are mutually exclusive.
+Without either extra, model profiles use PyPI's platform default (CUDA on Linux,
+CPU on Windows/macOS).
+
+The GPU training path targets Linux x86_64 with a compatible NVIDIA driver and
+PyTorch CUDA build. On Quadro RTX 8000 / compute capability 7.5,
 training uses FP16 and PyTorch SDPA; Flash Attention 2 is treated as unsupported
 unless running on compatible Ampere+ hardware with a separately installed
 `flash_attn` package.
@@ -276,10 +327,11 @@ uv run python train.py \
 are cached under `data/preflight_cache/` unless `--preflight-cache-dir` points
 elsewhere; use `--overwrite-preflight-cache` to recompute.
 
-The CI data-quality gate in `.github/workflows/data-quality.yml` runs
-`uv sync --dev --frozen`, targeted CPU-only regression tests for data
-generation/export/training CLI behavior, and a deterministic quality-gate report
-smoke with Hugging Face and Transformers offline.
+The CI data-quality gate in `.github/workflows/data-quality.yml` installs with
+`uv sync --dev --extra training --extra web --extra analysis --extra cpu --frozen`.
+It verifies that PyTorch is CPU-only, runs the complete regression suite on
+Python 3.10 and 3.12, and exercises deterministic quality-gate report generation
+with Hugging Face and Transformers offline.
 
 ## 5. Kick off training
 
@@ -343,13 +395,31 @@ uv run python train.py \
 ```
 
 Direct `train.py` splitting does not reserve the six fixed evaluation gates.
-Use `./run_train_qwen_qlora_full_body_balanced.sh` for an eval-clean full-data
-experiment. With its default `RUN_GATES=1`, the runner now checks that all six
-baseline JSONs exist and match the bundled-only selector policy, gate datasets,
-decode settings, zero prompt truncation, and behavior-only metric **before**
-spending GPU time.
-Regenerate historical baselines first; `RUN_GATES=0` allows a diagnostic run
+Use `./run_train_qwen_qlora_500.sh` for an eval-clean sample or
+`./run_train_qwen_qlora_full_body_balanced.sh` for an eval-clean full-data
+experiment. Both exclude the broad30, calls23, state17, holdout64,
+pure-negative64, and large192 gates before selection, then group split rows by
+recomputed output body. Gate exclusions check both full-output and evaluator
+body-only identities, so changing a function name cannot reintroduce the same
+heldout body. Stale sample/body-balanced caches fail closed; change `RUN_ID`
+or set `RECREATE_DATASET=1` to rebuild. With its default `RUN_GATES=1`,
+the full runner checks that **all six** baseline JSONs cover their exact gate
+rows and match bundled-only selector prompts, decoding, measured zero prompt
+truncation, and behavior-only metrics **before** spending GPU time. Regenerate
+historical baselines first; `RUN_GATES=0` allows a diagnostic training run
 without baseline acceptance but is not evidence of improvement.
+
+After training, the full runner calls `run_eval_gate_suite_for_model.sh` with a
+new gate output directory. The shared gate runner checks train/val/test split
+integrity and exclusion, all ancestor training/selection provenance, and
+baseline-cohort compatibility before loading the model. Each evaluation writes
+to its own explicit JSON path; the first 30 training rows are evaluated only
+as a memorization diagnostic, never as a heldout gate. Standalone usage:
+
+```bash
+MODEL_PATH=models/my_run/final_model GATE_DIR=models/my_run/gates_new \
+  ./run_eval_gate_suite_for_model.sh
+```
 
 `--no-compiler-metadata` is retained as a deprecated no-op for old scripts.
 If an older JSONL embeds `// Compiler:` or source/ABI annotations inside the
@@ -605,9 +675,10 @@ Key metrics:
 | `replication_behavior_only_f1_micro` | source-extracted calls, control flow, events, guards, returns, and state writes only; not execution equivalence |
 | `solidity_valid_mean` | higher is better; syntax/scaffold validity for function fragments, including context-limited compiler failures, not full contract compilability |
 | `solidity_ast_valid_mean` | generated fragment passed compiler AST validation with available context |
+| `bytecode_semantic_score_mean` | structural/opcode proxy only; not proof of equivalent execution |
 | `bytecode_semantic_checked_mean` | coverage of the evaluator's available evidence; do not read it as runtime-equivalence coverage |
 | `bytecode_runtime_checked_mean` | proportion with an actual runtime-bytecode comparison; zero means no measured runtime equivalence |
-| `bytecode_deployable_mean` | generated Solidity compiled into bytecode in the harness; not proof of chain deployment or runtime equivalence |
+| `bytecode_deployable_mean` | generated Solidity compiled in the harness when contract context is available; not proof of chain deployment or runtime equivalence |
 
 The replication metrics compare structured Solidity facts extracted from the
 ground-truth function and generated function: ABI/function facts, visibility,
@@ -657,6 +728,20 @@ fragment, and unsupported-import controls. Its 121 controls yielded 61 checked
 change is byte-unequal despite unchanged executable prefix, illustrating why
 exact bytecode equality is not a behavioral-equivalence score. Both benchmarks
 use installed compilers only, write JSON to stdout, and do not use a model.
+
+Embedding similarity, edit distance, and extracted-fact overlap are diagnostics,
+not proof that generated Solidity preserves behavior. In particular, distinguish
+storage-write expressions and call recipients/arguments rather than only their
+names. Failed generations must contribute missing reference facts to micro
+recall. Execution comparisons must report the eligible/checked population
+separately; a high conditional match rate with low coverage is not a broad
+equivalence claim.
+
+Only compare runs with the same evaluator version, prompt/decoding settings,
+content-bound evaluation cohort, and reserved-data provenance. A missing metric,
+duplicate identity, mismatched cohort, or unknown training overlap is not a pass.
+Small behavior slices remain regression diagnostics; acceptance requires an
+independent, sufficiently large holdout with contract/body-level sample counts.
 
 Evaluation helpers now use true normalized Levenshtein distance for
 `edit_distance_mean` instead of a `difflib.SequenceMatcher` ratio. Compiler/AST
@@ -873,7 +958,7 @@ not read `src/settings.yaml`.
 | `WEB_MAX_CONCURRENT_DECOMPILES` | `1` | Bounded semaphore capacity |
 | `WEB_MAX_DECOMPILE_FUNCTIONS` | `128` | Function work cap |
 | `WEB_DECOMPILE_TIMEOUT_SECONDS` | `900` | Request deadline for analyzer/model calls; `0` disables |
-| `WEB_KILLABLE_INFERENCE_WORKERS` | `true` | Run model calls in terminable worker processes for hard timeout/cancel cleanup |
+| `WEB_KILLABLE_INFERENCE_WORKERS` | `true` | Require a terminable worker; `false` permits cooperative execution for injected test models, not unsafe fork/thread fallback |
 | `WEB_MAX_NEW_TOKENS` | `4096` | Maximum request generation cap |
 | `WEB_DEFAULT_MAX_NEW_TOKENS` | `1024` | UI/API default generation cap |
 | `WEB_DEFAULT_TEMPERATURE` | `0.1` | UI/API default |
@@ -1017,9 +1102,9 @@ uv run pytest
 The GitHub Actions workflow `.github/workflows/data-quality.yml` runs on pushes
 and pull requests, sets offline/model-safe environment variables
 (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `WANDB_DISABLED=true`,
-`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`), installs with `uv sync --dev --frozen`, and
-runs the CPU data-quality regression set plus a deterministic quality-gate
-report smoke.
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`), installs the training/web/analysis and CPU
+extras with the frozen lockfile, and runs the complete CPU regression suite
+plus a deterministic quality-gate report smoke on Python 3.10 and 3.12.
 
 ## 10. Artifact cleanup
 

@@ -157,9 +157,17 @@ def test_cli_json_includes_solidity_validation(monkeypatch, capsys):
         def _assemble_contract(self, functions, analyzer):
             return "contract DecompiledContract {\n" + "\n".join(functions.values()) + "\n}"
 
-    import src.model_setup as model_setup
+        def run(self, operation, timeout):
+            return operation()
 
-    monkeypatch.setattr(model_setup, "SmartContractDecompiler", FakeDecompiler)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(decompile, "PersistentModelWorker", FakeDecompiler)
+    monkeypatch.setattr(
+        "src.inference.validate_solidity_output",
+        lambda source, metadata=None: {"valid": True, "method": "scaffold", "compiler_checked": False},
+    )
 
     code = decompile.main(["--format", "json", "--bytecode", "0x6000"])
     data = json.loads(capsys.readouterr().out)
@@ -176,3 +184,58 @@ def test_cli_json_includes_solidity_validation(monkeypatch, capsys):
     assert calls[0]["repetition_penalty"] == 1.05
 
     shutil.rmtree(model_dir, ignore_errors=True)
+
+
+def test_cli_model_deadline_terminates_spawn_worker(monkeypatch, capsys):
+    from src.inference import PersistentModelWorker
+    from tests.test_inference import WorkerTestModel
+
+    decompile = load_decompile_module()
+    analyzer = SimpleNamespace(
+        instructions=[],
+        basic_blocks={},
+        functions={
+            "function_0x12345678": SimpleNamespace(
+                selector="0x12345678", basic_blocks=[]
+            )
+        },
+    )
+    monkeypatch.setattr(decompile, "_resolve_model_path", lambda _: ROOT)
+    monkeypatch.setattr(
+        decompile, "_analyze_tac",
+        lambda _: (
+            analyzer,
+            {"function_0x12345678": "sleep"},
+            "sleep",
+        ),
+    )
+    worker = PersistentModelWorker("slow", factory=WorkerTestModel, startup_timeout=10)
+    worker.initialize()
+    monkeypatch.setattr(decompile, "PersistentModelWorker", lambda _: worker)
+    try:
+        code = decompile.main([
+            "--format", "json", "--bytecode", "0x00", "--timeout-seconds", "0.05",
+        ])
+        result = json.loads(capsys.readouterr().out)
+        assert code == 124
+        assert result["stage_status"] == "failed"
+        assert result["decompilation_status"] == "timeout"
+        assert worker._process is None
+    finally:
+        worker.close()
+
+
+def test_cli_tac_does_not_import_optional_model_dependencies(monkeypatch, capsys):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"torch", "transformers", "peft", "sentence_transformers"}:
+            raise AssertionError(f"TAC-only CLI imported optional model dependency: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    decompile = load_decompile_module()
+    assert decompile.main(["--format", "tac", "--bytecode", "0x600000"]) == 0
+    assert capsys.readouterr().out
