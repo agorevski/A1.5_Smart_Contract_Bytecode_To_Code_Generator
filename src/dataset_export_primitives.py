@@ -756,6 +756,15 @@ def extract_tac_for_function(
     *,
     logger: Optional[Any] = None,
 ) -> str:
+    generator = getattr(type(analyzer), "generate_function_tac", None)
+    if callable(generator):
+        tac = generator(analyzer, bytecode_function)
+        if not isinstance(tac, str) or not tac.strip():
+            raise ValueError(
+                f"No recoverable TAC for function {getattr(bytecode_function, 'name', '<unknown>')}"
+            )
+        return tac
+
     lines: List[str] = []
     try:
         ensure_tac_integrated(analyzer)

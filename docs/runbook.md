@@ -152,6 +152,13 @@ real pairs fail fast unless `--allow-demo-fallback` is set.
 
 The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles each with one source-aligned `solc`/optimizer configuration, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests. For production prompt design, treat compiler version and optimizer fields/comments in generated data as oracle-only and exclude or sanitize them before training.
 
+Training export now uses the analyzer's caller-context per-function TAC, the
+same path used at inference, rather than walking global CFG successor unions.
+On one bounded 2,000-source audit with the actual Qwen tokenizer and an
+8,192-token cap, this increased usable unique-body rows from 409 to 758 and
+reduced overlength rejects from 618 to 276. The remaining long-input tail is
+not solved; these counts are data coverage, **not** a model-quality improvement.
+
 ```bash
 # Quick data-generation test
 uv run python download_hf_contracts.py --limit 20

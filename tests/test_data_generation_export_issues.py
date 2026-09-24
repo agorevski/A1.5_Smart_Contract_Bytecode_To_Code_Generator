@@ -5,6 +5,44 @@ from pathlib import Path
 
 import pytest
 
+from src.bytecode_analyzer import BytecodeAnalyzer
+from src.dataset_export_primitives import collect_blocks, extract_tac_for_function
+
+
+def test_real_analyzer_export_uses_inference_function_tac_not_global_cfg():
+    bytecode = "0x60003560e01c80631111111114601c57806322222222146020575b005b6001005b600200"
+    analyzer = BytecodeAnalyzer(bytecode)
+    inference_tac = analyzer.generate_per_function_tac()
+
+    for name, function in analyzer.functions.items():
+        assert extract_tac_for_function(function, analyzer) == inference_tac[name]
+    assert "block_001c:" not in inference_tac["function_0x22222222"]
+
+
+def test_compiler_shared_decoder_export_does_not_copy_sibling_function_blocks():
+    # solc 0.8.20, optimizer enabled, metadata disabled: write(uint256) and read(uint256).
+    bytecode = (
+        "6080604052348015600e575f80fd5b50600436106030575f3560e01c80632f048afa"
+        "146034578063ed2e5a97146045575b5f80fd5b6043603f3660046078565b5f55565b"
+        "005b605460503660046078565b6066565b60405190815260200160405180910390f35b5f"
+        "815f5460729190608e565b92915050565b5f602082840312156087575f80fd5b503591"
+        "9050565b80820180821115607257634e487b7160e01b5f52601160045260245ffd"
+    )
+    analyzer = BytecodeAnalyzer(bytecode)
+    inference_tac = analyzer.generate_per_function_tac()
+    selectors = {
+        "function_0x2f048afa",
+        "function_0xed2e5a97",
+    }
+
+    assert selectors.issubset(inference_tac)
+    for name in selectors:
+        function = analyzer.functions[name]
+        global_blocks = collect_blocks(function.entry_block, analyzer.basic_blocks)
+        local_blocks = analyzer._blocks_for_function(function)
+        assert len(local_blocks) < len(global_blocks)
+        assert extract_tac_for_function(function, analyzer) == inference_tac[name]
+
 
 class _CharacterTokenizer:
     name_or_path = "character-test-tokenizer"
@@ -231,8 +269,7 @@ def test_download_preserves_distinct_targets_and_verified_compiler_configs(tmp_p
             "language": ["Solidity"] * len(rows),
             "source_code": [source] * len(rows),
             "contract_address": [
-                f"0x{idx:040x}" if idx <= 5 else ""
-                for idx in range(1, len(rows) + 1)
+                f"0x{idx:040x}" if idx <= 5 else "" for idx in range(1, len(rows) + 1)
             ],
             "contract_name": [row[0] for row in rows],
             "compiler_version": [row[1] for row in rows],
@@ -253,9 +290,9 @@ def test_download_preserves_distinct_targets_and_verified_compiler_configs(tmp_p
     db_path = tmp_path / "contracts.db"
     manifest_path = tmp_path / "download.manifest.json"
     download_hf_contracts.init_database(db_path)
-    assert download_hf_contracts.download_contracts(
-        db_path=db_path, manifest_path=manifest_path
-    ) == 6
+    assert (
+        download_hf_contracts.download_contracts(db_path=db_path, manifest_path=manifest_path) == 6
+    )
     with sqlite3.connect(db_path) as conn:
         stored = conn.execute(
             "SELECT address, contract_name, compiler_version, optimization_enabled "
@@ -270,17 +307,18 @@ def test_download_preserves_distinct_targets_and_verified_compiler_configs(tmp_p
         ("A", "v0.8.20", 0),
     ]
     assert len({row[0] for row in synthetic}) == 2
-    assert {row[1:] for row in synthetic} == {
-        ("B", "v0.8.19", 1), ("B", "v0.8.19", 0)
-    }
-    assert download_hf_contracts.download_contracts(
-        db_path=db_path, manifest_path=manifest_path
-    ) == 0
+    assert {row[1:] for row in synthetic} == {("B", "v0.8.19", 1), ("B", "v0.8.19", 0)}
+    assert (
+        download_hf_contracts.download_contracts(db_path=db_path, manifest_path=manifest_path) == 0
+    )
     manifest = json.loads(manifest_path.read_text())
     assert manifest["drop_counts"]["source_deduped"] == 7
     assert manifest["parameters"]["dedup_key"] == [
-        "source_hash", "contract_name", "compiler_version",
-        "optimization_enabled", "optimization_runs",
+        "source_hash",
+        "contract_name",
+        "compiler_version",
+        "optimization_enabled",
+        "optimization_runs",
     ]
 
 
@@ -325,17 +363,19 @@ def test_hf_compile_quarantines_ambiguous_selector_alignment(monkeypatch):
     selector = "0x23b872dd"
     source_functions = [
         {
-            "name": "transferFrom", "selector": selector, "contract_name": "ERC20",
+            "name": "transferFrom",
+            "selector": selector,
+            "contract_name": "ERC20",
             "body": "function transferFrom(address from, address to, uint256 amount) public returns (bool) { return true; }",
         },
         {
-            "name": "transferFrom", "selector": selector, "contract_name": "ERC721",
+            "name": "transferFrom",
+            "selector": selector,
+            "contract_name": "ERC721",
             "body": "function transferFrom(address from, address to, uint256 tokenId) public { ownerOf[tokenId] = to; }",
         },
     ]
-    bytecode_function = SimpleNamespace(
-        selector=selector, entry_block="block_0", basic_blocks=[]
-    )
+    bytecode_function = SimpleNamespace(selector=selector, entry_block="block_0", basic_blocks=[])
 
     class FakeAnalyzer:
         basic_blocks = {}
@@ -352,7 +392,8 @@ def test_hf_compile_quarantines_ambiguous_selector_alignment(monkeypatch):
     monkeypatch.setattr(download_hf_contracts, "install_solc_version", lambda _: True)
     monkeypatch.setattr(download_hf_contracts, "BytecodeAnalyzer", FakeAnalyzer)
     monkeypatch.setattr(
-        download_hf_contracts, "compile_source",
+        download_hf_contracts,
+        "compile_source",
         lambda *_args, **_kwargs: SimpleNamespace(
             success=True,
             contracts={
@@ -422,18 +463,21 @@ def test_etherscan_compile_records_ambiguous_selector_diagnostic(tmp_path, monke
 
     builder = dataset_pipeline.DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
     builder.etherscan.get_contract_source = lambda address: dataset_pipeline.ContractData(
-        address=address, source_code=source, bytecode="0x6000600055",
-        compiler_version="v0.8.20", optimization_enabled=True, optimization_runs=200,
+        address=address,
+        source_code=source,
+        bytecode="0x6000600055",
+        compiler_version="v0.8.20",
+        optimization_enabled=True,
+        optimization_runs=200,
     )
     monkeypatch.setattr(dataset_pipeline, "install_solc_version", lambda _: True)
     monkeypatch.setattr(dataset_pipeline, "BytecodeAnalyzer", FakeAnalyzer)
     monkeypatch.setattr(
-        dataset_pipeline, "compile_source",
+        dataset_pipeline,
+        "compile_source",
         lambda *_args, **_kwargs: SimpleNamespace(
             success=True,
-            contracts={
-                "Derived": SimpleNamespace(runtime_bytecode="6000600055", abi=[])
-            },
+            contracts={"Derived": SimpleNamespace(runtime_bytecode="6000600055", abi=[])},
         ),
     )
     outcome = builder._collect_compile_address(
@@ -442,8 +486,7 @@ def test_etherscan_compile_records_ambiguous_selector_diagnostic(tmp_path, monke
     assert outcome.pairs == []
     assert outcome.status_update["status"] == "ambiguous_selector_alignment"
     assert any(
-        diag["status"] == "ambiguous_selector_alignment"
-        and "0x23b872dd" in diag["error"]
+        diag["status"] == "ambiguous_selector_alignment" and "0x23b872dd" in diag["error"]
         for diag in outcome.diagnostics
     )
 
@@ -531,9 +574,7 @@ def test_export_exact_length_includes_training_eos():
 
     record = {"input": "function example:\n  return", "output": "function example() {}"}
     without_eos = export_length_report(record, 8192, _CharacterTokenizer())
-    with_eos = export_length_report(
-        record, without_eos["total_tokens"], EosCharacterTokenizer()
-    )
+    with_eos = export_length_report(record, without_eos["total_tokens"], EosCharacterTokenizer())
 
     assert with_eos["target_tokens"] == without_eos["target_tokens"] + 1
     assert with_eos["reasons"] == ["context_overlength"]
@@ -549,15 +590,19 @@ def test_both_export_paths_quarantine_exact_tokenizer_overlength(tmp_path):
     long_body = "function longer() public { uint256 x = 2; emit Done(x); }"
     short_tac = "function same:\n  block_1:\n    temp = 1"
     long_tac = "function same:\n  block_2:\n    temp = " + "ADD 1 2 " * 45
-    budget = export_length_report(
-        build_training_record(short_tac, short_body), 8192, tokenizer
-    )["total_tokens"] + 1
-    assert not export_length_report(
-        build_training_record(long_tac, long_body), budget
-    )["reasons"]
-    assert "context_overlength" in export_length_report(
-        build_training_record(long_tac, long_body), budget, tokenizer
-    )["reasons"]
+    budget = (
+        export_length_report(build_training_record(short_tac, short_body), 8192, tokenizer)[
+            "total_tokens"
+        ]
+        + 1
+    )
+    assert not export_length_report(build_training_record(long_tac, long_body), budget)["reasons"]
+    assert (
+        "context_overlength"
+        in export_length_report(build_training_record(long_tac, long_body), budget, tokenizer)[
+            "reasons"
+        ]
+    )
 
     db_path = tmp_path / "hf.db"
     output_path = tmp_path / "hf.jsonl"
@@ -565,9 +610,7 @@ def test_both_export_paths_quarantine_exact_tokenizer_overlength(tmp_path):
     download_hf_contracts.init_database(db_path)
     pairs = [
         {**_make_pair(download_hf_contracts, idx, body), "tac_representation": tac}
-        for idx, (body, tac) in enumerate(
-            [(short_body, short_tac), (long_body, long_tac)], start=1
-        )
+        for idx, (body, tac) in enumerate([(short_body, short_tac), (long_body, long_tac)], start=1)
     ]
     assert download_hf_contracts._store_pairs_batch(db_path, pairs) == 2
     download_hf_contracts.export_training_data(
@@ -589,9 +632,7 @@ def test_both_export_paths_quarantine_exact_tokenizer_overlength(tmp_path):
     assert manifest["validation"]["token_length_filter"]["token_count_method"] == "tokenizer"
 
     builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
-    for idx, (body, tac) in enumerate(
-        [(short_body, short_tac), (long_body, long_tac)], start=1
-    ):
+    for idx, (body, tac) in enumerate([(short_body, short_tac), (long_body, long_tac)], start=1):
         builder._store_function_pair(
             FunctionPair(
                 function_name="short" if idx == 1 else "longer",
@@ -626,9 +667,7 @@ def test_export_cli_loads_exact_tokenizer_offline(tmp_path, monkeypatch):
     output_path = tmp_path / "dataset.jsonl"
     download_hf_contracts.init_database(db_path)
     body = "function short() public { uint256 x = 1; emit Done(x); }"
-    download_hf_contracts._store_pairs_batch(
-        db_path, [_make_pair(download_hf_contracts, 1, body)]
-    )
+    download_hf_contracts._store_pairs_batch(db_path, [_make_pair(download_hf_contracts, 1, body)])
     loaded = []
 
     def load_tokenizer(name, **kwargs):
@@ -637,11 +676,19 @@ def test_export_cli_loads_exact_tokenizer_offline(tmp_path, monkeypatch):
 
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
     monkeypatch.setattr(
-        sys, "argv",
+        sys,
+        "argv",
         [
-            "download_hf_contracts.py", "--export-only", "--db", str(db_path),
-            "--output", str(output_path), "--length-tokenizer", "locally-cached-tokenizer",
-            "--max-seq-length", "128",
+            "download_hf_contracts.py",
+            "--export-only",
+            "--db",
+            str(db_path),
+            "--output",
+            str(output_path),
+            "--length-tokenizer",
+            "locally-cached-tokenizer",
+            "--max-seq-length",
+            "128",
         ],
     )
     download_hf_contracts.main()
@@ -661,7 +708,10 @@ def test_shared_primitives_produce_same_final_rows_across_export_paths(tmp_path)
     from src.dataset_pipeline import DatasetBuilder, FunctionPair
 
     assert download_hf_contracts.hash_normalized_pair is dataset_pipeline.hash_normalized_pair
-    assert download_hf_contracts.sanitize_tac_prompt_input is dataset_pipeline.sanitize_tac_prompt_input
+    assert (
+        download_hf_contracts.sanitize_tac_prompt_input
+        is dataset_pipeline.sanitize_tac_prompt_input
+    )
 
     tac = (
         "function transfer(address to):\n"
@@ -675,10 +725,13 @@ def test_shared_primitives_produce_same_final_rows_across_export_paths(tmp_path)
     hf_db = tmp_path / "hf.db"
     hf_output = tmp_path / "hf.jsonl"
     download_hf_contracts.init_database(hf_db)
-    assert download_hf_contracts._store_pairs_batch(
-        hf_db,
-        [_make_pair(download_hf_contracts, 1, body) | {"tac_representation": tac}],
-    ) == 1
+    assert (
+        download_hf_contracts._store_pairs_batch(
+            hf_db,
+            [_make_pair(download_hf_contracts, 1, body) | {"tac_representation": tac}],
+        )
+        == 1
+    )
     download_hf_contracts.export_training_data(
         str(hf_output),
         max_body_dupes=5,
@@ -721,16 +774,10 @@ def test_export_training_data_deduplicates_after_final_sanitization(tmp_path):
 
     body = "function transfer(address to) public { uint256 x = 1; emit Done(to, x); }"
     tac_a = (
-        "function transfer(address to):\n"
-        "  // Selector: 0xa9059cbb\n"
-        "  block:\n"
-        "    temp = 1"
+        "function transfer(address to):\n" "  // Selector: 0xa9059cbb\n" "  block:\n" "    temp = 1"
     )
     tac_b = (
-        "function selector_a9059cbb:\n"
-        "  // Selector: 0xa9059cbb\n"
-        "  block:\n"
-        "    temp = 1"
+        "function selector_a9059cbb:\n" "  // Selector: 0xa9059cbb\n" "  block:\n" "    temp = 1"
     )
     with sqlite3.connect(db_path) as conn:
         for idx, tac in enumerate([tac_a, tac_b], start=1):
@@ -767,7 +814,9 @@ def test_export_training_data_deduplicates_after_final_sanitization(tmp_path):
     )
 
     rows = output_path.read_text().splitlines()
-    rejects = [json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()]
+    rejects = [
+        json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()
+    ]
     manifest = json.loads(manifest_path.read_text())
     assert len(rows) == 1
     assert len(rejects) == 1
@@ -844,7 +893,9 @@ def test_export_training_data_quarantines_tac_errors_and_auxiliary_contracts(tmp
     )
 
     exported = [json.loads(line) for line in output_path.read_text().splitlines()]
-    rejects = [json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()]
+    rejects = [
+        json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()
+    ]
     manifest = json.loads(manifest_path.read_text())
     assert [row["metadata"]["function_name"] for row in exported] == ["good"]
     assert {reason for row in rejects for reason in row["reasons"]} >= {
@@ -1006,9 +1057,7 @@ block_0:
     assert "likely:" not in sanitized
     assert prompt_leakage_reject_reasons(sanitized) == []
     assert prompt_leakage_reject_reasons("  return memory[temp_1:temp_2]") == []
-    assert prompt_leakage_reject_reasons("// Returns: amount") == [
-        "prompt_source_metadata_leak"
-    ]
+    assert prompt_leakage_reject_reasons("// Returns: amount") == ["prompt_source_metadata_leak"]
 
     record = build_training_record(
         tac,
@@ -1054,7 +1103,9 @@ def test_export_training_data_quarantines_malformed_metadata_with_quality_signal
     )
 
     rows = [json.loads(line) for line in output_path.read_text().splitlines()]
-    rejects = [json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()]
+    rejects = [
+        json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()
+    ]
     manifest = json.loads(manifest_path.read_text())
 
     assert len(rows) == 1
