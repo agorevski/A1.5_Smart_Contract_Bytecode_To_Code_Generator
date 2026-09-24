@@ -56,6 +56,41 @@ SAMPLE_OWNER_BYTECODE = (
     "634300080a0033"
 )
 
+# solc 0.8.20, optimizer enabled (200 runs): public stored getter + update helper.
+OPTIMIZED_GETTER_BYTECODE = (
+    "0x6080604052348015600e575f80fd5b50600436106030575f3560e01c806382ab890a"
+    "146034578063e582dd31146045575b5f80fd5b6043603f366004607c565b605e565b"
+    "005b604c5f5481565b60405190815260200160405180910390f35b5f606682606c565b"
+    "5f555050565b5f60768260016092565b92915050565b5f60208284031215608b575f80"
+    "fd5b5035919050565b80820180821115607657634e487b7160e01b5f526011600452"
+    "60245ffdfea2646970667358221220716cbfad7bed540550d4fcbeb66cd0fc5110f7e"
+    "9b20a9d062f6a203614de258c64736f6c63430008140033"
+)
+
+# solc 0.8.20, optimizer 200, Shanghai, metadata disabled: read3(uint256)
+# returns stored + x + 3; write3(uint256) stores x + 3.
+PARAMETERIZED_GETTER_BYTECODE = (
+    "0x6080604052348015600e575f80fd5b50600436106026575f3560e01c80630342c79d"
+    "14602a575b5f80fd5b603960353660046066565b604b565b604051908152602001604051"
+    "80910390f35b5f815f5460579190607c565b6060906003607c565b92915050565b5f60"
+    "2082840312156075575f80fd5b5035919050565b80820180821115606057634e487b71"
+    "60e01b5f52601160045260245ffd"
+)
+PARAMETERIZED_SETTER_BYTECODE = (
+    "0x6080604052348015600e575f80fd5b50600436106026575f3560e01c80631e9e15ab"
+    "14602a575b5f80fd5b603960353660046049565b603b565b005b6044816003605f565b"
+    "5f5550565b5f602082840312156058575f80fd5b5035919050565b8082018082111560"
+    "7d57634e487b7160e01b5f52601160045260245ffd5b9291505056"
+)
+SHARED_PARAMETER_DECODER_BYTECODE = (
+    "0x6080604052348015600e575f80fd5b50600436106030575f3560e01c80633f81a2c0"
+    "1460345780634d0392a8146045575b5f80fd5b6043603f3660046086565b6066565b"
+    "005b605460503660046086565b6074565b60405190815260200160405180910390f35b60"
+    "6f816001609c565b5f5550565b5f815f5460809190609c565b92915050565b5f602082"
+    "840312156095575f80fd5b5035919050565b80820180821115608057634e487b7160e0"
+    "1b5f52601160045260245ffd"
+)
+
 
 def _make_dict_instructions(names):
     """Build a list of dict-format instructions with auto-incremented PCs."""
@@ -301,6 +336,77 @@ class TestFunctionIdentification:
         analyzer.analyze_control_flow()
         functions = analyzer.identify_functions()
         assert "function_0x12345678" in functions
+
+    def test_large_dispatcher_identifies_selectors_beyond_256_instructions(self):
+        prefix = "60003560e01c"
+        entries = "".join(f"8063{selector:08x}1461029a57" for selector in range(1, 61))
+        analyzer = BytecodeAnalyzer("0x" + prefix + entries + "5b00")
+        analyzer.analyze_control_flow()
+        functions = analyzer.identify_functions()
+
+        assert len(analyzer.instructions) > 256
+        assert sum(func.selector is not None for func in functions.values()) == 60
+        assert "function_0x0000003c" in functions
+        assert "block_029a:" in analyzer.generate_per_function_tac()["function_0x0000003c"]
+
+    def test_large_dispatcher_target_after_jumpdest_is_not_a_function(self):
+        prefix = "60003560e01c"
+        # The original 60-selector fixture pointed at STOP (0x29b), not JUMPDEST (0x29a).
+        entries = "".join(f"8063{selector:08x}1461029b57" for selector in range(1, 61))
+        tac = BytecodeAnalyzer("0x" + prefix + entries + "5b00").generate_per_function_tac()
+
+        assert set(tac) == {"fallback_function"}
+        assert "block_029a:" in tac["fallback_function"]
+
+    @pytest.mark.parametrize("target", ["11", "20", "99"])
+    def test_invalid_dispatcher_target_does_not_create_function(self, target):
+        # The fallback JUMPDEST is at 0x10; 0x11 is STOP, and 0x20/0x99 are absent.
+        analyzer = BytecodeAnalyzer("0x60003560e01c8063123456781460" + target + "575b00")
+        tac = analyzer.generate_per_function_tac()
+
+        assert set(analyzer.basic_blocks) == {"block_0000", "block_0010"}
+        assert "function_0x12345678" not in tac
+        assert analyzer.rejected_dispatcher_targets == {"0x12345678": int(target, 16)}
+        assert set(tac) == {"fallback_function"}
+        assert "block_0010:" in tac["fallback_function"]
+        assert "block_0000:" not in tac["fallback_function"]
+        fake = Function(
+            name="function_0x12345678", selector="0x12345678",
+            basic_blocks=list(analyzer.basic_blocks.values()), entry_block=f"block_00{target}",
+        )
+        assert analyzer.generate_function_tac(fake) == ""
+        assert analyzer._blocks_for_function(fake, fallback_to_all=True) == []
+
+    def test_valid_dispatcher_target_includes_only_its_reachable_block(self):
+        analyzer = BytecodeAnalyzer("0x60003560e01c806312345678146010575b00")
+        tac = analyzer.generate_per_function_tac()["function_0x12345678"]
+
+        assert analyzer.functions["function_0x12345678"].entry_block == "block_0010"
+        assert [b.id for b in analyzer._blocks_for_function(
+            analyzer.functions["function_0x12345678"], fallback_to_all=False
+        )] == ["block_0010"]
+        assert "block_0010:" in tac
+        assert "block_0000:" not in tac
+
+    def test_invalid_selector_does_not_hide_valid_receive_and_fallback(self):
+        # receive() at 0x17, fallback at 0x15; selector points outside code.
+        bytecode = "0x361560175760003560e01c8063123456781460ff575b005b005b00"
+        tac = BytecodeAnalyzer(bytecode).generate_per_function_tac()
+
+        assert "function_0x12345678" not in tac
+        assert "block_0017:" in tac["receive"]
+        assert "block_0015:" in tac["fallback_function"]
+
+    def test_invalid_selector_without_fallthrough_has_no_function_tac(self):
+        analyzer = BytecodeAnalyzer("0x60003560e01c80631234567814602057")
+        assert analyzer.generate_per_function_tac() == {}
+
+    @pytest.mark.parametrize("target", ["05", "99"])
+    def test_invalid_receive_target_does_not_create_receive_function(self, target):
+        invalid = BytecodeAnalyzer("0x361560" + target + "57005b00")
+        assert "receive" not in invalid.generate_per_function_tac()
+        valid = BytecodeAnalyzer("0x3615600657005b00")
+        assert "block_0006:" in valid.generate_per_function_tac()["receive"]
 
     def test_legacy_div_dispatcher_identifies_selector(self):
         divisor = "01" + ("00" * 28)
@@ -970,6 +1076,69 @@ class TestEndToEnd:
         # Should have identified the 2 known selectors
         assert "0x893d20e8" in output
         assert "0xa6f9dae1" in output
+
+    def test_optimized_getter_tracks_jump_target_below_consumed_push0(self):
+        analyzer = BytecodeAnalyzer(OPTIMIZED_GETTER_BYTECODE)
+        functions = analyzer.generate_per_function_tac()
+
+        getter = functions["function_0xe582dd31"]
+        assert analyzer.basic_blocks["block_0045"].successors == ["block_004c"]
+        assert "block_004c:" in getter
+        assert "return memory[" in getter
+        assert "stack_underflow" not in getter
+        assert "block_004c:" not in functions["function_0x82ab890a"]
+        assert not any(line.strip().startswith("storage[") for line in getter.splitlines())
+        assert any(
+            line.strip().startswith("storage[")
+            for line in functions["function_0x82ab890a"].splitlines()
+        )
+        assert "stack_underflow" not in functions["function_0x82ab890a"]
+
+    @pytest.mark.parametrize(
+        "bytecode,selector,handoff,witness,rendered",
+        [
+            (PARAMETERIZED_GETTER_BYTECODE, "0x0342c79d", "block_0075",
+             "block_0039", "return memory["),
+            (PARAMETERIZED_SETTER_BYTECODE, "0x1e9e15ab", "block_0058",
+             "block_0044", "storage["),
+        ],
+    )
+    def test_compiler_parameter_decoder_returns_to_function(
+        self, bytecode, selector, handoff, witness, rendered
+    ):
+        analyzer = BytecodeAnalyzer(bytecode)
+        tac = analyzer.generate_per_function_tac()["function_" + selector]
+
+        assert analyzer.basic_blocks[handoff].successors == ["block_0035"]
+        assert witness + ":" in tac
+        assert rendered in tac
+        assert "stack_underflow" not in tac
+        for block in analyzer.basic_blocks.values():
+            raw = block.metadata["raw_instructions"]
+            if analyzer._get_instruction_name(raw[-1]) == "JUMP":
+                assert all(
+                    analyzer._get_instruction_name(
+                        analyzer.basic_blocks[successor].metadata["raw_instructions"][0]
+                    ) == "JUMPDEST"
+                    for successor in block.successors
+                )
+
+    def test_shared_parameter_decoder_keeps_selector_paths_separate(self):
+        analyzer = BytecodeAnalyzer(SHARED_PARAMETER_DECODER_BYTECODE)
+        tac = analyzer.generate_per_function_tac()
+        setter = tac["function_0x3f81a2c0"]
+        getter = tac["function_0x4d0392a8"]
+
+        assert set(analyzer.basic_blocks["block_0095"].successors) == {
+            "block_003f", "block_0050",
+        }
+        assert "block_003f:" in setter and "block_0050:" not in setter
+        assert "block_0050:" in getter and "block_003f:" not in getter
+        assert "  // Successors: block_003f" in setter
+        assert "  // Successors: block_0050" in getter
+        assert any(line.strip().startswith("storage[") for line in setter.splitlines())
+        assert not any(line.strip().startswith("storage[") for line in getter.splitlines())
+        assert "return memory[" in getter
 
     def test_generate_tac_representation(self):
         analyzer = BytecodeAnalyzer(SAMPLE_OWNER_BYTECODE)

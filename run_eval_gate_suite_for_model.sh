@@ -13,7 +13,8 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
     echo "MODEL_PATH does not exist or is not a directory: ${MODEL_PATH}" >&2
     exit 1
 fi
-MODEL_PATH="$(cd "${MODEL_PATH}" && pwd)"
+MODEL_PATH="$(realpath "${MODEL_PATH}")"
+cd "${SCRIPT_DIR}"
 
 LABEL="${LABEL:-$(basename "${MODEL_PATH}")}"
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -48,6 +49,23 @@ for required in \
     fi
 done
 
+FIXED_EVAL_DATASETS="${BROAD_DATASET}:${CALLS_DATASET}:${STATE_DATASET}:${HOLDOUT64_DATASET}:${PURE_NEGATIVE_DATASET}:${LARGE192_DATASET}"
+VERIFIED_TRAIN_DATASET="$(python -m scripts.gate_dataset verify-model "${MODEL_PATH}" "${FIXED_EVAL_DATASETS}")"
+if [[ -n "${TRAIN_DATASET:-}" && "$(realpath "${TRAIN_DATASET}")" != "$(realpath "${VERIFIED_TRAIN_DATASET}")" ]]; then
+    echo "TRAIN_DATASET does not match verified model training input: ${VERIFIED_TRAIN_DATASET}" >&2
+    exit 1
+fi
+TRAIN_DATASET="${VERIFIED_TRAIN_DATASET}"
+
+for label in BROAD CALLS STATE HOLDOUT64 PURE_NEGATIVE LARGE192; do
+    dataset_var="${label}_DATASET"
+    baseline_var="${label}_BASELINE"
+    python -m scripts.gate_dataset verify-baseline "${!baseline_var}" "${!dataset_var}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
+        --repetition-penalty "${EVAL_REPETITION_PENALTY}"
+done
+
+mkdir -p "$(dirname "${GATE_DIR}")"
 if ! mkdir "${GATE_DIR}"; then
     echo "Gate output directory must be new (prevents concurrent/stale output reuse): ${GATE_DIR}" >&2
     exit 1
@@ -79,6 +97,8 @@ run_eval() {
         --latest-results "${latest_path}" \
         --eval-output-json "${eval_json}" \
         "$@"
+    python -m scripts.gate_dataset verify-eval "${eval_json}" "${MODEL_PATH}" "${dataset_path}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
     test -s "${eval_json}"
     printf '%s\t%s\t%s\t%s\n' "${label}" "${MODEL_PATH}" "${dataset_path}" "${eval_json}" | tee -a "${EVAL_MAP}"
 }

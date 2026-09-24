@@ -54,7 +54,8 @@ from src.dataset_export_primitives import LABEL_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
-TOKENIZATION_CACHE_VERSION = 3
+TOKENIZATION_CACHE_VERSION = 4
+SELECTOR_SIGNATURE_PROMPT_POLICY = "bundled_only_v1"
 DEFAULT_REPETITION_PENALTY = 1.05
 
 SOLIDITY_RESERVED_WORDS = {
@@ -510,31 +511,19 @@ def _format_count_part(label: str, value: Optional[int]) -> Optional[str]:
 def resolve_selector_signature_for_prompt(
     selector: Optional[str], selector_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Resolve a selector locally for prompt context without remote lookups."""
+    """Only expose bundled signatures, including when using a saved context."""
     normalized = _normalize_selector(selector)
     if not normalized:
         return None
+    from src.selector_resolver import _BUILTIN_SELECTORS
+
+    signature = _BUILTIN_SELECTORS.get(normalized)
+    if not signature:
+        return None
     if selector_context is not None:
-        from src.selector_resolver import resolve_selector_from_context
-        return resolve_selector_from_context(normalized, selector_context)
-    try:
-        from src.selector_resolver import get_resolver
-
-        result = get_resolver(use_remote=False).resolve(normalized)
-    except Exception as exc:
-        logger.debug("Selector prompt resolution failed for %s: %s", normalized, exc)
-        return None
-
-    best = getattr(result, "best_match", None)
-    if best is None or getattr(best, "source", None) == "unknown":
-        return None
-    try:
-        confidence = float(getattr(best, "confidence", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
-    signature = str(getattr(best, "signature", "") or "").strip()
-    if confidence < 0.8 or not signature:
-        return None
+        entry = selector_context.get("mapping", {}).get(normalized, {})
+        if entry.get("source") != "builtin" or entry.get("signature") != signature:
+            return None
     return signature
 
 
@@ -1109,8 +1098,8 @@ class SmartContractDataset(Dataset):
                 never included in prompts.
             tokenization_cache: Optional cache config/path. Disabled by default
                 to preserve existing lazy tokenization behavior.
-            selector_context: Validated local selector snapshot shared with preflight
-                and saved-model inference. Captured locally when not supplied.
+            selector_context: Validated selector snapshot shared with preflight
+                and saved-model inference. Only bundled entries enter prompts.
             require_current_tac_schema: Reject stale/unversioned TAC and labels
                 even when the CLI preflight was skipped.
         """
@@ -1456,31 +1445,33 @@ class SmartContractDataset(Dataset):
             raise ValueError(f"Training example {idx} has an empty tokenized target")
 
         if len(target_ids) >= self.max_length:
-            input_ids = target_ids[: self.max_length]
-            prefix_len = 0
-        else:
-            prefix_before_tac, tac_text, prefix_after_tac, _target, _suffix = (
-                self._format_prompt_components(item["input"], output, item.get("metadata", {}))
+            raise ValueError(
+                f"Training example {idx} target requires {len(target_ids)} tokens "
+                f"(including EOS), leaving no context under max_length={self.max_length}"
             )
-            header_ids = _tokenize_to_ids(self.tokenizer, prefix_before_tac)
-            tac_ids = _tokenize_to_ids(self.tokenizer, tac_text)
-            footer_ids = _tokenize_to_ids(self.tokenizer, prefix_after_tac)
 
-            prefix_budget = self.max_length - len(target_ids)
-            fixed_prefix_len = len(header_ids) + len(footer_ids)
-            if fixed_prefix_len > prefix_budget:
-                footer_budget = min(len(footer_ids), prefix_budget)
-                header_budget = max(0, prefix_budget - footer_budget)
-                header_ids = header_ids[:header_budget]
-                footer_ids = footer_ids[-footer_budget:] if footer_budget else []
-                tac_ids = []
-            else:
-                tac_budget = prefix_budget - fixed_prefix_len
-                tac_ids = tac_ids[:tac_budget]
+        prefix_before_tac, tac_text, prefix_after_tac, _target, _suffix = (
+            self._format_prompt_components(item["input"], output, item.get("metadata", {}))
+        )
+        header_ids = _tokenize_to_ids(self.tokenizer, prefix_before_tac)
+        tac_ids = _tokenize_to_ids(self.tokenizer, tac_text)
+        footer_ids = _tokenize_to_ids(self.tokenizer, prefix_after_tac)
 
-            prefix_ids = header_ids + tac_ids + footer_ids
-            prefix_len = len(prefix_ids)
-            input_ids = prefix_ids + target_ids
+        prefix_budget = self.max_length - len(target_ids)
+        fixed_prefix_len = len(header_ids) + len(footer_ids)
+        if fixed_prefix_len > prefix_budget:
+            footer_budget = min(len(footer_ids), prefix_budget)
+            header_budget = max(0, prefix_budget - footer_budget)
+            header_ids = header_ids[:header_budget]
+            footer_ids = footer_ids[-footer_budget:] if footer_budget else []
+            tac_ids = []
+        else:
+            tac_budget = prefix_budget - fixed_prefix_len
+            tac_ids = tac_ids[:tac_budget]
+
+        prefix_ids = header_ids + tac_ids + footer_ids
+        prefix_len = len(prefix_ids)
+        input_ids = prefix_ids + target_ids
 
         labels = [-100] * prefix_len + target_ids[: len(input_ids) - prefix_len]
         tokenized = {
@@ -2306,6 +2297,7 @@ class SmartContractModelTrainer:
             "schema_version": 2,
             "tac_schema_version": TAC_SCHEMA_VERSION,
             "label_schema_version": LABEL_SCHEMA_VERSION,
+            "selector_signature_prompt_policy": SELECTOR_SIGNATURE_PROMPT_POLICY,
             "selector_context_digest": (
                 self.config.selector_context["digest"] if self.config.selector_context else None
             ),
@@ -2413,6 +2405,11 @@ class SmartContractModelTrainer:
                 if getattr(previous_config, flag) != getattr(self.config, flag):
                     raise ValueError(f"Resume prompt mismatch for {flag}; use the checkpoint settings or start a new run.")
             if previous_config.include_bytecode_metadata and previous_config.include_selector_signature_metadata:
+                if previous.get("selector_signature_prompt_policy") != SELECTOR_SIGNATURE_PROMPT_POLICY:
+                    raise ValueError(
+                        "Checkpoint selector prompt policy differs; start a new training run "
+                        "with bundled-only signatures instead of resuming."
+                    )
                 if previous_config.selector_context is None:
                     raise ValueError("Checkpoint has no frozen selector context; start a new training run.")
                 if self.config.selector_context is not None and (
@@ -2739,9 +2736,9 @@ class SmartContractModelTrainer:
             and self.config.selector_context is None
         ):
             logger.warning(
-                "Model %s has no saved selector context snapshot; selector-signature prompts "
-                "depend on the current local registry and are not reproducible. Regenerate "
-                "training artifacts and retrain to persist the selector mapping.",
+                "Model %s has no saved selector context snapshot; bundled-only "
+                "selector-signature prompts may change if the bundled map changes. "
+                "Regenerate training artifacts and retrain to persist the mapping.",
                 load_path,
             )
 

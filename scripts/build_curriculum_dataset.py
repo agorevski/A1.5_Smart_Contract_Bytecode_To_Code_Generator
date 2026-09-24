@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import random
 import sys
@@ -15,7 +14,15 @@ from typing import Any, Iterable, Mapping, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.replication_metrics import extract_solidity_facts
+from src.replication_metrics import extract_solidity_facts  # noqa: E402
+
+from scripts.gate_dataset import (  # noqa: E402
+    Key,
+    body_identity,
+    canonicalize_body_hash,
+    load_jsonl as load_gate_jsonl,
+    row_keys,
+)
 
 
 FOCUS_CATEGORIES = {
@@ -56,23 +63,7 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
 
 
 def row_identity(row: Mapping[str, Any]) -> str:
-    metadata = row.get("metadata")
-    if isinstance(metadata, Mapping):
-        body_hash = metadata.get("body_hash")
-        if body_hash:
-            return f"body_hash:{body_hash}"
-        parts = [
-            metadata.get("contract_address"),
-            metadata.get("selector"),
-            metadata.get("function_signature"),
-            metadata.get("compiler_version"),
-        ]
-        if any(parts):
-            return "metadata:" + "|".join(str(part or "") for part in parts)
-    digest = hashlib.sha256(
-        (str(row.get("input", "")) + "\0" + str(row.get("output", ""))).encode("utf-8")
-    ).hexdigest()
-    return f"content:{digest}"
+    return f"body_hash:{body_identity(row)}"
 
 
 def focus_categories(focus: str) -> tuple[str, ...]:
@@ -84,11 +75,11 @@ def focus_categories(focus: str) -> tuple[str, ...]:
     return categories
 
 
-def excluded_identities(paths: Iterable[str | Path]) -> set[str]:
-    identities: set[str] = set()
+def excluded_identities(paths: Iterable[str | Path]) -> set[Key]:
+    identities: set[Key] = set()
     for path in paths:
-        for row in load_jsonl(path):
-            identities.add(row_identity(row))
+        for row in load_gate_jsonl(path):
+            identities.update(row_keys(row))
     return identities
 
 
@@ -96,7 +87,7 @@ def select_curriculum_rows(
     rows: Sequence[dict[str, Any]],
     *,
     categories: Sequence[str],
-    exclude: set[str] | None = None,
+    exclude: set[Key] | None = None,
     max_rows: int = 64,
     min_focus_facts: int = 1,
     max_focus_facts: int | None = None,
@@ -117,7 +108,7 @@ def select_curriculum_rows(
     candidates_by_identity: dict[str, CurriculumCandidate] = {}
     for index, row in enumerate(rows):
         identity = row_identity(row)
-        if identity in excluded:
+        if row_keys(row) & excluded:
             continue
         input_text = str(row.get("input", ""))
         output_text = str(row.get("output", ""))
@@ -182,7 +173,7 @@ def write_curriculum(
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         for candidate in candidates:
-            json.dump(candidate.row, handle, sort_keys=True)
+            json.dump(canonicalize_body_hash(candidate.row), handle, sort_keys=True)
             handle.write("\n")
 
     manifest = {
@@ -225,7 +216,9 @@ def main() -> None:
     parser.add_argument("--source-dataset", required=True, help="Source JSONL dataset")
     parser.add_argument("--output", required=True, help="Output curriculum JSONL path")
     parser.add_argument("--manifest", help="Output manifest path")
-    parser.add_argument("--focus", default="calls", help="Known focus or comma-separated categories")
+    parser.add_argument(
+        "--focus", default="calls", help="Known focus or comma-separated categories"
+    )
     parser.add_argument("--exclude-dataset", action="append", default=[], help="Dataset to exclude")
     parser.add_argument("--max-rows", type=int, default=64, help="Maximum rows to write")
     parser.add_argument("--min-focus-facts", type=int, default=1)

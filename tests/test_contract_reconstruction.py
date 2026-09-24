@@ -6,6 +6,18 @@ from src.contract_reconstruction import (
     build_function_quality,
     build_reconstruction_plan,
 )
+from src.inference import analyze_bytecode_tac
+
+
+def test_reconstruction_plan_keeps_reachable_blocks_from_real_function():
+    bytecode = "0x60003560e01c806312345678146010575b00"
+    analyzer, function_tac, _ = analyze_bytecode_tac(bytecode)
+
+    plan = build_reconstruction_plan(bytecode, analyzer, function_tac)
+    chunk = next(c for c in plan["semantic_chunks"] if c["selector"] == "0x12345678")
+
+    assert chunk["basic_blocks"] == ["block_0010"]
+    assert chunk["instruction_count"] == 2
 
 
 def test_reconstruction_plan_handles_contract_fallback_chunk():
@@ -74,6 +86,18 @@ def test_quality_labels_scaffold_only_as_non_deployable():
     assert contract_quality["scaffold_only"] is True
     assert contract_quality["deployable"] is False
     assert contract_quality["truncated_functions"] == ["func_00000000"]
+
+
+def test_invalid_dispatcher_target_is_not_deployable_even_if_scaffold_compiles():
+    quality = build_contract_quality(
+        {"valid": True, "compiler_checked": True},
+        reconstruction_plan={"contract_facts": {"analysis_status": {"status": "ok"}}},
+        rejected_dispatcher_targets={"0x12345678": 32},
+    )
+    assert quality["severity"] == "error"
+    assert quality["deployable"] is False
+    assert quality["unresolved_chunks"] == ["function_0x12345678"]
+    assert any("invalid dispatcher" in action for action in quality["recommended_actions"])
 
 
 def test_reconciles_shared_state_and_identical_helpers():

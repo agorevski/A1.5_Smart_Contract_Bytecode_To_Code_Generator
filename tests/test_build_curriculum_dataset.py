@@ -11,9 +11,9 @@ from scripts.build_curriculum_dataset import (
 )
 
 
-def _row(body_hash, output, input_text="function selector_deadbeef:\n  CALL"):
+def _row(body_hash, output, input_text=None):
     return {
-        "input": input_text,
+        "input": input_text or f"function selector_{body_hash}:\n  CALL",
         "metadata": {
             "body_hash": body_hash,
             "function_signature": f"function f_{body_hash}()",
@@ -34,7 +34,7 @@ def test_select_curriculum_rows_focuses_calls_and_excludes_identities(tmp_path):
         _row("excluded", "function excluded() public { token.transfer(msg.sender, 1); }"),
         _row(
             "best",
-            "function duplicateLong() public { token.balanceOf(msg.sender); token.transfer(owner, 1); }",
+            "FUNCTION best() public { /* same body */ token.balanceOf(msg.sender); token.transfer(owner, 1); }",
             input_text="function selector_deadbeef:\n  CALL\n" + ("  JUMP\n" * 100),
         ),
         _row(
@@ -56,6 +56,22 @@ def test_select_curriculum_rows_focuses_calls_and_excludes_identities(tmp_path):
     assert [candidate.identity for candidate in selected] == [row_identity(source_rows[1])]
     assert selected[0].source_index == 2
     assert selected[0].focus_counts == {"call": 4, "member_call": 2}
+
+
+def test_curriculum_excludes_missing_hash_duplicates_and_keeps_distinct_bodies(tmp_path):
+    gate = _row("declared", "function a() public { token.transfer(owner, 1); }")
+    gate_path = tmp_path / "gate.jsonl"
+    _write_jsonl(gate_path, [gate])
+    without_hash = _row(None, "FUNCTION a() public { /* comment */ token.transfer(owner, 1); }")
+    stale_hash = _row("declared", "function other() public { token.transfer(owner, 1); }")
+    distinct = _row(None, "function different() public { token.transfer(owner, 2); }")
+    selected = select_curriculum_rows(
+        [without_hash, stale_hash, distinct],
+        categories=focus_categories("calls"),
+        exclude=excluded_identities([gate_path]),
+    )
+
+    assert [candidate.row for candidate in selected] == [distinct]
 
 
 def test_write_curriculum_outputs_dataset_and_manifest(tmp_path):
@@ -86,6 +102,10 @@ def test_write_curriculum_outputs_dataset_and_manifest(tmp_path):
     assert output_path.exists()
     assert manifest_path.exists()
     assert len(load_jsonl(output_path)) == 1
+    assert (
+        load_jsonl(output_path)[0]["metadata"]["body_hash"]
+        == row_identity(source_rows[0]).split(":", 1)[1]
+    )
     assert manifest["selected_rows"] == 1
     assert manifest["rows"][0]["focus_counts"]["member_call"] == 1
 

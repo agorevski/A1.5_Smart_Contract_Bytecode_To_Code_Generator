@@ -78,6 +78,7 @@ def test_cli_autodiscovers_newest_final_model(monkeypatch):
 
 def test_cli_function_limit_returns_structured_json(monkeypatch, capsys):
     decompile = load_decompile_module()
+    monkeypatch.setattr(decompile, "_resolve_model_path", lambda _model_path: ROOT)
 
     analyzer = SimpleNamespace(instructions=[1], basic_blocks={"b": 1}, functions={})
     monkeypatch.setattr(
@@ -96,6 +97,7 @@ def test_cli_function_limit_returns_structured_json(monkeypatch, capsys):
 
 def test_cli_timeout_returns_structured_json(monkeypatch, capsys):
     decompile = load_decompile_module()
+    monkeypatch.setattr(decompile, "_resolve_model_path", lambda _model_path: ROOT)
 
     def slow_analyze(bytecode):
         import time
@@ -189,11 +191,23 @@ def test_cli_model_deadline_terminates_spawn_worker(monkeypatch, capsys):
     from tests.test_inference import WorkerTestModel
 
     decompile = load_decompile_module()
-    analyzer = SimpleNamespace(instructions=[], basic_blocks={}, functions={})
+    analyzer = SimpleNamespace(
+        instructions=[],
+        basic_blocks={},
+        functions={
+            "function_0x12345678": SimpleNamespace(
+                selector="0x12345678", basic_blocks=[]
+            )
+        },
+    )
     monkeypatch.setattr(decompile, "_resolve_model_path", lambda _: ROOT)
     monkeypatch.setattr(
         decompile, "_analyze_tac",
-        lambda _: (analyzer, {"contract": "stop()"}, "stop()"),
+        lambda _: (
+            analyzer,
+            {"function_0x12345678": "sleep"},
+            "sleep",
+        ),
     )
     worker = PersistentModelWorker("slow", factory=WorkerTestModel, startup_timeout=10)
     worker.initialize()

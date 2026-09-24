@@ -27,7 +27,7 @@ _SIGNATURE_QUALIFIERS = {
     "view",
     "virtual",
 }
-_PARAM_QUALIFIERS = {"memory", "storage", "calldata", "indexed"}
+_PARAM_QUALIFIERS = {"memory", "storage", "calldata", "indexed", "payable"}
 _CONTROL_KEYWORDS = {"if", "for", "while"}
 _CALL_EXCLUSIONS = {
     "assert",
@@ -60,6 +60,7 @@ _RESERVED_IDENTIFIERS = {
     "uint",
     "uint256",
 }
+_TYPE_CONVERSION_RE = re.compile(r"(?:u?int(?:\d{1,3})?|bytes(?:\d{1,2})?)\Z")
 _HALLUCINATION_BUCKET_BY_CATEGORY = {
     "abi": "unsupported_abi_elements",
     "visibility": "unsupported_abi_elements",
@@ -73,6 +74,15 @@ _HALLUCINATION_BUCKET_BY_CATEGORY = {
     "return": "unsupported_return_expressions",
     "control_flow": "unsupported_control_flow",
 }
+BEHAVIOR_FACT_CATEGORIES = (
+    "call",
+    "control_flow",
+    "event",
+    "guard",
+    "member_call",
+    "return",
+    "state_write",
+)
 
 
 @dataclass(frozen=True)
@@ -231,6 +241,27 @@ def evaluate_replication(
     )
 
 
+def behavior_only_replication_micro(
+    by_category: Mapping[str, Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Micro F1 for extracted behavior facts, excluding ABI and modifiers.
+
+    This compares source-extracted facts, not runtime or bytecode behavior.
+    """
+    counts = {"true_positives": 0, "false_positives": 0, "false_negatives": 0}
+    for category in BEHAVIOR_FACT_CATEGORIES:
+        category_score = by_category.get(category)
+        if not isinstance(category_score, Mapping):
+            continue
+        for key in counts:
+            counts[key] += int(category_score.get(key, 0))
+    if not any(counts.values()):
+        return None
+    return PrecisionRecallF1.from_counts(
+        counts["true_positives"], counts["false_positives"], counts["false_negatives"]
+    ).to_dict()
+
+
 def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
     """Aggregate per-example replication metrics into mean and micro scores."""
     metric_rows = list(metrics)
@@ -323,6 +354,10 @@ def aggregate_replication_scores(metrics: Iterable[Mapping[str, Any]]) -> Dict[s
             ).to_dict()
             for category, counts in sorted(category_counts.items())
         }
+        behavior_micro = behavior_only_replication_micro(summary["by_category_micro"])
+        if behavior_micro is not None:
+            summary["behavior_only_micro"] = behavior_micro
+            summary["behavior_only_categories"] = list(BEHAVIOR_FACT_CATEGORIES)
         summary["category_gap_summary"] = _category_gap_summary(category_counts)
 
     hallucination_total = sum(hallucination_counts.values())
@@ -473,11 +508,12 @@ def _mask_string_literals(code: str) -> str:
 
 def _extract_function_signature(code: str) -> Dict[str, Any]:
     match = re.search(
-        r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)?\s*" r"\((?P<params>.*?)\)\s*(?P<tail>[^{;]*)",
+        r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)?\s*\(",
         code,
         flags=re.DOTALL,
     )
-    if not match:
+    params_end = _find_matching_paren(code, match.end() - 1) if match else None
+    if not match or params_end is None:
         return {
             "function_name": None,
             "params": {"types": [], "names": []},
@@ -489,19 +525,20 @@ def _extract_function_signature(code: str) -> Dict[str, Any]:
             "match_end": 0,
         }
 
-    tail = match.group("tail") or ""
-    returns_match = re.search(r"\breturns\s*\((?P<returns>.*?)\)", tail, re.DOTALL)
-    returns = (
-        _parse_parameter_list(returns_match.group("returns"))
-        if returns_match
-        else {
-            "types": [],
-            "names": [],
-        }
-    )
-    tail_without_returns = (
-        tail[: returns_match.start()] + tail[returns_match.end() :] if returns_match else tail
-    )
+    tail_start = params_end + 1
+    tail_boundary = re.search(r"[{;]", code[tail_start:])
+    tail_end = tail_start + tail_boundary.start() if tail_boundary else len(code)
+    tail = code[tail_start:tail_end]
+    returns_match = re.search(r"\breturns\s*\(", tail, re.DOTALL)
+    returns = {"types": [], "names": []}
+    tail_without_returns = tail
+    if returns_match:
+        returns_end = _find_matching_paren(tail, returns_match.end() - 1)
+        if returns_end is not None:
+            returns = _parse_parameter_list(tail[returns_match.end() : returns_end])
+            tail_without_returns = tail[: returns_match.start()] + tail[returns_end + 1 :]
+        else:
+            tail_without_returns = tail[: returns_match.start()]
     tail_tokens = [
         token.lower() if token.lower() in _SIGNATURE_QUALIFIERS else token
         for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", tail_without_returns)
@@ -517,13 +554,13 @@ def _extract_function_signature(code: str) -> Dict[str, Any]:
 
     return {
         "function_name": match.group(1),
-        "params": _parse_parameter_list(match.group("params")),
+        "params": _parse_parameter_list(code[match.end() : params_end]),
         "returns": returns["types"],
         "visibility": visibility,
         "mutability": mutability,
         "is_payable": "payable" in tail_tokens,
         "modifiers": sorted(set(modifiers)),
-        "match_end": match.end(),
+        "match_end": tail_end,
     }
 
 
@@ -559,8 +596,11 @@ def _add_signature_facts(facts: FactMap, signature: Mapping[str, Any]):
 
 def _extract_function_body(code: str, match_end: int) -> str:
     start = code.find("{", max(0, match_end - 1))
+    declaration_end = code.find(";", max(0, match_end - 1))
+    if declaration_end >= 0 and (start < 0 or declaration_end < start):
+        return ""
     if start < 0:
-        return code
+        return ""
     end = _find_matching_brace(code, start)
     return code[start + 1 : end] if end is not None else code[start + 1 :]
 
@@ -615,7 +655,7 @@ def _split_top_level_commas(text: str) -> List[str]:
 
 
 def _canonical_type(parameter: str) -> str:
-    parameter = parameter.split("=")[0].strip()
+    parameter = parameter.strip()
     parameter = re.sub(
         rf"\b({'|'.join(sorted(_PARAM_QUALIFIERS))})\b",
         " ",
@@ -633,10 +673,10 @@ def _canonical_type(parameter: str) -> str:
 
 
 def _parameter_name(parameter: str) -> Optional[str]:
-    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", parameter)
-    if len(tokens) < 2:
+    match = re.search(r"\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", parameter)
+    if not match:
         return None
-    candidate = tokens[-1]
+    candidate = match.group(1)
     if candidate.lower() in _PARAM_QUALIFIERS:
         return None
     return candidate
@@ -677,6 +717,8 @@ def _add_call_facts(facts: FactMap, body: str, function_name: Optional[str], ali
         if normalized in _CALL_EXCLUSIONS:
             continue
         if normalized in _RESERVED_IDENTIFIERS:
+            continue
+        if _TYPE_CONVERSION_RE.fullmatch(normalized):
             continue
         if function_name and normalized == _normalize_identifier(function_name):
             continue

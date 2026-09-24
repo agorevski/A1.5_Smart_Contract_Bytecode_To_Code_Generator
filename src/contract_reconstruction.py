@@ -502,6 +502,7 @@ def build_contract_quality(
     function_results: list[Mapping[str, Any]] | None = None,
     source_summary: Mapping[str, Any] | None = None,
     reconstruction_plan: Mapping[str, Any] | None = None,
+    rejected_dispatcher_targets: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Return whole-contract quality/severity without conflating selector confidence."""
     validation = validation if isinstance(validation, Mapping) else {}
@@ -524,7 +525,8 @@ def build_contract_quality(
     compiler_checked = bool(validation.get("compiler_checked"))
     validation_valid = bool(validation.get("valid")) and not conflicts
     deployable = bool(
-        validation_valid and compiler_checked and validation.get("deployable", True)
+        validation_valid and compiler_checked and analysis_reliable
+        and not rejected_dispatcher_targets and validation.get("deployable", True)
     )
     scaffold_only = validation_valid and not compiler_checked
     unresolved = [
@@ -532,6 +534,10 @@ def build_contract_quality(
         for item in function_results
         if item.get("status") == "error" or item.get("source") == "error"
     ]
+    for selector in rejected_dispatcher_targets or {}:
+        name = f"function_{selector}"
+        if name not in unresolved:
+            unresolved.append(name)
     truncated = [
         str(item.get("name"))
         for item in function_results
@@ -553,6 +559,8 @@ def build_contract_quality(
     actions: list[str] = []
     if unresolved:
         actions.append("Resolve failed chunks before using the reconstructed contract.")
+    if rejected_dispatcher_targets:
+        actions.append("Inspect invalid dispatcher targets before trusting contract coverage.")
     if conflicts:
         actions.append("Resolve conflicting contract-wide declarations; no conflicting declaration was silently discarded.")
     if unresolved_helpers:

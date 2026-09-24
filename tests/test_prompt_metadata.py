@@ -1,10 +1,16 @@
+import sqlite3
+
+import pytest
+
 from src.model_setup import (
     ModelConfig,
     SmartContractDataset,
     SmartContractDecompiler,
     format_prompt_metadata,
+    resolve_selector_signature_for_prompt,
     sanitize_tac_for_prompt,
 )
+from src.selector_resolver import SelectorResolver
 
 
 class FakeTokenizer:
@@ -76,6 +82,43 @@ block_success:
         "functions=4"
     )
     assert_source_metadata_excluded(line)
+
+
+def test_prompt_ignores_unshipped_heldout_signatures_in_local_registry(tmp_path, monkeypatch):
+    selector = "0x5312ea8e"
+    db_path = tmp_path / "contracts.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE selector_registry "
+            "(selector TEXT, signature TEXT, source TEXT, occurrences INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO selector_registry VALUES (?, ?, ?, ?)",
+            (selector, "emergencyWithdraw(uint256)", "compiled", 10),
+        )
+
+    resolver = SelectorResolver(
+        use_remote=False,
+        db_path=db_path,
+        json_path=tmp_path / "absent-selectors.json",
+    )
+    assert resolver.resolve(selector).best_match.source == "db"
+    monkeypatch.setattr("src.selector_resolver.get_resolver", lambda **_kwargs: resolver)
+
+    assert resolve_selector_signature_for_prompt(selector) is None
+    assert resolve_selector_signature_for_prompt("0xa9059cbb") == "transfer(address,uint256)"
+    from src.selector_resolver import snapshot_local_selector_context
+    snapshot = snapshot_local_selector_context(db_path=db_path, json_path=tmp_path / "absent-selectors.json")
+    assert resolve_selector_signature_for_prompt(selector, snapshot) is None
+    assert resolve_selector_signature_for_prompt("0xa9059cbb", snapshot) == "transfer(address,uint256)"
+    prompt_metadata = format_prompt_metadata(
+        {"selector": selector, "function_signature": "emergencyWithdraw(uint256)"},
+        tac_input=f"function function_{selector}:\nblock_entry:\n  return",
+        selector_context=snapshot,
+    )
+    assert f"selector={selector}" in prompt_metadata
+    assert "selector_signature=" not in prompt_metadata
+    assert "emergencyWithdraw" not in prompt_metadata
 
 
 def test_dataset_prompt_excludes_source_metadata_with_deprecated_flag_enabled():
@@ -154,6 +197,37 @@ block_entry:
     assert_source_metadata_excluded(prompt)
     assert "function balanceOf" not in prompt
     assert "### Response:" in prompt
+
+
+@pytest.mark.parametrize("selector_signature_enabled", [False, True])
+def test_training_and_inference_prompts_match_without_truncation(selector_signature_enabled):
+    metadata = {
+        "selector": "0xa9059cbb",
+        "function_name": "transfer",
+        "compiler_version": "0.8.20",
+        "bytecode_length": 256,
+    }
+    tac = """// Compiler: solc 0.8.20
+function transfer(address to, uint256 value):
+block_entry:
+  v0 = CALLDATALOAD 0x04
+"""
+    dataset = SmartContractDataset.__new__(SmartContractDataset)
+    dataset.template_format = "alpaca"
+    dataset.include_bytecode_metadata = True
+    dataset.include_selector_signature_metadata = selector_signature_enabled
+    train_prefix, _, _ = dataset._format_prompt_parts(tac, "function transfer() {}", metadata)
+
+    decompiler = SmartContractDecompiler.__new__(SmartContractDecompiler)
+    decompiler.tokenizer = FakeTokenizer()
+    decompiler.config = ModelConfig(
+        include_selector_signature_metadata=selector_signature_enabled
+    )
+    inference_prompt = decompiler._build_prompt(tac, metadata, max_new_tokens=256)
+
+    assert train_prefix == inference_prompt
+    assert ("selector_signature=transfer(address,uint256)" in train_prefix) is selector_signature_enabled
+    assert_source_metadata_excluded(train_prefix)
 
 
 def test_decompiler_inference_context_keeps_prompt_budget_above_training_sweep_length():

@@ -38,6 +38,7 @@ data/*.log
 data/split_manifest.json
 data/manifests/
 data/preflight_cache/
+data/audit_*/
 scripts/data/*.db*
 
 # Keep demo dataset for reference

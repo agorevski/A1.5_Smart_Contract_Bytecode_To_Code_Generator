@@ -36,6 +36,7 @@ from src.contract_reconstruction import (
 from src.inference import DEFAULT_GENERATION_CONFIG as INFERENCE_DEFAULT_GENERATION_CONFIG
 from src.inference import (
     PersistentModelWorker, inference_outcome, analyzer_status, selector_context_provenance,
+    build_function_metadata,
     _build_function_results as shared_function_results,
     _source_summary as shared_source_summary,
     validate_solidity_output as shared_validate_solidity,
@@ -1194,22 +1195,8 @@ def _safe_function_metadata(
     contract_metadata: dict | None = None,
 ) -> dict:
     """Build model metadata only from bytecode/analyzer-derived facts."""
-    hex_body = bytecode[2:] if bytecode.startswith("0x") else bytecode
-    metadata = {
-        "selector": None,
-        "bytecode_hex_length": len(hex_body),
-        "bytecode_byte_length": len(hex_body) // 2,
-        "instruction_count": len(analyzer.instructions),
-        "basic_block_count": len(analyzer.basic_blocks),
-        "function_count": len(analyzer.functions),
-        "tac_line_count": len(tac_text.splitlines()),
-        "tac_char_count": len(tac_text),
-    }
-
+    metadata = build_function_metadata(bytecode, analyzer, fname, tac_text)
     func_obj = analyzer.functions.get(fname)
-    selector = getattr(func_obj, "selector", None)
-    if selector:
-        metadata["selector"] = selector
 
     abi_fact = _abi_fact_for_function(fname, analyzer, contract_metadata)
     if abi_fact:
@@ -1960,6 +1947,29 @@ def api_decompile():
             num_blocks = len(analyzer.basic_blocks)
             num_functions = len(analyzer.functions)
             func_names = list(func_tac_map.keys())
+            rejected_targets = dict(getattr(analyzer, "rejected_dispatcher_targets", {}) or {})
+            incomplete_reason = (
+                "Some dispatcher selectors have invalid targets: "
+                + ", ".join(
+                    f"{selector} -> 0x{target:x}"
+                    for selector, target in sorted(rejected_targets.items())
+                )
+                if rejected_targets
+                else None
+            )
+            trace["analysis"] = {
+                "analyzer_status": analyzer_status(analyzer),
+                "num_instructions": num_instructions,
+                "num_basic_blocks": num_blocks,
+                "num_functions": num_functions,
+                "tac_generation_time_s": round(tac_time, 3),
+                "rejected_dispatcher_targets": rejected_targets,
+            }
+            if not func_names:
+                raise DecompileRequestError(
+                    "No recoverable function boundaries in bytecode; refusing to infer "
+                    "Solidity from whole-contract TAC."
+                )
             if len(func_names) > MAX_DECOMPILE_FUNCTIONS:
                 raise DecompileRequestError(
                     (
@@ -1968,13 +1978,6 @@ def api_decompile():
                     )
                 )
             _check_timeout()
-            trace["analysis"] = {
-                "analyzer_status": analyzer_status(analyzer),
-                "num_instructions": num_instructions,
-                "num_basic_blocks": num_blocks,
-                "num_functions": num_functions,
-                "tac_generation_time_s": round(tac_time, 3),
-            }
             trace["analysis"]["tac_schema_version"] = getattr(
                 analyzer, "tac_schema_version", analyzer_status(analyzer).get("schema_version")
             )
@@ -2681,6 +2684,7 @@ def api_decompile():
                 function_results,
                 source_summary,
                 reconstruction_plan,
+                rejected_dispatcher_targets=rejected_targets,
             )
             failure_count = len(function_errors)
             validation_failed = not bool(validation.get("valid"))
@@ -2688,6 +2692,7 @@ def api_decompile():
                 function_sources, function_errors, validation,
                 degraded=analyzer_status(analyzer)["status"] in {"degraded", "failed"},
                 conflicts=bool(reconstruction_plan.get("reconciliation", {}).get("conflicts")),
+                incomplete_analysis=bool(incomplete_reason),
             )
             success, partial_success = outcome["success"], outcome["partial_success"]
 
@@ -2696,6 +2701,7 @@ def api_decompile():
                 "num_instructions": num_instructions,
                 "num_basic_blocks": num_blocks,
                 "num_functions": num_functions,
+                "rejected_dispatcher_targets": rejected_targets,
                 "tac_generation_time_s": round(tac_time, 3),
                 "solidity_generation_time_s": round(gen_time, 3),
                 "lookup_hits": lookup_hits,
@@ -2725,7 +2731,7 @@ def api_decompile():
                 trace["functions"].setdefault(item["name"], {}).update(item)
             trace_path = _finish_trace(
                 "success" if success else "partial" if partial_success else "failed",
-                (
+                incomplete_reason or (
                     None
                     if success or partial_success
                     else (
@@ -2741,6 +2747,7 @@ def api_decompile():
                 {
                     "request_id": request_id,
                     **outcome,
+                    "error": incomplete_reason,
                     "tac": combined_tac,
                     "tac_per_function": func_tac_map,
                     "solidity": assembled,

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Full-data, body-balanced Qwen2.5-Coder QLoRA training run.
 #
-# This runner first materializes a dataset capped by metadata.body_hash so
+# This runner first materializes a dataset capped by normalized Solidity body so
 # optimizer/compiler variants of the same Solidity body do not dominate the
-# training signal. By default it keeps one row per body_hash, trains for one
+# training signal. By default it keeps one row per body, trains for one
 # epoch, then evaluates the resulting adapter against the current gate suite.
 # Reuse requires matching source/selection/exclusion fingerprints and a clean
 # overlap check. Set RECREATE_DATASET=1 to rebuild a stale artifact explicitly.
@@ -13,7 +13,7 @@
 #   RUN_ID=full_body_balanced_v1 ./run_train_qwen_qlora_full_body_balanced.sh
 #   CAP_PER_BODY=2 EPOCHS=1 ./run_train_qwen_qlora_full_body_balanced.sh
 #   MAX_ROWS=5000 ./run_train_qwen_qlora_full_body_balanced.sh
-#   EVAL_EXCLUDE_DATASETS= ./run_train_qwen_qlora_full_body_balanced.sh
+#   EVAL_EXCLUDE_DATASETS=other_gate.jsonl ./run_train_qwen_qlora_full_body_balanced.sh
 #   RUN_GATES=0 ./run_train_qwen_qlora_full_body_balanced.sh
 
 set -euo pipefail
@@ -66,7 +66,7 @@ HOLDOUT64_DATASET="${HOLDOUT64_DATASET:-${SCRIPT_DIR}/data/curriculum_eval/calls
 PURE_NEGATIVE_DATASET="${PURE_NEGATIVE_DATASET:-${SCRIPT_DIR}/data/curriculum_negative/no_calls_no_state_simple64_nonoverlap.jsonl}"
 LARGE192_DATASET="${LARGE192_DATASET:-${SCRIPT_DIR}/data/curriculum_eval/large_stratified192_nonoverlap_iter32.jsonl}"
 DEFAULT_EVAL_EXCLUDE_DATASETS="${BROAD_DATASET}:${CALLS_DATASET}:${STATE_DATASET}:${HOLDOUT64_DATASET}:${PURE_NEGATIVE_DATASET}:${LARGE192_DATASET}"
-EVAL_EXCLUDE_DATASETS="${EVAL_EXCLUDE_DATASETS:-${DEFAULT_EVAL_EXCLUDE_DATASETS}}"
+EVAL_EXCLUDE_DATASETS="${DEFAULT_EVAL_EXCLUDE_DATASETS}${EVAL_EXCLUDE_DATASETS:+:${EVAL_EXCLUDE_DATASETS}}"
 
 BROAD_BASELINE="${BROAD_BASELINE:-${SCRIPT_DIR}/results/eval_1782624189.json}"
 CALLS_BASELINE="${CALLS_BASELINE:-${SCRIPT_DIR}/results/eval_1782624247.json}"
@@ -97,18 +97,64 @@ if [[ -n "${EVAL_EXCLUDE_DATASETS}" ]]; then
     done
 fi
 
+require_baseline() {
+    local label="$1"
+    local path="$2"
+    local dataset="$3"
+    if [[ ! -f "${path}" ]]; then
+        echo "Required ${label} baseline eval not found: ${path}; regenerate under bundled_only_v1 before training." >&2
+        exit 1
+    fi
+    python -m scripts.gate_dataset verify-baseline "${path}" "${dataset}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
+        --repetition-penalty "${EVAL_REPETITION_PENALTY}"
+}
+
+if [[ "${RUN_GATES}" != "false" && "${RUN_GATES}" != "0" &&
+      "${DRY_RUN}" != "true" && "${DRY_RUN}" != "1" ]]; then
+    require_baseline "broad30" "${BROAD_BASELINE}" "${BROAD_DATASET}"
+    require_baseline "calls23" "${CALLS_BASELINE}" "${CALLS_DATASET}"
+    require_baseline "state17" "${STATE_BASELINE}" "${STATE_DATASET}"
+    require_baseline "holdout64" "${HOLDOUT64_BASELINE}" "${HOLDOUT64_DATASET}"
+    require_baseline "pure_negative64" "${PURE_NEGATIVE_BASELINE}" "${PURE_NEGATIVE_DATASET}"
+    require_baseline "large192" "${LARGE192_BASELINE}" "${LARGE192_DATASET}"
+    python - \
+        "${BROAD_DATASET}" "${BROAD_BASELINE}" \
+        "${CALLS_DATASET}" "${CALLS_BASELINE}" \
+        "${STATE_DATASET}" "${STATE_BASELINE}" \
+        "${HOLDOUT64_DATASET}" "${HOLDOUT64_BASELINE}" \
+        "${PURE_NEGATIVE_DATASET}" "${PURE_NEGATIVE_BASELINE}" \
+        "${LARGE192_DATASET}" "${LARGE192_BASELINE}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+from scripts.compare_eval_runs import (
+    PAIRED_METRICS, SUMMARY_GATE_METRICS, _validate_pair, load_eval,
+)
+
+for dataset, baseline_path in zip(sys.argv[1::2], sys.argv[2::2]):
+    baseline = load_eval(baseline_path)
+    _validate_pair(baseline, baseline, SUMMARY_GATE_METRICS, PAIRED_METRICS)
+    if baseline["dataset_content_sha256"] != hashlib.sha256(Path(dataset).read_bytes()).hexdigest():
+        raise ValueError(f"Baseline dataset content differs: {baseline_path}")
+    if len(baseline["details"]) != sum(
+        bool(line.strip()) for line in Path(dataset).read_text(encoding="utf-8").splitlines()
+    ):
+        raise ValueError(f"Baseline does not cover the entire gate dataset: {baseline_path}")
+print("All six bundled-only gate baselines have complete provenance and cohort coverage.")
+PY
+fi
+
 mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}"
 
-{
-    echo "Building body-balanced dataset from ${SOURCE_DATASET}"
-    echo "  cap per body_hash: ${CAP_PER_BODY}"
-    if [[ -n "${MAX_ROWS}" ]]; then
-        echo "  max selected rows: ${MAX_ROWS}"
-    fi
-    if [[ -n "${EVAL_EXCLUDE_DATASETS}" ]]; then
-        echo "  excluding eval datasets: ${EVAL_EXCLUDE_DATASETS}"
-    fi
-    uv run --extra quantization python - "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${BALANCED_MANIFEST}" "${CAP_PER_BODY}" "${SEED}" "${MAX_ROWS}" "${EVAL_EXCLUDE_DATASETS}" "${RECREATE_DATASET}" <<'PY'
+echo "Preparing body-balanced dataset from ${SOURCE_DATASET}"
+echo "  cap per body_hash: ${CAP_PER_BODY}"
+if [[ -n "${MAX_ROWS}" ]]; then
+    echo "  max selected rows: ${MAX_ROWS}"
+fi
+echo "  excluding eval datasets: ${EVAL_EXCLUDE_DATASETS}"
+python - "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${BALANCED_MANIFEST}" "${CAP_PER_BODY}" "${SEED}" "${MAX_ROWS}" "${EVAL_EXCLUDE_DATASETS}" "${RECREATE_DATASET}" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -120,8 +166,18 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Mapping
 
+from scripts.gate_dataset import (
+    body_identity,
+    canonicalize_body_hash,
+    exclude_eval_rows,
+    file_sha256,
+    load_jsonl,
+    row_keys,
+    selection_fingerprint,
+    selection_inputs,
+    verify_cache,
+)
 from src.replication_metrics import extract_solidity_facts
-from src.dataset_export_primitives import hash_normalized_body
 
 
 source = Path(sys.argv[1])
@@ -139,122 +195,60 @@ exclude_paths = [
 rng = random.Random(seed)
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            raw = line.strip()
-            if not raw:
-                continue
-            row = json.loads(raw)
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}:{line_number} is not a JSON object")
-            rows.append(row)
-    return rows
-
-
-def body_identity(row: Mapping[str, Any]) -> tuple[str, bool]:
-    metadata = row.get("metadata")
-    if isinstance(metadata, Mapping):
-        body_hash = metadata.get("body_hash")
-        if body_hash:
-            return f"body_hash:{body_hash}", True
-        parts = [
-            metadata.get("contract_address"),
-            metadata.get("selector"),
-            metadata.get("function_signature"),
-            metadata.get("compiler_version"),
-        ]
-        if any(parts):
-            return "metadata:" + "|".join(str(part or "") for part in parts), False
-    digest = hashlib.sha256(
-        (str(row.get("input", "")) + "\0" + str(row.get("output", ""))).encode("utf-8")
-    ).hexdigest()
-    return f"content:{digest}", False
-
-
 def fact_coverage(row: Mapping[str, Any]) -> dict[str, int]:
     facts = extract_solidity_facts(str(row.get("output", "")))
     return {category: len(values) for category, values in facts.items() if values}
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-selection_inputs = {
-    "selection_schema_version": 2,
-    "source": {"path": str(source.resolve()), "sha256": file_sha256(source)},
-    "cap_per_body": cap_per_body,
-    "seed": seed,
-    "max_rows": max_rows,
-    "exclusions": [
-        {"path": str(path.resolve()), "sha256": file_sha256(path)}
-        for path in exclude_paths
-    ],
-}
-selection_fingerprint = hashlib.sha256(
-    json.dumps(selection_inputs, sort_keys=True).encode("utf-8")
-).hexdigest()
-
-
+inputs = selection_inputs(
+    source, exclude_paths, cap_per_body=cap_per_body, seed=seed,
+    max_rows=max_rows, balance_policy="normalized_body_and_gate_keys_v2",
+)
 source_rows = load_jsonl(source)
 source_identity_counts: Counter[str] = Counter()
 for row in source_rows:
-    identity, _ = body_identity(row)
-    source_identity_counts[identity] += 1
+    source_identity_counts[body_identity(row)] += 1
 
-excluded_identities: set[str] = set()
-excluded_bodies: set[str] = set()
+gate_rows: list[dict[str, Any]] = []
 excluded_dataset_rows = 0
 for exclude_path in exclude_paths:
-    for row in load_jsonl(exclude_path):
-        identity, _ = body_identity(row)
-        excluded_identities.add(identity)
-        excluded_bodies.add(hash_normalized_body(str(row.get("output", ""))))
-        excluded_dataset_rows += 1
+    rows = load_jsonl(exclude_path)
+    gate_rows.extend(rows)
+    excluded_dataset_rows += len(rows)
+excluded_identities = {body_identity(row) for row in gate_rows}
+gate_keys = set().union(*(row_keys(row) for row in gate_rows))
 
 
 def validate_no_overlap(rows: list[dict[str, Any]]) -> None:
     if not rows:
         raise ValueError("Body-balanced dataset is empty")
     for row in rows:
-        identity, _ = body_identity(row)
-        if (identity in excluded_identities or
-                hash_normalized_body(str(row.get("output", ""))) in excluded_bodies):
-            raise ValueError("Training/evaluation body overlap detected before GPU launch")
+        if row_keys(row) & gate_keys:
+            raise ValueError("Training/evaluation identity overlap detected before GPU launch")
 
 
-recreate = len(sys.argv) > 8 and sys.argv[8].lower() in ("true", "1")
-if output.exists() and output.stat().st_size and not recreate:
-    prior = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    if prior.get("selection_fingerprint") != selection_fingerprint:
-        raise ValueError("Stale balanced dataset: source/selection/exclusions changed; set RECREATE_DATASET=1")
-    # Check overlap independently of the cached manifest and artifact digest.
+recreate = sys.argv[8].lower() in ("true", "1")
+if output.exists() and not recreate:
+    if not verify_cache(output, manifest_path, inputs):
+        raise ValueError("Body-balanced cache is unverified or stale; set RECREATE_DATASET=1")
     cached_rows = load_jsonl(output)
     validate_no_overlap(cached_rows)
-    if prior.get("output_sha256") != file_sha256(output):
-        raise ValueError("Balanced dataset content changed; set RECREATE_DATASET=1")
     print(f"Validated existing body-balanced dataset: {output}")
     raise SystemExit(0)
 
 groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-identity_uses_body_hash: dict[str, bool] = {}
-missing_body_hash_count = 0
-excluded_source_rows = 0
+missing_body_hash_count = sum(
+    not (isinstance(row.get("metadata"), Mapping) and row["metadata"].get("body_hash"))
+    for row in source_rows
+)
+available_rows, excluded_source_rows = exclude_eval_rows(source_rows, gate_rows)
+if not available_rows:
+    raise ValueError("All source rows overlap fixed eval gates; refusing empty training dataset")
+available_ids = {id(row) for row in available_rows}
 for source_index, row in enumerate(source_rows):
-    identity, used_body_hash = body_identity(row)
-    if (identity in excluded_identities or
-            hash_normalized_body(str(row.get("output", ""))) in excluded_bodies):
-        excluded_source_rows += 1
+    if id(row) not in available_ids:
         continue
-    identity_uses_body_hash[identity] = used_body_hash
-    if not used_body_hash:
-        missing_body_hash_count += 1
+    identity = body_identity(row)
     enriched = dict(row)
     enriched["_body_balance_source_index"] = source_index
     enriched["_body_balance_tie"] = rng.random()
@@ -284,13 +278,12 @@ visibilities: Counter[str] = Counter()
 input_chars: list[int] = []
 output_chars: list[int] = []
 for row in selected:
-    identity, _ = body_identity(row)
-    identity_counts[identity] += 1
-    clean = {
+    identity_counts[body_identity(row)] += 1
+    clean = canonicalize_body_hash({
         key: value
         for key, value in row.items()
         if not key.startswith("_body_balance_")
-    }
+    })
     clean_rows.append(clean)
     input_text = str(clean.get("input", ""))
     output_text = str(clean.get("output", ""))
@@ -312,15 +305,13 @@ with output.open("w", encoding="utf-8") as handle:
         json.dump(row, handle, sort_keys=True)
         handle.write("\n")
 
-selected_identity_digest = hashlib.sha256(
-    "\n".join(sorted(identity_counts)).encode("utf-8")
-).hexdigest()
+selected_identity_digest = hashlib.sha256("\n".join(sorted(identity_counts)).encode("utf-8")).hexdigest()
 source_body_duplicate_rows = sum(max(0, count - 1) for count in source_identity_counts.values())
 available_body_duplicate_rows = sum(max(0, len(rows) - 1) for rows in groups.values())
 manifest = {
     "manifest_kind": "body_balanced_dataset",
-    "selection_inputs": selection_inputs,
-    "selection_fingerprint": selection_fingerprint,
+    "selection_inputs": inputs,
+    "selection_fingerprint": selection_fingerprint(inputs),
     "output_sha256": file_sha256(output),
     "source_dataset": str(source),
     "output_dataset": str(output),
@@ -342,8 +333,8 @@ manifest = {
     "selected_identity_sha256": selected_identity_digest,
     "missing_body_hash_source_rows": missing_body_hash_count,
     "selection_policy": (
-        "group by metadata.body_hash when present; otherwise use metadata/content fallback; "
-        "select up to cap_per_body deterministic seeded variants per identity"
+        "group by recomputed normalized Solidity output body; exclude all fixed gate "
+        "body, input, output, source, and contract identities before deterministic selection"
     ),
     "input_chars": {
         "mean": mean(input_chars) if input_chars else 0,
@@ -364,7 +355,6 @@ with manifest_path.open("w", encoding="utf-8") as handle:
 
 print(json.dumps(manifest, indent=2, sort_keys=True))
 PY
-}
 
 if [[ "${GRADIENT_CHECKPOINTING}" == "false" || "${GRADIENT_CHECKPOINTING}" == "0" ]]; then
     GRADIENT_CHECKPOINTING_ARG="--no-gradient-checkpointing"
@@ -487,12 +477,13 @@ test -s "${GATE_DIR}/gate_suite.json"
 
 # Retain the historical training-set diagnostic outputs, but never use these
 # intentionally overlapping rows as held-out acceptance evidence.
+TRAIN_DATASET="$(python -m scripts.gate_dataset verify-model "${FINAL_MODEL}" "${DEFAULT_EVAL_EXCLUDE_DATASETS}")"
 EVAL_MAP="${GATE_DIR}/eval_paths.tsv"
 TRAIN_FIRST30_EVAL="${GATE_DIR}/eval_train_first30.json"
 echo "=== Train-first-30 diagnostic only (not an acceptance gate) ==="
 uv run --extra quantization torchrun --nproc_per_node="${NUM_GPUS}" train.py --eval-only \
     --model-path "${FINAL_MODEL}" \
-    --test-dataset "${DATA_DIR}/splits/train_dataset.jsonl" \
+    --test-dataset "${TRAIN_DATASET}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     --eval-max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
     --eval-repetition-penalty "${EVAL_REPETITION_PENALTY}" \
@@ -500,8 +491,10 @@ uv run --extra quantization torchrun --nproc_per_node="${NUM_GPUS}" train.py --e
     --eval-output-json "${TRAIN_FIRST30_EVAL}" \
     --eval-limit 30 --eval-first-n
 test -s "${TRAIN_FIRST30_EVAL}"
+python -m scripts.gate_dataset verify-eval "${TRAIN_FIRST30_EVAL}" "${FINAL_MODEL}" "${TRAIN_DATASET}" \
+    --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
 printf '%s\t%s\t%s\t%s\n' "train_first30" "${FINAL_MODEL}" \
-    "${DATA_DIR}/splits/train_dataset.jsonl" "${TRAIN_FIRST30_EVAL}" | tee -a "${EVAL_MAP}"
+    "${TRAIN_DATASET}" "${TRAIN_FIRST30_EVAL}" | tee -a "${EVAL_MAP}"
 
 echo ""
 echo "Gate eval map: ${EVAL_MAP}"

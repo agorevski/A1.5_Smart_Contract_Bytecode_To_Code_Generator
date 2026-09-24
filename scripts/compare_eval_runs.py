@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -21,10 +23,12 @@ from scripts.analyze_eval_failures import (  # noqa: E402
     missing_fact_categories,
 )
 from src.evaluation_identity import EVALUATOR_VERSION, BYTECODE_SCORE_KIND, content_sha256
+from src.replication_metrics import BEHAVIOR_FACT_CATEGORIES
 
 
 SUMMARY_GATE_METRICS = (
     "replication_f1_micro",
+    "replication_behavior_only_f1_micro",
     "bytecode_semantic_score_mean",
     "semantic_similarity_mean",
     "solidity_valid_mean",
@@ -35,6 +39,25 @@ PAIRED_METRICS = (
     "semantic_similarity",
     "solidity_valid",
 )
+COMPARABLE_SETTINGS = (
+    "eval_batch_size",
+    "eval_max_new_tokens",
+    "eval_repetition_penalty",
+    "include_selector_signature_metadata",
+    "selector_signature_prompt_policy",
+    "eval_sampling_strategy",
+    "eval_sample_indices",
+)
+IDENTITY_METADATA = (
+    "body_hash",
+    "contract_address",
+    "source_hash",
+    "selector",
+    "function_signature",
+    "compiler_version",
+    "optimizer_enabled",
+)
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def load_eval(path: str | Path) -> dict[str, Any]:
@@ -66,18 +89,128 @@ def _detail_metric(detail: Mapping[str, Any], metric: str) -> float | None:
     return _numeric(value)
 
 
-def _details_by_index(details: Sequence[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
+def _details_by_index(
+    details: Sequence[Mapping[str, Any]], label: str
+) -> tuple[dict[int, Mapping[str, Any]], list[str]]:
     indexed: dict[int, Mapping[str, Any]] = {}
-    for detail in details:
+    errors: list[str] = []
+    for position, detail in enumerate(details):
         if not isinstance(detail, Mapping):
-            raise ValueError("Malformed evaluation detail")
+            errors.append(f"{label} detail {position}: malformed evaluation detail")
+            continue
         dataset_index = detail.get("dataset_index")
         if type(dataset_index) is not int or dataset_index < 0:
-            raise ValueError("Missing or invalid dataset_index")
+            errors.append(f"{label} detail {position}: missing or invalid dataset_index")
+            continue
         if dataset_index in indexed:
-            raise ValueError(f"Duplicate dataset_index: {dataset_index}")
+            errors.append(f"{label}: duplicate dataset_index {dataset_index}")
+            continue
         indexed[dataset_index] = detail
-    return indexed
+    return indexed, errors
+
+
+def _identity_hash(detail: Mapping[str, Any], field: str) -> str:
+    declared = detail.get(f"{field}_hash")
+    text = detail.get("original" if field == "output" else "input")
+    if declared is None:
+        if not isinstance(text, str):
+            raise ValueError(f"missing {field}_hash and full {field} text")
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if not isinstance(declared, str) or not _HASH_RE.fullmatch(declared):
+        raise ValueError(f"invalid {field}_hash")
+    if (
+        isinstance(text, str)
+        and hashlib.sha256(text.encode("utf-8")).hexdigest() != declared.lower()
+    ):
+        raise ValueError(f"{field}_hash does not match full {field} text")
+    return declared.lower()
+
+
+def _detail_identity(detail: Mapping[str, Any]) -> tuple[Any, ...]:
+    metadata = detail.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("missing row metadata")
+    return (
+        _identity_hash(detail, "input"),
+        _identity_hash(detail, "output"),
+        tuple((key, json.dumps(metadata.get(key), sort_keys=True)) for key in IDENTITY_METADATA),
+    )
+
+
+def _comparability_errors(
+    baseline_summary: Mapping[str, Any],
+    candidate_summary: Mapping[str, Any],
+    baseline_details: Sequence[Mapping[str, Any]],
+    candidate_details: Sequence[Mapping[str, Any]],
+    baseline_by_index: Mapping[int, Mapping[str, Any]],
+    candidate_by_index: Mapping[int, Mapping[str, Any]],
+    gate_metrics: Sequence[str],
+    paired_metrics: Sequence[str],
+) -> tuple[list[str], list[int]]:
+    errors: list[str] = []
+    for label, summary, details in (
+        ("baseline", baseline_summary, baseline_details),
+        ("candidate", candidate_summary, candidate_details),
+    ):
+        if type(summary.get("num_evaluated")) is not int or summary["num_evaluated"] != len(
+            details
+        ):
+            errors.append(f"{label}: num_evaluated does not match details")
+        if type(summary.get("prompt_truncation_count")) is not int or (
+            summary["prompt_truncation_count"] != 0
+        ):
+            errors.append(f"{label}: prompt truncation must be measured and zero")
+        prompt_summary = summary.get("prompt_diagnostics")
+        if not isinstance(prompt_summary, Mapping) or (
+            type(prompt_summary.get("num_details")) is not int
+            or prompt_summary["num_details"] != len(details)
+            or type(prompt_summary.get("truncated_count")) is not int
+            or prompt_summary["truncated_count"] != summary.get("prompt_truncation_count")
+        ):
+            errors.append(f"{label}: incomplete prompt truncation diagnostic coverage")
+        for position, detail in enumerate(details):
+            diagnostics = detail.get("prompt_diagnostics")
+            if not isinstance(diagnostics, Mapping) or type(diagnostics.get("tac_truncated")) is not bool:
+                errors.append(f"{label} detail {position}: missing prompt truncation measurement")
+            elif diagnostics["tac_truncated"] is True:
+                errors.append(f"{label} detail {position}: prompt truncation observed")
+        for metric in gate_metrics:
+            value = summary.get(metric)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                errors.append(f"{label}: missing or non-finite gate metric {metric}")
+    for setting in COMPARABLE_SETTINGS:
+        if setting not in baseline_summary or setting not in candidate_summary:
+            errors.append(f"missing comparable eval setting: {setting}")
+        elif baseline_summary[setting] != candidate_summary[setting]:
+            errors.append(f"eval setting differs: {setting}")
+
+    if set(baseline_by_index) != set(candidate_by_index):
+        errors.append("evaluated dataset_index sets differ")
+    matched = []
+    for index in sorted(set(baseline_by_index) & set(candidate_by_index)):
+        try:
+            if _detail_identity(baseline_by_index[index]) != _detail_identity(
+                candidate_by_index[index]
+            ):
+                errors.append(f"dataset_index {index}: different source row")
+            else:
+                matched.append(index)
+                for label, detail in (
+                    ("baseline", baseline_by_index[index]),
+                    ("candidate", candidate_by_index[index]),
+                ):
+                    for metric in paired_metrics:
+                        if _detail_metric(detail, metric) is None:
+                            errors.append(
+                                f"{label} dataset_index {index}: missing or non-finite {metric}"
+                            )
+        except ValueError as exc:
+            errors.append(f"dataset_index {index}: {exc}")
+    return errors, matched
 
 
 def _validate_pair(baseline, candidate, gate_metrics, paired_metrics):
@@ -104,18 +237,37 @@ def _validate_pair(baseline, candidate, gate_metrics, paired_metrics):
                 or provenance["training_manifest_sha256"] != audit.get("training_manifest_sha256")
                 or audit.get("dataset_content_sha256") != run["dataset_content_sha256"]):
             raise ValueError(f"{label} lacks clean content-bound model lineage overlap proof")
-        rows = _details_by_index(run["details"])
+        rows, row_errors = _details_by_index(run["details"], label)
+        if row_errors:
+            raise ValueError("; ".join(row_errors))
         if not rows:
             raise ValueError("Empty evaluation cohort")
         if type(run["summary"].get("num_evaluated")) is not int or run["summary"]["num_evaluated"] != len(rows):
             raise ValueError(f"{label} num_evaluated disagrees with detail coverage")
+        aggregate = run["summary"].get("aggregate_statistics")
+        evaluator_errors = (
+            aggregate.get("evaluator_error_count") if isinstance(aggregate, Mapping) else None
+        )
+        if (
+            type(run["summary"].get("num_failed")) is not int
+            or run["summary"]["num_failed"] != 0
+            or type(run["summary"].get("num_succeeded")) is not int
+            or run["summary"]["num_succeeded"] != len(rows)
+            or _numeric(run["summary"].get("failure_rate")) != 0.0
+            or type(evaluator_errors) is not int
+            or evaluator_errors != 0
+        ):
+            raise ValueError(f"{label} contains incomplete or failed evaluation rows")
         for metric in gate_metrics:
             value = _numeric(run["summary"].get(metric))
             if value is None or not 0 <= value <= 1:
                 raise ValueError(f"{label} missing/nonfinite/invalid mandatory metric: {metric}")
         identities = []
         totals = [0, 0, 0]
+        behavior_totals = [0, 0, 0]
         for index, row in rows.items():
+            if row.get("success") is not True or row.get("error"):
+                raise ValueError(f"{label} dataset_index {index}: evaluation failed")
             for key in ("row_content_sha256", "body_content_sha256", "independent_unit"):
                 if not isinstance(row.get(key), str) or not row[key]:
                     raise ValueError(f"Missing content-bound row identity: {key}")
@@ -124,23 +276,53 @@ def _validate_pair(baseline, candidate, gate_metrics, paired_metrics):
                 value = _detail_metric(row, metric)
                 if value is None or not 0 <= value <= 1:
                     raise ValueError(f"{label} incomplete mandatory detail metric: {metric}")
-            if (row.get("metrics", {}).get("metadata") or {}).get("error"):
+            error_metadata = row.get("metrics", {}).get("metadata") or {}
+            if error_metadata.get("error") or error_metadata.get("error_kind"):
                 raise ValueError(f"{label} contains evaluator errors")
             replication = (row.get("metrics", {}).get("metadata") or {}).get("replication") or {}
             counts = replication.get("overall") or {}
+            row_counts = []
             for position, key in enumerate(("true_positives", "false_positives", "false_negatives")):
                 count = counts.get(key)
                 if type(count) is not int or count < 0:
                     raise ValueError(f"{label} missing/invalid replication count coverage")
                 totals[position] += count
+                row_counts.append(count)
+            if not math.isclose(
+                _f1_from_counts(*row_counts), row["metrics"]["replication_f1"], abs_tol=1e-7
+            ):
+                raise ValueError(f"{label} dataset_index {index}: replication F1 disagrees with counts")
+            by_category = replication.get("by_category")
+            if not isinstance(by_category, Mapping) or not by_category:
+                raise ValueError(f"{label} missing behavior category count coverage")
+            category_totals = [0, 0, 0]
+            for category, values in by_category.items():
+                if not isinstance(values, Mapping):
+                    raise ValueError(f"{label} invalid replication category {category}")
+                for position, key in enumerate(("true_positives", "false_positives", "false_negatives")):
+                    value = values.get(key)
+                    if type(value) is not int or value < 0:
+                        raise ValueError(f"{label} invalid replication category counts: {category}")
+                    category_totals[position] += value
+                    if category in BEHAVIOR_FACT_CATEGORIES:
+                        behavior_totals[position] += value
+            if category_totals != row_counts:
+                raise ValueError(f"{label} replication category counts disagree with overall")
         if content_sha256(sorted(identities)) != run["cohort_content_sha256"]:
             raise ValueError("Cohort content digest mismatch")
         if len({row["row_content_sha256"] for row in rows.values()}) != len(rows):
             raise ValueError("Duplicate content identities")
-        tp, fp, fn = totals
-        actual_micro = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0
-        if not math.isclose(actual_micro, run["summary"]["replication_f1_micro"], abs_tol=1e-7):
+        if not math.isclose(
+            _f1_from_counts(*totals), run["summary"]["replication_f1_micro"], abs_tol=1e-7
+        ):
             raise ValueError(f"{label} replication micro disagrees with fact counts")
+        if not any(behavior_totals) or not math.isclose(
+            _f1_from_counts(*behavior_totals),
+            run["summary"]["replication_behavior_only_f1_micro"], abs_tol=1e-7,
+        ):
+            raise ValueError(
+                f"{label} replication_behavior_only_f1_micro disagrees with behavior fact counts"
+            )
         for metric in paired_metrics:
             summary_key = metric + "_mean"
             if summary_key in gate_metrics:
@@ -155,6 +337,17 @@ def _validate_pair(baseline, candidate, gate_metrics, paired_metrics):
         if any(left[index][key] != right[index][key] for key in
                ("row_content_sha256", "body_content_sha256", "independent_unit")):
             raise ValueError("Paired row content/independent units differ")
+    errors, _ = _comparability_errors(
+        baseline["summary"], candidate["summary"],
+        baseline["details"], candidate["details"],
+        left, right, gate_metrics, paired_metrics,
+    )
+    if errors:
+        raise ValueError("; ".join(errors[:3]))
+
+
+def _f1_from_counts(tp: int, fp: int, fn: int) -> float:
+    return 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0
 
 
 def _paired_units(rows):
@@ -245,12 +438,21 @@ def compare_eval_runs(
         elif delta > tolerance:
             improvements.append(metric)
 
-    try:
-        baseline_by_index = _details_by_index(baseline_details)
-        candidate_by_index = _details_by_index(candidate_details)
-    except ValueError:
-        baseline_by_index = candidate_by_index = {}
-    paired_indices = sorted(set(baseline_by_index) & set(candidate_by_index))
+    baseline_by_index, baseline_errors = _details_by_index(baseline_details, "baseline")
+    candidate_by_index, candidate_errors = _details_by_index(candidate_details, "candidate")
+    comparable_errors, paired_indices = _comparability_errors(
+        baseline_summary,
+        candidate_summary,
+        baseline_details,
+        candidate_details,
+        baseline_by_index,
+        candidate_by_index,
+        gate_metrics,
+        paired_metrics,
+    )
+    comparable_errors = baseline_errors + candidate_errors + comparable_errors
+    if validation_error:
+        comparable_errors.append(validation_error)
     units_by_index = _paired_units(candidate_by_index)
     paired_results = {}
     row_deltas = []
@@ -309,9 +511,9 @@ def compare_eval_runs(
     row_deltas.sort(key=lambda item: (item["delta"], item["dataset_index"]))
     candidate_rows = len(candidate_details)
     baseline_rows = len(baseline_details)
-    if validation_error:
+    if comparable_errors:
         decision = "inconclusive"
-        reason = validation_error
+        reason = "incomparable evaluations: " + "; ".join(comparable_errors[:3])
     elif regressions:
         decision = "reject"
         reason = "gate metric regression: " + ", ".join(regressions)
@@ -337,6 +539,7 @@ def compare_eval_runs(
         "baseline_rows": baseline_rows,
         "candidate_rows": candidate_rows,
         "paired_rows": len(paired_indices),
+        "comparability_errors": comparable_errors,
         "independent_units": len(independent_units),
         "gate_settings": {"min_independent_units": max(30, min_rows), "regression_tolerance": tolerance,
                           "improvement_margin": improvement_margin, "confidence": 0.95},
@@ -417,7 +620,15 @@ def format_markdown_report(comparison: Mapping[str, Any]) -> str:
         ("Hallucination bucket deltas", "hallucination_bucket_deltas"),
         ("Missing fact deltas", "missing_fact_deltas"),
     ):
-        lines.extend(["", f"## {title}", "", "| bucket | baseline | candidate | delta |", "| --- | ---: | ---: | ---: |"])
+        lines.extend(
+            [
+                "",
+                f"## {title}",
+                "",
+                "| bucket | baseline | candidate | delta |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
         rows = sorted(
             comparison[key].items(),
             key=lambda item: (-abs(item[1]["delta"]), item[0]),

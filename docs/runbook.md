@@ -203,6 +203,13 @@ real pairs fail fast unless `--allow-demo-fallback` is set.
 
 The preferred generator is `download_hf_contracts.py`. It reads verified Solidity contracts from Hugging Face `andstor/smart_contracts`, compiles each with one source-aligned `solc`/optimizer configuration, emits TAC with `BytecodeAnalyzer`, deduplicates and filters pairs, validates normalized-body duplicate caps, and exports JSONL plus lineage manifests. For production prompt design, treat compiler version and optimizer fields/comments in generated data as oracle-only and exclude or sanitize them before training.
 
+Training export now uses the analyzer's caller-context per-function TAC, the
+same path used at inference, rather than walking global CFG successor unions.
+On one bounded 2,000-source audit with the actual Qwen tokenizer and an
+8,192-token cap, this increased usable unique-body rows from 409 to 758 and
+reduced overlength rejects from 618 to 276. The remaining long-input tail is
+not solved; these counts are data coverage, **not** a model-quality improvement.
+
 ```bash
 # Quick data-generation test
 uv run python download_hf_contracts.py --limit 20
@@ -218,6 +225,10 @@ uv run python download_hf_contracts.py \
 
 # Full Hugging Face-backed generation
 uv run python download_hf_contracts.py
+
+# Enforce the training token budget during export (tokenizer must be cached locally)
+uv run python download_hf_contracts.py --export-only \
+  --length-tokenizer Qwen/Qwen2.5-Coder-7B-Instruct
 
 # Keep all phase manifests together
 uv run python download_hf_contracts.py --limit 1000 --manifest-dir data/manifests
@@ -253,6 +264,7 @@ Useful flags:
 | `--export-only` | — | Export existing pairs to JSONL |
 | `--output PATH` | `data/hf_training_dataset.jsonl` | Export JSONL target |
 | `--max-seq-length N` | 8192 | Export-time prompt/target length budget |
+| `--length-tokenizer PATH` | none | Use a locally cached training tokenizer for exact prompt/target/EOS length filtering; without it the export reports estimated counts and train-time preflight must still check lengths |
 | `--no-filter-overlength` | off | Keep rows over `--max-seq-length` instead of quarantining them |
 | `--rejects-output PATH` | `<output>.rejects.jsonl` | JSONL quarantine for overlength, duplicate, quality, or auxiliary-contract rejects |
 | `--export-selectors PATH` | — | Export selector registry JSON |
@@ -370,7 +382,7 @@ rows, and 1,890 test rows. The inspected worktree also has a nonstandard
 previous artifact at `models/final_model_378/`; pass that path explicitly for
 evaluation/inference until a fresh default `models/final_model/` exists. The
 splitter preserves leakage-connected groups (source hash, contract address,
-contract+selector/signature, exact input hash, exact output hash), validates no
+contract+selector/signature, normalized output body, exact input/output hashes), validates no
 overlap across train/val/test, and reports holdout coverage by compiler version,
 optimizer, visibility, source, length bucket, and function family. Production
 inference only has Etherscan **Contract > Bytecode**, so training prompts
@@ -380,6 +392,33 @@ always ignore true compiler/optimizer metadata and sanitize legacy TAC inputs:
 uv run python train.py \
   --skip-collection \
   --dataset data/hf_training_dataset.jsonl
+```
+
+Direct `train.py` splitting does not reserve the six fixed evaluation gates.
+Use `./run_train_qwen_qlora_500.sh` for an eval-clean sample or
+`./run_train_qwen_qlora_full_body_balanced.sh` for an eval-clean full-data
+experiment. Both exclude the broad30, calls23, state17, holdout64,
+pure-negative64, and large192 gates before selection, then group split rows by
+recomputed output body. Gate exclusions check both full-output and evaluator
+body-only identities, so changing a function name cannot reintroduce the same
+heldout body. Stale sample/body-balanced caches fail closed; change `RUN_ID`
+or set `RECREATE_DATASET=1` to rebuild. With its default `RUN_GATES=1`,
+the full runner checks that **all six** baseline JSONs cover their exact gate
+rows and match bundled-only selector prompts, decoding, measured zero prompt
+truncation, and behavior-only metrics **before** spending GPU time. Regenerate
+historical baselines first; `RUN_GATES=0` allows a diagnostic training run
+without baseline acceptance but is not evidence of improvement.
+
+After training, the full runner calls `run_eval_gate_suite_for_model.sh` with a
+new gate output directory. The shared gate runner checks train/val/test split
+integrity and exclusion, all ancestor training/selection provenance, and
+baseline-cohort compatibility before loading the model. Each evaluation writes
+to its own explicit JSON path; the first 30 training rows are evaluated only
+as a memorization diagnostic, never as a heldout gate. Standalone usage:
+
+```bash
+MODEL_PATH=models/my_run/final_model GATE_DIR=models/my_run/gates_new \
+  ./run_eval_gate_suite_for_model.sh
 ```
 
 `--no-compiler-metadata` is retained as a deprecated no-op for old scripts.
@@ -432,6 +471,12 @@ databases:
 - Event/log and revert counts.
 - Bytecode length, instruction count, and function count.
 
+The model prompt currently uses signature guesses only from the bundled
+selector map. A local `contracts.db` compiled from the evaluation source is
+not an independent inference-time resource: using its signatures in test
+prompts leaks reference labels. Re-evaluate historical selector-assisted
+results after changing this policy; the old scores are not comparable.
+
 For inference, omit compiler flags and inspect the bytecode-derived TAC/analysis:
 
 ```bash
@@ -448,6 +493,12 @@ bytecode/TAC-derived count line; TAC/CFG remains the core model input and TAC
 sanitization still runs. Legacy inference flags such as `--compiler-version`,
 `--optimizer-enabled`, `--optimizer-runs`, and `--evm-version` are deprecated
 no-ops and are ignored.
+
+Inference reports `analysis_failed` when no function boundary is recoverable,
+instead of sending whole-contract TAC to a function-level model. When a malformed
+dispatcher target is rejected but another function or fallback remains, the
+output is explicitly `partial_analysis` with the missing selector in
+`analysis.rejected_dispatcher_targets` and an unresolved-chunk warning.
 
 ### Oracle-only compiler metadata study
 
@@ -620,19 +671,66 @@ Key metrics:
 | `edit_distance_mean` | lower is better |
 | `replication_precision_micro` | higher is better; measures recovered facts that are correct |
 | `replication_recall_micro` | higher is better; measures ground-truth facts recovered |
-| `replication_f1_micro` | higher is better; balanced structured replication score |
-| `solidity_valid_mean` | syntax/fragment validity; missing contract context may still prevent compilation |
-| `solidity_ast_valid_mean` | compiler-backed validity, reported separately from fragment syntax |
-| `bytecode_semantic_score_mean` | structural/opcode proxy only, not proof of equivalent execution |
-| `bytecode_semantic_checked_mean` | coverage of available static/runtime/compiler evidence, not correctness |
-| `bytecode_deployable_mean` | compilable/deployable coverage; fragments without contract context may be ineligible |
+| `replication_f1_micro` | higher is better; structured fact score, including ABI facts that can dominate the aggregate |
+| `replication_behavior_only_f1_micro` | source-extracted calls, control flow, events, guards, returns, and state writes only; not execution equivalence |
+| `solidity_valid_mean` | higher is better; syntax/scaffold validity for function fragments, including context-limited compiler failures, not full contract compilability |
+| `solidity_ast_valid_mean` | generated fragment passed compiler AST validation with available context |
+| `bytecode_semantic_score_mean` | structural/opcode proxy only; not proof of equivalent execution |
+| `bytecode_semantic_checked_mean` | coverage of the evaluator's available evidence; do not read it as runtime-equivalence coverage |
+| `bytecode_runtime_checked_mean` | proportion with an actual runtime-bytecode comparison; zero means no measured runtime equivalence |
+| `bytecode_deployable_mean` | generated Solidity compiled in the harness when contract context is available; not proof of chain deployment or runtime equivalence |
 
 The replication metrics compare structured Solidity facts extracted from the
 ground-truth function and generated function: ABI/function facts, visibility,
 mutability, modifiers, guards, events, calls, state writes, returns, and control
 flow. The evaluation JSON also includes `replication_by_category_micro` so you
 can see whether failures are concentrated in ABI recovery, state writes, guards,
-calls, or other categories.
+calls, or other categories. The aggregate may look reassuring while behavior
+categories fail: in `latest_results.txt`, all-fact F1 was 0.6281 while the
+behavior-only subset was 0.2245 (ABI F1 was 0.9588, call F1 0.2531, guard
+F1 0.1454, and state-write F1 0.1912). The reported bytecode
+semantic score is a proxy built from available evidence, not proof that the
+generated source executes equivalently to the original bytecode; check runtime
+coverage separately before making an equivalence claim. Paired gate comparisons
+now require a non-regressing behavior-only F1 and a matching
+`selector_signature_prompt_policy`; historical reports lacking that policy must
+be regenerated instead of compared as though their prompts were identical.
+Baselines and candidates must also measure zero prompt truncation for a keep
+decision.
+
+Exact runtime-bytecode comparison is opt-in: provide a complete named contract
+as both reference and generated source, a real reference runtime bytecode, and
+`metadata.runtime_comparison` with matching `contract_name`, `compiler_version`,
+`optimizer_enabled`, and `optimizer_runs` (optionally `source_name`). The
+evaluator recompiles the reference locally with those settings first; mismatched
+reference bytecode, missing local solc, fragments, constructors, inherited
+contracts, or unsupported deployment context remain **unchecked**, with skip
+reasons reported separately. Exact runtime equality is stricter than behavioral
+equivalence and does not prove deployment or execution equivalence. Inspect
+checked-row counts and equality *among checked rows* rather than treating
+unchecked rows as matches or mismatches.
+
+Run model-free controls before comparing trained adapters:
+
+```bash
+python -m scripts.benchmark_tac_fidelity
+python -m scripts.benchmark_runtime_controls
+```
+
+The first benchmark compiles 36 distinct selector-bearing functions with local
+solc 0.8.20 (getter, storage write, guard, external call, event, and branch).
+CI installs that pinned compiler before running its benchmark tests; a local
+environment without it skips those tests rather than fetching a compiler
+implicitly.
+It checks ABI selector recovery and source-mapped opcode reachability in each
+function's TAC: the measured coverage improved from 18/36 to 36/36 after the
+parameter-decoder CFG fix. Opcode coverage is **not** semantic correctness.
+The second compiles 30 complete contracts and checks identical, modified,
+fragment, and unsupported-import controls. Its 121 controls yielded 61 checked
+(30 byte-equal, 31 byte-unequal) and 60 correctly unchecked. A comment-only
+change is byte-unequal despite unchanged executable prefix, illustrating why
+exact bytecode equality is not a behavioral-equivalence score. Both benchmarks
+use installed compilers only, write JSON to stdout, and do not use a model.
 
 Embedding similarity, edit distance, and extracted-fact overlap are diagnostics,
 not proof that generated Solidity preserves behavior. In particular, distinguish
@@ -868,7 +966,7 @@ not read `src/settings.yaml`.
 | `WEB_DEFAULT_MAX_NEW_TOKENS` | `1024` | UI/API default generation cap |
 | `WEB_DEFAULT_TEMPERATURE` | `0.1` | UI/API default |
 | `WEB_DEFAULT_DO_SAMPLE` | `false` | UI/API default |
-| `WEB_DEFAULT_REPETITION_PENALTY` | `1.15` | UI/API default |
+| `WEB_DEFAULT_REPETITION_PENALTY` | `1.05` | UI/API default |
 | `WEB_ENABLE_REMOTE_SELECTOR_LOOKUP` / `--remote-selector-lookup` | `false` | Enables 4byte.directory lookups |
 | `WEB_TAC_LOOKUP_ENABLED` | `true` | Enables TAC exact-match lookup unless request lookup config disables it |
 | `WEB_READYZ_PUBLIC` | `false` | Makes `/readyz` public; keep false on shared hosts |

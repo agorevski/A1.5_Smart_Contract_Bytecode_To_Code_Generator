@@ -242,6 +242,17 @@ def test_dataset_truncation_preserves_full_short_target_span():
     assert supervised_labels == ["TARGET_A", "TARGET_B", "TARGET_C"]
 
 
+def test_dataset_rejects_target_that_cannot_fit_with_context_and_eos():
+    dataset = _dataset_for_item(
+        {"input": "tac", "output": "TARGET_A TARGET_B", "metadata": {}},
+        max_length=3,
+    )
+    dataset.tokenizer = NumericTokenizer()
+
+    with pytest.raises(ValueError, match="target.*max_length"):
+        dataset[0]
+
+
 def test_numeric_tokenizer_targets_include_eos_for_stop_learning():
     dataset = SmartContractDataset.__new__(SmartContractDataset)
     dataset.tokenizer = NumericTokenizer()
@@ -709,6 +720,7 @@ def test_training_pipeline_split_invokes_shared_preflight_and_manifest(tmp_path,
         train_test_split=0.6,
         validation_split=0.2,
     )
+    pipeline.config.model_config.include_selector_signature_metadata = False
 
     train_path, val_path, test_path = pipeline._split_dataset(str(dataset_path))
 
@@ -721,6 +733,7 @@ def test_training_pipeline_split_invokes_shared_preflight_and_manifest(tmp_path,
         "test": test_path,
     }
     assert captured["kwargs"]["allow_legacy_metadata_schema"] is False
+    assert captured["kwargs"]["include_selector_signature_metadata"] is False
     assert pipeline.last_preflight_report["status"] == "passed"
 
 
@@ -817,6 +830,38 @@ def test_tokenized_dataset_cache_reuses_examples_and_max_length_invalidates(tmp_
 
     assert changed_length_tokenizer.calls > 0
     assert changed_vocab_tokenizer.calls > 0
+
+
+def test_tokenized_cache_invalidates_legacy_selector_signatures(tmp_path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [{"input": "function function_0x5312ea8e:\n  return", "output": "TARGET", "metadata": {}}],
+    )
+    cache_dir = tmp_path / "token-cache"
+    cache_dir.mkdir()
+    tokenizer = CountingTokenizer()
+    dataset = SmartContractDataset(str(dataset_path), tokenizer, max_length=64)
+    legacy_metadata = dataset._cache_metadata(str(dataset_path))
+    legacy_metadata["cache_version"] = 2
+    cache_path, metadata_path = dataset._cache_paths(str(dataset_path), cache_dir, legacy_metadata)
+    dataset._write_tokenization_cache(
+        cache_path,
+        metadata_path,
+        legacy_metadata,
+        [{"input_ids": ["selector_signature=oracle()", "TARGET"],
+          "attention_mask": [1, 1], "labels": [-100, "TARGET"]}],
+    )
+
+    current = SmartContractDataset(
+        str(dataset_path),
+        tokenizer,
+        max_length=64,
+        tokenization_cache=TokenizationCacheConfig(enabled=True, cache_dir=str(cache_dir)),
+    )
+
+    assert tokenizer.calls > 0
+    assert "selector_signature=oracle()" not in current[0]["input_ids"]
 
 
 def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprint(tmp_path):
@@ -922,6 +967,11 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
 
     class FakeTrainer:
         def __init__(self, **kwargs):
+            captured["prompt_flags"] = {
+                split: getattr(kwargs[f"{split}_dataset"], "include_selector_signature_metadata")
+                if kwargs[f"{split}_dataset"] is not None else None
+                for split in ("train", "eval")
+            }
             captured["eval_ids"] = (
                 [row["metadata"]["id"] for row in kwargs["eval_dataset"].data]
                 if kwargs["eval_dataset"] is not None else []
@@ -982,6 +1032,9 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
 
     assert captured["eval_ids"] == expected_indices
     assert captured["eval_ids"] != [0, 1, 2, 3]
+    assert captured["prompt_flags"] == {
+        "train": selector_enabled, "eval": selector_enabled,
+    }
     assert manifest["status"] == "completed"
     assert manifest["seed"] == 123
     assert manifest["datasets"]["train"]["artifact"]["row_count"] == 6
@@ -992,6 +1045,7 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
     assert saved.include_selector_signature_metadata is selector_enabled
     assert manifest["model_config"]["include_selector_signature_metadata"] is selector_enabled
     assert manifest["tac_schema_version"] == model_setup.TAC_SCHEMA_VERSION
+    assert manifest["selector_signature_prompt_policy"] == "bundled_only_v1"
     assert manifest["provenance"]["complete"] is True
     assert [item["role"] for item in manifest["provenance"]["datasets"]] == ["train", "selection"]
     assert manifest["provenance"]["datasets"][0]["content_sha256"] == model_setup._sha256_file(train_path)
@@ -1050,8 +1104,8 @@ def test_selector_snapshot_invalidates_cache_and_preserves_saved_prompt(tmp_path
     )
     assert len(list((tmp_path / "cache").glob("*.meta.json"))) == 2
     assert original._format_prompt(row["input"], row["output"], {}) == old_prompt
-    assert "oldGuess()" in old_prompt
-    assert "newGuess()" in current._format_prompt(row["input"], row["output"], {})
+    assert "selector_signature=" not in old_prompt
+    assert current._format_prompt(row["input"], row["output"], {}) == old_prompt
 
     monkeypatch.setattr(train, "_load_preflight_tokenizer", lambda *_a, **_k: (CountingTokenizer(), {"name": "stable"}))
     reports = [
@@ -1070,8 +1124,8 @@ def test_selector_snapshot_invalidates_cache_and_preserves_saved_prompt(tmp_path
     inference.config = saved
     inference.tokenizer = NumericTokenizer()
     prompt = inference._build_prompt(row["input"], {}, max_new_tokens=1)
-    assert "oldGuess()" in prompt and "newGuess()" not in prompt
-    assert "selector_signature_evidence=inferred" in prompt
+    assert "oldGuess()" not in prompt and "newGuess()" not in prompt
+    assert "selector_signature=" not in prompt
     assert model_setup.resolve_selector_signature_for_prompt("0xffffffff", saved.selector_context) is None
     tampered = json.loads(json.dumps(saved.to_dict()))
     tampered["selector_context"]["mapping"]["0x12345678"]["signature"] = "oracle()"
@@ -1085,6 +1139,20 @@ def test_trainer_rejects_stale_checkpoint_before_loading_model(tmp_path, monkeyp
     trainer = SmartContractModelTrainer(ModelConfig(), output_dir=str(tmp_path / "model"))
     monkeypatch.setattr(trainer, "setup_model", lambda **_kwargs: pytest.fail("must fail before model load"))
     with pytest.raises(ValueError, match="without --resume"):
+        trainer.train("unused.jsonl", resume_from_checkpoint=str(checkpoint))
+
+
+def test_trainer_rejects_checkpoint_with_unknown_selector_prompt_policy(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "training_input_manifest.json").write_text(json.dumps({
+        "tac_schema_version": model_setup.TAC_SCHEMA_VERSION,
+        "label_schema_version": model_setup.LABEL_SCHEMA_VERSION,
+        "model_config": ModelConfig().to_dict(),
+    }), encoding="utf-8")
+    trainer = SmartContractModelTrainer(ModelConfig(), output_dir=str(tmp_path / "model"))
+    monkeypatch.setattr(trainer, "setup_model", lambda **_kwargs: pytest.fail("must fail before model load"))
+    with pytest.raises(ValueError, match="selector prompt policy differs"):
         trainer.train("unused.jsonl", resume_from_checkpoint=str(checkpoint))
 
 

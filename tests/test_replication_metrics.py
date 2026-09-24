@@ -4,6 +4,7 @@ Tests for structured Solidity replication precision/recall metrics.
 
 from src.replication_metrics import (
     aggregate_replication_scores,
+    behavior_only_replication_micro,
     evaluate_replication,
     extract_solidity_facts,
 )
@@ -60,6 +61,55 @@ class TestSolidityFactExtraction:
             "allowed[msg.sender][param_0]=param_1",
             "freemintaddresses[addresses[i]]=true",
         }
+
+    def test_nested_mapping_parameter_type_changes_reduce_abi_f1(self):
+        reference = (
+            "function f(mapping(address => uint256) storage ledger) internal "
+            "{ ledger[msg.sender] = 1; }"
+        )
+        candidate = (
+            "function f(mapping(address => bool) storage ledger) internal "
+            "{ ledger[msg.sender] = true; }"
+        )
+
+        assert "param_type:0:mapping(address=>uint256)" in extract_solidity_facts(reference)["abi"]
+        assert "param_type:0:mapping(address=>bool)" in extract_solidity_facts(candidate)["abi"]
+        result = evaluate_replication(reference, candidate)
+        assert result.by_category["abi"].f1 < 1.0
+        assert "modifier" not in result.by_category
+
+    def test_nested_function_type_signature_keeps_outer_parameter_and_return(self):
+        code = (
+            "function f(function(uint256) external returns (bool) callback) public "
+            "returns (uint256) { return callback(1) ? 1 : 0; }"
+        )
+        facts = extract_solidity_facts(code)
+
+        assert "param_count:1" in facts["abi"]
+        assert "param_type:0:function(uint256)external returns(bool)" in facts["abi"]
+        assert "return_type:0:uint256" in facts["abi"]
+        assert facts["visibility"] == {"public"}
+
+    def test_integer_and_fixed_bytes_casts_are_not_calls(self):
+        code = (
+            "function f(uint8 value) external pure returns (bytes32) { "
+            "_record(bytes32(uint256(value))); return bytes32(uint8(value)); }"
+        )
+
+        assert extract_solidity_facts(code)["call"] == {
+            "_record", "_record(bytes32(uint256(param_0)))"
+        }
+
+    def test_bodyless_declaration_does_not_borrow_next_function_body(self):
+        code = (
+            "abstract contract C { function first() public virtual; "
+            "function second() public { _unrelatedCall(); } }"
+        )
+
+        facts = extract_solidity_facts(code)
+
+        assert "function_name:first" in facts["abi"]
+        assert "call" not in facts
 
     def test_parameter_renames_do_not_penalize_guard_matching(self):
         reference = """
@@ -161,6 +211,22 @@ class TestReplicationEvaluation:
 
 
 class TestAggregateReplicationScores:
+    def test_behavior_only_micro_excludes_abi_and_requires_behavior_facts(self):
+        categories = {
+            "abi": {"true_positives": 9000, "false_positives": 0, "false_negatives": 0},
+            "modifier": {"true_positives": 100, "false_positives": 0, "false_negatives": 0},
+            "call": {"true_positives": 0, "false_positives": 3, "false_negatives": 2},
+            "state_write": {"true_positives": 1, "false_positives": 0, "false_negatives": 1},
+        }
+
+        assert behavior_only_replication_micro({"abi": categories["abi"]}) is None
+        behavior = behavior_only_replication_micro(categories)
+
+        assert behavior["true_positives"] == 1
+        assert behavior["false_positives"] == 3
+        assert behavior["false_negatives"] == 3
+        assert behavior["f1"] == 0.25
+
     def test_aggregates_mean_and_micro_scores(self):
         first = evaluate_replication(
             "function a() public { count = 1; }",
@@ -194,6 +260,8 @@ class TestAggregateReplicationScores:
         assert summary["micro"]["false_negatives"] == 2
         assert summary["fact_error_totals"] == {"matched": 12, "extra": 0, "missing": 2}
         assert summary["by_category_micro"]["state_write"]["false_negatives"] == 2
+        assert summary["behavior_only_micro"]["f1"] < 1
+        assert summary["behavior_only_micro"]["true_positives"] > 0
         assert summary["category_gap_summary"][0]["category"] == "state_write"
         assert summary["category_gap_summary"][0]["primary_error"] == "recall"
 

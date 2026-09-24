@@ -34,8 +34,15 @@ def evaluate_gate_suite(
         comparison["diagnostic_only"] = bool(pair.get("diagnostic_only", False))
         comparisons.append(comparison)
 
-    decisions = [comparison["decision"] for comparison in comparisons if not comparison["diagnostic_only"]]
+    required = [comparison for comparison in comparisons if not comparison["diagnostic_only"]]
+    decisions = [comparison["decision"] for comparison in required]
     all_decisions = [comparison["decision"] for comparison in comparisons]
+    trustworthy = [
+        comparison for comparison in required
+        if comparison["decision"] == "keep_candidate"
+        and comparison.get("independent_units", 0)
+        >= comparison.get("gate_settings", {}).get("min_independent_units", 30)
+    ]
     mixed_models = any(
         len({((comparison.get(key) or {}).get("model_path"),
               (comparison.get(key) or {}).get("training_manifest_sha256"))
@@ -44,16 +51,23 @@ def evaluate_gate_suite(
     )
     if "reject" in all_decisions:
         suite_decision = "reject"
-        reason = "one or more required comparisons regressed"
+        reason = "one or more comparisons regressed"
     elif not decisions or "inconclusive" in all_decisions or mixed_models:
         suite_decision = "inconclusive"
         reason = "missing required evidence or incompatible/incomplete evaluation/model identities"
     elif "smoke_only" in decisions:
         suite_decision = "smoke_only"
         reason = "one or more required comparisons has too few rows"
-    elif "keep_candidate" in decisions:
+    elif not required or not any(
+        comparison.get("independent_units", 0)
+        >= comparison.get("gate_settings", {}).get("min_independent_units", 30)
+        for comparison in required
+    ):
+        suite_decision = "smoke_only"
+        reason = "no required comparison has enough independent paired units"
+    elif trustworthy:
         suite_decision = "keep_candidate"
-        reason = "all required comparisons passed and at least one improved"
+        reason = "all required comparisons passed and at least one 30+ row comparison improved"
     else:
         suite_decision = "no_change"
         reason = "all required comparisons passed but none improved"
@@ -89,9 +103,7 @@ def format_markdown_report(suite: Mapping[str, Any]) -> str:
                 decision=comparison["decision"],
                 rows=comparison["candidate_rows"],
                 f1=_format_delta(_metric_delta(comparison, "replication_f1_micro")),
-                bytecode=_format_delta(
-                    _metric_delta(comparison, "bytecode_semantic_score_mean")
-                ),
+                bytecode=_format_delta(_metric_delta(comparison, "bytecode_semantic_score_mean")),
                 semantic=_format_delta(_metric_delta(comparison, "semantic_similarity_mean")),
                 valid=_format_delta(_metric_delta(comparison, "solidity_valid_mean")),
                 reason=comparison["decision_reason"],

@@ -1,16 +1,19 @@
 """Focused tests for evaluation quality metrics and reporting helpers."""
 
 import difflib
+import logging
 import subprocess
 import sys
 
 import pytest
 
 from src.training_pipeline import (
+    SolidityValidityResult,
     SmartContractTrainingPipeline,
     compare_evaluation_to_baseline,
     compute_benchmark_suite_metrics,
     compute_metadata_segment_metrics,
+    evaluate_bytecode_semantics,
     extract_opcode_control_flow_slices,
     load_curated_evaluation_benchmarks,
     mean_confidence_interval,
@@ -154,6 +157,323 @@ def test_solidity_validity_rejects_non_context_compiler_errors(monkeypatch):
     assert result.valid is False
     assert result.method == "compiler_ast"
     assert result.scaffold_valid is True
+
+
+def test_bytecode_score_is_unchecked_without_reference_bytecode_or_opcode_evidence():
+    code = "function foo() public { return; }"
+    scaffold = validate_generated_solidity(code, allow_compiler=False)
+    compiled_candidate = SolidityValidityResult(
+        valid=True,
+        method="compiler_ast",
+        scaffold_valid=True,
+        compiler_checked=True,
+        ast_valid=True,
+        bytecode_checked=True,
+        deployable=True,
+        compiled_runtime_bytecode="0x6000",
+    )
+
+    for validity in (scaffold, compiled_candidate):
+        result = evaluate_bytecode_semantics(code, code, {}, solidity_validity=validity)
+        assert result.checked is False
+        assert result.score == 0.0
+        assert result.runtime_bytecode_checked is False
+        assert result.to_dict()["checked_kind"] == "reference_bytecode_or_opcode_evidence"
+        assert result.to_dict()["score_kind"] == "source_fact_overlap_proxy"
+
+
+@pytest.fixture
+def local_reference_contract():
+    solcx = pytest.importorskip("solcx")
+    version = "0.8.20"
+    if version not in {str(installed) for installed in solcx.get_installed_solc_versions()}:
+        pytest.skip("solc 0.8.20 is not installed locally")
+
+    source = (
+        "pragma solidity ^0.8.20;\n"
+        "contract Decoy { function value() public pure returns (uint256) { return 99; } }\n"
+        "contract Counter { function value() public pure returns (uint256) { return 1; } }\n"
+    )
+
+    def compile_runtime(code, *, optimized=False):
+        output = solcx.compile_standard(
+            {
+                "language": "Solidity",
+                "sources": {"contract.sol": {"content": code}},
+                "settings": {
+                    "optimizer": {"enabled": optimized, "runs": 200},
+                    "outputSelection": {"*": {"*": ["evm.deployedBytecode.object"]}},
+                },
+            },
+            solc_version=version,
+        )
+        return output["contracts"]["contract.sol"]["Counter"]["evm"]["deployedBytecode"]["object"]
+
+    runtime = compile_runtime(source)
+    metadata = {
+        "bytecode": "0x" + runtime,
+        "compiler_version": version,
+        "optimizer_enabled": False,
+        "optimizer_runs": 200,
+        "runtime_comparison": {
+            "contract_name": "Counter",
+            "compiler_version": version,
+            "optimizer_enabled": False,
+            "optimizer_runs": 200,
+        },
+    }
+    return source, metadata, compile_runtime
+
+
+def test_runtime_comparison_checks_exact_named_full_contract(local_reference_contract):
+    source, metadata, _ = local_reference_contract
+    equal = evaluate_bytecode_semantics(source, source, metadata)
+
+    assert equal.runtime_bytecode_checked is True
+    assert equal.runtime_bytecode_match is True
+    assert equal.to_dict()["runtime_comparison_kind"] == "exact_full_contract_runtime_bytecode"
+    assert equal.to_dict()["score_kind"] == "source_fact_overlap_proxy"
+    assert equal.to_dict()["runtime_bytecode_skip_reason"] is None
+    assert (
+        evaluate_bytecode_semantics(
+            source, source, {**metadata, "runtime_bytecode": metadata["bytecode"]}
+        ).runtime_bytecode_match
+        is True
+    )
+    assert (
+        evaluate_bytecode_semantics(
+            source,
+            source,
+            {
+                **metadata,
+                "bytecode": "",
+                "evm": {"deployedBytecode": {"object": metadata["bytecode"]}},
+            },
+        ).runtime_bytecode_match
+        is True
+    )
+
+    changed = source.replace("return 1;", "return 2;")
+    wrong = evaluate_bytecode_semantics(
+        source, changed, {**metadata, "candidate_runtime_bytecode": metadata["bytecode"]}
+    )
+    assert wrong.runtime_bytecode_checked is True
+    assert wrong.runtime_bytecode_match is False
+    assert wrong.mismatch_buckets["runtime_bytecode_mismatch"] == ["compiled_runtime_differs"]
+
+
+def test_execution_fixtures_require_verified_full_contract_runtime(
+    local_reference_contract, monkeypatch,
+):
+    import src.training_pipeline as training_pipeline
+
+    source, metadata, _ = local_reference_contract
+    calls = []
+
+    def executed(reference_runtime, candidate_runtime, fixtures):
+        calls.append((reference_runtime, candidate_runtime, fixtures))
+        return {"checked": True, "match": True, "case_count": len(fixtures)}
+
+    monkeypatch.setattr(training_pipeline, "execute_equivalence_subset", executed)
+    with_fixtures = {**metadata, "execution_test_calldata": [""]}
+    checked = evaluate_bytecode_semantics(source, source, with_fixtures)
+    assert checked.runtime_bytecode_checked is True
+    assert checked.executed_equivalence == {
+        "checked": True, "match": True, "case_count": 1,
+    }
+    assert calls == [(metadata["bytecode"][2:], metadata["bytecode"][2:], [""])]
+
+    for unchecked_metadata in (
+        {**with_fixtures, "bytecode": "0x6000"},
+        {**with_fixtures, "runtime_comparison": None},
+        {key: value for key, value in with_fixtures.items() if key != "runtime_comparison"},
+    ):
+        unchecked = evaluate_bytecode_semantics(source, source, unchecked_metadata)
+        assert unchecked.executed_equivalence["checked"] is False
+    assert len(calls) == 1
+
+
+def test_runtime_comparison_rejects_unverified_reference_or_compiler_settings(
+    local_reference_contract,
+):
+    source, metadata, compile_runtime = local_reference_contract
+    for reference, skip_reason in (
+        ({**metadata, "bytecode": "0x6000"}, "reference_runtime_mismatch"),
+        ({**metadata, "runtime_bytecode": "0x6000"}, "reference_runtime_mismatch"),
+        (
+            {**metadata, "bytecode": "0x" + compile_runtime(source, optimized=True)},
+            "reference_runtime_mismatch",
+        ),
+        (
+            {**metadata, "bytecode": "", "creation_bytecode": metadata["bytecode"]},
+            "missing_or_invalid_reference_runtime",
+        ),
+        (
+            {**metadata, "bytecode": "", "evm": {"bytecode": {"object": metadata["bytecode"]}}},
+            "missing_or_invalid_reference_runtime",
+        ),
+        ({**metadata, "optimizer_enabled": True}, "conflicting_compiler_settings"),
+        ({**metadata, "compiler_version": "0.8.19"}, "conflicting_compiler_settings"),
+        ({**metadata, "runtime_comparison": True}, "invalid_compiler_settings"),
+        (
+            {
+                **metadata,
+                "runtime_comparison": {
+                    **metadata["runtime_comparison"],
+                    "compiler_version": "9.9.9",
+                },
+                "compiler_version": "9.9.9",
+            },
+            "reference_solc_version_not_installed",
+        ),
+        (
+            {
+                **metadata,
+                "runtime_comparison": {
+                    **metadata["runtime_comparison"],
+                    "contract_name": "Missing",
+                },
+            },
+            "reference_target_contract_missing",
+        ),
+        (
+            {
+                **metadata,
+                "runtime_comparison": {**metadata["runtime_comparison"], "contract_name": "Decoy"},
+            },
+            "reference_runtime_mismatch",
+        ),
+    ):
+        result = evaluate_bytecode_semantics(source, source, reference)
+        assert result.runtime_bytecode_checked is False
+        assert result.runtime_bytecode_match is None
+        assert result.to_dict()["runtime_bytecode_skip_reason"] == skip_reason
+
+
+def test_runtime_comparison_does_not_treat_compilable_fragments_as_full_contracts(
+    local_reference_contract,
+):
+    _, metadata, _ = local_reference_contract
+    fragment = "function value() public pure returns (uint256) { return 1; }"
+    validity = validate_generated_solidity(fragment, metadata)
+    assert validity.ast_valid is True
+    assert validity.compiled_runtime_bytecode
+
+    result = evaluate_bytecode_semantics(
+        fragment,
+        fragment,
+        {**metadata, "candidate_runtime_bytecode": metadata["bytecode"]},
+        solidity_validity=validity,
+    )
+    assert result.runtime_bytecode_checked is False
+    assert result.runtime_bytecode_match is None
+    assert result.to_dict()["runtime_bytecode_skip_reason"] == "reference_fragment"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "contract Counter { uint256 public x; constructor() { x = 1; } }",
+        "contract Counter { uint256 public x = 1; }",
+        "contract Parent {}\n"
+        "contract Counter is Parent { function value() public pure returns (uint256) { return 1; } }",
+    ],
+)
+def test_runtime_comparison_excludes_deployment_or_inherited_context(
+    source,
+    local_reference_contract,
+):
+    _, metadata, compile_runtime = local_reference_contract
+    metadata = {**metadata, "bytecode": "0x" + compile_runtime(source)}
+    result = evaluate_bytecode_semantics(source, source, metadata)
+    assert result.runtime_bytecode_checked is False
+    assert result.runtime_bytecode_match is None
+    assert result.to_dict()["runtime_bytecode_skip_reason"] in {
+        "reference_abstract_or_inherited_contract",
+        "reference_constructor_or_state_initializer",
+    }
+
+
+def test_runtime_compiler_rejection_exposes_skip_reason_and_log(
+    local_reference_contract,
+    monkeypatch,
+    caplog,
+):
+    import solcx
+    from solcx.exceptions import SolcError
+
+    source, metadata, _ = local_reference_contract
+    validity = validate_generated_solidity(source, allow_compiler=False)
+    compiler = solcx.compile_standard
+
+    def reject_candidate(*args, **kwargs):
+        if "return 2;" in args[0]["sources"]["contract.sol"]["content"]:
+            raise SolcError("Candidate compilation failed")
+        return compiler(*args, **kwargs)
+
+    monkeypatch.setattr(solcx, "compile_standard", reject_candidate)
+    with caplog.at_level(logging.INFO, logger="src.training_pipeline"):
+        result = evaluate_bytecode_semantics(
+            source,
+            source.replace("return 1;", "return 2;"),
+            metadata,
+            solidity_validity=validity,
+        )
+    assert result.runtime_bytecode_checked is False
+    assert result.runtime_bytecode_match is None
+    assert result.to_dict()["runtime_bytecode_skip_reason"] == "candidate_compiler_rejected_source"
+    assert "candidate_compiler_rejected_source" in caplog.text
+
+
+def test_runtime_compiler_io_failure_is_unchecked_and_logged(
+    local_reference_contract,
+    monkeypatch,
+    caplog,
+):
+    import solcx
+
+    source, metadata, _ = local_reference_contract
+    validity = validate_generated_solidity(source, allow_compiler=False)
+
+    def compiler_io_failure(*args, **kwargs):
+        raise OSError("solc binary inaccessible")
+
+    monkeypatch.setattr(solcx, "compile_standard", compiler_io_failure)
+    with caplog.at_level(logging.WARNING, logger="src.training_pipeline"):
+        result = evaluate_bytecode_semantics(source, source, metadata, solidity_validity=validity)
+    assert result.runtime_bytecode_checked is False
+    assert result.to_dict()["runtime_bytecode_skip_reason"] == "reference_compiler_io_error"
+    assert "solc binary inaccessible" in caplog.text
+
+
+def test_runtime_missing_local_solcx_is_unchecked_and_reported(
+    local_reference_contract,
+    monkeypatch,
+    caplog,
+):
+    source, metadata, _ = local_reference_contract
+    validity = validate_generated_solidity(source, allow_compiler=False)
+    monkeypatch.setitem(sys.modules, "solcx", None)
+
+    with caplog.at_level(logging.INFO, logger="src.training_pipeline"):
+        result = evaluate_bytecode_semantics(source, source, metadata, solidity_validity=validity)
+    assert result.runtime_bytecode_checked is False
+    assert result.to_dict()["runtime_bytecode_skip_reason"] == "reference_solcx_unavailable"
+    assert "reference_solcx_unavailable" in caplog.text
+
+
+def test_runtime_unexpected_compiler_error_is_not_silenced(local_reference_contract, monkeypatch):
+    import solcx
+
+    source, metadata, _ = local_reference_contract
+    validity = validate_generated_solidity(source, allow_compiler=False)
+
+    def unexpected_error(*args, **kwargs):
+        raise RuntimeError("unexpected compiler bridge bug")
+
+    monkeypatch.setattr(solcx, "compile_standard", unexpected_error)
+    with pytest.raises(RuntimeError, match="unexpected compiler bridge bug"):
+        evaluate_bytecode_semantics(source, source, metadata, solidity_validity=validity)
 
 
 def test_function_signature_match_compares_name_params_and_returns():
@@ -338,6 +658,56 @@ def test_training_pipeline_aggregate_stats_include_ci_segments_and_baseline():
     assert stats["solidity_valid"]["mean"] == pytest.approx(0.5)
     assert stats["metadata_segments"]["coverage"]["compiler_version"]["known"] == 2
     assert stats["baseline_comparison"]["num_metrics_compared"] >= 2
+
+
+def test_runtime_aggregate_reports_checked_count_and_equality_among_checked_only():
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    results = [
+        {"metrics": {"bytecode_runtime_checked": True, "bytecode_runtime_match": True}},
+        {"metrics": {"bytecode_runtime_checked": True, "bytecode_runtime_match": False}},
+        {
+            "metrics": {
+                "bytecode_runtime_checked": False,
+                "bytecode_runtime_match": False,
+                "metadata": {
+                    "bytecode_semantics": {"runtime_bytecode_skip_reason": "not_opted_in"}
+                },
+            }
+        },
+    ]
+    comparison = pipeline._compute_aggregate_statistics(results)["runtime_bytecode_comparison"]
+    assert comparison == {
+        "checked_n": 2,
+        "equal_n": 1,
+        "total_n": 3,
+        "equality_rate_checked": 0.5,
+        "skip_reasons": {"not_opted_in": 1},
+        "scope": "exact_full_contract_runtime_bytecode_not_deployment_or_behavior",
+    }
+    no_checks = pipeline._compute_aggregate_statistics(results[-1:])["runtime_bytecode_comparison"]
+    assert no_checks["checked_n"] == 0
+    assert no_checks["equality_rate_checked"] is None
+    assert no_checks["skip_reasons"] == {"not_opted_in": 1}
+
+
+def test_execution_aggregate_counts_only_executed_stateless_fixtures():
+    pipeline = SmartContractTrainingPipeline.__new__(SmartContractTrainingPipeline)
+    results = [
+        {"metrics": {"metadata": {"bytecode_semantics": {
+            "executed_equivalence": {"checked": True, "match": True},
+        }}}},
+        {"metrics": {"metadata": {"bytecode_semantics": {
+            "executed_equivalence": {"checked": True, "match": False},
+        }}}},
+        {"metrics": {"metadata": {"bytecode_semantics": {
+            "executed_equivalence": {"checked": False, "reason": "unsupported_opcode"},
+        }}}},
+    ]
+    execution = pipeline._compute_aggregate_statistics(results)["executed_equivalence"]
+    assert execution == {
+        "checked_n": 2, "matched_n": 1, "total_n": 3,
+        "scope": "bounded_stateless_explicit_calldata_fixtures_not_general_equivalence",
+    }
 
 
 def test_curated_evaluation_benchmarks_include_expected_facts_and_failures():
