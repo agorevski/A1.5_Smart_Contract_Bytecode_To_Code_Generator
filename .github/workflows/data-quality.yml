@@ -48,6 +48,11 @@ jobs:
           uv run --frozen --extra training --extra web --extra analysis --extra cpu \
             python -c "import torch; assert torch.version.cuda is None, 'CI must use CPU-only PyTorch'"
 
+      - name: Install pinned compiler for TAC fidelity benchmark
+        run: |
+          uv run --frozen --extra training --extra web --extra analysis --extra cpu \
+            python -c 'import solcx; solcx.install_solc("0.8.20")'
+
       - name: Run CPU-only regression suite
         run: |
           uv run --frozen --extra training --extra web --extra analysis --extra cpu pytest

@@ -719,6 +719,9 @@ python -m scripts.benchmark_runtime_controls
 
 The first benchmark compiles 36 distinct selector-bearing functions with local
 solc 0.8.20 (getter, storage write, guard, external call, event, and branch).
+CI installs that pinned compiler before running its benchmark tests; a local
+environment without it skips those tests rather than fetching a compiler
+implicitly.
 It checks ABI selector recovery and source-mapped opcode reachability in each
 function's TAC: the measured coverage improved from 18/36 to 36/36 after the
 parameter-decoder CFG fix. Opcode coverage is **not** semantic correctness.

@@ -9,6 +9,10 @@ from scripts import benchmark_tac_fidelity as benchmark
 
 @pytest.fixture(scope="module")
 def report():
+    if benchmark.SOLC_VERSION not in {
+        str(version) for version in benchmark.solcx.get_installed_solc_versions()
+    }:
+        pytest.skip(f"locally installed solc {benchmark.SOLC_VERSION} required")
     return benchmark.run_benchmark()
 
 
