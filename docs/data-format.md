@@ -185,6 +185,28 @@ Splits are leakage-connected components, not independent rows: rows sharing any
 leakage key stay in the same split. If fewer than three groups exist, all rows
 are written to train and validation/test are left empty to avoid leakage.
 
+## Fixed evaluation gates
+
+`run_train_qwen_qlora_500.sh` and `run_train_qwen_qlora_full_body_balanced.sh`
+exclude the six fixed gate datasets before selecting training rows. Exclusion
+matches recomputed normalized Solidity bodies (including missing or stale
+`metadata.body_hash`), exact TAC/target text, and source/contract identity.
+`EVAL_EXCLUDE_DATASETS` adds extra gates; it does not replace the fixed gates.
+`scripts/build_curriculum_dataset.py` uses the same exclusion keys when
+constructing heldout-clean curricula. Selected rows receive a recomputed
+`metadata.body_hash` so grouped train/val/test splitting also keeps normalized
+target duplicates together when source metadata was missing or stale.
+Previously selected datasets may be reused only when their source, exclusions,
+parameters, and output match the selection manifest; otherwise set
+`RECREATE_DATASET=1` to rebuild them.
+
+`run_eval_gate_suite_for_model.sh` requires a completed model training-input
+manifest and verified train/val/test split artifacts without fixed-gate overlap.
+`scripts/compare_eval_runs.py` rejects candidate improvements unless baseline
+and candidate evaluate the same indexed rows with the same decode settings and
+complete gate metrics. Sub-30-row slices can veto a regression but cannot by
+themselves promote a candidate.
+
 ## Quality checks and rejects
 
 Export-time rejects are written to `<output>.rejects.jsonl`. Reject rows include

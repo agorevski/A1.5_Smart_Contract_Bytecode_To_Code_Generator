@@ -2027,6 +2027,28 @@ def api_decompile():
             num_blocks = len(analyzer.basic_blocks)
             num_functions = len(analyzer.functions)
             func_names = list(func_tac_map.keys())
+            rejected_targets = dict(getattr(analyzer, "rejected_dispatcher_targets", {}) or {})
+            incomplete_reason = (
+                "Some dispatcher selectors have invalid targets: "
+                + ", ".join(
+                    f"{selector} -> 0x{target:x}"
+                    for selector, target in sorted(rejected_targets.items())
+                )
+                if rejected_targets
+                else None
+            )
+            trace["analysis"] = {
+                "num_instructions": num_instructions,
+                "num_basic_blocks": num_blocks,
+                "num_functions": num_functions,
+                "tac_generation_time_s": round(tac_time, 3),
+                "rejected_dispatcher_targets": rejected_targets,
+            }
+            if not func_names:
+                raise DecompileRequestError(
+                    "No recoverable function boundaries in bytecode; refusing to infer "
+                    "Solidity from whole-contract TAC."
+                )
             if len(func_names) > MAX_DECOMPILE_FUNCTIONS:
                 raise DecompileRequestError(
                     (
@@ -2035,12 +2057,6 @@ def api_decompile():
                     )
                 )
             _check_timeout()
-            trace["analysis"] = {
-                "num_instructions": num_instructions,
-                "num_basic_blocks": num_blocks,
-                "num_functions": num_functions,
-                "tac_generation_time_s": round(tac_time, 3),
-            }
 
             # ---- Resolve function selectors ----
             resolver = get_resolver(use_remote=ENABLE_REMOTE_SELECTOR_LOOKUP)
@@ -2733,22 +2749,33 @@ def api_decompile():
                 function_results,
                 source_summary,
                 reconstruction_plan,
+                rejected_dispatcher_targets=rejected_targets,
             )
             failure_count = len(function_errors)
             validation_failed = not bool(validation.get("valid"))
             success = (
                 failure_count == 0
                 and not validation_failed
+                and incomplete_reason is None
                 and not (decompiler is None and unresolved_fnames)
             )
-            partial_success = (failure_count > 0 or validation_failed) and any(
+            partial_success = (failure_count > 0 or validation_failed or incomplete_reason is not None) and any(
                 source != "error" for source in function_sources.values()
             )
+            if incomplete_reason:
+                decompilation_status = "partial_analysis"
+            elif partial_success:
+                decompilation_status = "partial_error"
+            elif success:
+                decompilation_status = "model_generated"
+            else:
+                decompilation_status = "analysis_failed"
 
             analysis = {
                 "num_instructions": num_instructions,
                 "num_basic_blocks": num_blocks,
                 "num_functions": num_functions,
+                "rejected_dispatcher_targets": rejected_targets,
                 "tac_generation_time_s": round(tac_time, 3),
                 "solidity_generation_time_s": round(gen_time, 3),
                 "lookup_hits": lookup_hits,
@@ -2778,7 +2805,7 @@ def api_decompile():
                 trace["functions"].setdefault(item["name"], {}).update(item)
             trace_path = _finish_trace(
                 "success" if success else "partial" if partial_success else "failed",
-                (
+                incomplete_reason or (
                     None
                     if success or partial_success
                     else (
@@ -2795,6 +2822,8 @@ def api_decompile():
                     "request_id": request_id,
                     "success": success,
                     "partial_success": partial_success,
+                    "decompilation_status": decompilation_status,
+                    "error": incomplete_reason,
                     "tac": combined_tac,
                     "tac_per_function": func_tac_map,
                     "solidity": assembled,

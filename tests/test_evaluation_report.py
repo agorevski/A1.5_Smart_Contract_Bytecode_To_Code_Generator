@@ -50,6 +50,14 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
         "bytecode_deployable_mean": 1.0,
         "bytecode_runtime_checked_mean": 1.0,
         "bytecode_runtime_match_mean": 0.0,
+        "aggregate_statistics": {
+            "runtime_bytecode_comparison": {
+                "checked_n": 1,
+                "equal_n": 0,
+                "total_n": 1,
+                "equality_rate_checked": 0.0,
+            }
+        },
         "confidence_intervals": {
             "semantic_similarity_mean": {
                 "mean": 0.9,
@@ -143,9 +151,13 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
     assert "Examples evaluated: 1" in report
     assert "Semantic similarity mean: 0.9000" in report
     assert "Replication F1 micro: 0.7742" in report
-    assert "Solidity valid outputs: 100.00%" in report
-    assert "Bytecode semantic score mean: 0.8750" in report
-    assert "Runtime bytecode matches: 0.00%" in report
+    assert "Behavior-only source-fact F1 micro: n/a" in report
+    assert "Solidity best-effort valid (may be scaffold/context-limited): 100.00%" in report
+    assert "Source-fact overlap proxy mean: 0.8750" in report
+    assert "Runtime bytecode match rate (checked only): 0.00%" in report
+    assert "Exact full-contract runtime bytecode checked: 1 / 1" in report
+    assert "Exact runtime bytecode equal (checked only): 0 / 1" in report
+    assert "not constructor, deployment, or behavioral equivalence" in report
     assert "abi | 1.0000 | 0.5000 | 0.6667 | 1 | 0 | 1" in report
     assert "unsupported_calls | 2 | 66.67%" in report
     assert "Opcode and Control-Flow Coverage" in report
@@ -155,6 +167,22 @@ def test_format_latest_results_report_includes_quality_and_model_metadata(tmp_pa
     assert "compiler_version=0.8.20 | 1 | 0.9000 | 0.1000 | 0.7742 | 100.00%" in report
     assert "Metrics compared: 2" in report
     assert "edit_distance_mean | 0.1000 | 0.0800 | 0.0200 | 0.2500 | regressed" in report
+
+    summary["aggregate_statistics"]["runtime_bytecode_comparison"] = {
+        "checked_n": 0,
+        "equal_n": 0,
+        "total_n": 1,
+        "equality_rate_checked": None,
+    }
+    summary["bytecode_runtime_checked_mean"] = 0.0
+    no_runtime_report = format_latest_results_report(
+        summary=summary,
+        model_path=str(model_dir),
+        test_dataset_path=str(dataset),
+        results_json_path="results/eval_test.json",
+    )
+    assert "Exact full-contract runtime bytecode checked: 0 / 1" in no_runtime_report
+    assert "Runtime bytecode match rate (checked only): n/a (no comparisons)" in no_runtime_report
 
 
 def test_format_latest_results_report_derives_hallucination_rates_from_details(tmp_path):
@@ -419,7 +447,14 @@ def test_evaluation_diagnostics_accept_nested_replication_metrics_without_missin
                     "precision": 0.82,
                     "recall": 0.81,
                     "f1": 0.815,
-                }
+                },
+                "by_category_micro": {
+                    "guard": {
+                        "true_positives": 1,
+                        "false_positives": 3,
+                        "false_negatives": 2,
+                    }
+                },
             },
             "solidity_valid_mean": 1.0,
             "bytecode_semantic_checked_mean": 1.0,
@@ -427,7 +462,138 @@ def test_evaluation_diagnostics_accept_nested_replication_metrics_without_missin
     )
 
     assert diagnostics["metrics_used"]["replication_f1_micro"] == 0.815
+    assert abs(diagnostics["metrics_used"]["replication_behavior_only_f1_micro"] - 2 / 7) < 1e-8
     assert not any("Replication metrics are missing" in caveat for caveat in diagnostics["caveats"])
+
+
+def test_reference_bytecode_coverage_does_not_claim_behavior_without_runtime_checks(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    dataset = tmp_path / "test_dataset.jsonl"
+    dataset.write_text('{"input": "a", "output": "b"}\n')
+    summary = {
+        "num_evaluated": 1890,
+        "bytecode_semantic_checked_mean": 1.0,
+        "bytecode_semantic_score_mean": 0.5083,
+        "bytecode_runtime_checked_mean": 0.0,
+        "bytecode_runtime_match_mean": 0.0,
+        "solidity_compiler_checked_mean": 1.0,
+        "solidity_ast_valid_mean": 0.0243,
+        "solidity_valid_mean": 0.9619,
+        "bytecode_deployable_mean": 0.0243,
+        "evaluation_diagnostics": {
+            "overall_status": "needs_attention",
+            "issues": [
+                {
+                    "title": "Bytecode-grounded behavior does not match reference behavior often enough."
+                }
+            ],
+            "strengths": [],
+            "caveats": [],
+            "next_experiments": [],
+            "issue_counts_by_severity": {},
+            "metrics_used": {},
+        },
+    }
+
+    diagnostics = build_evaluation_diagnostics(summary)
+    assert any("source-fact overlap proxy" in caveat for caveat in diagnostics["caveats"])
+    assert any(
+        "No generated/reference runtime comparisons" in caveat for caveat in diagnostics["caveats"]
+    )
+    assert any("compiler-only checks" in caveat for caveat in diagnostics["caveats"])
+    assert any(
+        "solidity_valid_mean includes scaffold" in caveat for caveat in diagnostics["caveats"]
+    )
+    assert any(issue["id"] == "bytecode_runtime_coverage_gap" for issue in diagnostics["issues"])
+    assert not any(
+        "Bytecode-grounded behavior" in issue["title"] for issue in diagnostics["issues"]
+    )
+
+    report = format_latest_results_report(
+        summary=summary,
+        model_path=str(model_dir),
+        test_dataset_path=str(dataset),
+        results_json_path="results/missing.json",
+    )
+
+    assert "Source-fact overlap proxy mean: 0.5083" in report
+    assert "Legacy bytecode semantic checked flag: 100.00%" in report
+    assert "Reference bytecode/opcode coverage: 100.00%" not in report
+    assert "Runtime bytecode match rate (checked only): n/a (no comparisons)" in report
+    assert "No generated/reference runtime comparisons" in report
+    assert (
+        "Bytecode-grounded behavior does not match reference behavior often enough." not in report
+    )
+
+
+def test_runtime_match_diagnostics_use_only_checked_rows(tmp_path):
+    summary = {
+        "num_evaluated": 40,
+        "bytecode_semantic_checked_mean": 1.0,
+        "bytecode_semantic_score_mean": 0.9,
+        "bytecode_runtime_checked_mean": 0.1,
+        "bytecode_runtime_match_mean": 0.1,
+    }
+
+    diagnostics = build_evaluation_diagnostics(summary)
+    assert not any(issue["id"] == "runtime_bytecode_mismatch" for issue in diagnostics["issues"])
+    report = format_latest_results_report(
+        summary=summary,
+        model_path=str(tmp_path),
+        test_dataset_path=str(tmp_path / "missing.jsonl"),
+        results_json_path="results/missing.json",
+    )
+    assert "Runtime bytecode match rate (checked only): 100.00%" in report
+
+
+def test_behavior_only_f1_from_historical_category_counts_is_separate_from_aggregate(tmp_path):
+    counts = {
+        "abi": (9034, 397, 379),
+        "call": (683, 1619, 2413),
+        "control_flow": (89, 205, 225),
+        "event": (83, 161, 210),
+        "guard": (204, 1349, 1050),
+        "member_call": (238, 574, 898),
+        "modifier": (310, 425, 601),
+        "mutability": (815, 54, 50),
+        "return": (238, 818, 775),
+        "state_write": (197, 750, 917),
+        "visibility": (1120, 770, 770),
+    }
+    categories = {
+        category: {
+            "true_positives": tp,
+            "false_positives": fp,
+            "false_negatives": fn,
+        }
+        for category, (tp, fp, fn) in counts.items()
+    }
+    summary = {
+        "num_evaluated": 1890,
+        "replication_f1_micro": 0.6281,
+        "replication_by_category_micro": categories,
+    }
+
+    diagnostics = build_evaluation_diagnostics(summary)
+    assert (
+        abs(diagnostics["metrics_used"]["replication_behavior_only_f1_micro"] - 0.2245268343) < 1e-8
+    )
+    report = format_latest_results_report(
+        summary=summary,
+        model_path=str(tmp_path),
+        test_dataset_path=str(tmp_path / "missing.jsonl"),
+        results_json_path="results/missing.json",
+    )
+
+    assert "Replication F1 micro: 0.6281" in report
+    assert "Behavior-only source-fact F1 micro: 0.2245" in report
+    assert (
+        "Behavior facts: call, control_flow, event, guard, member_call, return, state_write"
+        in report
+    )
+    assert "excludes ABI, modifier, mutability, visibility; not bytecode equivalence" in report
+    assert summary["replication_f1_micro"] == 0.6281
 
 
 def test_write_latest_results_report_creates_file(tmp_path):

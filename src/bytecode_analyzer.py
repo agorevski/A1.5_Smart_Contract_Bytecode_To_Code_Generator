@@ -16,6 +16,7 @@ Pipeline:
 """
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -234,6 +235,7 @@ class BytecodeAnalyzer:
         self.instructions: List = []
         self.basic_blocks: Dict[str, BasicBlock] = {}
         self.functions: Dict[str, Function] = {}
+        self.rejected_dispatcher_targets: Dict[str, int] = {}
         self.variable_counter: int = 0
         self.logger = logging.getLogger(__name__)
         self.abi_enricher = abi_enricher  # Optional ABIEnricher for custom error decoding
@@ -538,6 +540,75 @@ class BytecodeAnalyzer:
         pc_to_block: Dict[int, str] = {b.start_address: b.id for b in blocks.values()}
         for block in blocks.values():
             self._analyze_single_block_relationships(block, blocks, pc_to_block)
+        if blocks:
+            self._trace_stack_paths(blocks, self._entry_blocks(blocks)[0], add_edges=True)
+
+    def _trace_stack_paths(
+        self, blocks: Dict[str, BasicBlock], entry: str, *, add_edges: bool = False
+    ) -> set:
+        """Track the top 64 stack slots through bounded paths, without guessing jumps."""
+        if entry not in blocks:
+            return set()
+        destinations = {
+            block.start_address: block.id
+            for block in blocks.values()
+            if block.metadata.get("raw_instructions")
+            and self._get_instruction_name(block.metadata["raw_instructions"][0]) == "JUMPDEST"
+        }
+        starts = {block.start_address: block.id for block in blocks.values()}
+        initial_stack = () if add_edges else (None,) * 16
+        worklist = deque([(entry, initial_stack)])
+        seen: set = set()
+        reachable: set = set()
+        max_states = min(4096, max(128, len(blocks) * 32))
+
+        while worklist and len(seen) < max_states:
+            bid, stack_state = worklist.popleft()
+            state = (bid, stack_state)
+            if state in seen:
+                continue
+            seen.add(state)
+            reachable.add(bid)
+            raw = blocks[bid].metadata.get("raw_instructions", [])
+            if not raw or len(raw) > 4096:
+                continue
+
+            simulator = self._StackSimulator()
+            simulator.stack = list(stack_state)
+            for i, instr in enumerate(raw[:-1]):
+                simulator.process_instruction(instr, i)
+
+            last = raw[-1]
+            name = self._get_instruction_name(last)
+            last_pc = self._get_pc(last, blocks[bid].end_address)
+            successors: List[str] = []
+            if name in ("JUMP", "JUMPI"):
+                target = simulator.get_stack_top_value()
+                condition = simulator.stack[-2] if len(simulator.stack) >= 2 else None
+                if name == "JUMP" or condition is None or condition != 0:
+                    if target in destinations:
+                        successors.append(destinations[target])
+                if name == "JUMPI" and (condition is None or condition == 0):
+                    ft = self._get_next_instruction_pc(last_pc)
+                    if ft in starts:
+                        successors.append(starts[ft])
+            elif name not in ("RETURN", "REVERT", "STOP", "SELFDESTRUCT", "INVALID"):
+                ft = self._get_next_instruction_pc(last_pc)
+                if ft in starts:
+                    successors.append(starts[ft])
+
+            simulator.process_instruction(last, len(raw) - 1)
+            next_stack = tuple(simulator.stack[-64:])
+            for successor in successors:
+                if add_edges:
+                    self._add_edge(bid, successor, blocks)
+                next_state = (successor, next_stack)
+                if next_state not in seen:
+                    worklist.append(next_state)
+
+        if worklist:
+            logger.debug("Stopped stack-aware CFG traversal after %d contexts", max_states)
+        return reachable
 
     def _analyze_single_block_relationships(
         self,
@@ -572,16 +643,20 @@ class BytecodeAnalyzer:
                 self._add_edge(block.id, pc_to_block[ft], all_blocks)
 
     def _get_jump_targets_from_block(self, instructions: List) -> set:
-        """Return the nearest PUSH operand preceding the terminating jump."""
-        targets: set = set()
-        for i in range(len(instructions) - 2, -1, -1):
-            instr = instructions[i]
-            if self._get_instruction_name(instr).startswith("PUSH"):
-                val = self._parse_operand_as_int(self._get_operand(instr))
-                if val is not None:
-                    targets.add(val)
-                break
-        return targets
+        """Resolve a local jump only when its actual stack operand is a JUMPDEST."""
+        if not instructions or len(instructions) > 4096:
+            return set()
+
+        simulator = self._StackSimulator()
+        simulator.stack = [None] * 16
+        for i, instr in enumerate(instructions[:-1]):
+            simulator.process_instruction(instr, i)
+
+        target = simulator.get_stack_top_value()
+        idx = self._pc_to_index.get(target)
+        if idx is not None and self._get_instruction_name(self.instructions[idx]) == "JUMPDEST":
+            return {target}
+        return set()
 
     def _get_next_instruction_pc(self, current_pc: int) -> Optional[int]:
         """Return the PC of the instruction after *current_pc* (O(1) lookup)."""
@@ -726,14 +801,20 @@ class BytecodeAnalyzer:
     def identify_functions(self) -> Dict[str, Function]:
         """Identify functions by scanning the dispatcher for ``PUSH4 … EQ … JUMPI`` patterns."""
         functions: Dict[str, Function] = {}
+        self.rejected_dispatcher_targets = {}
         logger.info("Identifying functions from bytecode dispatcher")
 
-        for pattern in self._find_dispatcher_patterns():
+        dispatcher_patterns = self._find_dispatcher_patterns()
+        for pattern in dispatcher_patterns:
             selector = pattern["selector"]
             jump_target = pattern["target"]
+            entry = self._jumpdest_block_at_address(jump_target)
+            if entry is None:
+                self.rejected_dispatcher_targets[selector] = jump_target
+                logger.warning("Skipping selector %s with invalid destination %04x", selector, jump_target)
+                continue
 
             fname = f"function_{selector}"
-            entry = self._block_at_address(jump_target) or f"block_{jump_target:04x}"
             functions[fname] = Function(
                 name=fname, selector=selector, basic_blocks=[], entry_block=entry,
             )
@@ -759,7 +840,7 @@ class BytecodeAnalyzer:
         if internal:
             self.logger.info("Detected %d internal function(s)", len(internal))
 
-        if not functions and self.basic_blocks:
+        if not functions and self.basic_blocks and not dispatcher_patterns:
             entry = next(iter(self.basic_blocks))
             functions["fallback"] = Function(
                 name="fallback", selector=None,
@@ -796,8 +877,8 @@ class BytecodeAnalyzer:
                                 self._get_operand(self.instructions[k])
                             )
                         elif kname == "JUMPI" and target is not None:
-                            entry = self._block_at_address(target) or f"block_{target:04x}"
-                            if entry not in dispatcher_targets:
+                            entry = self._jumpdest_block_at_address(target)
+                            if entry is not None and entry not in dispatcher_targets:
                                 return Function(
                                     name="receive",
                                     selector=None,
@@ -920,7 +1001,6 @@ class BytecodeAnalyzer:
         """Find selector comparisons fed by calldata selector extraction."""
         patterns: List[Dict[str, Any]] = []
         stack: List[Any] = []
-        max_scan = min(len(self.instructions), 256)
 
         def pop() -> Any:
             return stack.pop() if stack else ("unknown",)
@@ -949,8 +1029,7 @@ class BytecodeAnalyzer:
         def is_selector_divisor(value: Optional[int]) -> bool:
             return value == (1 << 224)
 
-        for i in range(max_scan):
-            instr = self.instructions[i]
+        for i, instr in enumerate(self.instructions):
             name = self._get_instruction_name(instr)
 
             if patterns and name == "JUMPDEST":
@@ -1097,6 +1176,16 @@ class BytecodeAnalyzer:
         for bid, b in self.basic_blocks.items():
             if b.start_address == addr:
                 return bid
+        return None
+
+    def _jumpdest_block_at_address(self, addr: int) -> Optional[str]:
+        """Return a real JUMPDEST block at *addr*, never a synthetic entry."""
+        bid = self._block_at_address(addr)
+        if bid is None:
+            return None
+        raw = self.basic_blocks[bid].metadata.get("raw_instructions", [])
+        if raw and self._get_instruction_name(raw[0]) == "JUMPDEST":
+            return bid
         return None
 
     # ------------------------------------------------------------------ #
@@ -1611,6 +1700,10 @@ class BytecodeAnalyzer:
         def process_instruction(self, instr: Any, index: int) -> None:
             name = self._get_name(instr)
 
+            def ensure_depth(depth: int) -> None:
+                if len(self.stack) < depth:
+                    self.stack[:0] = [None] * (depth - len(self.stack))
+
             if name == "PUSH0":
                 self.stack.append(0)
                 self.stack_values[index] = 0
@@ -1628,37 +1721,34 @@ class BytecodeAnalyzer:
                     self.stack.append(None)
 
             elif name == "POP":
-                if self.stack:
-                    self.stack.pop()
+                ensure_depth(1)
+                self.stack.pop()
 
             elif name.startswith("DUP"):
                 d = int(name[3:]) if len(name) > 3 else 1
-                self.stack.append(self.stack[-d] if len(self.stack) >= d else None)
+                ensure_depth(d)
+                self.stack.append(self.stack[-d])
 
             elif name.startswith("SWAP"):
                 d = int(name[4:]) if len(name) > 4 else 1
-                if len(self.stack) > d:
-                    self.stack[-1], self.stack[-1 - d] = self.stack[-1 - d], self.stack[-1]
+                ensure_depth(d + 1)
+                self.stack[-1], self.stack[-1 - d] = self.stack[-1 - d], self.stack[-1]
 
-            elif name in ("ADDMOD", "MULMOD"):
-                for _ in range(min(3, len(self.stack))):
-                    self.stack.pop()
-                self.stack.append(None)
-
-            elif name in ("ISZERO", "NOT"):
-                if self.stack:
-                    self.stack[-1] = None
-
-            elif name in _BINARY_OPS:
-                if len(self.stack) >= 2:
-                    self.stack.pop()
-                    self.stack[-1] = None
-
-            else:
-                effects = _EVM_STACK_EFFECTS.get(name)
-                if effects:
+            elif name != "JUMPDEST":
+                effects = (
+                    (3, 1) if name in ("ADDMOD", "MULMOD")
+                    else (2, 1) if name in _BINARY_OPS
+                    else (1, 1) if name in ("ISZERO", "NOT", "MLOAD", "SLOAD")
+                    else (2, 0) if name in ("MSTORE", "SSTORE", "JUMPI")
+                    else (1, 0) if name == "JUMP"
+                    else _EVM_STACK_EFFECTS.get(name)
+                )
+                if effects is None:
+                    self.stack = [None] * len(self.stack)
+                else:
                     pops, pushes = effects
-                    for _ in range(min(pops, len(self.stack))):
+                    ensure_depth(pops)
+                    for _ in range(pops):
                         self.stack.pop()
                     self.stack.extend([None] * pushes)
 
@@ -1697,12 +1787,15 @@ class BytecodeAnalyzer:
                 :meth:`identify_functions`.
 
         Returns:
-            A human-readable TAC string for *func*.
+            A human-readable TAC string for *func*, or an empty string if
+            its entry block is absent.
         """
         if self.basic_blocks and not any(b.instructions for b in self.basic_blocks.values()):
             self._convert_and_integrate_tac()
 
-        blocks = self._blocks_for_function(func, fallback_to_all=True)
+        blocks = self._blocks_for_function(func)
+        if not blocks:
+            return ""
 
         lines: List[str] = []
         lines.append(f"function {func.name}:")
@@ -1711,33 +1804,17 @@ class BytecodeAnalyzer:
         lines.append(f"  // Entry block: {func.entry_block}")
         lines.append("")
 
+        included = {block.id for block in blocks}
         for b in blocks:
-            self._format_block_tac(lines, b, indent="  ")
+            self._format_block_tac(lines, b, indent="  ", allowed_blocks=included)
 
         return "\n".join(lines)
 
     def _blocks_for_function(
         self, func: Function, fallback_to_all: bool = False
     ) -> List[BasicBlock]:
-        """Return blocks reachable from a function entry without global duplication."""
-        reachable_ids: set = set()
-
-        def _walk(bid: str) -> None:
-            if bid in reachable_ids or bid not in self.basic_blocks:
-                return
-            reachable_ids.add(bid)
-            for s in self.basic_blocks[bid].successors:
-                _walk(s)
-
-        entry = func.entry_block
-        _walk(entry)
-
-        # If walk found nothing (entry not in basic_blocks), use func.basic_blocks
-        if not reachable_ids and func.basic_blocks:
-            reachable_ids = {b.id for b in func.basic_blocks}
-
-        if fallback_to_all and not reachable_ids:
-            reachable_ids = set(self.basic_blocks.keys())
+        """Return reachable blocks; retain the old argument without fabricating blocks."""
+        reachable_ids = self._trace_stack_paths(self.basic_blocks, func.entry_block)
 
         blocks = [
             self.basic_blocks[bid]
@@ -1761,7 +1838,9 @@ class BytecodeAnalyzer:
 
         result: Dict[str, str] = {}
         for fname, func in self.functions.items():
-            result[fname] = self.generate_function_tac(func)
+            tac = self.generate_function_tac(func)
+            if tac:
+                result[fname] = tac
         return result
 
     # ------------------------------------------------------------------ #
@@ -2019,13 +2098,14 @@ class BytecodeAnalyzer:
             lines.append("  // View: true")
         lines.append("")
 
-        blocks = self._blocks_for_function(func, fallback_to_all=False)
+        blocks = self._blocks_for_function(func)
         if not blocks:
             lines.append("  // No reachable basic blocks found for this function")
             lines.append("")
             return
+        included = {block.id for block in blocks}
         for b in sorted(blocks, key=lambda x: x.start_address):
-            self._format_block_tac(lines, b, indent="  ")
+            self._format_block_tac(lines, b, indent="  ", allowed_blocks=included)
 
     def _format_all_blocks_tac(self, lines: List[str]) -> None:
         lines.append("main:")
@@ -2034,15 +2114,30 @@ class BytecodeAnalyzer:
         for b in sorted(self.basic_blocks.values(), key=lambda x: x.start_address):
             self._format_block_tac(lines, b, indent="  ")
 
-    def _format_block_tac(self, lines: List[str], block: BasicBlock, indent: str = "") -> None:
+    def _format_block_tac(
+        self, lines: List[str], block: BasicBlock, indent: str = "",
+        allowed_blocks: Optional[set] = None,
+    ) -> None:
         lines.append(f"{indent}{block.id}:")
         lines.append(f"{indent}  // Address range: {block.start_address:04x} - {block.end_address:04x}")
-        if block.predecessors:
-            lines.append(f"{indent}  // Predecessors: {', '.join(block.predecessors)}")
-        if block.successors:
-            lines.append(f"{indent}  // Successors: {', '.join(block.successors)}")
+        predecessors = [
+            bid for bid in block.predecessors if allowed_blocks is None or bid in allowed_blocks
+        ]
+        successors = [
+            bid for bid in block.successors if allowed_blocks is None or bid in allowed_blocks
+        ]
+        if predecessors:
+            lines.append(f"{indent}  // Predecessors: {', '.join(predecessors)}")
+        if successors:
+            lines.append(f"{indent}  // Successors: {', '.join(successors)}")
         if "block_type" in block.metadata:
-            lines.append(f"{indent}  // Block type: {block.metadata['block_type']}")
+            block_type = block.metadata["block_type"]
+            if allowed_blocks is not None:
+                block_type = (
+                    "exit" if not successors else "sequential" if len(successors) == 1
+                    else "conditional" if len(successors) == 2 else "complex"
+                )
+            lines.append(f"{indent}  // Block type: {block_type}")
         if block.metadata.get("is_loop_header"):
             lines.append(f"{indent}  // Loop header")
         if block.metadata.get("is_dead_code"):

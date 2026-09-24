@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -23,6 +26,7 @@ from scripts.analyze_eval_failures import (  # noqa: E402
 
 SUMMARY_GATE_METRICS = (
     "replication_f1_micro",
+    "replication_behavior_only_f1_micro",
     "bytecode_semantic_score_mean",
     "semantic_similarity_mean",
     "solidity_valid_mean",
@@ -33,6 +37,25 @@ PAIRED_METRICS = (
     "semantic_similarity",
     "solidity_valid",
 )
+COMPARABLE_SETTINGS = (
+    "eval_batch_size",
+    "eval_max_new_tokens",
+    "eval_repetition_penalty",
+    "include_selector_signature_metadata",
+    "selector_signature_prompt_policy",
+    "eval_sampling_strategy",
+    "eval_sample_indices",
+)
+IDENTITY_METADATA = (
+    "body_hash",
+    "contract_address",
+    "source_hash",
+    "selector",
+    "function_signature",
+    "compiler_version",
+    "optimizer_enabled",
+)
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def load_eval(path: str | Path) -> dict[str, Any]:
@@ -41,7 +64,7 @@ def load_eval(path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"{path} does not contain a JSON object")
     details = payload.get("details") or payload.get("detailed_results")
-    if not isinstance(details, list):
+    if not isinstance(details, list) or any(not isinstance(item, Mapping) for item in details):
         raise ValueError(f"{path} does not contain details/detailed_results")
     summary = payload.get("summary") or payload.get("aggregate_statistics") or {}
     if not isinstance(summary, Mapping):
@@ -50,7 +73,10 @@ def load_eval(path: str | Path) -> dict[str, Any]:
 
 
 def _numeric(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float, bool)) else None
+    if not isinstance(value, (int, float, bool)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _detail_metric(detail: Mapping[str, Any], metric: str) -> float | None:
@@ -60,12 +86,111 @@ def _detail_metric(detail: Mapping[str, Any], metric: str) -> float | None:
     return _numeric(metrics.get(metric))
 
 
-def _details_by_index(details: Sequence[Mapping[str, Any]]) -> dict[int, Mapping[str, Any]]:
+def _details_by_index(
+    details: Sequence[Mapping[str, Any]], label: str
+) -> tuple[dict[int, Mapping[str, Any]], list[str]]:
     indexed: dict[int, Mapping[str, Any]] = {}
-    for fallback_index, detail in enumerate(details):
-        dataset_index = int(detail.get("dataset_index", fallback_index))
+    errors: list[str] = []
+    for position, detail in enumerate(details):
+        dataset_index = detail.get("dataset_index")
+        if type(dataset_index) is not int or dataset_index < 0:
+            errors.append(f"{label} detail {position}: missing or invalid dataset_index")
+            continue
+        if dataset_index in indexed:
+            errors.append(f"{label}: duplicate dataset_index {dataset_index}")
+            continue
         indexed[dataset_index] = detail
-    return indexed
+    return indexed, errors
+
+
+def _identity_hash(detail: Mapping[str, Any], field: str) -> str:
+    declared = detail.get(f"{field}_hash")
+    text = detail.get("original" if field == "output" else "input")
+    if declared is None:
+        if not isinstance(text, str):
+            raise ValueError(f"missing {field}_hash and full {field} text")
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if not isinstance(declared, str) or not _HASH_RE.fullmatch(declared):
+        raise ValueError(f"invalid {field}_hash")
+    if (
+        isinstance(text, str)
+        and hashlib.sha256(text.encode("utf-8")).hexdigest() != declared.lower()
+    ):
+        raise ValueError(f"{field}_hash does not match full {field} text")
+    return declared.lower()
+
+
+def _detail_identity(detail: Mapping[str, Any]) -> tuple[Any, ...]:
+    metadata = detail.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("missing row metadata")
+    return (
+        _identity_hash(detail, "input"),
+        _identity_hash(detail, "output"),
+        tuple((key, json.dumps(metadata.get(key), sort_keys=True)) for key in IDENTITY_METADATA),
+    )
+
+
+def _comparability_errors(
+    baseline_summary: Mapping[str, Any],
+    candidate_summary: Mapping[str, Any],
+    baseline_details: Sequence[Mapping[str, Any]],
+    candidate_details: Sequence[Mapping[str, Any]],
+    baseline_by_index: Mapping[int, Mapping[str, Any]],
+    candidate_by_index: Mapping[int, Mapping[str, Any]],
+    gate_metrics: Sequence[str],
+    paired_metrics: Sequence[str],
+) -> tuple[list[str], list[int]]:
+    errors: list[str] = []
+    for label, summary, details in (
+        ("baseline", baseline_summary, baseline_details),
+        ("candidate", candidate_summary, candidate_details),
+    ):
+        if type(summary.get("num_evaluated")) is not int or summary["num_evaluated"] != len(
+            details
+        ):
+            errors.append(f"{label}: num_evaluated does not match details")
+        if type(summary.get("prompt_truncation_count")) is not int or (
+            summary["prompt_truncation_count"] != 0
+        ):
+            errors.append(f"{label}: prompt truncation must be measured and zero")
+        for metric in gate_metrics:
+            value = summary.get(metric)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                errors.append(f"{label}: missing or non-finite gate metric {metric}")
+    for setting in COMPARABLE_SETTINGS:
+        if setting not in baseline_summary or setting not in candidate_summary:
+            errors.append(f"missing comparable eval setting: {setting}")
+        elif baseline_summary[setting] != candidate_summary[setting]:
+            errors.append(f"eval setting differs: {setting}")
+
+    if set(baseline_by_index) != set(candidate_by_index):
+        errors.append("evaluated dataset_index sets differ")
+    matched = []
+    for index in sorted(set(baseline_by_index) & set(candidate_by_index)):
+        try:
+            if _detail_identity(baseline_by_index[index]) != _detail_identity(
+                candidate_by_index[index]
+            ):
+                errors.append(f"dataset_index {index}: different source row")
+            else:
+                matched.append(index)
+                for label, detail in (
+                    ("baseline", baseline_by_index[index]),
+                    ("candidate", candidate_by_index[index]),
+                ):
+                    for metric in paired_metrics:
+                        if _detail_metric(detail, metric) is None:
+                            errors.append(
+                                f"{label} dataset_index {index}: missing or non-finite {metric}"
+                            )
+        except ValueError as exc:
+            errors.append(f"dataset_index {index}: {exc}")
+    return errors, matched
 
 
 def _counter_delta(
@@ -125,9 +250,19 @@ def compare_eval_runs(
         elif delta > tolerance:
             improvements.append(metric)
 
-    baseline_by_index = _details_by_index(baseline_details)
-    candidate_by_index = _details_by_index(candidate_details)
-    paired_indices = sorted(set(baseline_by_index) & set(candidate_by_index))
+    baseline_by_index, baseline_errors = _details_by_index(baseline_details, "baseline")
+    candidate_by_index, candidate_errors = _details_by_index(candidate_details, "candidate")
+    comparable_errors, paired_indices = _comparability_errors(
+        baseline_summary,
+        candidate_summary,
+        baseline_details,
+        candidate_details,
+        baseline_by_index,
+        candidate_by_index,
+        gate_metrics,
+        paired_metrics,
+    )
+    comparable_errors = baseline_errors + candidate_errors + comparable_errors
     paired_results = {}
     row_deltas = []
     for metric in paired_metrics:
@@ -165,9 +300,12 @@ def compare_eval_runs(
         }
 
     row_deltas.sort(key=lambda item: (item["delta"], item["dataset_index"]))
-    candidate_rows = int(candidate_summary.get("num_evaluated") or len(candidate_details))
-    baseline_rows = int(baseline_summary.get("num_evaluated") or len(baseline_details))
-    if candidate_rows < min_rows or baseline_rows < min_rows:
+    candidate_rows = len(candidate_details)
+    baseline_rows = len(baseline_details)
+    if comparable_errors:
+        decision = "reject"
+        reason = "incomparable evaluations: " + "; ".join(comparable_errors[:3])
+    elif candidate_rows < min_rows or baseline_rows < min_rows:
         decision = "smoke_only"
         reason = f"fewer than {min_rows} rows in baseline or candidate"
     elif regressions:
@@ -186,6 +324,7 @@ def compare_eval_runs(
         "baseline_rows": baseline_rows,
         "candidate_rows": candidate_rows,
         "paired_rows": len(paired_indices),
+        "comparability_errors": comparable_errors,
         "decision": decision,
         "decision_reason": reason,
         "summary_deltas": summary_deltas,
@@ -263,7 +402,15 @@ def format_markdown_report(comparison: Mapping[str, Any]) -> str:
         ("Hallucination bucket deltas", "hallucination_bucket_deltas"),
         ("Missing fact deltas", "missing_fact_deltas"),
     ):
-        lines.extend(["", f"## {title}", "", "| bucket | baseline | candidate | delta |", "| --- | ---: | ---: | ---: |"])
+        lines.extend(
+            [
+                "",
+                f"## {title}",
+                "",
+                "| bucket | baseline | candidate | delta |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
         rows = sorted(
             comparison[key].items(),
             key=lambda item: (-abs(item[1]["delta"]), item[0]),

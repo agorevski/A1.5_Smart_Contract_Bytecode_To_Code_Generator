@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+from .replication_metrics import BEHAVIOR_FACT_CATEGORIES, behavior_only_replication_micro
+
 
 DEFAULT_LATEST_RESULTS_PATH = "latest_results.txt"
 
@@ -131,7 +133,7 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                 evidence=evidence,
                 likely_root_causes=[
                     "Training data may under-represent the failing opcode/control-flow slices.",
-                    "The model may be learning surface syntax while missing bytecode-grounded behavior.",
+                    "High source-text similarity can hide incorrect guards, calls, or state effects.",
                     "Learning rate, LoRA rank, or epoch count may not provide enough capacity for semantic recovery.",
                 ],
                 suggested_experiments=[
@@ -216,6 +218,18 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
         "replication_metrics.micro.precision",
         "aggregate_statistics.replication_metrics.micro.precision",
     )
+    behavior_micro = _behavior_only_replication_micro(summary)
+    if behavior_micro is not None:
+        behavior_f1 = behavior_micro["f1"]
+        metrics_used["replication_behavior_only_f1_micro"] = _json_safe_number(behavior_f1)
+        if replication_f1 is not None and replication_f1 - behavior_f1 >= 0.10:
+            caveats.append(
+                f"All-fact replication F1={replication_f1:.4f} exceeds behavior-only source-fact F1={behavior_f1:.4f}; ABI-heavy counts can mask missing behavior facts. Neither score verifies bytecode behavior."
+            )
+        else:
+            caveats.append(
+                "Behavior-only F1 compares source-extracted call, control-flow, event, guard, return, and state-write facts; it does not verify bytecode behavior."
+            )
     category_gaps = _replication_category_gaps(summary)
     replication_issue = _below_any((replication_f1, 0.75), (replication_recall, 0.75)) or bool(
         category_gaps
@@ -344,6 +358,15 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
         )
 
     solidity_valid = metric("solidity_valid_mean")
+    solidity_ast_valid = metric("solidity_ast_valid_mean")
+    if (
+        solidity_valid is not None
+        and solidity_ast_valid is not None
+        and solidity_ast_valid < solidity_valid
+    ):
+        caveats.append(
+            "solidity_valid_mean includes scaffold or missing-context checks; solidity_ast_valid_mean is the separate compiler AST-valid fraction, not a deployment test."
+        )
     if solidity_valid is not None and solidity_valid < 0.95:
         issues.append(
             _diagnostic_issue(
@@ -377,26 +400,42 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
     bytecode_deployable = metric("bytecode_deployable_mean")
     runtime_checked = metric("bytecode_runtime_checked_mean")
     runtime_match = metric("bytecode_runtime_match_mean")
+    runtime_match_rate = _checked_runtime_match_rate(runtime_checked, runtime_match)
+    if runtime_match_rate is not None:
+        metrics_used["bytecode_runtime_match_rate_checked"] = _json_safe_number(runtime_match_rate)
+    if bytecode_score is not None:
+        caveats.append(
+            "bytecode_semantic_score_mean is a source-fact overlap proxy with bytecode/opcode hints, not a verified bytecode or behavioral match."
+        )
+    if bytecode_checked is not None:
+        caveats.append(
+            "bytecode_semantic_checked_mean is a legacy flag: historical runs also counted compiler-only checks, so aggregates alone cannot prove reference bytecode coverage."
+        )
+    if runtime_checked == 0:
+        caveats.append(
+            "No generated/reference runtime comparisons were performed; bytecode_semantic_checked_mean is not behavioral verification."
+        )
     if bytecode_checked is not None and bytecode_checked < 0.95:
         issues.append(
             _diagnostic_issue(
                 issue_id="bytecode_grounding_coverage_gap",
                 category="evaluation_data",
                 severity="medium",
-                title="Not enough rows have bytecode-grounded semantic checks.",
+                title="The legacy bytecode-check flag is below target; reference evidence needs verification.",
                 evidence=[
                     _target_evidence(
                         "bytecode_semantic_checked_mean", bytecode_checked, ">=", 0.95, percent=True
                     )
                 ],
                 likely_root_causes=[
-                    "Evaluation rows may be missing runtime bytecode, opcode analysis, compiler version, or differential-call evidence.",
+                    "Evaluation rows may be missing reference bytecode, TAC, or opcode metadata.",
+                    "Older evaluators also counted compiler-only checks, so this flag does not prove reference coverage.",
                     "Dataset export may not be carrying bytecode metadata into the evaluation artifact.",
                 ],
                 suggested_experiments=[
                     _experiment(
                         "eval-metadata-backfill",
-                        "Backfill bytecode/opcode/runtime metadata for the holdout set before using bytecode metrics as model gates.",
+                        "Backfill reference bytecode/opcode metadata for the holdout before using the source-fact proxy as a model gate.",
                         "data/evaluation",
                         "bytecode_semantic_checked_mean reaches 95%+",
                     )
@@ -409,20 +448,49 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                 issue_id="bytecode_semantic_gap",
                 category="model_behavior",
                 severity="high" if bytecode_score < 0.60 else "medium",
-                title="Bytecode-grounded behavior does not match reference behavior often enough.",
+                title="The source-fact overlap proxy is below target; bytecode behavior is unverified.",
                 evidence=[
                     _target_evidence("bytecode_semantic_score_mean", bytecode_score, ">=", 0.80)
                 ],
                 likely_root_causes=[
-                    "The model may recover text that looks plausible but changes guards, returns, calls, or state effects.",
-                    "Training may need examples that emphasize bytecode behavior over lexical similarity.",
+                    "The generated source differs in extracted guards, returns, calls, ABI, or state effects.",
+                    "The source-fact parser can miss behavior not expressible as extracted facts.",
                 ],
                 suggested_experiments=[
                     _experiment(
-                        "bytecode-mismatch-slice",
-                        "Fine-tune or evaluate separately on rows with bytecode mismatch buckets before broad retraining.",
-                        "model/training",
+                        "source-fact-mismatch-slice",
+                        "Inspect source-fact mismatch buckets separately from compiled runtime or differential-call checks.",
+                        "evaluation/model",
                         "bytecode_semantic_score_mean improves and replication_f1_micro does not regress",
+                    )
+                ],
+            )
+        )
+    if bytecode_checked is not None and runtime_checked == 0:
+        issues.append(
+            _diagnostic_issue(
+                issue_id="bytecode_runtime_coverage_gap",
+                category="evaluation_data",
+                severity="medium",
+                title="No generated/reference runtime bytecode comparisons were performed.",
+                evidence=[
+                    _diagnostic_metric_text(
+                        "bytecode_runtime_checked_mean", runtime_checked, percent=True
+                    ),
+                    _diagnostic_metric_text(
+                        "bytecode_semantic_checked_mean", bytecode_checked, percent=True
+                    ),
+                ],
+                likely_root_causes=[
+                    "Reference bytecode alone does not supply a generated runtime for comparison.",
+                    "Function fragments may not compile without their contract-level context.",
+                ],
+                suggested_experiments=[
+                    _experiment(
+                        "paired-runtime-check",
+                        "Compile generated source with matched contract context and compiler settings, then compare its runtime with reference runtime on evaluable rows.",
+                        "evaluation",
+                        "bytecode_runtime_checked_mean rises above zero on a comparable heldout set",
                     )
                 ],
             )
@@ -433,7 +501,7 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                 issue_id="deployability_gap",
                 category="syntax_and_deployability",
                 severity="medium",
-                title="Generated Solidity is not consistently deployable in bytecode-aware validation.",
+                title="Generated source rarely compiles to bytecode in the evaluation harness.",
                 evidence=[
                     _target_evidence(
                         "bytecode_deployable_mean", bytecode_deployable, ">=", 0.95, percent=True
@@ -453,21 +521,20 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                 ],
             )
         )
-    if (
-        runtime_checked is not None
-        and runtime_checked > 0
-        and runtime_match is not None
-        and runtime_match < 0.95
-    ):
+    if runtime_match_rate is not None and runtime_match_rate < 0.95:
         issues.append(
             _diagnostic_issue(
                 issue_id="runtime_bytecode_mismatch",
                 category="model_behavior",
-                severity="high" if runtime_match < 0.50 else "medium",
+                severity="high" if runtime_match_rate < 0.50 else "medium",
                 title="Generated runtime bytecode does not match the reference runtime when checked.",
                 evidence=[
                     _target_evidence(
-                        "bytecode_runtime_match_mean", runtime_match, ">=", 0.95, percent=True
+                        "bytecode_runtime_match_rate_checked",
+                        runtime_match_rate,
+                        ">=",
+                        0.95,
+                        percent=True,
                     ),
                     _diagnostic_metric_text(
                         "bytecode_runtime_checked_mean", runtime_checked, percent=True
@@ -482,7 +549,7 @@ def build_evaluation_diagnostics(summary: Mapping[str, Any]) -> Dict[str, Any]:
                         "runtime-diff-triage",
                         "Compare normalized runtime diffs for the lowest bytecode_semantic_score samples.",
                         "model/evaluation",
-                        "bytecode_runtime_match_mean improves on checked rows",
+                        "bytecode_runtime_match_rate_checked improves on checked rows",
                     )
                 ],
             )
@@ -642,6 +709,7 @@ def format_latest_results_report(
         f"Evaluation duration: {_format_duration(duration)}",
         f"Distributed world size: {world_size}",
         f"Eval limit: {eval_limit if eval_limit is not None else 'none'}",
+        f"Selector signature prompt policy: {summary.get('selector_signature_prompt_policy', 'unknown')}",
         "",
         "Model",
         "-----",
@@ -677,9 +745,8 @@ def format_latest_results_report(
         ]
     )
 
-    diagnostics = summary.get("evaluation_diagnostics")
-    if not isinstance(diagnostics, Mapping):
-        diagnostics = build_evaluation_diagnostics(summary)
+    # Historical summaries can embed diagnostics generated with older metric labels.
+    diagnostics = build_evaluation_diagnostics(summary)
     _append_evaluation_diagnostics_report(lines, diagnostics)
 
     lines.extend(
@@ -704,6 +771,8 @@ def format_latest_results_report(
             f"Replication precision micro: {_metric(summary, 'replication_precision_micro')}",
             f"Replication recall micro: {_metric(summary, 'replication_recall_micro')}",
             f"Replication F1 micro: {_metric(summary, 'replication_f1_micro')}",
+            f"Behavior-only source-fact F1 micro: {_format_number((_behavior_only_replication_micro(summary) or {}).get('f1'))}",
+            f"Behavior facts: {', '.join(BEHAVIOR_FACT_CATEGORIES)} (excludes ABI, modifier, mutability, visibility; not bytecode equivalence)",
             f"Functions > 0.8 replication F1: {_percent_metric(summary, 'pct_above_0.8_replication_f1')}",
         ]
     )
@@ -718,7 +787,7 @@ def format_latest_results_report(
     ):
         lines.extend(
             [
-                f"Solidity valid outputs: {_percent_metric(summary, 'solidity_valid_mean')}",
+                f"Solidity best-effort valid (may be scaffold/context-limited): {_percent_metric(summary, 'solidity_valid_mean')}",
                 f"Solidity compiler-checked outputs: {_percent_metric(summary, 'solidity_compiler_checked_mean')}",
                 f"Solidity AST-valid outputs: {_percent_metric(summary, 'solidity_ast_valid_mean')}",
             ]
@@ -736,13 +805,23 @@ def format_latest_results_report(
     ):
         lines.extend(
             [
-                f"Bytecode semantic score mean: {_metric(summary, 'bytecode_semantic_score_mean')}",
-                f"Bytecode semantic checked outputs: {_percent_metric(summary, 'bytecode_semantic_checked_mean')}",
-                f"Bytecode deployable outputs: {_percent_metric(summary, 'bytecode_deployable_mean')}",
+                f"Source-fact overlap proxy mean: {_metric(summary, 'bytecode_semantic_score_mean')}",
+                f"Legacy bytecode semantic checked flag: {_percent_metric(summary, 'bytecode_semantic_checked_mean')}",
+                f"Compiler-valid with generated bytecode (legacy deployable metric): {_percent_metric(summary, 'bytecode_deployable_mean')}",
                 f"Runtime bytecode checked outputs: {_percent_metric(summary, 'bytecode_runtime_checked_mean')}",
-                f"Runtime bytecode matches: {_percent_metric(summary, 'bytecode_runtime_match_mean')}",
+                f"Runtime bytecode match rate (checked only): {_runtime_match_rate(summary)}",
             ]
         )
+        runtime_counts = _runtime_comparison_counts(summary)
+        if runtime_counts is not None:
+            checked, equal, total = runtime_counts
+            lines.extend(
+                [
+                    f"Exact full-contract runtime bytecode checked: {checked} / {total}",
+                    f"Exact runtime bytecode equal (checked only): {equal} / {checked}",
+                    "Runtime equality is bytecode identity, not constructor, deployment, or behavioral equivalence.",
+                ]
+            )
 
     lines.extend(
         [
@@ -1142,6 +1221,48 @@ def _percent_metric(summary: Mapping[str, Any], key: str) -> str:
     return f"{float(value) * 100:.2f}%"
 
 
+def _checked_runtime_match_rate(
+    checked: Optional[float], matched: Optional[float]
+) -> Optional[float]:
+    if checked is None or checked <= 0 or matched is None:
+        return None
+    return max(0.0, min(1.0, matched / checked))
+
+
+def _runtime_comparison_counts(
+    summary: Mapping[str, Any],
+) -> Optional[tuple[int, int, int]]:
+    comparison = _mapping_path_value(
+        summary, ("aggregate_statistics", "runtime_bytecode_comparison")
+    )
+    if not isinstance(comparison, Mapping):
+        return None
+    checked, equal, total = (
+        comparison.get("checked_n"),
+        comparison.get("equal_n"),
+        comparison.get("total_n"),
+    )
+    if not all(type(value) is int for value in (checked, equal, total)):
+        return None
+    if not 0 <= equal <= checked <= total:
+        return None
+    return checked, equal, total
+
+
+def _runtime_match_rate(summary: Mapping[str, Any]) -> str:
+    counts = _runtime_comparison_counts(summary)
+    if counts is not None:
+        checked, equal, _ = counts
+        return f"{equal / checked * 100:.2f}%" if checked else "n/a (no comparisons)"
+    checked = _coerce_float(summary.get("bytecode_runtime_checked_mean"))
+    if checked == 0:
+        return "n/a (no comparisons)"
+    rate = _checked_runtime_match_rate(
+        checked, _coerce_float(summary.get("bytecode_runtime_match_mean"))
+    )
+    return f"{rate * 100:.2f}%" if rate is not None else "n/a"
+
+
 def _format_number(value: Any) -> str:
     if not isinstance(value, (int, float)) or math.isnan(float(value)):
         return "n/a"
@@ -1350,6 +1471,19 @@ def _replication_category_gaps(summary: Mapping[str, Any]) -> list[Dict[str, Any
     return gaps
 
 
+def _behavior_only_replication_micro(summary: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    category_scores = summary.get("replication_by_category_micro")
+    if not isinstance(category_scores, Mapping):
+        category_scores = _mapping_path_value(summary, ("replication_metrics", "by_category_micro"))
+    if not isinstance(category_scores, Mapping):
+        category_scores = _mapping_path_value(
+            summary, ("aggregate_statistics", "replication_metrics", "by_category_micro")
+        )
+    if not isinstance(category_scores, Mapping):
+        return None
+    return behavior_only_replication_micro(category_scores)
+
+
 def _hallucination_rate(summary: Mapping[str, Any]) -> Optional[float]:
     direct = _first_numeric_summary_value(
         summary,
@@ -1462,7 +1596,7 @@ def _add_missing_metric_caveats(summary: Mapping[str, Any], caveats: list[str]) 
         ),
         (
             ("bytecode_semantic_checked_mean",),
-            "Bytecode-grounded metrics are missing; semantic conclusions rely mainly on text similarity.",
+            "Legacy bytecode semantic checked flag is missing; reference bytecode coverage cannot be established from the aggregate.",
         ),
     ]
     for keys, caveat in checks:
@@ -1782,7 +1916,7 @@ def _append_benchmark_suite_report(
         return
     lines.extend(["", "Benchmark Suites", "----------------"])
     lines.append(
-        "suite | count | semantic | edit distance | replication F1 | bytecode semantic | Solidity valid"
+        "suite | count | text similarity | edit distance | replication F1 | source-fact proxy | best-effort Solidity valid"
     )
     lines.append("--- | ---: | ---: | ---: | ---: | ---: | ---:")
     for suite, suite_summary in sorted(benchmark_suites.items()):

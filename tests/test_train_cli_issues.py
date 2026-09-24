@@ -338,6 +338,65 @@ def test_jsonl_preflight_reports_schema_and_token_length_errors(tmp_path):
     assert report["error_counts"]["target_overlength"] == 1
 
 
+def test_jsonl_preflight_counts_training_eos_token(tmp_path):
+    class EosTokenizer(TinyTokenizer):
+        eos_token_id = 99
+
+        def __call__(self, text, **_kwargs):
+            return {"input_ids": list(range(len(str(text).split())))}
+
+    row = {"input": "tac", "output": "target", "metadata": {"schema_version": 1}}
+    dataset_path = tmp_path / "eos.jsonl"
+    _write_jsonl(dataset_path, [row])
+    prefix, target, suffix = train._preflight_prompt_parts(row, True, True, "alpaca")
+    max_seq_length = len(prefix.split()) + len(f"{target}{suffix}".split())
+
+    report = train.validate_jsonl_schema_and_lengths(
+        dataset_path, tokenizer=EosTokenizer(), max_seq_length=max_seq_length
+    )
+
+    assert report["status"] == "failed"
+    assert report["lengths"]["max_total_tokens"] == max_seq_length + 1
+    assert report["error_counts"]["context_overlength"] == 1
+
+
+def test_dataset_only_preflight_honors_selector_metadata_flag(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "source.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [{"input": f"tac {i}", "output": f"sol {i}", "metadata": {}} for i in range(6)],
+    )
+    captured = {}
+
+    def fake_preflight(_paths, **kwargs):
+        captured.update(kwargs)
+        return {"status": "passed"}
+
+    monkeypatch.setattr(train, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(train, "run_data_preflight", fake_preflight)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--skip-collection",
+            "--dataset",
+            str(dataset_path),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--dataset-only",
+            "--no-selector-signature-metadata",
+            "--no-auto-torchrun",
+            "--run-manifest",
+            str(tmp_path / "manifest.json"),
+        ],
+    )
+
+    train.main()
+
+    assert captured["include_selector_signature_metadata"] is False
+
+
 def test_jsonl_preflight_rejects_malformed_versioned_metadata(tmp_path):
     dataset_path = tmp_path / "bad_metadata.jsonl"
     _write_jsonl(
@@ -428,6 +487,27 @@ class FakeEvaluator:
         return FakeMetrics()
 
 
+def test_aggregate_summary_exposes_behavior_only_f1(monkeypatch):
+    from src.training_pipeline import SmartContractTrainingPipeline
+
+    monkeypatch.setattr(
+        SmartContractTrainingPipeline,
+        "_compute_aggregate_statistics",
+        lambda self, results, baseline_summary=None: {
+            "replication_metrics": {
+                "micro": {"f1": 0.63},
+                "behavior_only_micro": {"f1": 0.22},
+                "by_category_micro": {"call": {"f1": 0.22}},
+            }
+        },
+    )
+    summary = {}
+    train._merge_aggregate_statistics(summary, [{"metrics": {}}], None)
+
+    assert summary["replication_f1_micro"] == 0.63
+    assert summary["replication_behavior_only_f1_micro"] == 0.22
+
+
 def _patch_evaluation_dependencies(monkeypatch, decompiler_cls):
     import src.evaluation_report as evaluation_report
     import src.model_setup as model_setup
@@ -503,8 +583,11 @@ def test_evaluate_model_uses_decompile_batch_chunks(tmp_path, monkeypatch):
     assert summary["eval_batch_size"] == 2
     assert summary["eval_max_new_tokens"] == 77
     assert summary["eval_repetition_penalty"] == 1.05
+    assert summary["selector_signature_prompt_policy"] == "bundled_only_v1"
     assert summary["num_evaluated"] == 3
-    assert Path(summary["results_path"]).exists()
+    assert json.loads(Path(summary["results_path"]).read_text())["summary"][
+        "selector_signature_prompt_policy"
+    ] == "bundled_only_v1"
 
 
 def test_evaluate_model_batch_oom_falls_back_to_single_examples(tmp_path, monkeypatch):
@@ -1141,6 +1224,50 @@ def test_split_dataset_reuses_matching_manifest_without_resplitting(tmp_path, mo
 
     assert second == first
     assert train.split_dataset.last_status["reused"] is True
+
+
+def test_split_dataset_groups_normalized_targets_even_with_stale_or_missing_body_hash(tmp_path):
+    rows = [
+        {"input": "tac duplicate A", "output": "function f() public { return; }",
+         "metadata": {"body_hash": "stale-hash"}},
+        {"input": "tac duplicate B",
+         "output": "function f() public { /* different comment */ return; }",
+         "metadata": {}},
+    ]
+    rows.extend(
+        {"input": f"tac distinct {index}",
+         "output": f"function distinct{index}() public {{ return; }}",
+         "metadata": {}}
+        for index in range(7)
+    )
+    dataset_path = tmp_path / "source.jsonl"
+    _write_jsonl(dataset_path, rows)
+
+    split_paths = train.split_dataset(
+        str(dataset_path), str(tmp_path / "splits"),
+        train_ratio=0.6, val_ratio=0.2, seed=0,
+    )
+
+    duplicates = [
+        split_name
+        for split_name, path in zip(("train", "val", "test"), split_paths)
+        for row in (json.loads(line) for line in Path(path).read_text().splitlines())
+        if row["input"].startswith("tac duplicate")
+    ]
+    assert len(duplicates) == 2
+    assert len(set(duplicates)) == 1
+    manifest_path = tmp_path / "splits" / "split_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["leakage_validation"]["status"] == "passed"
+
+    manifest["schema_version"] -= 1
+    manifest_path.write_text(json.dumps(manifest))
+    train.split_dataset(
+        str(dataset_path), str(tmp_path / "splits"),
+        train_ratio=0.6, val_ratio=0.2, seed=0, reuse_existing=True,
+    )
+    assert train.split_dataset.last_status["reused"] is False
+    assert train.split_dataset.last_status["reason"] == "schema_version_mismatch"
 
 
 def test_split_dataset_creates_nested_output_directory(tmp_path):

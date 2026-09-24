@@ -672,22 +672,33 @@ def _token_count_estimate(text: Any) -> int:
 
 
 def export_prompt_parts(record: Dict[str, Any]) -> Tuple[str, str, str]:
-    try:
-        import train
+    import train
 
-        return train._preflight_prompt_parts(
-            record,
-            include_bytecode_metadata=True,
-            template_format="alpaca",
-        )
-    except Exception:
-        return record.get("input", ""), record.get("output", ""), ""
+    return train._preflight_prompt_parts(
+        record,
+        include_bytecode_metadata=True,
+        include_selector_signature_metadata=True,
+        template_format="alpaca",
+    )
 
 
-def export_length_report(record: Dict[str, Any], max_seq_length: int) -> Dict[str, Any]:
+def export_length_report(
+    record: Dict[str, Any], max_seq_length: int, tokenizer: Any = None
+) -> Dict[str, Any]:
+    """Count the training prompt and target, exactly when a tokenizer is supplied."""
     prefix, target, suffix = export_prompt_parts(record)
-    context_tokens = _token_count_estimate(prefix)
-    target_tokens = _token_count_estimate(f"{target}{suffix}")
+    if tokenizer is None:
+        context_tokens = _token_count_estimate(prefix)
+        target_tokens = _token_count_estimate(f"{target}{suffix}")
+    else:
+        from .model_setup import _append_eos_if_supported, _tokenize_to_ids
+
+        context_tokens = len(_tokenize_to_ids(tokenizer, prefix))
+        target_tokens = len(
+            _append_eos_if_supported(
+                tokenizer, _tokenize_to_ids(tokenizer, f"{target}{suffix}")
+            )
+        )
     total_tokens = context_tokens + target_tokens
     reasons: List[str] = []
     if target_tokens >= max_seq_length:
@@ -699,6 +710,7 @@ def export_length_report(record: Dict[str, Any], max_seq_length: int) -> Dict[st
         "target_tokens": target_tokens,
         "total_tokens": total_tokens,
         "max_seq_length": max_seq_length,
+        "token_count_method": "tokenizer" if tokenizer is not None else "estimate",
         "reasons": reasons,
     }
 
@@ -780,21 +792,51 @@ def match_functions_by_selector(
     solidity_functions: List[Dict[str, Any]],
     bytecode_functions: Dict[Any, Any],
     analyzer: Any,
+    *,
+    ambiguous_selectors: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
+    """Match only selectors with an unambiguous Solidity target and runtime entry."""
     ensure_tac_integrated(analyzer)
-    sol_by_sel = {f["selector"]: f for f in solidity_functions if f.get("selector")}
-    bc_by_sel = {f.selector: f for f in bytecode_functions.values() if getattr(f, "selector", None)}
+    sol_by_sel: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for function in solidity_functions:
+        if function.get("selector"):
+            sol_by_sel[function["selector"]].append(function)
+    bc_by_sel: Dict[str, List[Any]] = defaultdict(list)
+    for function in bytecode_functions.values():
+        if getattr(function, "selector", None):
+            bc_by_sel[function.selector].append(function)
 
     matches: List[Dict[str, Any]] = []
-    for selector, sol_func in sol_by_sel.items():
-        if selector in bc_by_sel:
-            tac = extract_tac_for_function(bc_by_sel[selector], analyzer)
-            matches.append(
-                {
-                    "solidity_function": sol_func,
-                    "bytecode_function": bc_by_sel[selector],
-                    "tac": tac,
-                    "selector": selector,
-                }
+    for selector, source_candidates in sol_by_sel.items():
+        runtime_candidates = bc_by_sel.get(selector)
+        if not runtime_candidates:
+            continue
+        target = str(source_candidates[0].get("body") or "").strip()
+        if (
+            len(source_candidates) > 1
+            and (
+                not target
+                or any(str(f.get("body") or "").strip() != target for f in source_candidates[1:])
             )
+        ) or (
+            len(runtime_candidates) > 1
+            and (
+                any(not getattr(f, "entry_block", None) for f in runtime_candidates)
+                or len({str(f.entry_block) for f in runtime_candidates}) > 1
+            )
+        ):
+            if ambiguous_selectors is not None:
+                ambiguous_selectors.add(selector)
+            continue
+        sol_func = source_candidates[0]
+        bytecode_func = runtime_candidates[0]
+        tac = extract_tac_for_function(bytecode_func, analyzer)
+        matches.append(
+            {
+                "solidity_function": sol_func,
+                "bytecode_function": bytecode_func,
+                "tac": tac,
+                "selector": selector,
+            }
+        )
     return matches

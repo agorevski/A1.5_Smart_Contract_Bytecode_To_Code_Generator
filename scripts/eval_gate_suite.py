@@ -32,15 +32,19 @@ def evaluate_gate_suite(
         comparisons.append(comparison)
 
     decisions = [comparison["decision"] for comparison in comparisons]
+    trustworthy = [comparison for comparison in comparisons if comparison["paired_rows"] >= 30]
     if "reject" in decisions:
         suite_decision = "reject"
         reason = "one or more required comparisons regressed"
     elif "smoke_only" in decisions:
         suite_decision = "smoke_only"
         reason = "one or more required comparisons has too few rows"
-    elif "keep_candidate" in decisions:
+    elif not trustworthy:
+        suite_decision = "smoke_only"
+        reason = "no comparison has at least 30 paired rows"
+    elif any(comparison["decision"] == "keep_candidate" for comparison in trustworthy):
         suite_decision = "keep_candidate"
-        reason = "all required comparisons passed and at least one improved"
+        reason = "all required comparisons passed and at least one 30+ row comparison improved"
     else:
         suite_decision = "no_change"
         reason = "all required comparisons passed but none improved"
@@ -76,9 +80,7 @@ def format_markdown_report(suite: Mapping[str, Any]) -> str:
                 decision=comparison["decision"],
                 rows=comparison["candidate_rows"],
                 f1=_format_delta(_metric_delta(comparison, "replication_f1_micro")),
-                bytecode=_format_delta(
-                    _metric_delta(comparison, "bytecode_semantic_score_mean")
-                ),
+                bytecode=_format_delta(_metric_delta(comparison, "bytecode_semantic_score_mean")),
                 semantic=_format_delta(_metric_delta(comparison, "semantic_similarity_mean")),
                 valid=_format_delta(_metric_delta(comparison, "solidity_valid_mean")),
                 reason=comparison["decision_reason"],

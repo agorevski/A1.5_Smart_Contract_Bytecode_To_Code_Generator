@@ -1537,14 +1537,17 @@
     solidityOutput.textContent = data.solidity || "(no Solidity output)";
 
     // Model / partial-failure warning
-    if (data.model_error || data.partial_success || data.success === false) {
+    if (data.model_error || data.error || data.partial_success || data.success === false) {
       var warning = data.model_error || "";
+      if (data.error) {
+        warning += (warning ? " " : "") + data.error;
+      }
       if (data.source_summary && data.source_summary.error) {
         warning +=
           (warning ? " " : "") +
           data.source_summary.error +
           " function(s) failed; see Function Mapping for details.";
-      } else if (data.success === false) {
+      } else if (data.success === false && !data.error) {
         warning += (warning ? " " : "") + "Decompilation did not fully succeed.";
       }
       if (data.validation && !data.validation.valid) {

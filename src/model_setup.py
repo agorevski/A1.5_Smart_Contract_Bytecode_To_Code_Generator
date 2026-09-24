@@ -52,7 +52,8 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-TOKENIZATION_CACHE_VERSION = 2
+TOKENIZATION_CACHE_VERSION = 3
+SELECTOR_SIGNATURE_PROMPT_POLICY = "bundled_only_v1"
 DEFAULT_REPETITION_PENALTY = 1.05
 
 SOLIDITY_RESERVED_WORDS = {
@@ -495,7 +496,7 @@ def _format_count_part(label: str, value: Optional[int]) -> Optional[str]:
 
 
 def resolve_selector_signature_for_prompt(selector: Optional[str]) -> Optional[str]:
-    """Resolve a selector locally for prompt context without remote lookups."""
+    """Use only bundled selector signatures available without the training database."""
     normalized = _normalize_selector(selector)
     if not normalized:
         return None
@@ -508,7 +509,7 @@ def resolve_selector_signature_for_prompt(selector: Optional[str]) -> Optional[s
         return None
 
     best = getattr(result, "best_match", None)
-    if best is None or getattr(best, "source", None) == "unknown":
+    if best is None or getattr(best, "source", None) != "builtin":
         return None
     try:
         confidence = float(getattr(best, "confidence", 0.0) or 0.0)
@@ -1381,31 +1382,33 @@ class SmartContractDataset(Dataset):
             raise ValueError(f"Training example {idx} has an empty tokenized target")
 
         if len(target_ids) >= self.max_length:
-            input_ids = target_ids[: self.max_length]
-            prefix_len = 0
-        else:
-            prefix_before_tac, tac_text, prefix_after_tac, _target, _suffix = (
-                self._format_prompt_components(item["input"], output, item.get("metadata", {}))
+            raise ValueError(
+                f"Training example {idx} target requires {len(target_ids)} tokens "
+                f"(including EOS), leaving no context under max_length={self.max_length}"
             )
-            header_ids = _tokenize_to_ids(self.tokenizer, prefix_before_tac)
-            tac_ids = _tokenize_to_ids(self.tokenizer, tac_text)
-            footer_ids = _tokenize_to_ids(self.tokenizer, prefix_after_tac)
 
-            prefix_budget = self.max_length - len(target_ids)
-            fixed_prefix_len = len(header_ids) + len(footer_ids)
-            if fixed_prefix_len > prefix_budget:
-                footer_budget = min(len(footer_ids), prefix_budget)
-                header_budget = max(0, prefix_budget - footer_budget)
-                header_ids = header_ids[:header_budget]
-                footer_ids = footer_ids[-footer_budget:] if footer_budget else []
-                tac_ids = []
-            else:
-                tac_budget = prefix_budget - fixed_prefix_len
-                tac_ids = tac_ids[:tac_budget]
+        prefix_before_tac, tac_text, prefix_after_tac, _target, _suffix = (
+            self._format_prompt_components(item["input"], output, item.get("metadata", {}))
+        )
+        header_ids = _tokenize_to_ids(self.tokenizer, prefix_before_tac)
+        tac_ids = _tokenize_to_ids(self.tokenizer, tac_text)
+        footer_ids = _tokenize_to_ids(self.tokenizer, prefix_after_tac)
 
-            prefix_ids = header_ids + tac_ids + footer_ids
-            prefix_len = len(prefix_ids)
-            input_ids = prefix_ids + target_ids
+        prefix_budget = self.max_length - len(target_ids)
+        fixed_prefix_len = len(header_ids) + len(footer_ids)
+        if fixed_prefix_len > prefix_budget:
+            footer_budget = min(len(footer_ids), prefix_budget)
+            header_budget = max(0, prefix_budget - footer_budget)
+            header_ids = header_ids[:header_budget]
+            footer_ids = footer_ids[-footer_budget:] if footer_budget else []
+            tac_ids = []
+        else:
+            tac_budget = prefix_budget - fixed_prefix_len
+            tac_ids = tac_ids[:tac_budget]
+
+        prefix_ids = header_ids + tac_ids + footer_ids
+        prefix_len = len(prefix_ids)
+        input_ids = prefix_ids + target_ids
 
         labels = [-100] * prefix_len + target_ids[: len(input_ids) - prefix_len]
         tokenized = {
@@ -2304,6 +2307,7 @@ class SmartContractModelTrainer:
             tokenizer,
             max_length=self.config.max_sequence_length,
             include_bytecode_metadata=self.config.include_bytecode_metadata,
+            include_selector_signature_metadata=self.config.include_selector_signature_metadata,
             tokenization_cache=tokenization_cache_config,
         )
 
@@ -2321,6 +2325,7 @@ class SmartContractModelTrainer:
                 tokenizer,
                 max_length=self.config.max_sequence_length,
                 include_bytecode_metadata=self.config.include_bytecode_metadata,
+                include_selector_signature_metadata=self.config.include_selector_signature_metadata,
                 tokenization_cache=tokenization_cache_config,
             )
             if len(eval_dataset) == 0:

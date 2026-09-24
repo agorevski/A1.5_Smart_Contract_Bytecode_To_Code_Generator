@@ -67,6 +67,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from src.dataset_export_primitives import hash_normalized_body
+
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Coder-7B-Instruct"
 DEFAULT_NUM_GPUS = 4
 DEFAULT_BATCH_SIZE = 1
@@ -88,8 +90,8 @@ SPLIT_ARTIFACT_FILENAMES = {
     "validation_dataset.jsonl",
     "test_dataset.jsonl",
 }
-SPLIT_CACHE_SCHEMA_VERSION = 2
-PREFLIGHT_CACHE_SCHEMA_VERSION = 2
+SPLIT_CACHE_SCHEMA_VERSION = 3
+PREFLIGHT_CACHE_SCHEMA_VERSION = 4
 DEFAULT_MIN_SPLIT_TARGET_RATIO = 0.5
 DEFAULT_MAX_COMPONENT_TARGET_RATIO = 1.0
 DEFAULT_QUALITY_THRESHOLDS = {
@@ -572,6 +574,9 @@ def _row_leakage_keys(item: dict) -> dict[str, set[str]]:
             "solidity_body_hash",
         ),
     )
+    output = item.get("output")
+    if isinstance(output, str) and output.strip():
+        _add_leakage_key(keys, "body_hash", hash_normalized_body(output))
 
     _add_leakage_key(
         keys,
@@ -1142,6 +1147,8 @@ def _split_manifest_matches(
 ) -> tuple[bool, str, dict[str, str]]:
     if manifest.get("manifest_kind") != "dataset_split":
         return False, "manifest_kind_mismatch", {}
+    if manifest.get("schema_version") != SPLIT_CACHE_SCHEMA_VERSION:
+        return False, "schema_version_mismatch", {}
     if manifest.get("input_sha256") != source_sha256:
         return False, "source_sha256_mismatch", {}
     manifest_params = manifest.get("parameters")
@@ -1493,7 +1500,7 @@ def validate_jsonl_schema_and_lengths(
     max_errors: int = 50,
 ) -> dict:
     """Validate JSONL schema and token lengths before training/evaluation."""
-    from src.model_setup import _tokenize_to_ids
+    from src.model_setup import _append_eos_if_supported, _tokenize_to_ids
     from src.dataset_pipeline import (
         TRAINING_ROW_SCHEMA_VERSION,
         validate_training_metadata_schema,
@@ -1641,7 +1648,11 @@ def validate_jsonl_schema_and_lengths(
                     template_format=template_format,
                 )
                 context_tokens = len(_tokenize_to_ids(tokenizer, prefix))
-                target_tokens = len(_tokenize_to_ids(tokenizer, f"{target}{suffix}"))
+                target_tokens = len(
+                    _append_eos_if_supported(
+                        tokenizer, _tokenize_to_ids(tokenizer, f"{target}{suffix}")
+                    )
+                )
                 total_tokens = context_tokens + target_tokens
             except Exception as exc:
                 _record_preflight_error(
@@ -2549,6 +2560,7 @@ def _merge_aggregate_statistics(
     replication = aggregate.get("replication_metrics")
     if isinstance(replication, Mapping):
         micro = replication.get("micro", {})
+        behavior_micro = replication.get("behavior_only_micro", {})
         summary.update(
             {
                 "replication_precision_mean": replication.get("precision_mean"),
@@ -2562,6 +2574,9 @@ def _merge_aggregate_statistics(
                     micro.get("recall") if isinstance(micro, Mapping) else None
                 ),
                 "replication_f1_micro": micro.get("f1") if isinstance(micro, Mapping) else None,
+                "replication_behavior_only_f1_micro": (
+                    behavior_micro.get("f1") if isinstance(behavior_micro, Mapping) else None
+                ),
                 "replication_by_category_micro": replication.get("by_category_micro", {}),
             }
         )
@@ -2999,7 +3014,7 @@ def evaluate_model(
         extract_opcode_control_flow_slices,
         sample_evaluation_data,
     )
-    from src.model_setup import SmartContractDecompiler
+    from src.model_setup import SELECTOR_SIGNATURE_PROMPT_POLICY, SmartContractDecompiler
     from src.evaluation_report import write_latest_results_report
     from src.replication_metrics import aggregate_replication_scores
     from dataclasses import asdict
@@ -3554,6 +3569,7 @@ def evaluate_model(
                 "include_selector_signature_metadata": _decompiler_selector_signature_metadata(
                     decompiler
                 ),
+                "selector_signature_prompt_policy": SELECTOR_SIGNATURE_PROMPT_POLICY,
                 "generation_config": generation_config,
                 "model_path": model_path,
                 "test_dataset": test_path,
@@ -3576,6 +3592,7 @@ def evaluate_model(
             summary["worst_samples"] = _worst_evaluation_samples(results)
             if replication_summary:
                 replication_micro = replication_summary.get("micro", {})
+                behavior_micro = replication_summary.get("behavior_only_micro", {})
                 summary.update(
                     {
                         "replication_precision_mean": replication_summary.get("precision_mean"),
@@ -3585,6 +3602,7 @@ def evaluate_model(
                         "replication_precision_micro": replication_micro.get("precision"),
                         "replication_recall_micro": replication_micro.get("recall"),
                         "replication_f1_micro": replication_micro.get("f1"),
+                        "replication_behavior_only_f1_micro": behavior_micro.get("f1"),
                         "replication_by_category_micro": replication_summary.get(
                             "by_category_micro", {}
                         ),
@@ -3608,6 +3626,7 @@ def evaluate_model(
                 "include_selector_signature_metadata": _decompiler_selector_signature_metadata(
                     decompiler
                 ),
+                "selector_signature_prompt_policy": SELECTOR_SIGNATURE_PROMPT_POLICY,
                 "generation_config": generation_config,
                 "model_path": model_path,
                 "test_dataset": test_path,
@@ -4596,6 +4615,7 @@ def main():
             tokenizer_source=args.model_name,
             max_seq_length=args.max_seq_length,
             include_bytecode_metadata=not args.no_bytecode_metadata,
+            include_selector_signature_metadata=not args.no_selector_signature_metadata,
             skip=args.skip_data_preflight,
             allow_tokenizer_download=args.preflight_tokenizer_download,
             allow_whitespace_fallback=args.allow_whitespace_preflight_fallback,

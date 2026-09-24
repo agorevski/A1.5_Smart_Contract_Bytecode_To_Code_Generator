@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Full-data, body-balanced Qwen2.5-Coder QLoRA training run.
 #
-# This runner first materializes a dataset capped by metadata.body_hash so
+# This runner first materializes a dataset capped by normalized Solidity body so
 # optimizer/compiler variants of the same Solidity body do not dominate the
-# training signal. By default it keeps one row per body_hash, trains for one
+# training signal. By default it keeps one row per body, trains for one
 # epoch, then evaluates the resulting adapter against the current gate suite.
 #
 # Common overrides:
@@ -11,7 +11,7 @@
 #   RUN_ID=full_body_balanced_v1 ./run_train_qwen_qlora_full_body_balanced.sh
 #   CAP_PER_BODY=2 EPOCHS=1 ./run_train_qwen_qlora_full_body_balanced.sh
 #   MAX_ROWS=5000 ./run_train_qwen_qlora_full_body_balanced.sh
-#   EVAL_EXCLUDE_DATASETS= ./run_train_qwen_qlora_full_body_balanced.sh
+#   EVAL_EXCLUDE_DATASETS=other_gate.jsonl ./run_train_qwen_qlora_full_body_balanced.sh
 #   RUN_GATES=0 ./run_train_qwen_qlora_full_body_balanced.sh
 
 set -euo pipefail
@@ -56,7 +56,6 @@ DRY_RUN="${DRY_RUN:-false}"
 
 RUN_GATES="${RUN_GATES:-true}"
 GATE_DIR="${GATE_DIR:-${OUTPUT_DIR}/eval_gates}"
-BASELINE_MODEL="${BASELINE_MODEL:-${SCRIPT_DIR}/models/qwen2_5_coder_7b_qlora_500_loop_iter12_selector_metadata_100/final_model}"
 
 BROAD_DATASET="${BROAD_DATASET:-${SCRIPT_DIR}/data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl}"
 CALLS_DATASET="${CALLS_DATASET:-${SCRIPT_DIR}/data/eval_failure_slices/broad30_reppenalty_1_05_fixed_extractor/calls.jsonl}"
@@ -65,7 +64,7 @@ HOLDOUT64_DATASET="${HOLDOUT64_DATASET:-${SCRIPT_DIR}/data/curriculum_eval/calls
 PURE_NEGATIVE_DATASET="${PURE_NEGATIVE_DATASET:-${SCRIPT_DIR}/data/curriculum_negative/no_calls_no_state_simple64_nonoverlap.jsonl}"
 LARGE192_DATASET="${LARGE192_DATASET:-${SCRIPT_DIR}/data/curriculum_eval/large_stratified192_nonoverlap_iter32.jsonl}"
 DEFAULT_EVAL_EXCLUDE_DATASETS="${BROAD_DATASET}:${CALLS_DATASET}:${STATE_DATASET}:${HOLDOUT64_DATASET}:${PURE_NEGATIVE_DATASET}:${LARGE192_DATASET}"
-EVAL_EXCLUDE_DATASETS="${EVAL_EXCLUDE_DATASETS:-${DEFAULT_EVAL_EXCLUDE_DATASETS}}"
+EVAL_EXCLUDE_DATASETS="${DEFAULT_EVAL_EXCLUDE_DATASETS}${EVAL_EXCLUDE_DATASETS:+:${EVAL_EXCLUDE_DATASETS}}"
 
 BROAD_BASELINE="${BROAD_BASELINE:-${SCRIPT_DIR}/results/eval_1782624189.json}"
 CALLS_BASELINE="${CALLS_BASELINE:-${SCRIPT_DIR}/results/eval_1782624247.json}"
@@ -96,9 +95,40 @@ if [[ -n "${EVAL_EXCLUDE_DATASETS}" ]]; then
     done
 fi
 
+require_baseline() {
+    local label="$1"
+    local path="$2"
+    local dataset="$3"
+    if [[ ! -f "${path}" ]]; then
+        echo "Required ${label} baseline eval not found: ${path}; regenerate under bundled_only_v1 before training." >&2
+        exit 1
+    fi
+    python -m scripts.gate_dataset verify-baseline "${path}" "${dataset}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" \
+        --repetition-penalty "${EVAL_REPETITION_PENALTY}"
+}
+
+if [[ "${RUN_GATES}" != "false" && "${RUN_GATES}" != "0" &&
+      "${DRY_RUN}" != "true" && "${DRY_RUN}" != "1" ]]; then
+    require_baseline "broad30" "${BROAD_BASELINE}" "${BROAD_DATASET}"
+    require_baseline "calls23" "${CALLS_BASELINE}" "${CALLS_DATASET}"
+    require_baseline "state17" "${STATE_BASELINE}" "${STATE_DATASET}"
+    require_baseline "holdout64" "${HOLDOUT64_BASELINE}" "${HOLDOUT64_DATASET}"
+    require_baseline "pure_negative64" "${PURE_NEGATIVE_BASELINE}" "${PURE_NEGATIVE_DATASET}"
+    require_baseline "large192" "${LARGE192_BASELINE}" "${LARGE192_DATASET}"
+fi
+
 mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}"
 
-if [[ ! -s "${BALANCED_DATASET}" || "${RECREATE_DATASET}" == "true" || "${RECREATE_DATASET}" == "1" ]]; then
+if [[ -e "${BALANCED_DATASET}" && "${RECREATE_DATASET}" != "true" && "${RECREATE_DATASET}" != "1" ]]; then
+    CACHE_ARGS=(--manifest "${BALANCED_MANIFEST}" --cap-per-body "${CAP_PER_BODY}" --seed "${SEED}")
+    if [[ -n "${MAX_ROWS}" ]]; then
+        CACHE_ARGS+=(--max-rows "${MAX_ROWS}")
+    fi
+    python -m scripts.gate_dataset verify-balanced-cache \
+        "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${EVAL_EXCLUDE_DATASETS}" "${CACHE_ARGS[@]}"
+    echo "Using verified body-balanced dataset: ${BALANCED_DATASET}"
+else
     echo "Building body-balanced dataset from ${SOURCE_DATASET}"
     echo "  cap per body_hash: ${CAP_PER_BODY}"
     if [[ -n "${MAX_ROWS}" ]]; then
@@ -107,7 +137,7 @@ if [[ ! -s "${BALANCED_DATASET}" || "${RECREATE_DATASET}" == "true" || "${RECREA
     if [[ -n "${EVAL_EXCLUDE_DATASETS}" ]]; then
         echo "  excluding eval datasets: ${EVAL_EXCLUDE_DATASETS}"
     fi
-    uv run python - "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${BALANCED_MANIFEST}" "${CAP_PER_BODY}" "${SEED}" "${MAX_ROWS}" "${EVAL_EXCLUDE_DATASETS}" <<'PY'
+    python - "${SOURCE_DATASET}" "${BALANCED_DATASET}" "${BALANCED_MANIFEST}" "${CAP_PER_BODY}" "${SEED}" "${MAX_ROWS}" "${EVAL_EXCLUDE_DATASETS}" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -119,6 +149,15 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Mapping
 
+from scripts.gate_dataset import (
+    body_identity,
+    canonicalize_body_hash,
+    exclude_eval_rows,
+    file_sha256,
+    load_jsonl,
+    selection_fingerprint,
+    selection_inputs,
+)
 from src.replication_metrics import extract_solidity_facts
 
 
@@ -137,71 +176,39 @@ exclude_paths = [
 rng = random.Random(seed)
 
 
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            raw = line.strip()
-            if not raw:
-                continue
-            row = json.loads(raw)
-            if not isinstance(row, dict):
-                raise ValueError(f"{path}:{line_number} is not a JSON object")
-            rows.append(row)
-    return rows
-
-
-def body_identity(row: Mapping[str, Any]) -> tuple[str, bool]:
-    metadata = row.get("metadata")
-    if isinstance(metadata, Mapping):
-        body_hash = metadata.get("body_hash")
-        if body_hash:
-            return f"body_hash:{body_hash}", True
-        parts = [
-            metadata.get("contract_address"),
-            metadata.get("selector"),
-            metadata.get("function_signature"),
-            metadata.get("compiler_version"),
-        ]
-        if any(parts):
-            return "metadata:" + "|".join(str(part or "") for part in parts), False
-    digest = hashlib.sha256(
-        (str(row.get("input", "")) + "\0" + str(row.get("output", ""))).encode("utf-8")
-    ).hexdigest()
-    return f"content:{digest}", False
-
-
 def fact_coverage(row: Mapping[str, Any]) -> dict[str, int]:
     facts = extract_solidity_facts(str(row.get("output", "")))
     return {category: len(values) for category, values in facts.items() if values}
 
 
+inputs = selection_inputs(source, exclude_paths, cap_per_body=cap_per_body, seed=seed, max_rows=max_rows)
 source_rows = load_jsonl(source)
 source_identity_counts: Counter[str] = Counter()
 for row in source_rows:
-    identity, _ = body_identity(row)
-    source_identity_counts[identity] += 1
+    source_identity_counts[body_identity(row)] += 1
 
 excluded_identities: set[str] = set()
+gate_rows: list[dict[str, Any]] = []
 excluded_dataset_rows = 0
 for exclude_path in exclude_paths:
     for row in load_jsonl(exclude_path):
-        identity, _ = body_identity(row)
-        excluded_identities.add(identity)
+        excluded_identities.add(body_identity(row))
+        gate_rows.append(row)
         excluded_dataset_rows += 1
 
 groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-identity_uses_body_hash: dict[str, bool] = {}
-missing_body_hash_count = 0
-excluded_source_rows = 0
+missing_body_hash_count = sum(
+    not (isinstance(row.get("metadata"), Mapping) and row["metadata"].get("body_hash"))
+    for row in source_rows
+)
+available_rows, excluded_source_rows = exclude_eval_rows(source_rows, gate_rows)
+if not available_rows:
+    raise ValueError("All source rows overlap fixed eval gates; refusing empty training dataset")
+available_ids = {id(row) for row in available_rows}
 for source_index, row in enumerate(source_rows):
-    identity, used_body_hash = body_identity(row)
-    if identity in excluded_identities:
-        excluded_source_rows += 1
+    if id(row) not in available_ids:
         continue
-    identity_uses_body_hash[identity] = used_body_hash
-    if not used_body_hash:
-        missing_body_hash_count += 1
+    identity = body_identity(row)
     enriched = dict(row)
     enriched["_body_balance_source_index"] = source_index
     enriched["_body_balance_tie"] = rng.random()
@@ -231,13 +238,12 @@ visibilities: Counter[str] = Counter()
 input_chars: list[int] = []
 output_chars: list[int] = []
 for row in selected:
-    identity, _ = body_identity(row)
-    identity_counts[identity] += 1
-    clean = {
+    identity_counts[body_identity(row)] += 1
+    clean = canonicalize_body_hash({
         key: value
         for key, value in row.items()
         if not key.startswith("_body_balance_")
-    }
+    })
     clean_rows.append(clean)
     input_text = str(clean.get("input", ""))
     output_text = str(clean.get("output", ""))
@@ -258,13 +264,14 @@ with output.open("w", encoding="utf-8") as handle:
         json.dump(row, handle, sort_keys=True)
         handle.write("\n")
 
-selected_identity_digest = hashlib.sha256(
-    "\n".join(sorted(identity_counts)).encode("utf-8")
-).hexdigest()
+selected_identity_digest = hashlib.sha256("\n".join(sorted(identity_counts)).encode("utf-8")).hexdigest()
 source_body_duplicate_rows = sum(max(0, count - 1) for count in source_identity_counts.values())
 available_body_duplicate_rows = sum(max(0, len(rows) - 1) for rows in groups.values())
 manifest = {
     "manifest_kind": "body_balanced_dataset",
+    "selection_inputs": inputs,
+    "selection_fingerprint": selection_fingerprint(inputs),
+    "output_sha256": file_sha256(output),
     "source_dataset": str(source),
     "output_dataset": str(output),
     "cap_per_body": cap_per_body,
@@ -285,8 +292,8 @@ manifest = {
     "selected_identity_sha256": selected_identity_digest,
     "missing_body_hash_source_rows": missing_body_hash_count,
     "selection_policy": (
-        "group by metadata.body_hash when present; otherwise use metadata/content fallback; "
-        "select up to cap_per_body deterministic seeded variants per identity"
+        "group by recomputed normalized Solidity output body; exclude all fixed gate "
+        "body, input, output, source, and contract identities before deterministic selection"
     ),
     "input_chars": {
         "mean": mean(input_chars) if input_chars else 0,
@@ -307,8 +314,6 @@ with manifest_path.open("w", encoding="utf-8") as handle:
 
 print(json.dumps(manifest, indent=2, sort_keys=True))
 PY
-else
-    echo "Using existing body-balanced dataset: ${BALANCED_DATASET}"
 fi
 
 if [[ "${GRADIENT_CHECKPOINTING}" == "false" || "${GRADIENT_CHECKPOINTING}" == "0" ]]; then
@@ -419,6 +424,7 @@ if [[ ! -d "${FINAL_MODEL}" ]]; then
     exit 1
 fi
 
+TRAIN_DATASET="$(python -m scripts.gate_dataset verify-model "${FINAL_MODEL}" "${DEFAULT_EVAL_EXCLUDE_DATASETS}")"
 mkdir -p "${GATE_DIR}"
 EVAL_MAP="${GATE_DIR}/eval_paths.tsv"
 : > "${EVAL_MAP}"
@@ -452,34 +458,12 @@ run_eval() {
         "$@"
     local eval_json
     eval_json="$(newest_eval_json)"
+    python -m scripts.gate_dataset verify-eval "${eval_json}" "${model_path}" "${dataset_path}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
     printf '%s\t%s\t%s\t%s\n' "${label}" "${model_path}" "${dataset_path}" "${eval_json}" | tee -a "${EVAL_MAP}"
 }
 
-require_baseline() {
-    local label="$1"
-    local path="$2"
-    if [[ ! -f "${path}" ]]; then
-        echo "Required ${label} baseline eval not found: ${path}" >&2
-        exit 1
-    fi
-}
-
-require_baseline "broad30" "${BROAD_BASELINE}"
-require_baseline "calls23" "${CALLS_BASELINE}"
-require_baseline "state17" "${STATE_BASELINE}"
-require_baseline "holdout64" "${HOLDOUT64_BASELINE}"
-require_baseline "pure_negative64" "${PURE_NEGATIVE_BASELINE}"
-
-if [[ ! -f "${LARGE192_BASELINE}" ]]; then
-    if [[ ! -d "${BASELINE_MODEL}" ]]; then
-        echo "Large192 baseline is missing and BASELINE_MODEL does not exist: ${BASELINE_MODEL}" >&2
-        exit 1
-    fi
-    run_eval "large192_baseline" "${BASELINE_MODEL}" "${LARGE192_DATASET}" "${GATE_DIR}/latest_results_large192_baseline.txt"
-    LARGE192_BASELINE="$(tail -1 "${EVAL_MAP}" | cut -f4)"
-fi
-
-run_eval "train_first30" "${FINAL_MODEL}" "${DATA_DIR}/splits/train_dataset.jsonl" "${GATE_DIR}/latest_results_train_first30.txt" --eval-limit 30 --eval-first-n
+run_eval "train_first30" "${FINAL_MODEL}" "${TRAIN_DATASET}" "${GATE_DIR}/latest_results_train_first30.txt" --eval-limit 30 --eval-first-n
 run_eval "broad30" "${FINAL_MODEL}" "${BROAD_DATASET}" "${GATE_DIR}/latest_results_broad30.txt"
 run_eval "calls23" "${FINAL_MODEL}" "${CALLS_DATASET}" "${GATE_DIR}/latest_results_calls23.txt"
 run_eval "state17" "${FINAL_MODEL}" "${STATE_DATASET}" "${GATE_DIR}/latest_results_state17.txt"

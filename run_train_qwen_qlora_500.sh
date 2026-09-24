@@ -14,6 +14,9 @@
 #   LORA_RANK=32 LORA_ALPHA=64 LORA_DROPOUT=0 TRAIN_EVAL_STRATEGY=no ./run_train_qwen_qlora_500.sh
 #   RESUME=/path/to/checkpoint ./run_train_qwen_qlora_500.sh
 #   DRY_RUN=1 ./run_train_qwen_qlora_500.sh
+#
+# Fixed eval slices are excluded before sampling, including aliases of their
+# body hashes. SAMPLE_COUNT must fit the remaining eval-clean source.
 
 set -euo pipefail
 
@@ -54,6 +57,15 @@ GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 RECREATE_DATASET="${RECREATE_DATASET:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 
+BROAD_DATASET="${BROAD_DATASET:-${SCRIPT_DIR}/data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl}"
+CALLS_DATASET="${CALLS_DATASET:-${SCRIPT_DIR}/data/eval_failure_slices/broad30_reppenalty_1_05_fixed_extractor/calls.jsonl}"
+STATE_DATASET="${STATE_DATASET:-${SCRIPT_DIR}/data/eval_failure_slices/broad30_reppenalty_1_05_fixed_extractor/state_writes.jsonl}"
+HOLDOUT64_DATASET="${HOLDOUT64_DATASET:-${SCRIPT_DIR}/data/curriculum_eval/calls_state64_holdout_nonoverlap.jsonl}"
+PURE_NEGATIVE_DATASET="${PURE_NEGATIVE_DATASET:-${SCRIPT_DIR}/data/curriculum_negative/no_calls_no_state_simple64_nonoverlap.jsonl}"
+LARGE192_DATASET="${LARGE192_DATASET:-${SCRIPT_DIR}/data/curriculum_eval/large_stratified192_nonoverlap_iter32.jsonl}"
+FIXED_EVAL_DATASETS="${BROAD_DATASET}:${CALLS_DATASET}:${STATE_DATASET}:${HOLDOUT64_DATASET}:${PURE_NEGATIVE_DATASET}:${LARGE192_DATASET}"
+EVAL_EXCLUDE_DATASETS="${FIXED_EVAL_DATASETS}${EVAL_EXCLUDE_DATASETS:+:${EVAL_EXCLUDE_DATASETS}}"
+
 if [[ ! -f "${SOURCE_DATASET}" ]]; then
     echo "Source dataset not found: ${SOURCE_DATASET}" >&2
     echo "Set SOURCE_DATASET=/path/to/dataset.jsonl or generate data first." >&2
@@ -67,42 +79,12 @@ fi
 
 mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}"
 
-if [[ ! -s "${SAMPLED_DATASET}" || "${RECREATE_DATASET}" == "true" || "${RECREATE_DATASET}" == "1" ]]; then
-    echo "Sampling ${SAMPLE_COUNT} rows from ${SOURCE_DATASET} -> ${SAMPLED_DATASET}"
-    uv run python - "${SOURCE_DATASET}" "${SAMPLED_DATASET}" "${SAMPLE_COUNT}" "${SEED}" <<'PY'
-import json
-import random
-import sys
-from pathlib import Path
-
-source = Path(sys.argv[1])
-target = Path(sys.argv[2])
-sample_count = int(sys.argv[3])
-seed = int(sys.argv[4])
-
-rows = []
-with source.open("r", encoding="utf-8") as handle:
-    for line in handle:
-        line = line.strip()
-        if line:
-            rows.append(line)
-
-if len(rows) < sample_count:
-    raise SystemExit(f"{source} only has {len(rows)} non-empty rows; need {sample_count}")
-
-rng = random.Random(seed)
-indices = list(range(len(rows)))
-rng.shuffle(indices)
-
-target.parent.mkdir(parents=True, exist_ok=True)
-with target.open("w", encoding="utf-8") as handle:
-    for index in indices[:sample_count]:
-        json.loads(rows[index])
-        handle.write(rows[index] + "\n")
-PY
-else
-    echo "Using existing sampled dataset: ${SAMPLED_DATASET}"
+SAMPLE_ARGS=()
+if [[ "${RECREATE_DATASET}" == "true" || "${RECREATE_DATASET}" == "1" ]]; then
+    SAMPLE_ARGS+=(--recreate)
 fi
+python -m scripts.gate_dataset sample "${SOURCE_DATASET}" "${SAMPLED_DATASET}" "${EVAL_EXCLUDE_DATASETS}" \
+    --count "${SAMPLE_COUNT}" --seed "${SEED}" "${SAMPLE_ARGS[@]}"
 
 if [[ "${GRADIENT_CHECKPOINTING}" == "false" || "${GRADIENT_CHECKPOINTING}" == "0" ]]; then
     GRADIENT_CHECKPOINTING_ARG="--no-gradient-checkpointing"
@@ -175,6 +157,7 @@ fi
 echo "=== Basic Qwen QLoRA training ==="
 echo "  Sampled dataset:       ${SAMPLED_DATASET}"
 echo "  Sample count:          ${SAMPLE_COUNT}"
+echo "  Fixed eval exclusions: ${EVAL_EXCLUDE_DATASETS}"
 echo "  Epochs:                ${EPOCHS}"
 echo "  Model:                 ${MODEL}"
 echo "  QLoRA 4-bit:           enabled"

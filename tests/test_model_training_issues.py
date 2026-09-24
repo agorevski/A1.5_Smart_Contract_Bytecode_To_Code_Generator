@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import train
 from src import model_setup
 from src.model_setup import (
@@ -238,6 +240,17 @@ def test_dataset_truncation_preserves_full_short_target_span():
     supervised_labels = [label for label in item["labels"] if label != -100]
 
     assert supervised_labels == ["TARGET_A", "TARGET_B", "TARGET_C"]
+
+
+def test_dataset_rejects_target_that_cannot_fit_with_context_and_eos():
+    dataset = _dataset_for_item(
+        {"input": "tac", "output": "TARGET_A TARGET_B", "metadata": {}},
+        max_length=3,
+    )
+    dataset.tokenizer = NumericTokenizer()
+
+    with pytest.raises(ValueError, match="target.*max_length"):
+        dataset[0]
 
 
 def test_numeric_tokenizer_targets_include_eos_for_stop_learning():
@@ -704,6 +717,7 @@ def test_training_pipeline_split_invokes_shared_preflight_and_manifest(tmp_path,
         train_test_split=0.6,
         validation_split=0.2,
     )
+    pipeline.config.model_config.include_selector_signature_metadata = False
 
     train_path, val_path, test_path = pipeline._split_dataset(str(dataset_path))
 
@@ -716,6 +730,7 @@ def test_training_pipeline_split_invokes_shared_preflight_and_manifest(tmp_path,
         "test": test_path,
     }
     assert captured["kwargs"]["allow_legacy_metadata_schema"] is False
+    assert captured["kwargs"]["include_selector_signature_metadata"] is False
     assert pipeline.last_preflight_report["status"] == "passed"
 
 
@@ -814,6 +829,38 @@ def test_tokenized_dataset_cache_reuses_examples_and_max_length_invalidates(tmp_
     assert changed_vocab_tokenizer.calls > 0
 
 
+def test_tokenized_cache_invalidates_legacy_selector_signatures(tmp_path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    _write_jsonl(
+        dataset_path,
+        [{"input": "function function_0x5312ea8e:\n  return", "output": "TARGET", "metadata": {}}],
+    )
+    cache_dir = tmp_path / "token-cache"
+    cache_dir.mkdir()
+    tokenizer = CountingTokenizer()
+    dataset = SmartContractDataset(str(dataset_path), tokenizer, max_length=64)
+    legacy_metadata = dataset._cache_metadata(str(dataset_path))
+    legacy_metadata["cache_version"] = 2
+    cache_path, metadata_path = dataset._cache_paths(str(dataset_path), cache_dir, legacy_metadata)
+    dataset._write_tokenization_cache(
+        cache_path,
+        metadata_path,
+        legacy_metadata,
+        [{"input_ids": ["selector_signature=oracle()", "TARGET"],
+          "attention_mask": [1, 1], "labels": [-100, "TARGET"]}],
+    )
+
+    current = SmartContractDataset(
+        str(dataset_path),
+        tokenizer,
+        max_length=64,
+        tokenization_cache=TokenizationCacheConfig(enabled=True, cache_dir=str(cache_dir)),
+    )
+
+    assert tokenizer.calls > 0
+    assert "selector_signature=oracle()" not in current[0]["input_ids"]
+
+
 def test_tokenized_dataset_cache_invalidates_prompt_flags_and_dataset_fingerprint(tmp_path):
     dataset_path = tmp_path / "dataset.jsonl"
     rows = [
@@ -910,6 +957,10 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
     class FakeTrainer:
         def __init__(self, **kwargs):
             captured["eval_ids"] = [row["metadata"]["id"] for row in kwargs["eval_dataset"].data]
+            captured["prompt_flags"] = {
+                split: getattr(kwargs[f"{split}_dataset"], "include_selector_signature_metadata")
+                for split in ("train", "eval")
+            }
             self.state = SimpleNamespace(log_history=[{"loss": 0.5, "step": 1}])
 
         def train(self, **_kwargs):
@@ -934,7 +985,11 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
     monkeypatch.setattr(SmartContractModelTrainer, "setup_model", fake_setup_model)
 
     trainer = SmartContractModelTrainer(
-        ModelConfig(max_sequence_length=128, use_quantization=False),
+        ModelConfig(
+            max_sequence_length=128,
+            use_quantization=False,
+            include_selector_signature_metadata=False,
+        ),
         output_dir=str(tmp_path / "models"),
     )
     model_path = trainer.train(
@@ -961,6 +1016,7 @@ def test_train_time_eval_cap_uses_seeded_sample_and_writes_input_manifest(tmp_pa
 
     assert captured["eval_ids"] == expected_indices
     assert captured["eval_ids"] != [0, 1, 2, 3]
+    assert captured["prompt_flags"] == {"train": False, "eval": False}
     assert manifest["status"] == "completed"
     assert manifest["seed"] == 123
     assert manifest["datasets"]["train"]["artifact"]["row_count"] == 6

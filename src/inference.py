@@ -101,7 +101,7 @@ def analyze_bytecode_tac(bytecode: str):
     analyzer = BytecodeAnalyzer(bytecode)
     func_tac = analyzer.generate_per_function_tac()
     if not func_tac:
-        func_tac = {"contract": analyzer.generate_tac_representation()}
+        return analyzer, {}, analyzer.generate_tac_representation()
     combined = "\n\n".join(func_tac.values())
     return analyzer, func_tac, combined
 
@@ -113,7 +113,7 @@ def build_function_metadata(
     tac_text: str,
     base_metadata: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """Build inference metadata using only bytecode/analyzer-derived facts."""
+    """Build function prompt metadata without adding training-absent contract counts."""
     metadata = dict(base_metadata or {})
     hex_body = bytecode[2:] if str(bytecode).lower().startswith("0x") else str(bytecode)
     func_obj = getattr(analyzer, "functions", {}).get(fname)
@@ -124,9 +124,7 @@ def build_function_metadata(
         {
             "bytecode_hex_length": len(hex_body),
             "bytecode_byte_length": len(hex_body) // 2,
-            "bytecode_instruction_count": len(getattr(analyzer, "instructions", []) or []),
             "basic_block_count": len(getattr(analyzer, "basic_blocks", {}) or {}),
-            "function_count": len(getattr(analyzer, "functions", {}) or {}),
             "tac_line_count": len(str(tac_text or "").splitlines()),
             "tac_char_count": len(str(tac_text or "")),
         }
@@ -412,7 +410,10 @@ def run_bytecode_inference(
         "bytecode analysis",
         operation_runner,
     )
-    func_names = list(func_tac_map.keys())
+    no_function_boundaries = not func_tac_map or (
+        set(func_tac_map) == {"contract"} and not getattr(analyzer, "functions", {})
+    )
+    func_names = [] if no_function_boundaries else list(func_tac_map.keys())
     if max_functions is not None and len(func_names) > max_functions:
         raise InferenceWorkLimitError(
             f"too many functions detected ({len(func_names)}); maximum is {max_functions}"
@@ -422,11 +423,87 @@ def run_bytecode_inference(
     analysis_base = {
         "num_instructions": len(getattr(analyzer, "instructions", []) or []),
         "num_basic_blocks": len(getattr(analyzer, "basic_blocks", {}) or {}),
-        "num_functions": len(func_tac_map),
+        "num_functions": len(func_names),
         "tac_generation_time_s": round(tac_time, 3),
     }
+    rejected_targets = dict(getattr(analyzer, "rejected_dispatcher_targets", {}) or {})
+    if rejected_targets:
+        analysis_base["rejected_dispatcher_targets"] = rejected_targets
+    incomplete_reason = (
+        "Some dispatcher selectors have invalid targets: "
+        + ", ".join(
+            f"{selector} -> 0x{target:x}" for selector, target in sorted(rejected_targets.items())
+        )
+        if rejected_targets
+        else None
+    )
     trace["analysis"].update(analysis_base)
     _trace_event(trace, "analysis_done", **analysis_base)
+
+    if no_function_boundaries:
+        error = (
+            "No recoverable function boundaries in bytecode; refusing to infer a "
+            "function from whole-contract TAC."
+        )
+        diagnostic_tac = f"// Analysis failed: {error}\n{combined_tac}"
+        source_summary = {"exact_match": 0, "model_inference": 0, "error": 0, "unknown": 0}
+        reconstruction = build_reconstruction_plan(bytecode, analyzer, {})
+        reconstruction["strategy"] = "no_recoverable_function_chunks"
+        reconstruction["description"] = error
+        quality = build_contract_quality(
+            {"valid": False, "method": "not_run"},
+            [],
+            source_summary,
+            reconstruction,
+            rejected_dispatcher_targets=rejected_targets,
+        )
+        quality["recommended_actions"].insert(0, "Inspect runtime dispatcher targets.")
+        analysis = {
+            **analysis_base,
+            "error": error,
+            "function_sources": {},
+            "function_errors": {},
+            "function_results": [],
+            "source_summary": source_summary,
+            "reconstruction": reconstruction,
+            "quality": quality,
+        }
+        trace["analysis"].update(analysis)
+        trace["reconstruction"] = reconstruction
+        _trace_event(trace, "analysis_failed", error=error)
+        _finish_trace(trace, started_at, "failed", error)
+        return {
+            "success": False,
+            "partial_success": False,
+            "decompilation_status": "analysis_failed",
+            "error": error,
+            "model_path": model_path,
+            "model_config": model_config_dict,
+            "generation_config": generation,
+            "effective_generation_config": generation,
+            "lookup_config": lookup,
+            "lookup": {
+                "enabled": bool(lookup.get("enabled")),
+                "available": bool(tac_lookup is not None and getattr(tac_lookup, "available", True)),
+                "hits": 0,
+                "misses": 0,
+                "provenance": {},
+            },
+            "tac": diagnostic_tac,
+            "tac_per_function": {},
+            "functions": {},
+            "function_results": [],
+            "source_summary": source_summary,
+            "solidity": "",
+            "validation": {},
+            "function_validation": {},
+            "selector_map": {},
+            "reconstruction": reconstruction,
+            "quality": quality,
+            "analysis": analysis,
+            "trace": trace,
+            "trace_path": None,
+        }
 
     selector_map: Dict[str, Any] = {}
     for fname in func_names:
@@ -527,7 +604,10 @@ def run_bytecode_inference(
 
     if tac_only:
         source_summary = {"exact_match": 0, "model_inference": 0, "error": 0, "unknown": 0}
-        quality = build_contract_quality({}, [], source_summary, reconstruction_plan)
+        quality = build_contract_quality(
+            {}, [], source_summary, reconstruction_plan,
+            rejected_dispatcher_targets=rejected_targets,
+        )
         analysis = {
             **analysis_base,
             "solidity_generation_time_s": 0.0,
@@ -551,11 +631,14 @@ def run_bytecode_inference(
             "quality": quality,
         }
         trace["analysis"].update(analysis)
-        _finish_trace(trace, started_at, "tac_only")
+        _finish_trace(
+            trace, started_at, "partial" if incomplete_reason else "tac_only", incomplete_reason
+        )
         return {
-            "success": True,
-            "partial_success": False,
-            "decompilation_status": "tac_only_no_model",
+            "success": incomplete_reason is None,
+            "partial_success": incomplete_reason is not None,
+            "decompilation_status": "partial_analysis" if incomplete_reason else "tac_only_no_model",
+            "error": incomplete_reason,
             "model_path": model_path,
             "model_config": model_config_dict,
             "generation_config": generation,
@@ -678,18 +761,29 @@ def run_bytecode_inference(
         lookup_provenance=lookup_provenance,
     )
     source_summary = _source_summary(function_sources, function_errors, function_results)
-    quality = build_contract_quality(validation, function_results, source_summary, reconstruction_plan)
+    quality = build_contract_quality(
+        validation, function_results, source_summary, reconstruction_plan,
+        rejected_dispatcher_targets=rejected_targets,
+    )
     failure_count = len(function_errors)
     validation_failed = not bool(validation.get("valid"))
-    success = failure_count == 0 and not validation_failed and not (decompiler is None and unresolved_fnames)
-    partial_success = (failure_count > 0 or validation_failed) and any(
+    success = (
+        failure_count == 0
+        and not validation_failed
+        and incomplete_reason is None
+        and not (decompiler is None and unresolved_fnames)
+    )
+    partial_success = (failure_count > 0 or validation_failed or incomplete_reason is not None) and any(
         source != "error" for source in function_sources.values()
     )
-    decompilation_status = (
-        "partial_error"
-        if function_errors
-        else "validation_failed" if validation_failed else "model_generated"
-    )
+    if function_errors:
+        decompilation_status = "partial_error"
+    elif validation_failed:
+        decompilation_status = "validation_failed"
+    elif incomplete_reason:
+        decompilation_status = "partial_analysis"
+    else:
+        decompilation_status = "model_generated"
     analysis = {
         **analysis_base,
         "solidity_generation_time_s": round(gen_time, 3),
@@ -722,13 +816,15 @@ def run_bytecode_inference(
         trace,
         started_at,
         "success" if success else "partial" if partial_success else "failed",
-        None if success or partial_success else "Solidity validation failed" if validation_failed else None,
+        incomplete_reason
+        or (None if success or partial_success else "Solidity validation failed" if validation_failed else None),
     )
 
     return {
         "success": success,
         "partial_success": partial_success,
         "decompilation_status": decompilation_status,
+        "error": incomplete_reason,
         "model_path": model_path,
         "model_config": model_config_dict,
         "generation_config": generation,

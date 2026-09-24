@@ -576,7 +576,7 @@ class TestCollectAndCompileContracts:
                 },
             )
 
-        def fake_match(solidity_functions, _bytecode_functions, _analyzer):
+        def fake_match(solidity_functions, _bytecode_functions, _analyzer, **_kwargs):
             return [
                 {
                     "solidity_function": solidity_functions[0],
@@ -895,6 +895,77 @@ class TestMatchFunctionsBySelector:
         mock_analyzer = MagicMock()
         matches = builder._match_functions_by_selector(sol_funcs, bc_funcs, mock_analyzer)
         assert matches == []
+
+    def test_conflicting_selector_targets_are_not_labeled(self, builder):
+        selector = "0x23b872dd"
+        erc20 = {
+            "name": "transferFrom",
+            "selector": selector,
+            "body": "function transferFrom(address from, address to, uint256 amount) public returns (bool) { return true; }",
+        }
+        erc721 = {
+            "name": "transferFrom",
+            "selector": selector,
+            "body": "function transferFrom(address from, address to, uint256 tokenId) public { ownerOf[tokenId] = to; }",
+        }
+        distinct = {
+            "name": "transfer",
+            "selector": "0xa9059cbb",
+            "body": "function transfer(address to, uint256 amount) public { emit Transfer(to, amount); }",
+        }
+        bytecode_funcs = {
+            "collision": SimpleNamespace(selector=selector, entry_block="block_0", basic_blocks=[]),
+            "transfer": SimpleNamespace(
+                selector=distinct["selector"], entry_block="block_1", basic_blocks=[]
+            ),
+        }
+        analyzer = MagicMock(basic_blocks={})
+        ambiguous = set()
+        matches = builder._match_functions_by_selector(
+            [erc20, erc721, distinct], bytecode_funcs, analyzer,
+            ambiguous_selectors=ambiguous,
+        )
+        assert ambiguous == {selector}
+        assert [match["solidity_function"] for match in matches] == [distinct]
+        assert builder._match_functions_by_selector(
+            [erc20], bytecode_funcs, analyzer
+        )[0]["solidity_function"] == erc20
+
+    def test_identical_source_targets_with_same_selector_remain_matchable(self, builder):
+        selector = "0x23b872dd"
+        source = {
+            "name": "transferFrom",
+            "selector": selector,
+            "body": "function transferFrom(address from, address to, uint256 value) public { emit Transfer(from, to, value); }",
+        }
+        bytecode = SimpleNamespace(selector=selector, entry_block="block_0", basic_blocks=[])
+        ambiguous = set()
+        matches = builder._match_functions_by_selector(
+            [source, dict(source)], {"first": bytecode}, MagicMock(basic_blocks={}),
+            ambiguous_selectors=ambiguous,
+        )
+        assert ambiguous == set()
+        assert len(matches) == 1
+        assert matches[0]["solidity_function"] == source
+
+    def test_duplicate_runtime_selector_with_distinct_entries_is_ambiguous(self, builder):
+        selector = "0x23b872dd"
+        source = {
+            "name": "transferFrom",
+            "selector": selector,
+            "body": "function transferFrom(address from, address to, uint256 amount) public { emit Transfer(from, to, amount); }",
+        }
+        bytecode_funcs = {
+            "first": SimpleNamespace(selector=selector, entry_block="block_0"),
+            "second": SimpleNamespace(selector=selector, entry_block="block_1"),
+        }
+        ambiguous = set()
+        matches = builder._match_functions_by_selector(
+            [source], bytecode_funcs, MagicMock(basic_blocks={}),
+            ambiguous_selectors=ambiguous,
+        )
+        assert matches == []
+        assert ambiguous == {selector}
 
 
 class TestCollectFunctionBlocks:

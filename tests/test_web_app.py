@@ -95,6 +95,7 @@ def test_ui_provides_in_memory_api_key_field_and_auth_headers(client):
     assert 'fetch("/api/gpu-stats", { headers: apiHeaders() })' in app_js
     assert 'headers: apiHeaders({ "Content-Type": "application/json" })' in app_js
     assert 'headers.Authorization = "Bearer " + apiKey' in app_js
+    assert "if (data.error)" in app_js
 
 
 def test_health_splits_liveness_readiness_and_redacts_public_details(client, monkeypatch):
@@ -451,6 +452,57 @@ def test_decompile_lookup_hit_surfaces_provenance_and_can_be_disabled(client, mo
     ][-1]
     assert disabled_result["source_summary"]["exact_match"] == 0
     assert disabled_result["lookup_config"]["benchmark_mode"] is True
+
+
+def test_decompile_stream_rejects_unrecoverable_function_boundaries(client, monkeypatch):
+    monkeypatch.setattr(web_app, "decompiler", None)
+    monkeypatch.setattr(web_app, "tac_lookup", None)
+    monkeypatch.setattr(web_app, "_write_inference_trace", lambda trace: None)
+    response = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x60003560e01c80631234567814602057"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    events = _parse_sse_events(response.get_data(as_text=True))
+    assert not any(event == "result" and data.get("success") for event, data in events)
+    assert any(
+        event == "error" and "No recoverable function boundaries" in data["error"]
+        for event, data in events
+    )
+
+
+def test_decompile_stream_marks_rejected_selector_with_fallback_partial(client, monkeypatch):
+    class FakeDecompiler:
+        def decompile_tac_to_solidity(self, tac, **kwargs):
+            return "fallback() external {}"
+
+    monkeypatch.setattr(web_app, "decompiler", FakeDecompiler())
+    monkeypatch.setattr(web_app, "tac_lookup", None)
+    monkeypatch.setattr(web_app, "_write_inference_trace", lambda trace: None)
+    monkeypatch.setattr(
+        web_app,
+        "_validate_solidity_output",
+        lambda source, metadata=None: {"valid": True, "method": "scaffold"},
+    )
+    response = client.post(
+        "/api/decompile",
+        json={"bytecode": "0x60003560e01c806312345678146020575b00"},
+        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+    )
+
+    results = [
+        data for event, data in _parse_sse_events(response.get_data(as_text=True))
+        if event == "result"
+    ]
+    assert len(results) == 1
+    assert results[0]["success"] is False
+    assert results[0]["partial_success"] is True
+    assert results[0]["decompilation_status"] == "partial_analysis"
+    assert results[0]["analysis"]["rejected_dispatcher_targets"] == {"0x12345678": 0x20}
+    assert "function_0x12345678" in results[0]["quality"]["unresolved_chunks"]
+    assert results[0]["quality"]["severity"] == "error"
+    assert "0x12345678 -> 0x20" in results[0]["error"]
 
 
 def test_decompile_rejects_invalid_abi_json(client):

@@ -1,8 +1,16 @@
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
+
+
+class _CharacterTokenizer:
+    name_or_path = "character-test-tokenizer"
+
+    def __call__(self, text, **_kwargs):
+        return {"input_ids": list(range(len(text)))}
 
 
 def _make_pair(download_hf_contracts, idx, body):
@@ -199,6 +207,83 @@ def test_download_contracts_streams_parquet_batches_without_full_dataframe(tmp_p
     assert manifest["drop_counts"]["non_solidity"] == 1
 
 
+def test_download_preserves_distinct_targets_and_verified_compiler_configs(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import download_hf_contracts
+
+    source = (
+        "pragma solidity ^0.8.0; "
+        "contract A { function a() public { emit Done(1); } } "
+        "contract B { function b() public { emit Done(2); } }"
+    )
+    rows = [
+        ("A", "v0.8.20", True, 200),
+        ("B", "v0.8.20", True, 200),
+        ("A", "v0.8.19", True, 200),
+        ("A", "v0.8.20", False, 200),
+        ("A", "v0.8.20+commit.a1b79de6", True, 200),
+        ("B", "v0.8.19", True, 200),
+        ("B", "v0.8.19", False, 200),
+    ]
+    table = pa.table(
+        {
+            "language": ["Solidity"] * len(rows),
+            "source_code": [source] * len(rows),
+            "contract_address": [
+                f"0x{idx:040x}" if idx <= 5 else ""
+                for idx in range(1, len(rows) + 1)
+            ],
+            "contract_name": [row[0] for row in rows],
+            "compiler_version": [row[1] for row in rows],
+            "optimization_used": [row[2] for row in rows],
+            "runs": [row[3] for row in rows],
+        }
+    )
+    parquet_path = tmp_path / "same-source.parquet"
+    pq.write_table(table, parquet_path)
+    monkeypatch.setattr(
+        download_hf_contracts, "_get_parquet_files", lambda *a, **k: ["data/train/0.parquet"]
+    )
+    monkeypatch.setattr(download_hf_contracts, "_resolve_hf_revision", lambda _: "resolved")
+    monkeypatch.setattr(
+        download_hf_contracts, "hf_hub_download", lambda **_kwargs: str(parquet_path)
+    )
+
+    db_path = tmp_path / "contracts.db"
+    manifest_path = tmp_path / "download.manifest.json"
+    download_hf_contracts.init_database(db_path)
+    assert download_hf_contracts.download_contracts(
+        db_path=db_path, manifest_path=manifest_path
+    ) == 6
+    with sqlite3.connect(db_path) as conn:
+        stored = conn.execute(
+            "SELECT address, contract_name, compiler_version, optimization_enabled "
+            "FROM contracts ORDER BY address"
+        ).fetchall()
+    named = [row[1:] for row in stored if row[0].startswith("0x")]
+    synthetic = [row for row in stored if row[0].startswith("hf_")]
+    assert named == [
+        ("A", "v0.8.20", 1),
+        ("B", "v0.8.20", 1),
+        ("A", "v0.8.19", 1),
+        ("A", "v0.8.20", 0),
+    ]
+    assert len({row[0] for row in synthetic}) == 2
+    assert {row[1:] for row in synthetic} == {
+        ("B", "v0.8.19", 1), ("B", "v0.8.19", 0)
+    }
+    assert download_hf_contracts.download_contracts(
+        db_path=db_path, manifest_path=manifest_path
+    ) == 0
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["drop_counts"]["source_deduped"] == 7
+    assert manifest["parameters"]["dedup_key"] == [
+        "source_hash", "contract_name", "compiler_version",
+        "optimization_enabled", "optimization_runs",
+    ]
+
+
 def test_prepare_contract_uses_single_source_aligned_compiler_config():
     import download_hf_contracts
 
@@ -231,6 +316,136 @@ def test_prepare_contract_uses_single_source_aligned_compiler_config():
         }
     ]
     assert "compatible_versions" not in prepared
+
+
+def test_hf_compile_quarantines_ambiguous_selector_alignment(monkeypatch):
+    from types import SimpleNamespace
+    import download_hf_contracts
+
+    selector = "0x23b872dd"
+    source_functions = [
+        {
+            "name": "transferFrom", "selector": selector, "contract_name": "ERC20",
+            "body": "function transferFrom(address from, address to, uint256 amount) public returns (bool) { return true; }",
+        },
+        {
+            "name": "transferFrom", "selector": selector, "contract_name": "ERC721",
+            "body": "function transferFrom(address from, address to, uint256 tokenId) public { ownerOf[tokenId] = to; }",
+        },
+    ]
+    bytecode_function = SimpleNamespace(
+        selector=selector, entry_block="block_0", basic_blocks=[]
+    )
+
+    class FakeAnalyzer:
+        basic_blocks = {}
+
+        def __init__(self, _bytecode):
+            pass
+
+        def analyze_control_flow(self):
+            pass
+
+        def identify_functions(self):
+            return {"transferFrom": bytecode_function}
+
+    monkeypatch.setattr(download_hf_contracts, "install_solc_version", lambda _: True)
+    monkeypatch.setattr(download_hf_contracts, "BytecodeAnalyzer", FakeAnalyzer)
+    monkeypatch.setattr(
+        download_hf_contracts, "compile_source",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            success=True,
+            contracts={
+                "Derived": SimpleNamespace(
+                    runtime_bytecode="6000600055",
+                    abi=[{"name": "transferFrom", "type": "function"}],
+                )
+            },
+        ),
+    )
+    outcome = download_hf_contracts._compile_one_job(
+        "0x" + "1" * 40,
+        {
+            "contract.sol": (
+                "pragma solidity ^0.8.0; contract ERC20 { "
+                "function transferFrom(address from, address to, uint256 value) "
+                "public returns (bool) { return true; } } "
+                "contract Derived is ERC20 {}"
+            )
+        },
+        source_functions,
+        "0.8.20",
+        True,
+        200,
+        min_body_length=0,
+        target_contract_name="Derived",
+    )
+    assert outcome["pairs"] == []
+    assert outcome["status"] == "ambiguous_selector_alignment"
+    assert outcome["drop_counts"]["ambiguous_selector_alignment"] == 1
+    assert selector in outcome["error"]
+
+
+def test_etherscan_compile_records_ambiguous_selector_diagnostic(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from src import dataset_pipeline
+
+    source = """
+    pragma solidity ^0.8.0;
+    contract ERC20 {
+        function transferFrom(address from, address to, uint256 value)
+            public returns (bool) { return true; }
+    }
+    contract ERC721 {
+        function transferFrom(address from, address to, uint256 tokenId)
+            public { ownerOf[tokenId] = to; }
+    }
+    contract Derived is ERC20 {}
+    """
+
+    class FakeAnalyzer:
+        basic_blocks = {}
+
+        def __init__(self, _bytecode):
+            pass
+
+        def analyze_control_flow(self):
+            pass
+
+        def identify_functions(self):
+            return {
+                "transferFrom": SimpleNamespace(
+                    selector="0x23b872dd", entry_block="block_0", basic_blocks=[]
+                )
+            }
+
+    builder = dataset_pipeline.DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
+    builder.etherscan.get_contract_source = lambda address: dataset_pipeline.ContractData(
+        address=address, source_code=source, bytecode="0x6000600055",
+        compiler_version="v0.8.20", optimization_enabled=True, optimization_runs=200,
+    )
+    monkeypatch.setattr(dataset_pipeline, "install_solc_version", lambda _: True)
+    monkeypatch.setattr(dataset_pipeline, "BytecodeAnalyzer", FakeAnalyzer)
+    monkeypatch.setattr(
+        dataset_pipeline, "compile_source",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            success=True,
+            contracts={
+                "Derived": SimpleNamespace(runtime_bytecode="6000600055", abi=[])
+            },
+        ),
+    )
+    outcome = builder._collect_compile_address(
+        "0x" + "1" * 40, max_compiler_configs=1, compiler_install_lock=threading.Lock()
+    )
+    assert outcome.pairs == []
+    assert outcome.status_update["status"] == "ambiguous_selector_alignment"
+    assert any(
+        diag["status"] == "ambiguous_selector_alignment"
+        and "0x23b872dd" in diag["error"]
+        for diag in outcome.diagnostics
+    )
 
 
 def test_export_training_data_quarantines_overlength_rows(tmp_path):
@@ -275,6 +490,168 @@ def test_export_training_data_quarantines_overlength_rows(tmp_path):
     manifest = json.loads(manifest_path.read_text())
     assert manifest["drop_counts"]["overlength_rows"] == 2
     assert manifest["artifacts"]["rejects_jsonl"]["row_count"] == 2
+
+
+def test_export_length_report_uses_training_prompt_and_exact_tokenizer():
+    import train
+    from src.dataset_export_primitives import export_length_report, export_prompt_parts
+
+    record = {
+        "input": "function selector_12345678:\n  block_0:\n    temp_1 = ADD 1 2",
+        "output": "function add() public pure returns (uint256) { return 1 + 2; }",
+        "metadata": {"selector": "0x12345678"},
+    }
+    expected_parts = train._preflight_prompt_parts(
+        record,
+        include_bytecode_metadata=True,
+        include_selector_signature_metadata=True,
+        template_format="alpaca",
+    )
+    assert export_prompt_parts(record) == expected_parts
+    prefix, target, suffix = expected_parts
+    assert prefix.startswith("### Instruction:")
+    assert "Bytecode metadata:" in prefix
+    tokenizer = _CharacterTokenizer()
+    exact = export_length_report(record, len(prefix) + len(target + suffix) - 1, tokenizer)
+    assert exact["context_tokens"] == len(prefix)
+    assert exact["target_tokens"] == len(target + suffix)
+    assert exact["total_tokens"] == len(prefix) + len(target + suffix)
+    assert exact["token_count_method"] == "tokenizer"
+    assert exact["reasons"] == ["context_overlength"]
+    estimated = export_length_report(record, exact["max_seq_length"])
+    assert estimated["token_count_method"] == "estimate"
+    assert estimated["total_tokens"] < exact["total_tokens"]
+
+
+def test_export_exact_length_includes_training_eos():
+    from src.dataset_export_primitives import export_length_report
+
+    class EosCharacterTokenizer(_CharacterTokenizer):
+        eos_token_id = 999999
+
+    record = {"input": "function example:\n  return", "output": "function example() {}"}
+    without_eos = export_length_report(record, 8192, _CharacterTokenizer())
+    with_eos = export_length_report(
+        record, without_eos["total_tokens"], EosCharacterTokenizer()
+    )
+
+    assert with_eos["target_tokens"] == without_eos["target_tokens"] + 1
+    assert with_eos["reasons"] == ["context_overlength"]
+
+
+def test_both_export_paths_quarantine_exact_tokenizer_overlength(tmp_path):
+    import download_hf_contracts
+    from src.dataset_export_primitives import build_training_record, export_length_report
+    from src.dataset_pipeline import DatasetBuilder, FunctionPair
+
+    tokenizer = _CharacterTokenizer()
+    short_body = "function short() public { uint256 x = 1; emit Done(x); }"
+    long_body = "function longer() public { uint256 x = 2; emit Done(x); }"
+    short_tac = "function same:\n  block_1:\n    temp = 1"
+    long_tac = "function same:\n  block_2:\n    temp = " + "ADD 1 2 " * 45
+    budget = export_length_report(
+        build_training_record(short_tac, short_body), 8192, tokenizer
+    )["total_tokens"] + 1
+    assert not export_length_report(
+        build_training_record(long_tac, long_body), budget
+    )["reasons"]
+    assert "context_overlength" in export_length_report(
+        build_training_record(long_tac, long_body), budget, tokenizer
+    )["reasons"]
+
+    db_path = tmp_path / "hf.db"
+    output_path = tmp_path / "hf.jsonl"
+    manifest_path = tmp_path / "hf.manifest.json"
+    download_hf_contracts.init_database(db_path)
+    pairs = [
+        {**_make_pair(download_hf_contracts, idx, body), "tac_representation": tac}
+        for idx, (body, tac) in enumerate(
+            [(short_body, short_tac), (long_body, long_tac)], start=1
+        )
+    ]
+    assert download_hf_contracts._store_pairs_batch(db_path, pairs) == 2
+    download_hf_contracts.export_training_data(
+        str(output_path),
+        db_path=db_path,
+        manifest_path=manifest_path,
+        max_seq_length=budget,
+        length_tokenizer=tokenizer,
+    )
+    assert len(output_path.read_text().splitlines()) == 1
+    hf_rejects = [
+        json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()
+    ]
+    assert len(hf_rejects) == 1
+    assert hf_rejects[0]["reasons"] == ["context_overlength"]
+    assert hf_rejects[0]["lengths"]["token_count_method"] == "tokenizer"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["parameters"]["length_tokenizer"] == tokenizer.name_or_path
+    assert manifest["validation"]["token_length_filter"]["token_count_method"] == "tokenizer"
+
+    builder = DatasetBuilder("dummy", output_dir=str(tmp_path / "builder"))
+    for idx, (body, tac) in enumerate(
+        [(short_body, short_tac), (long_body, long_tac)], start=1
+    ):
+        builder._store_function_pair(
+            FunctionPair(
+                function_name="short" if idx == 1 else "longer",
+                tac_representation=tac,
+                solidity_code=body,
+                function_signature="function short()" if idx == 1 else "function longer()",
+                visibility="public",
+                is_payable=False,
+                is_view=False,
+                contract_address=f"0x{idx:040x}",
+            )
+        )
+    builder_output = Path(
+        builder.export_dataset("jsonl", max_seq_length=budget, length_tokenizer=tokenizer)
+    )
+    assert len(builder_output.read_text().splitlines()) == 1
+    builder_rejects = [
+        json.loads(line)
+        for line in Path(f"{builder_output}.rejects.jsonl").read_text().splitlines()
+    ]
+    assert len(builder_rejects) == 1
+    assert builder_rejects[0]["reasons"] == ["context_overlength"]
+    builder_manifest = json.loads(Path(f"{builder_output}.manifest.json").read_text())
+    assert builder_manifest["parameters"]["length_tokenizer"] == tokenizer.name_or_path
+
+
+def test_export_cli_loads_exact_tokenizer_offline(tmp_path, monkeypatch):
+    import download_hf_contracts
+    from transformers import AutoTokenizer
+
+    db_path = tmp_path / "contracts.db"
+    output_path = tmp_path / "dataset.jsonl"
+    download_hf_contracts.init_database(db_path)
+    body = "function short() public { uint256 x = 1; emit Done(x); }"
+    download_hf_contracts._store_pairs_batch(
+        db_path, [_make_pair(download_hf_contracts, 1, body)]
+    )
+    loaded = []
+
+    def load_tokenizer(name, **kwargs):
+        loaded.append((name, kwargs))
+        return _CharacterTokenizer()
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "download_hf_contracts.py", "--export-only", "--db", str(db_path),
+            "--output", str(output_path), "--length-tokenizer", "locally-cached-tokenizer",
+            "--max-seq-length", "128",
+        ],
+    )
+    download_hf_contracts.main()
+    assert loaded == [("locally-cached-tokenizer", {"local_files_only": True})]
+    assert output_path.read_text() == ""
+    rejects = [
+        json.loads(line) for line in Path(f"{output_path}.rejects.jsonl").read_text().splitlines()
+    ]
+    assert len(rejects) == 1
+    assert "context_overlength" in rejects[0]["reasons"]
 
 
 def test_shared_primitives_produce_same_final_rows_across_export_paths(tmp_path):

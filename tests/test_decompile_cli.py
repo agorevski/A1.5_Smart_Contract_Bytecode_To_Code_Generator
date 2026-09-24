@@ -78,6 +78,7 @@ def test_cli_autodiscovers_newest_final_model(monkeypatch):
 
 def test_cli_function_limit_returns_structured_json(monkeypatch, capsys):
     decompile = load_decompile_module()
+    monkeypatch.setattr(decompile, "_resolve_model_path", lambda _model_path: ROOT)
 
     analyzer = SimpleNamespace(instructions=[1], basic_blocks={"b": 1}, functions={})
     monkeypatch.setattr(
@@ -96,6 +97,7 @@ def test_cli_function_limit_returns_structured_json(monkeypatch, capsys):
 
 def test_cli_timeout_returns_structured_json(monkeypatch, capsys):
     decompile = load_decompile_module()
+    monkeypatch.setattr(decompile, "_resolve_model_path", lambda _model_path: ROOT)
 
     def slow_analyze(bytecode):
         import time

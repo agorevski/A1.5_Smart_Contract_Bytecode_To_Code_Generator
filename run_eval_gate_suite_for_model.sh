@@ -13,6 +13,8 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
     echo "MODEL_PATH does not exist or is not a directory: ${MODEL_PATH}" >&2
     exit 1
 fi
+MODEL_PATH="$(realpath "${MODEL_PATH}")"
+cd "${SCRIPT_DIR}"
 
 LABEL="${LABEL:-$(basename "${MODEL_PATH}")}"
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -21,7 +23,6 @@ EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
 EVAL_REPETITION_PENALTY="${EVAL_REPETITION_PENALTY:-1.05}"
 GATE_DIR="${GATE_DIR:-${SCRIPT_DIR}/models/eval_gate_${LABEL}_$(date +%Y%m%d-%H%M%S)}"
 
-TRAIN_DATASET="${TRAIN_DATASET:-${SCRIPT_DIR}/data/qwen_qlora_full_body_balanced_20260628-162859/splits/train_dataset.jsonl}"
 BROAD_DATASET="${BROAD_DATASET:-${SCRIPT_DIR}/data/loop_iter10_selector_prompt_broad_eval/broad30_excluding_iter4.jsonl}"
 CALLS_DATASET="${CALLS_DATASET:-${SCRIPT_DIR}/data/eval_failure_slices/broad30_reppenalty_1_05_fixed_extractor/calls.jsonl}"
 STATE_DATASET="${STATE_DATASET:-${SCRIPT_DIR}/data/eval_failure_slices/broad30_reppenalty_1_05_fixed_extractor/state_writes.jsonl}"
@@ -37,7 +38,7 @@ PURE_NEGATIVE_BASELINE="${PURE_NEGATIVE_BASELINE:-${SCRIPT_DIR}/results/eval_178
 LARGE192_BASELINE="${LARGE192_BASELINE:-${SCRIPT_DIR}/results/eval_1782687160.json}"
 
 for required in \
-    "${TRAIN_DATASET}" "${BROAD_DATASET}" "${CALLS_DATASET}" "${STATE_DATASET}" \
+    "${BROAD_DATASET}" "${CALLS_DATASET}" "${STATE_DATASET}" \
     "${HOLDOUT64_DATASET}" "${PURE_NEGATIVE_DATASET}" "${LARGE192_DATASET}" \
     "${BROAD_BASELINE}" "${CALLS_BASELINE}" "${STATE_BASELINE}" \
     "${HOLDOUT64_BASELINE}" "${PURE_NEGATIVE_BASELINE}" "${LARGE192_BASELINE}"; do
@@ -46,6 +47,14 @@ for required in \
         exit 1
     fi
 done
+
+FIXED_EVAL_DATASETS="${BROAD_DATASET}:${CALLS_DATASET}:${STATE_DATASET}:${HOLDOUT64_DATASET}:${PURE_NEGATIVE_DATASET}:${LARGE192_DATASET}"
+VERIFIED_TRAIN_DATASET="$(python -m scripts.gate_dataset verify-model "${MODEL_PATH}" "${FIXED_EVAL_DATASETS}")"
+if [[ -n "${TRAIN_DATASET:-}" && "$(realpath "${TRAIN_DATASET}")" != "$(realpath "${VERIFIED_TRAIN_DATASET}")" ]]; then
+    echo "TRAIN_DATASET does not match verified model training input: ${VERIFIED_TRAIN_DATASET}" >&2
+    exit 1
+fi
+TRAIN_DATASET="${VERIFIED_TRAIN_DATASET}"
 
 mkdir -p "${GATE_DIR}"
 EVAL_MAP="${GATE_DIR}/eval_paths.tsv"
@@ -75,6 +84,8 @@ run_eval() {
         "$@"
     local eval_json
     eval_json="$(newest_eval_json)"
+    python -m scripts.gate_dataset verify-eval "${eval_json}" "${MODEL_PATH}" "${dataset_path}" \
+        --max-new-tokens "${EVAL_MAX_NEW_TOKENS}" --repetition-penalty "${EVAL_REPETITION_PENALTY}"
     printf '%s\t%s\t%s\t%s\n' "${label}" "${MODEL_PATH}" "${dataset_path}" "${eval_json}" | tee -a "${EVAL_MAP}"
 }
 

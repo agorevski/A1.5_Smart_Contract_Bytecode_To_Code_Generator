@@ -6,6 +6,18 @@ from src.contract_reconstruction import (
     build_function_quality,
     build_reconstruction_plan,
 )
+from src.inference import analyze_bytecode_tac
+
+
+def test_reconstruction_plan_keeps_reachable_blocks_from_real_function():
+    bytecode = "0x60003560e01c806312345678146010575b00"
+    analyzer, function_tac, _ = analyze_bytecode_tac(bytecode)
+
+    plan = build_reconstruction_plan(bytecode, analyzer, function_tac)
+    chunk = next(c for c in plan["semantic_chunks"] if c["selector"] == "0x12345678")
+
+    assert chunk["basic_blocks"] == ["block_0010"]
+    assert chunk["instruction_count"] == 2
 
 
 def test_reconstruction_plan_handles_contract_fallback_chunk():

@@ -1315,10 +1315,26 @@ class DatasetBuilder:
                         f for f in solidity_with_selectors if f.get("contract_name", "") == cname
                     ] or solidity_with_selectors
 
+                    ambiguous_selectors: set[str] = set()
                     matched = self._match_functions_by_selector(
-                        contract_sol_funcs, bytecode_functions, analyzer
+                        contract_sol_funcs, bytecode_functions, analyzer,
+                        ambiguous_selectors=ambiguous_selectors,
                     )
-                    if not matched:
+                    if ambiguous_selectors:
+                        address_failures.append(
+                            ("ambiguous_selector_alignment", ", ".join(sorted(ambiguous_selectors)))
+                        )
+                        add_diagnostic(
+                            stage="match",
+                            contract_address=addr,
+                            compiler_version=ver,
+                            optimizer_enabled=opt,
+                            optimization_runs=runs,
+                            contract_name=cname,
+                            status="ambiguous_selector_alignment",
+                            error=f"conflicting source or runtime candidates: {', '.join(sorted(ambiguous_selectors))}",
+                        )
+                    if not matched and not ambiguous_selectors:
                         address_failures.append(("no_selector_matches", cname))
                         add_diagnostic(
                             stage="match",
@@ -1825,6 +1841,8 @@ class DatasetBuilder:
         solidity_functions: List[Dict],
         bytecode_functions: Dict,
         analyzer: BytecodeAnalyzer,
+        *,
+        ambiguous_selectors: Optional[set[str]] = None,
     ) -> List[Dict]:
         """Match Solidity functions with bytecode functions by selector.
 
@@ -1836,12 +1854,17 @@ class DatasetBuilder:
         Returns:
             List of matched function dicts.
         """
-        matches = match_functions_by_selector(solidity_functions, bytecode_functions, analyzer)
+        matches = match_functions_by_selector(
+            solidity_functions, bytecode_functions, analyzer,
+            ambiguous_selectors=ambiguous_selectors,
+        )
         matched_selectors = {m["selector"] for m in matches}
         for sol_func in solidity_functions:
             selector = sol_func.get("selector")
             if selector in matched_selectors:
                 logger.debug(f"Matched function {sol_func['name']} with selector {selector}")
+            elif ambiguous_selectors is not None and selector in ambiguous_selectors:
+                logger.debug("Skipped ambiguous selector %s for %s", selector, sol_func["name"])
             elif selector:
                 logger.debug(f"No bytecode match for {sol_func['name']} (selector: {selector})")
         return matches
@@ -2216,6 +2239,7 @@ class DatasetBuilder:
         filter_overlength: bool = True,
         rejects_path: Optional[str] = None,
         write_manifest: bool = True,
+        length_tokenizer: Any = None,
     ) -> str:
         """Export the dataset in the specified format.
 
@@ -2230,6 +2254,8 @@ class DatasetBuilder:
             filter_overlength: Quarantine rows exceeding ``max_seq_length``.
             rejects_path: Optional JSONL path for rejected main-dataset rows.
             write_manifest: Write an export manifest next to the main artifact.
+            length_tokenizer: Optional training tokenizer for exact length
+                filtering; without one, token lengths are only estimates.
 
         Returns:
             Path to exported file.
@@ -2346,7 +2372,7 @@ class DatasetBuilder:
             record = row_to_record(row)
             quality_report = training_record_quality_report(record)
             reasons = list(quality_report["reasons"])
-            length_report = export_length_report(record, max_seq_length)
+            length_report = export_length_report(record, max_seq_length, length_tokenizer)
             length_reasons = length_report["reasons"] if filter_overlength else []
             reasons.extend(length_reasons)
             row_hash = record_final_row_hash(record)
@@ -2456,6 +2482,12 @@ class DatasetBuilder:
                     "include_partial": include_partial,
                     "max_seq_length": max_seq_length,
                     "filter_overlength": filter_overlength,
+                    "token_count_method": "tokenizer" if length_tokenizer is not None else "estimate",
+                    "length_tokenizer": (
+                        getattr(length_tokenizer, "name_or_path", None)
+                        if length_tokenizer is not None
+                        else None
+                    ),
                     "final_row_duplicate_policy": "quarantine",
                     "tac_quality_policy": "quarantine",
                     "record_quality_policy": "quarantine",
@@ -2495,6 +2527,7 @@ class DatasetBuilder:
                         "status": "filtered" if overlength_row_rejects else "passed",
                         "max_seq_length": max_seq_length,
                         "filter_overlength": filter_overlength,
+                        "token_count_method": "tokenizer" if length_tokenizer is not None else "estimate",
                         "reject_count": overlength_row_rejects,
                         "reason_counts": dict(sorted(overlength_counts.items())),
                     },

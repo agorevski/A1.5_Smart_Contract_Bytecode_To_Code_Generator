@@ -9,7 +9,7 @@ pairs with bytecode-only TAC input, Solidity output, and metadata retained only
 for analysis/filtering/manifests.
 
 Deduplication strategy (multi-layer):
-  1. Contract-level: address PRIMARY KEY + source_hash dedup
+  1. Contract-level: address PRIMARY KEY + source/target/compiler-config dedup
   2. Pair-level exact: hash(TAC + body) UNIQUE in function_pairs
   3. Pair-level semantic: pair_norm_hash(normalized_TAC + normalized_body) UNIQUE
      -- catches identical bytecode from different compilers
@@ -26,6 +26,7 @@ Usage:
     python download_hf_contracts.py --workers 8              # set parallelism
     python download_hf_contracts.py --max-body-dupes 5       # cap duplicates
     python download_hf_contracts.py --min-body-length 50     # quality filter
+    python download_hf_contracts.py --export-only --length-tokenizer ./models/tokenizer
     python download_hf_contracts.py --validate-jsonl data/hf_training_dataset.jsonl
 """
 
@@ -90,6 +91,7 @@ from src.local_compiler import (
     parse_etherscan_source,
     parse_pragma,
     select_compilation_configs,
+    _normalize_version,
 )
 
 try:
@@ -656,13 +658,24 @@ def count_function_pairs(db_path: Path = DB_PATH) -> int:
     return _count_query(db_path, "SELECT COUNT(*) FROM function_pairs")
 
 
-def get_existing_source_hashes(db_path: Path = DB_PATH) -> Set[str]:
-    """Load all existing source_hash values for fast dedup lookups."""
+def get_existing_contract_keys(db_path: Path = DB_PATH) -> Set[Tuple[str, str, str, bool, int]]:
+    """Load source/target/compiler identities already queued for compilation."""
     with _db_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT source_hash FROM contracts WHERE source_hash IS NOT NULL"
+            "SELECT source_hash, contract_name, compiler_version, "
+            "optimization_enabled, optimization_runs "
+            "FROM contracts WHERE source_hash IS NOT NULL"
         ).fetchall()
-    return {r[0] for r in rows}
+    return {
+        (
+            row[0],
+            str(row[1] or "").strip().lower(),
+            _normalize_version(row[2]) or "",
+            _parse_opt_used(row[3]),
+            _parse_runs(row[4]),
+        )
+        for row in rows
+    }
 
 
 def get_body_hash_counts(db_path: Path = DB_PATH) -> Dict[str, int]:
@@ -1128,7 +1141,7 @@ def download_contracts(
     command_args: Optional[List[str]] = None,
     parquet_batch_size: int = PARQUET_READ_BATCH_SIZE,
 ) -> int:
-    """Download contracts from HuggingFace with source-code-level dedup.
+    """Download contracts from HuggingFace with source/target/config dedup.
 
     Parquet files are cached locally (default: ~/.cache/huggingface/hub/).
     On rerun, cached files are reused without re-downloading.
@@ -1171,8 +1184,8 @@ def download_contracts(
         return 0
     logger.info(f"Found {len(parquet_files)} Parquet file(s)")
 
-    existing_hashes = get_existing_source_hashes(db_path)
-    logger.info(f"Loaded {len(existing_hashes)} existing source hashes for dedup")
+    existing_keys = get_existing_contract_keys(db_path)
+    logger.info("Loaded %s existing source/target/compiler identities for dedup", len(existing_keys))
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -1240,18 +1253,28 @@ def download_contracts(
                             continue
 
                         src_hash = hash_source_code(src)
-                        if src_hash in existing_hashes:
-                            deduped += 1
-                            continue
-                        existing_hashes.add(src_hash)
-
-                        address = str(_row_get(row, "contract_address", "") or "").strip()
-                        if not address:
-                            address = f"hf_{src_hash}"
-
+                        contract_name = str(_row_get(row, "contract_name", "") or "").strip()
                         compiler_version = str(_row_get(row, "compiler_version", "") or "")
                         opt_used = _parse_opt_used(_row_get(row, "optimization_used", False))
                         runs = _parse_runs(_row_get(row, "runs", 200))
+                        contract_key = (
+                            src_hash,
+                            contract_name.lower(),
+                            _normalize_version(compiler_version) or "",
+                            opt_used,
+                            runs,
+                        )
+                        if contract_key in existing_keys:
+                            deduped += 1
+                            continue
+                        existing_keys.add(contract_key)
+
+                        address = str(_row_get(row, "contract_address", "") or "").strip()
+                        if not address:
+                            key_hash = hashlib.sha256(
+                                json.dumps(contract_key, separators=(",", ":")).encode("utf-8")
+                            ).hexdigest()
+                            address = f"hf_{key_hash}"
 
                         batch.append(
                             (
@@ -1262,7 +1285,7 @@ def download_contracts(
                                 opt_used,
                                 runs,
                                 str(_row_get(row, "abi", "") or ""),
-                                str(_row_get(row, "contract_name", "") or ""),
+                                contract_name,
                                 "huggingface",
                                 src_hash,
                             )
@@ -1313,8 +1336,8 @@ def download_contracts(
                 max_rss_mb,
             )
             logger.info(
-                f"  Running: {inserted} inserted, {ignored} ignored, "
-                f"{deduped} deduped, {skipped} skipped, {total_seen} seen"
+                "  Running: %s inserted, %s ignored, %s source/target/config deduped, "
+                "%s skipped, %s seen", inserted, ignored, deduped, skipped, total_seen,
             )
             if limit_reached:
                 logger.info(f"Reached download limit of {limit}")
@@ -1325,8 +1348,8 @@ def download_contracts(
 
     conn.close()
     logger.info(
-        f"Download complete: {inserted} stored, {ignored} ignored, "
-        f"{deduped} source-deduped, {skipped} skipped, {total_seen} total"
+        "Download complete: %s stored, %s ignored, %s source/target/config deduped, "
+        "%s skipped, %s total", inserted, ignored, deduped, skipped, total_seen,
     )
 
     duration_seconds = time.perf_counter() - start_time
@@ -1348,6 +1371,10 @@ def download_contracts(
                 "limit": limit,
                 "cache_dir": cache_dir,
                 "parquet_batch_size": parquet_batch_size,
+                "dedup_key": [
+                    "source_hash", "contract_name", "compiler_version",
+                    "optimization_enabled", "optimization_runs",
+                ],
             },
             "artifacts": {"database": _artifact_summary(db_path)},
             "row_counts": {
@@ -1478,6 +1505,7 @@ def _compile_one_job(
         pairs: List[Dict] = []
         analysis_errors: List[str] = []
         drop_counts: Counter = Counter()
+        ambiguous_selector_values: Set[str] = set()
         compiled_contract_counts: Counter = Counter()
         target_name = str(target_contract_name or "").strip()
         for cname, compiled in comp.contracts.items():
@@ -1508,7 +1536,15 @@ def _compile_one_job(
                 f for f in solidity_functions if f.get("contract_name", "") == cname
             ] or solidity_functions
 
-            for m in _match_functions(contract_sol_funcs, bytecode_functions, analyzer):
+            ambiguous_selectors: Set[str] = set()
+            matches = _match_functions(
+                contract_sol_funcs, bytecode_functions, analyzer,
+                ambiguous_selectors=ambiguous_selectors,
+            )
+            if ambiguous_selectors:
+                ambiguous_selector_values.update(ambiguous_selectors)
+                drop_counts["ambiguous_selector_alignment"] += len(ambiguous_selectors)
+            for m in matches:
                 sol_body = m["solidity_function"]["body"]
                 if len(sol_body.strip()) < min_body_length:
                     continue
@@ -1545,6 +1581,17 @@ def _compile_one_job(
                 "pairs": [],
                 "status": "no_target_contract",
                 "error": f"target contract {target_name!r} not found in compiled artifacts",
+                "drop_counts": dict(drop_counts),
+                "compiled_contract_counts": dict(compiled_contract_counts),
+            }
+        if drop_counts.get("ambiguous_selector_alignment"):
+            return {
+                "pairs": [],
+                "status": "ambiguous_selector_alignment",
+                "error": (
+                    "conflicting source targets or runtime entries for selectors: "
+                    + ", ".join(sorted(ambiguous_selector_values)[:10])
+                ),
                 "drop_counts": dict(drop_counts),
                 "compiled_contract_counts": dict(compiled_contract_counts),
             }
@@ -2032,13 +2079,17 @@ def _match_functions(
     optimizer_enabled: bool = False,
     abi_enricher: Optional[Any] = None,
     storage_resolver: Optional[Any] = None,
+    ambiguous_selectors: Optional[Set[str]] = None,
 ) -> List[Dict]:
     """Match Solidity labels to bytecode functions by selector.
 
     Source/ABI/compiler arguments are accepted for backwards compatibility but
     are intentionally ignored when constructing TAC prompt text.
     """
-    return match_functions_by_selector(solidity_functions, bytecode_functions, analyzer)
+    return match_functions_by_selector(
+        solidity_functions, bytecode_functions, analyzer,
+        ambiguous_selectors=ambiguous_selectors,
+    )
 
 
 def _ensure_tac_integrated(analyzer) -> None:
@@ -2309,6 +2360,7 @@ def export_training_data(
     max_seq_length: int = DEFAULT_EXPORT_MAX_SEQ_LENGTH,
     filter_overlength: bool = True,
     rejects_path: Optional[Path] = None,
+    length_tokenizer: Optional[Any] = None,
 ) -> str:
     """Export deterministic JSONL with bytecode-only inputs and metadata.
 
@@ -2451,7 +2503,7 @@ def export_training_data(
                 target_contract_name,
                 compiled_contract,
             )
-            length_report = _export_length_report(record, max_seq_length)
+            length_report = _export_length_report(record, max_seq_length, length_tokenizer)
             length_reasons = length_report["reasons"] if filter_overlength else []
             row_hash = final_row_hash(record["input"], record["output"])
             duplicate_reasons: List[str] = []
@@ -2569,6 +2621,12 @@ def export_training_data(
                 "validate_body_dupes": validate_body_dupes,
                 "max_seq_length": max_seq_length,
                 "filter_overlength": filter_overlength,
+                "token_count_method": "tokenizer" if length_tokenizer is not None else "estimate",
+                "length_tokenizer": (
+                    getattr(length_tokenizer, "name_or_path", None)
+                    if length_tokenizer is not None
+                    else None
+                ),
                 "final_row_duplicate_policy": "quarantine",
                 "tac_quality_policy": "quarantine",
                 "record_quality_policy": "quarantine",
@@ -2644,6 +2702,7 @@ def export_training_data(
                     "status": "filtered" if overlength_row_rejects else "passed",
                     "max_seq_length": max_seq_length,
                     "filter_overlength": filter_overlength,
+                    "token_count_method": "tokenizer" if length_tokenizer is not None else "estimate",
                     "reject_count": overlength_row_rejects,
                     "reason_counts": dict(sorted(overlength_counts.items())),
                     "reject_samples": reject_samples,
@@ -2745,6 +2804,16 @@ def main():
         "--no-filter-overlength",
         action="store_true",
         help="Do not quarantine rows that exceed --max-seq-length.",
+    )
+    parser.add_argument(
+        "--length-tokenizer",
+        type=str,
+        default=None,
+        help=(
+            "Locally available tokenizer path or model ID for exact export-time "
+            "length filtering; without it, counts are estimates and training "
+            "preflight can still reject rows."
+        ),
     )
     parser.add_argument(
         "--rejects-output",
@@ -2904,6 +2973,13 @@ def main():
     logger.info(f"Total function pairs in DB: {total}")
 
     if total > 0:
+        length_tokenizer = None
+        if args.length_tokenizer:
+            from transformers import AutoTokenizer
+
+            length_tokenizer = AutoTokenizer.from_pretrained(
+                args.length_tokenizer, local_files_only=True
+            )
         out = export_training_data(
             output_path=args.output,
             max_body_dupes=args.max_body_dupes,
@@ -2914,6 +2990,7 @@ def main():
             max_seq_length=args.max_seq_length,
             filter_overlength=not args.no_filter_overlength,
             rejects_path=Path(args.rejects_output) if args.rejects_output else None,
+            length_tokenizer=length_tokenizer,
         )
         logger.info(f"Training data written to: {out}")
     else:
