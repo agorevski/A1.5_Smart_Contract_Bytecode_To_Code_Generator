@@ -85,7 +85,7 @@ jobs:
               "pct_below_0.4_edit_dist": 1.0,
               "replication_f1_mean": 0.90,
               "solidity_valid_mean": 1.0,
-              "solidity_compiler_checked_mean": 0.0,
+              "solidity_compiler_checked_mean": 1.0,
               "solidity_ast_valid_mean": 1.0,
               "baseline_comparison": {"num_regressions": 0, "num_metrics_compared": 1},
           }
@@ -104,6 +104,20 @@ jobs:
               "max_baseline_regressions": 0,
           }
 
+          missing_evidence = evaluate_quality_gate(summary, gate_config)
+          assert missing_evidence["status"] == "failed", missing_evidence
+          assert {
+              "bytecode_semantic_score_mean",
+              "bytecode_semantic_checked_mean",
+              "bytecode_deployable_mean",
+          }.issubset({item["metric"] for item in missing_evidence["failures"]})
+
+          # Synthetic fully checked statistics exercise the positive gate/report path.
+          summary.update({
+              "bytecode_semantic_score_mean": 0.9,
+              "bytecode_semantic_checked_mean": 1.0,
+              "bytecode_deployable_mean": 1.0,
+          })
           summary["quality_gate"] = evaluate_quality_gate(summary, gate_config)
           assert summary["quality_gate"]["status"] == "passed", summary["quality_gate"]
 
